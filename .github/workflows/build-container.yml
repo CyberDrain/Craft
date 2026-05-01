@@ -43,5 +43,5 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:beta
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.description=CRAFT - Container Runtime for Azure Functions Technology
+            org.opencontainers.image.description=CRAFT - CyberDrain Runtime for Apps, Functions, Tasks
             org.opencontainers.image.revision=${{ github.sha }}

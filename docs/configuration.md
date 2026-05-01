@@ -1,6 +1,6 @@
 # CRAFT Configuration Guide
 
-CRAFT (Container Runtime for Azure Functions Technology) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
+CRAFT (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
 
 ## Configuration Hierarchy
 

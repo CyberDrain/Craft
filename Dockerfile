@@ -1,5 +1,5 @@
 # ── CRAFT Base Image ───────────────────────────────────────
-# Container Runtime for Azure Functions Technology
+# CyberDrain Runtime for Apps, Functions, Tasks
 # This is the base runtime — app-specific modules, config,
 # and frontend are layered on top by downstream projects.
 
