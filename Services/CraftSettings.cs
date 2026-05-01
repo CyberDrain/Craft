@@ -1,7 +1,7 @@
 namespace CRAFT.Services;
 
 /// <summary>
-/// Central configuration for the CRAFT (Container Runtime for Azure Functions Technology) host.
+/// Central configuration for the CRAFT (CyberDrain Runtime for Apps, Functions, Tasks) host.
 /// All application-specific behavior is driven by these settings — the host itself
 /// is generic. Bind from the "App" section of appsettings.json.
 ///
