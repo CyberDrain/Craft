@@ -222,6 +222,38 @@ app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
 
+    // Setup redirect: when auth is not configured and not in dev mode,
+    // redirect browser requests to the setup page and return 403 for API calls
+    if (!authService.IsConfigured && !app.Environment.IsDevelopment()
+        && !string.IsNullOrEmpty(CraftSettings.Auth.SetupPath))
+    {
+        var setupPath = CraftSettings.Auth.SetupPath;
+        // Allow the setup page itself, its assets, and the setup API endpoint through
+        if (!path.Equals(setupPath, StringComparison.OrdinalIgnoreCase)
+            && !path.StartsWith("/_next/", StringComparison.OrdinalIgnoreCase)
+            && !path.StartsWith("/assets/", StringComparison.OrdinalIgnoreCase)
+            && !Path.HasExtension(path))
+        {
+            if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
+            {
+                // Allow configured setup API paths through without auth
+                if (CraftSettings.Auth.SetupAllowedPaths.Exists(p =>
+                    path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                {
+                    await next();
+                    return;
+                }
+                context.Response.StatusCode = 403;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(
+                    System.Text.Json.JsonSerializer.Serialize(new { setupRequired = true, setupPath }));
+                return;
+            }
+            context.Response.Redirect(setupPath);
+            return;
+        }
+    }
+
     // Always try to resolve CRAFT session and store it for /.auth/me to use
     if (authService.IsConfigured)
     {

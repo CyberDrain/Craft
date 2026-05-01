@@ -177,6 +177,19 @@ public class AuthSettings
     /// If empty, /api/me returns the raw client principal without PS processing.
     /// </summary>
     public string MeEndpointFunction { get; set; } = "";
+
+    /// <summary>
+    /// Path to redirect to when auth is not configured (non-dev only).
+    /// Empty string disables the redirect. API calls get a 403 JSON response instead.
+    /// </summary>
+    public string SetupPath { get; set; } = "";
+
+    /// <summary>
+    /// API paths allowed through without auth when setup redirect is active.
+    /// Matched as case-insensitive prefixes against the request path.
+    /// Example: ["/api/ExecSetup", "/api/ExecListAppId"]
+    /// </summary>
+    public List<string> SetupAllowedPaths { get; set; } = [];
 }
 
 /// <summary>

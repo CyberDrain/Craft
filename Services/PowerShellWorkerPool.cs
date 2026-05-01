@@ -57,27 +57,35 @@ public class PowerShellWorkerPool : IDisposable
         var bgISS = BuildISS(isHttp: false);
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        // Sequential init — parallel causes deadlocks in PS type system
-        for (int i = 0; i < _httpPoolSize; i++)
+        // First HTTP worker must init sequentially — warmup scripts set process-level state
+        // (env vars, auth tokens, caches) that subsequent workers benefit from.
+        var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
+        firstWorker.Initialize(_repo, _apiBasePath, _settings);
+        if (_settings.Worker.WarmupScripts.Count > 0)
         {
-            var w = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
-            w.Initialize(_repo, _apiBasePath, _settings);
-            if (i == 0 && _settings.Worker.WarmupScripts.Count > 0)
-            {
-                // Pre-warm on first HTTP worker using configured warmup scripts.
-                // These are process-level so all subsequent workers benefit.
-                var warmSw = System.Diagnostics.Stopwatch.StartNew();
-                w.Warmup(_settings);
-                _logger.LogInformation("[System] Pre-warm completed in {Ms}ms", warmSw.ElapsedMilliseconds);
-            }
-            _httpPool.Add(w);
+            var warmSw = System.Diagnostics.Stopwatch.StartNew();
+            firstWorker.Warmup(_settings);
+            _logger.LogInformation("[System] Pre-warm completed in {Ms}ms", warmSw.ElapsedMilliseconds);
         }
+        _httpPool.Add(firstWorker);
 
+        // Remaining workers can init in parallel — ISS is a thread-safe template,
+        // and each runspace gets its own isolated session state.
+        var remaining = new List<(PowerShellWorker worker, bool isHttp)>();
+        for (int i = 1; i < _httpPoolSize; i++)
+            remaining.Add((new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger), true));
         for (int i = 0; i < _bgPoolSize; i++)
+            remaining.Add((new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger), false));
+
+        Parallel.ForEach(remaining, entry =>
         {
-            var w = new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger);
-            w.Initialize(_repo, _apiBasePath, _settings);
-            _bgPool.Add(w);
+            entry.worker.Initialize(_repo, _apiBasePath, _settings);
+        });
+
+        foreach (var entry in remaining)
+        {
+            if (entry.isHttp) _httpPool.Add(entry.worker);
+            else _bgPool.Add(entry.worker);
         }
 
         _logger.LogInformation("[System] Pool ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",

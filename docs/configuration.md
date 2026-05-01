@@ -112,6 +112,8 @@ Controls the PowerShell runspace pools that execute all scripts.
 
 **Memory impact:** Each worker consumes ~100–200 MB depending on module count. A config with `HttpPoolSize: 2` + `BgPoolSize: 4` uses ~6 workers × 150 MB ≈ 900 MB baseline. Scale accordingly.
 
+**Startup behavior:** The first HTTP worker initializes sequentially and runs `WarmupScripts` (which set process-level state like auth tokens and caches). All remaining workers (HTTP + BG) initialize **in parallel** afterward, benefiting from the process-level state already set. With source (non-compiled) modules, parallel init significantly reduces startup time.
+
 ---
 
 ### Auth
@@ -143,7 +145,17 @@ Controls authentication and the dev-mode auto-login principal.
 
   // PowerShell function to call for /api/me.
   // Empty string = return raw client principal without PS processing.
-  "MeEndpointFunction": "me"
+  "MeEndpointFunction": "me",
+
+  // Path to redirect to when auth is not configured (production only).
+  // When set and auth env vars are missing, all browser requests redirect here
+  // and API calls return 403 JSON: { "setupRequired": true, "setupPath": "..." }.
+  // Empty string (default) = no redirect, requests pass through without identity.
+  "SetupPath": "/onboarding",
+
+  // API paths allowed through without auth when setup redirect is active.
+  // Matched as case-insensitive prefixes. Use this to whitelist your setup endpoints.
+  "SetupAllowedPaths": ["/api/ExecSetup", "/api/ExecListAppId"]
 }
 ```
 
@@ -283,7 +295,6 @@ Controls where the host discovers PowerShell scripts.
 
   // Directories (under API/) scanned for background scripts.
   // These are deployed as Function:\ items on each worker.
-  // Note: CraftRuntime/ is always auto-loaded if present.
   "BackgroundScriptDirs": [],
 
   // RBAC metadata extraction from comment-based help (.ROLE, .FUNCTIONALITY)
@@ -442,7 +453,9 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
     "Auth": {
       "CookieName": "cipp-session",
       "DevRoles": ["superadmin", "admin", "editor", "readonly", "authenticated", "anonymous"],
-      "MeEndpointFunction": "me"
+      "MeEndpointFunction": "me",
+      "SetupPath": "/onboardingv2",
+      "SetupAllowedPaths": ["/api/ExecSAMSetup", "/api/ExecCombinedSetup", "/api/ExecListAppId"]
     },
 
     "Scheduler": { "ConfigFile": "CIPPTimers.json" },
@@ -468,6 +481,26 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
   }
 }
 ```
+
+---
+
+## Directory Structure
+
+CRAFT separates its own built-in scripts from application content:
+
+```
+/app/
+├── Runtime/              ← CRAFT built-in (ships with the base image)
+│   ├── CraftRuntime/     ← Orchestrator/queue/task scripts
+│   └── HTTP/Exec/        ← Built-in admin endpoint
+├── API/                  ← Application content (downstream overlay)
+│   ├── Modules/          ← PowerShell modules
+│   ├── Config/           ← App config files (timers, permissions, etc.)
+│   └── Shared/           ← Shared assemblies
+└── Frontend/             ← Static frontend build
+```
+
+`Runtime/` is owned by CRAFT and always loaded. `API/` is 100% owned by the downstream application — safe to volume-mount in dev without overwriting CRAFT internals.
 
 ---
 
