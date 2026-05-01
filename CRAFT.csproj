@@ -22,7 +22,7 @@
   <!-- Include runtime content in published output -->
   <ItemGroup>
     <Content Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="API\**\*.ps1" CopyToOutputDirectory="PreserveNewest" LinkBase="API" />
+    <Content Include="Runtime\**\*.ps1" CopyToOutputDirectory="PreserveNewest" LinkBase="Runtime" />
   </ItemGroup>
 
 </Project>

@@ -40,6 +40,7 @@ public class ScriptRepository
     public void LoadAll(string apiBasePath)
     {
         _apiBasePath = apiBasePath;
+        var runtimeBasePath = Path.Combine(AppContext.BaseDirectory, "Runtime");
         var modulesPath = Path.Combine(apiBasePath, "Modules");
 
         // Scan configured HTTP modules for route table + permissions
@@ -49,9 +50,13 @@ public class ScriptRepository
             if (Directory.Exists(modulePath)) LoadDirectory(modulePath, FunctionCategory.Http);
         }
 
-        // Always load CraftRuntime if it exists (framework-provided scripts)
-        var craftRuntimePath = Path.Combine(apiBasePath, "CraftRuntime");
+        // Always load CraftRuntime if it exists (framework-provided scripts in Runtime/)
+        var craftRuntimePath = Path.Combine(runtimeBasePath, "CraftRuntime");
         if (Directory.Exists(craftRuntimePath)) LoadDirectory(craftRuntimePath, FunctionCategory.Background);
+
+        // Load built-in HTTP endpoints from Runtime/HTTP/
+        var runtimeHttpPath = Path.Combine(runtimeBasePath, "HTTP");
+        if (Directory.Exists(runtimeHttpPath)) LoadDirectory(runtimeHttpPath, FunctionCategory.Http);
 
         // Background scripts from configured directories
         foreach (var dirName in _settings.Scripts.BackgroundScriptDirs)
