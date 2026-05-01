@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+obj/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vs/
+.vscode/
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Docs / non-runtime
+docs/
+*.md
+.env
+.env.example
+.github/
