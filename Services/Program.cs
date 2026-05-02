@@ -555,6 +555,7 @@ OrchestratorBridge.Initialize(orchestrator);
 AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
+QueueStatusBridge.Initialize(jobManager);
 
 // --- Job Status API (C# direct — no PS overhead) ---
 
