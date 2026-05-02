@@ -1,11 +1,11 @@
 using System.Text.Json;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Static bridge allowing PowerShell (Get-CIPPQueueData) to query orchestrator/job
 /// progress without HTTP round-trips. Returns data in the shape the CIPP frontend expects.
-/// PS usage: [CRAFT.Services.QueueStatusBridge]::GetRunStatus($Reference, $QueueId)
+/// PS usage: [Craft.Services.QueueStatusBridge]::GetRunStatus($Reference, $QueueId)
 /// </summary>
 public static class QueueStatusBridge
 {
@@ -19,7 +19,7 @@ public static class QueueStatusBridge
     /// Returns a JSON string matching the Get-CIPPQueueData output shape.
     /// </summary>
     /// <param name="reference">Optional run reference/name to filter by (maps to RunName in JobManager)</param>
-    /// <param name="queueId">Optional queue ID (same as reference in CRAFT context)</param>
+    /// <param name="queueId">Optional queue ID (same as reference in Craft context)</param>
     /// <returns>JSON array of queue status objects</returns>
     public static string GetRunStatus(string? reference = null, string? queueId = null)
     {

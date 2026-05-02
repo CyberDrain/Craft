@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 // ── API Models ──
 

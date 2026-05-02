@@ -1,4 +1,4 @@
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Ambient invocation context that flows across async calls.

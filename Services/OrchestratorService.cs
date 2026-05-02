@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Thread-safe bridge allowing PowerShell (Start-CIPPOrchestrator) to queue

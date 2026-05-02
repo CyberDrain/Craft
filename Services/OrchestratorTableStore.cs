@@ -3,7 +3,7 @@ using System.Text.Json;
 using Azure;
 using Azure.Data.Tables;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Typed CRUD wrapper around Azure Table Storage for orchestrator persistence.

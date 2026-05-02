@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Cronos;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Mirrors a single entry from CIPPTimers.json.

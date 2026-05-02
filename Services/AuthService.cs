@@ -9,11 +9,11 @@ using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Static bridge so PowerShell can trigger auth reload without DI.
-/// Call [CRAFT.Services.AuthBridge]::ReloadAuth() from PS after credentials change.
+/// Call [Craft.Services.AuthBridge]::ReloadAuth() from PS after credentials change.
 /// </summary>
 public static class AuthBridge
 {
@@ -22,7 +22,7 @@ public static class AuthBridge
 
     /// <summary>
     /// Reloads OIDC configuration after auth credentials are updated.
-    /// Safe to call from PowerShell: [CRAFT.Services.AuthBridge]::ReloadAuth()
+    /// Safe to call from PowerShell: [Craft.Services.AuthBridge]::ReloadAuth()
     /// </summary>
     public static void ReloadAuth() => s_service?.ReloadConfiguration();
 }
@@ -60,7 +60,7 @@ public class AuthService
       PooledConnectionLifetime = TimeSpan.FromMinutes(15)
     };
     s_httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(45) };
-    s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("CRAFT-AuthService/1.0");
+    s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Craft-AuthService/1.0");
   }
 
   // Cookie & crypto settings

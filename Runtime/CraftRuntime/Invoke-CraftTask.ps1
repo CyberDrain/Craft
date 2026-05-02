@@ -1,7 +1,7 @@
 function Invoke-CraftTask {
     <#
     .SYNOPSIS
-        Generic task executor for CRAFT orchestrators.
+        Generic task executor for Craft orchestrators.
     .DESCRIPTION
         Reads FunctionName from the task JSON and dispatches to Push-{FunctionName}.
         Output is captured by the C# host for result collection.

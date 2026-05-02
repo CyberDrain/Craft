@@ -1,7 +1,7 @@
 function Start-CraftOrchestrator {
     <#
     .SYNOPSIS
-        Queue an orchestrator run from PowerShell into the CRAFT OrchestratorService.
+        Queue an orchestrator run from PowerShell into the Craft OrchestratorService.
     .DESCRIPTION
         Generic bridge function that serializes a batch of tasks and queues them
         for fan-out execution via the C# OrchestratorService.
@@ -46,7 +46,7 @@ function Start-CraftOrchestrator {
     # QueueFunction pattern: call the function first to generate batch items
     if (-not $InputObject.Batch -and $InputObject.QueueFunction) {
         $QueueFuncName = "Push-$($InputObject.QueueFunction.FunctionName)"
-        Write-Information "CRAFT: Calling QueueFunction '$QueueFuncName' to build batch for '$OrchestratorName'"
+        Write-Information "Craft: Calling QueueFunction '$QueueFuncName' to build batch for '$OrchestratorName'"
         $QueueItem = [PSCustomObject]@{}
         if ($InputObject.QueueFunction.Parameters) {
             $QueueItem = [PSCustomObject]$InputObject.QueueFunction.Parameters
@@ -54,15 +54,15 @@ function Start-CraftOrchestrator {
         $BatchResult = & $QueueFuncName -Item $QueueItem
         $QueueBatch = @($BatchResult | Where-Object { $null -ne $_ })
         if ($QueueBatch.Count -eq 0) {
-            Write-Information "CRAFT: QueueFunction '$QueueFuncName' returned 0 tasks for '$OrchestratorName' - skipping"
-            return "CRAFT-$OrchestratorName-NoTasks"
+            Write-Information "Craft: QueueFunction '$QueueFuncName' returned 0 tasks for '$OrchestratorName' - skipping"
+            return "Craft-$OrchestratorName-NoTasks"
         }
         $InputObject | Add-Member -MemberType NoteProperty -Name 'Batch' -Value $QueueBatch -Force
     }
 
     if (-not $InputObject.Batch -or $InputObject.Batch.Count -eq 0) {
-        Write-Information "CRAFT: No batch items for '$OrchestratorName' - skipping"
-        return "CRAFT-$OrchestratorName-NoTasks"
+        Write-Information "Craft: No batch items for '$OrchestratorName' - skipping"
+        return "Craft-$OrchestratorName-NoTasks"
     }
 
     $BatchJson = ConvertTo-Json -InputObject @($InputObject.Batch) -Depth 10 -Compress
@@ -76,13 +76,13 @@ function Start-CraftOrchestrator {
         }
     }
 
-    Write-Information "CRAFT: Queuing orchestrator '$OrchestratorName' ($($InputObject.Batch.Count) tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
-    [CRAFT.Services.OrchestratorBridge]::QueueOrchestration(
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($($InputObject.Batch.Count) tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
+    [Craft.Services.OrchestratorBridge]::QueueOrchestration(
         $OrchestratorName,
         $BatchJson,
         4,
         $PostExecFunctionName,
         $PostExecParametersJson
     )
-    return "CRAFT-$OrchestratorName"
+    return "Craft-$OrchestratorName"
 }

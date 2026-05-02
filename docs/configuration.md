@@ -1,6 +1,6 @@
-# CRAFT Configuration Guide
+# Craft Configuration Guide
 
-CRAFT (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
+Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
 
 ## Configuration Hierarchy
 
@@ -239,7 +239,7 @@ Start-CraftOrchestrator -InputObject @{
 }
 ```
 
-This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applications can provide their own wrapper function (e.g. CIPP uses `Start-CIPPOrchestrator` for dual-boot compatibility) — just have it call `[CRAFT.Services.OrchestratorBridge]::QueueOrchestration()` internally.
+This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applications can provide their own wrapper function (e.g. CIPP uses `Start-CIPPOrchestrator` for dual-boot compatibility) — just have it call `[Craft.Services.OrchestratorBridge]::QueueOrchestration()` internally.
 
 **How orchestration works:**
 1. A scheduler task or HTTP endpoint calls `Start-CraftOrchestrator` with a batch
@@ -321,7 +321,7 @@ These are process-level variables read directly (not part of `App:*`):
 
 ### Authentication Environment Variables
 
-These configure the built-in Azure AD / Entra ID OIDC authentication. When set, CRAFT handles login, token validation, session cookies, and user authorization via the `allowedUsers` Azure Table.
+These configure the built-in Azure AD / Entra ID OIDC authentication. When set, Craft handles login, token validation, session cookies, and user authorization via the `allowedUsers` Azure Table.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -329,9 +329,9 @@ These configure the built-in Azure AD / Entra ID OIDC authentication. When set, 
 | `AUTH_SECRET` | Yes (prod) | Azure AD client secret for the app registration |
 | `WEBSITE_AUTH_AAD_ALLOWED_TENANTS` | No | Tenant ID to restrict logins to. Defaults to `common` (any tenant) |
 
-When **none** of these are set, CRAFT's auth is unconfigured — the `/login` endpoint returns an error and API requests receive no identity header. In **Development** mode, a dev principal is injected automatically (see `Auth.DevRoles`).
+When **none** of these are set, Craft's auth is unconfigured — the `/login` endpoint returns an error and API requests receive no identity header. In **Development** mode, a dev principal is injected automatically (see `Auth.DevRoles`).
 
-These variable names are intentionally compatible with Azure App Service's built-in authentication headers so that the same configuration works whether auth is handled by CRAFT directly or by the App Service platform.
+These variable names are intentionally compatible with Azure App Service's built-in authentication headers so that the same configuration works whether auth is handled by Craft directly or by the App Service platform.
 
 #### Key Vault References
 
@@ -348,15 +348,15 @@ Key Vault references require:
 2. The Key Vault has an **access policy** granting that identity `Get` permission on secrets
 3. The App Setting values use the `@Microsoft.KeyVault(...)` syntax exactly as shown
 
-App Service resolves these at startup and injects the secret values as environment variables. CRAFT reads them the same way regardless of whether they are plain values or KV references — it's transparent.
+App Service resolves these at startup and injects the secret values as environment variables. Craft reads them the same way regardless of whether they are plain values or KV references — it's transparent.
 
-> **Note:** Key Vault access in CRAFT uses **access policies**, not Azure RBAC for Key Vault. Ensure the Key Vault has access policies enabled (the default), not "Azure role-based access control" as the permission model.
+> **Note:** Key Vault access in Craft uses **access policies**, not Azure RBAC for Key Vault. Ensure the Key Vault has access policies enabled (the default), not "Azure role-based access control" as the permission model.
 
 #### allowedUsers Table
 
 The `allowedUsers` table works the same way as Azure Static Web Apps user invitations — it's an application-level authorization layer that maps Azure AD identities to app-specific roles. This is separate from Azure AD group membership or app roles; it gives the application full control over who can access it and with what permissions.
 
-By default, the table lives in the same storage account as the rest of the app (`AzureWebJobsStorage`). To isolate it — for example, to share a single user table across multiple CRAFT instances, or to keep user data in a separate storage account from operational data — set `Auth.UserStorageConnection` to a different connection string.
+By default, the table lives in the same storage account as the rest of the app (`AzureWebJobsStorage`). To isolate it — for example, to share a single user table across multiple Craft instances, or to keep user data in a separate storage account from operational data — set `Auth.UserStorageConnection` to a different connection string.
 
 In `appsettings.json`:
 ```jsonc
@@ -375,7 +375,7 @@ App__Auth__UserStorageConnection = @Microsoft.KeyVault(VaultName=myvault;SecretN
 **Login flow:**
 1. User visits `/login` (or `/.auth/login/aad`) → redirected to Azure AD
 2. Azure AD authenticates user → redirects to `/.auth/callback` with authorization code
-3. CRAFT exchanges the code for tokens, validates the `id_token` JWT signature against Azure AD's published signing keys
+3. Craft exchanges the code for tokens, validates the `id_token` JWT signature against Azure AD's published signing keys
 4. User's UPN is checked against the `allowedUsers` Azure Table for role mapping (or assigned default roles if `AllowAllTenantUsers` is enabled)
 5. An encrypted session cookie is set (AES-256, derived from `AUTH_SECRET`)
 6. The `x-ms-client-principal` header is injected on subsequent requests (SWA-compatible format)
@@ -385,15 +385,15 @@ App__Auth__UserStorageConnection = @Microsoft.KeyVault(VaultName=myvault;SecretN
 - Sessions are stored in-memory with an 8-hour TTL (token expiry + 1 hour grace)
 - Cookie is `HttpOnly`, `Secure`, `SameSite=Lax`
 
-**Auth header formats — CRAFT handles three scenarios:**
+**Auth header formats — Craft handles three scenarios:**
 
 | Source | Detection | Behavior |
 |--------|-----------|----------|
 | **App Service EasyAuth** | `x-ms-client-principal` with `claims` array, no `userRoles` | Transforms to SWA format, adds roles from `allowedUsers` table |
 | **Azure SWA** | `x-ms-client-principal` with `userRoles` array | Passes through as-is |
-| **CRAFT session cookie** | No `x-ms-client-principal` header, valid session cookie | Builds and injects the header from the validated session |
+| **Craft session cookie** | No `x-ms-client-principal` header, valid session cookie | Builds and injects the header from the validated session |
 
-This means CRAFT works identically whether deployed standalone (container), behind Azure App Service authentication, or behind Azure Static Web Apps — downstream PowerShell always sees the same `x-ms-client-principal` header format.
+This means Craft works identically whether deployed standalone (container), behind Azure App Service authentication, or behind Azure Static Web Apps — downstream PowerShell always sees the same `x-ms-client-principal` header format.
 
 #### allowedUsers Table Schema
 
@@ -412,7 +412,7 @@ Roles are cached in-memory for 5 minutes. If a user is not in the table, behavio
 
 #### Redirect URIs
 
-When using CRAFT's built-in auth, the Azure AD app registration must include these redirect URIs:
+When using Craft's built-in auth, the Azure AD app registration must include these redirect URIs:
 
 ```
 https://<your-host>/.auth/callback
@@ -486,11 +486,11 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
 
 ## Directory Structure
 
-CRAFT separates its own built-in scripts from application content:
+Craft separates its own built-in scripts from application content:
 
 ```
 /app/
-├── Runtime/              ← CRAFT built-in (ships with the base image)
+├── Runtime/              ← Craft built-in (ships with the base image)
 │   ├── CraftRuntime/     ← Orchestrator/queue/task scripts
 │   └── HTTP/Exec/        ← Built-in admin endpoint
 ├── API/                  ← Application content (downstream overlay)
@@ -500,7 +500,7 @@ CRAFT separates its own built-in scripts from application content:
 └── Frontend/             ← Static frontend build
 ```
 
-`Runtime/` is owned by CRAFT and always loaded. `API/` is 100% owned by the downstream application — safe to volume-mount in dev without overwriting CRAFT internals.
+`Runtime/` is owned by Craft and always loaded. `API/` is 100% owned by the downstream application — safe to volume-mount in dev without overwriting Craft internals.
 
 ---
 

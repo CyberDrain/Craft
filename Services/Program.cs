@@ -1,6 +1,6 @@
 using System.Collections;
 using System.Net.Http;
-using CRAFT.Services;
+using Craft.Services;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Options;
@@ -216,13 +216,13 @@ var authService = app.Services.GetRequiredService<AuthService>();
 //    → Transform to SWA format with roles from allowedUsers table
 // 2. Azure SWA EasyAuth (x-ms-client-principal in SWA format — has "userRoles")
 //    → Pass through as-is
-// 3. CRAFT session cookie (no x-ms-client-principal)
+// 3. Craft session cookie (no x-ms-client-principal)
 //    → Build header from validated session
 app.Use(async (context, next) =>
 {
     var path = context.Request.Path.Value ?? "";
 
-    // Always try to resolve CRAFT session and store it for /.auth/me to use
+    // Always try to resolve Craft session and store it for /.auth/me to use
     if (authService.IsConfigured)
     {
         var session = authService.GetSession(context);
@@ -309,7 +309,7 @@ app.Use(async (context, next) =>
         return;
     }
 
-    // No x-ms-client-principal header — try CRAFT session cookie
+    // No x-ms-client-principal header — try Craft session cookie
     if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session2)
     {
         var headerValue = authService.BuildClientPrincipalHeader(session2);
@@ -437,7 +437,7 @@ app.MapGet("/.auth/logout", (HttpContext context) =>
 // /.auth/me — returns clientPrincipal in Azure SWA format for frontend compatibility
 app.MapGet("/.auth/me", (HttpContext context) =>
 {
-    // If we have a CRAFT session, return clientPrincipal from validated token
+    // If we have a Craft session, return clientPrincipal from validated token
     if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session)
     {
         var clientPrincipal = authService.BuildClientPrincipal(session);

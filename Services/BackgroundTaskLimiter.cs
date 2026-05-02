@@ -1,4 +1,4 @@
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Gates all background (non-HTTP) work behind a dynamic concurrency semaphore

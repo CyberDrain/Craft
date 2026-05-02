@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Management.Automation.Runspaces;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 public class PowerShellWorkerPool : IDisposable
 {

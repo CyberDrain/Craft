@@ -1,7 +1,7 @@
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
-/// Central configuration for the CRAFT (CyberDrain Runtime for Apps, Functions, Tasks) host.
+/// Central configuration for the Craft (CyberDrain Runtime for Apps, Functions, Tasks) host.
 /// All application-specific behavior is driven by these settings — the host itself
 /// is generic. Bind from the "App" section of appsettings.json.
 ///

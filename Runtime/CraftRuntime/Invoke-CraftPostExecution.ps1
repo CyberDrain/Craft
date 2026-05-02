@@ -1,7 +1,7 @@
 function Invoke-CraftPostExecution {
     <#
     .SYNOPSIS
-        PostExecution dispatcher for CRAFT orchestrators.
+        PostExecution dispatcher for Craft orchestrators.
     .DESCRIPTION
         Receives collected task results as JSON from the C# host,
         builds the $Item (FunctionName, Results, Parameters),

@@ -3,7 +3,7 @@ function Invoke-ExecBackendProcess {
     .SYNOPSIS
         List or trigger scheduled background tasks.
     .DESCRIPTION
-        Framework endpoint for the CRAFT scheduler. Lists tasks from the scheduler
+        Framework endpoint for the Craft scheduler. Lists tasks from the scheduler
         config or triggers one for immediate execution via _orchestratorTrigger/_scriptTrigger
         response flags that the C# middleware intercepts.
 

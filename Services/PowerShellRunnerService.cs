@@ -5,7 +5,7 @@ using System.Diagnostics;
 using System.Management.Automation;
 using System.Text.Json;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 public class PowerShellRunnerService : IDisposable
 {

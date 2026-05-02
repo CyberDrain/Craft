@@ -1,7 +1,7 @@
 function Invoke-CraftQueueTask {
     <#
     .SYNOPSIS
-        Executes a queued command on a CRAFT background worker.
+        Executes a queued command on a Craft background worker.
     .DESCRIPTION
         Receives a cmdlet name and JSON parameters, validates the command exists
         in an allowed module, and executes it.

@@ -3,7 +3,7 @@ using System.Management.Automation;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 public enum FunctionCategory { Core, Http, Background }
 

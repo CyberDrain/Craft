@@ -4,7 +4,7 @@ using System.Diagnostics.Tracing;
 using System.Reflection;
 using System.Text.RegularExpressions;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 /// <summary>
 /// Tracks slow HTTP requests via DiagnosticListener (method, URL, body) and

@@ -1,4 +1,4 @@
-# ── CRAFT Base Image ───────────────────────────────────────
+# ── Craft Base Image ───────────────────────────────────────
 # CyberDrain Runtime for Apps, Functions, Tasks
 # This is the base runtime — app-specific modules, config,
 # and frontend are layered on top by downstream projects.
@@ -6,7 +6,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS build
 WORKDIR /src
 
-COPY CRAFT.csproj .
+COPY Craft.csproj .
 RUN dotnet restore
 
 COPY . .
@@ -41,4 +41,4 @@ ENV CRAFT_VERBOSE="false"
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
 
-ENTRYPOINT ["dotnet", "CRAFT.dll"]
+ENTRYPOINT ["dotnet", "Craft.dll"]

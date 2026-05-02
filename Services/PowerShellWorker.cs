@@ -4,7 +4,7 @@ using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Reflection;
 
-namespace CRAFT.Services;
+namespace Craft.Services;
 
 public class PowerShellWorker : IDisposable
 {
@@ -87,7 +87,7 @@ class HttpResponseContext {
                 continue;
             var cacheKey = string.IsNullOrEmpty(injection.CacheKey) ? injection.Variable : injection.CacheKey;
             RunScript($@"
-$__cache = [CRAFT.Services.PowerShellRunnerService]::GetSharedCache('{cacheKey}')
+$__cache = [Craft.Services.PowerShellRunnerService]::GetSharedCache('{cacheKey}')
 & (Get-Module {injection.Module}) {{
     $script:{injection.Variable} = $args[0]
 }} $__cache
