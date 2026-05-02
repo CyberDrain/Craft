@@ -16,7 +16,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS runtime
 WORKDIR /app
 
 # Install PowerShell 7.4 from tar.gz (smaller than apt-based install)
-ENV POWERSHELL_VERSION=7.4.7
+ENV POWERSHELL_VERSION=7.4.15
 RUN apt-get update && \
     apt-get install -y --no-install-recommends wget ca-certificates libicu72 && \
     wget -q "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell-${POWERSHELL_VERSION}-linux-x64.tar.gz" \
