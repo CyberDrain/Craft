@@ -50,10 +50,6 @@ public class AuthService
   private readonly TimeSpan _allowedUsersCacheTtl = TimeSpan.FromMinutes(5);
   private readonly SemaphoreSlim _allowedUsersLock = new(1, 1);
 
-  // Setup invite (first-run)
-  // In-memory: maps token plaintext → invite entry for fast validation
-  // (see ProcessPendingInvitesAsync for the table-based invite flow)
-
   // Shared HttpClient for token exchange (singleton-safe, handles DNS rotation)
   private static readonly HttpClient s_httpClient;
 
@@ -100,18 +96,7 @@ public class AuthService
 
   // --- Instance ID & per-instance table ---
 
-  /// <summary>
-  /// Stable identifier for this CRAFT deployment. Used to derive a per-instance
-  /// user table name so multiple deployments sharing storage are fully isolated.
-  /// Must not change across container restarts, updates, or scaling events.
-  /// Set via WEBSITE_DEPLOYMENT_ID (Azure) or CRAFT_INSTANCE_ID (self-hosted).
-  /// </summary>
-  public string InstanceId =>
-      Environment.GetEnvironmentVariable("WEBSITE_DEPLOYMENT_ID")
-      ?? Environment.GetEnvironmentVariable("CRAFT_INSTANCE_ID")
-      ?? throw new InvalidOperationException(
-          "No stable instance ID configured. Set WEBSITE_DEPLOYMENT_ID or CRAFT_INSTANCE_ID environment variable. "
-          + "This is required to scope user access and setup invites per deployment.");
+  // --- User Table ---
 
   /// <summary>
   /// The Azure Table name for user authorization.
@@ -135,222 +120,6 @@ public class AuthService
     }
   }
 
-  // --- Setup Invites (first-run user provisioning without OIDC) ---
-  //
-  // Flow:
-  //   1. Deployer inserts a row into the instance user table (e.g. allowedUsersCippProd01):
-  //      PartitionKey="", RowKey={email}, Roles=["superadmin",...], InviteStatus="PendingInvite"
-  //   2. CRAFT polls the table on startup and periodically (when auth unconfigured).
-  //      For each PendingInvite row → generates token → writes InviteToken (hash),
-  //      InviteUrl, InviteStatus="InviteReady", InviteExpiresAt.
-  //   3. Deployer/portal reads the updated row → shows InviteUrl to end user.
-  //   4. User clicks URL → CRAFT validates hash → creates session → user does SAM setup.
-  //   5. After OIDC is configured, invite rows are cleaned up.
-
-  // In-memory: maps token plaintext → (upn, roles) for fast validation
-  private readonly ConcurrentDictionary<string, InviteEntry> _activeInvites = new(StringComparer.Ordinal);
-
-  private class InviteEntry
-  {
-    public string Upn { get; set; } = "";
-    public string[] Roles { get; set; } = Array.Empty<string>();
-    public DateTime ExpiresAt { get; set; }
-  }
-
-  /// <summary>
-  /// Scans the allowedUsers table for PendingInvite rows, generates tokens,
-  /// and updates the rows with the invite URL. Also refreshes InviteReady
-  /// tokens into the in-memory cache for validation.
-  /// Call on startup and periodically when auth is not configured.
-  /// </summary>
-  public async Task ProcessPendingInvitesAsync(string? baseUrl = null, CancellationToken ct = default)
-  {
-    try
-    {
-      var client = new TableClient(StorageConnectionString, UserTableFullName);
-      await client.CreateIfNotExistsAsync(cancellationToken: ct);
-
-      var processed = 0;
-      var loaded = 0;
-
-      await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
-      {
-        var status = entity.GetString("InviteStatus") ?? "";
-
-        if (status == "PendingInvite")
-        {
-          // Generate token and update row
-          var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-          var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
-          var expiresAt = DateTimeOffset.UtcNow.AddHours(72);
-          var setupPath = _settings.Auth.SetupPath;
-          var inviteUrl = string.IsNullOrEmpty(baseUrl)
-              ? $"{setupPath}?setup_token={token}"
-              : $"{baseUrl.TrimEnd('/')}{setupPath}?setup_token={token}";
-
-          entity["InviteStatus"] = "InviteReady";
-          entity["InviteToken"] = tokenHash;
-          entity["InviteUrl"] = inviteUrl;
-          entity["InviteExpiresAt"] = expiresAt;
-          entity["InviteCreatedAt"] = DateTimeOffset.UtcNow;
-
-          await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Merge, ct);
-
-          // Cache for validation
-          _activeInvites[token] = new InviteEntry
-          {
-            Upn = entity.RowKey,
-            Roles = ParseRoles(entity.GetString("Roles")),
-            ExpiresAt = expiresAt.UtcDateTime
-          };
-
-          processed++;
-          _logger.LogInformation("[Auth] Invite generated for {Upn} (table={Table})", entity.RowKey, UserTableFullName);
-        }
-        else if (status == "InviteReady")
-        {
-          // Load existing invite into memory for validation
-          var expiresAt = entity.GetDateTimeOffset("InviteExpiresAt");
-          if (expiresAt.HasValue && expiresAt.Value > DateTimeOffset.UtcNow)
-          {
-            var tokenHash = entity.GetString("InviteToken") ?? "";
-            // We can't recover plaintext from hash — but if we generated it
-            // in this process lifetime, it's already in _activeInvites.
-            // For cross-restart: re-generate if needed.
-            if (!_activeInvites.Values.Any(i => i.Upn == entity.RowKey))
-            {
-              // Token was generated by a previous instance — regenerate
-              var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-              var newHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
-              var setupPath = _settings.Auth.SetupPath;
-              var inviteUrl = string.IsNullOrEmpty(baseUrl)
-                  ? $"{setupPath}?setup_token={token}"
-                  : $"{baseUrl.TrimEnd('/')}{setupPath}?setup_token={token}";
-
-              entity["InviteToken"] = newHash;
-              entity["InviteUrl"] = inviteUrl;
-              await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Merge, ct);
-
-              _activeInvites[token] = new InviteEntry
-              {
-                Upn = entity.RowKey,
-                Roles = ParseRoles(entity.GetString("Roles")),
-                ExpiresAt = expiresAt.Value.UtcDateTime
-              };
-              loaded++;
-              _logger.LogInformation("[Auth] Invite re-generated for {Upn} after restart", entity.RowKey);
-            }
-            else
-            {
-              loaded++;
-            }
-          }
-          else
-          {
-            // Expired — mark as expired
-            entity["InviteStatus"] = "InviteExpired";
-            await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Merge, ct);
-            _logger.LogInformation("[Auth] Invite expired for {Upn}", entity.RowKey);
-          }
-        }
-      }
-
-      if (processed > 0 || loaded > 0)
-      {
-        _logger.LogInformation("[Auth] Invites: {Processed} new, {Loaded} active (table={Table})", processed, loaded, UserTableFullName);
-      }
-    }
-    catch (Exception ex)
-    {
-      _logger.LogError(ex, "[Auth] Failed to process pending invites");
-    }
-  }
-
-  private static string[] ParseRoles(string? rolesJson)
-  {
-    if (string.IsNullOrEmpty(rolesJson)) return ["superadmin", "authenticated", "anonymous"];
-    try { return JsonSerializer.Deserialize<string[]>(rolesJson) ?? ["superadmin", "authenticated", "anonymous"]; }
-    catch { return [rolesJson]; }
-  }
-
-  /// <summary>
-  /// Validates a setup token against active invites and creates a session.
-  /// Returns the session ID on success, null if invalid/expired.
-  /// </summary>
-  public string? ValidateSetupToken(string token)
-  {
-    if (IsConfigured) return null;
-
-    // Constant-time lookup: check each active invite
-    InviteEntry? matched = null;
-    string? matchedToken = null;
-    foreach (var kvp in _activeInvites)
-    {
-      if (CryptographicOperations.FixedTimeEquals(
-          Encoding.UTF8.GetBytes(token),
-          Encoding.UTF8.GetBytes(kvp.Key)))
-      {
-        matched = kvp.Value;
-        matchedToken = kvp.Key;
-      }
-    }
-
-    if (matched == null || DateTime.UtcNow > matched.ExpiresAt)
-      return null;
-
-    // Create a session for this invited user
-    var sessionId = Guid.NewGuid().ToString("N");
-    _sessions[sessionId] = new SessionData
-    {
-      Upn = matched.Upn,
-      ObjectId = "00000000-0000-0000-0000-000000000000",
-      Name = matched.Upn,
-      TenantId = "",
-      Roles = matched.Roles,
-      AccessToken = "",
-      IdToken = "",
-      ExpiresOn = DateTime.UtcNow.AddHours(2),
-      CreatedAt = DateTime.UtcNow
-    };
-
-    // Remove used invite from memory (single-use)
-    if (matchedToken != null) _activeInvites.TryRemove(matchedToken, out _);
-
-    _logger.LogInformation("[Auth] Invite token validated for {Upn} — session created", matched.Upn);
-    return sessionId;
-  }
-
-  /// <summary>
-  /// Cleans up all invite rows for this instance (called after OIDC is configured).
-  /// </summary>
-  public async Task CleanupInvitesAsync(CancellationToken ct = default)
-  {
-    _activeInvites.Clear();
-    try
-    {
-      var client = new TableClient(StorageConnectionString, UserTableFullName);
-      await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
-      {
-        var status = entity.GetString("InviteStatus") ?? "";
-        if (status is "PendingInvite" or "InviteReady")
-        {
-          entity["InviteStatus"] = "Completed";
-          entity.Remove("InviteToken");
-          entity.Remove("InviteUrl");
-          entity.Remove("InviteExpiresAt");
-          entity.Remove("InviteCreatedAt");
-          // Preserve Roles — only strip invite metadata
-          await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace, ct);
-        }
-      }
-      _logger.LogInformation("[Auth] Invite rows cleaned up (table={Table})", UserTableFullName);
-    }
-    catch (Exception ex)
-    {
-      _logger.LogWarning(ex, "[Auth] Failed to clean up invite rows");
-    }
-  }
-
   private string StorageConnectionString =>
       (!string.IsNullOrEmpty(_settings.Auth.UserStorageConnection)
           ? _settings.Auth.UserStorageConnection
@@ -362,8 +131,8 @@ public class AuthService
     get
     {
       if (_cookieKey != null) return _cookieKey;
-      // Derive a stable key — use client secret when configured, otherwise instance ID
-      var keyMaterial = IsConfigured ? ClientSecret : InstanceId;
+      // Derive a stable key from client secret
+      var keyMaterial = ClientSecret;
       _cookieKey = SHA256.HashData(Encoding.UTF8.GetBytes(keyMaterial + "_craft_session_key"));
       return _cookieKey;
     }
@@ -382,16 +151,6 @@ public class AuthService
     _cookieKey = null;
     _allowedUsersCacheExpiry = DateTime.MinValue;
     _sessions.Clear();
-    if (IsConfigured)
-    {
-      _activeInvites.Clear();
-      // Fire-and-forget cleanup of invite rows (best effort)
-      _ = Task.Run(async () =>
-      {
-        try { await CleanupInvitesAsync(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "[Auth] Failed to clean up invites"); }
-      });
-    }
     _logger.LogInformation("[Auth] Configuration reloaded — OIDC, sessions, and caches cleared. IsConfigured={IsConfigured}", IsConfigured);
   }
 
@@ -580,13 +339,19 @@ public class AuthService
 
   /// <summary>
   /// Gets the CIPP roles for a user from the allowedUsers table.
-  /// Returns ["anonymous", "authenticated"] if user not found (no CIPP roles).
+  /// Returns null if user is not authorized (not in table and AllowAllTenantUsers is false).
+  /// Returns ["anonymous", "authenticated"] as default roles if AllowAllTenantUsers is true.
   /// </summary>
-  public async Task<string[]> GetUserRoles(string upn, CancellationToken ct = default)
+  public async Task<string[]?> GetUserRoles(string upn, CancellationToken ct = default)
   {
     var user = await GetAllowedUser(upn, ct);
     if (user == null)
     {
+      if (!_settings.Auth.AllowAllTenantUsers)
+      {
+        _logger.LogWarning("[Auth] User {Upn} not in allowedUsers table — denied (AllowAllTenantUsers=false)", upn);
+        return null;
+      }
       return new[] { "anonymous", "authenticated" };
     }
     var roles = new List<string>(user.Roles);
@@ -637,7 +402,7 @@ public class AuthService
 
       await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
       {
-        // Skip internal rows (setup invite, etc.)
+        // Skip internal rows
         if (entity.RowKey.StartsWith("_")) continue;
 
         var upn = entity.RowKey;

@@ -183,27 +183,14 @@ public class AuthSettings
     public string MeEndpointFunction { get; set; } = "";
 
     /// <summary>
-    /// Path to redirect to when auth is not configured (non-dev only).
-    /// Empty string disables the redirect. API calls get a 403 JSON response instead.
-    /// </summary>
-    public string SetupPath { get; set; } = "";
-
-    /// <summary>
-    /// API paths allowed through without auth when setup redirect is active.
-    /// Matched as case-insensitive prefixes against the request path.
-    /// Example: ["/api/ExecSetup", "/api/ExecListAppId"]
-    /// </summary>
-    public List<string> SetupAllowedPaths { get; set; } = [];
-
-    /// <summary>
     /// When true, any user who authenticates against the configured AAD tenant
     /// is allowed in — even if they are not in the allowedUsers table.
     /// Users not in the table get ["authenticated", "anonymous"] as default roles.
     /// The hosted app (e.g. CIPP) can then do its own role resolution (e.g. via Entra group mapping).
-    /// When false (default), only users explicitly listed in the allowedUsers table can log in.
+    /// When false, only users explicitly listed in the allowedUsers table can log in.
     /// Override via Auth__AllowAllTenantUsers env var.
     /// </summary>
-    public bool AllowAllTenantUsers { get; set; } = false;
+    public bool AllowAllTenantUsers { get; set; } = true;
 }
 
 /// <summary>
