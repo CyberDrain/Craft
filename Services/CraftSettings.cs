@@ -151,7 +151,11 @@ public class AuthSettings
     /// <summary>Session cookie name.</summary>
     public string CookieName { get; set; } = "craft-session";
 
-    /// <summary>Azure Table name for user authorization (UPN → roles).</summary>
+    /// <summary>
+    /// Azure Table name for user authorization (UPN → roles).
+    /// Override via Auth__UserTableName env var or in appsettings.
+    /// Sanitized at runtime (alphanumeric only, 3-63 chars).
+    /// </summary>
     public string UserTableName { get; set; } = "allowedUsers";
 
     /// <summary>
@@ -190,6 +194,16 @@ public class AuthSettings
     /// Example: ["/api/ExecSetup", "/api/ExecListAppId"]
     /// </summary>
     public List<string> SetupAllowedPaths { get; set; } = [];
+
+    /// <summary>
+    /// When true, any user who authenticates against the configured AAD tenant
+    /// is allowed in — even if they are not in the allowedUsers table.
+    /// Users not in the table get ["authenticated", "anonymous"] as default roles.
+    /// The hosted app (e.g. CIPP) can then do its own role resolution (e.g. via Entra group mapping).
+    /// When false (default), only users explicitly listed in the allowedUsers table can log in.
+    /// Override via Auth__AllowAllTenantUsers env var.
+    /// </summary>
+    public bool AllowAllTenantUsers { get; set; } = false;
 }
 
 /// <summary>

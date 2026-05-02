@@ -228,29 +228,64 @@ app.Use(async (context, next) =>
         && !string.IsNullOrEmpty(CraftSettings.Auth.SetupPath))
     {
         var setupPath = CraftSettings.Auth.SetupPath;
-        // Allow the setup page itself, its assets, and the setup API endpoint through
-        if (!path.Equals(setupPath, StringComparison.OrdinalIgnoreCase)
-            && !path.StartsWith("/_next/", StringComparison.OrdinalIgnoreCase)
-            && !path.StartsWith("/assets/", StringComparison.OrdinalIgnoreCase)
-            && !Path.HasExtension(path))
+
+        // Check for setup_token in query string — validate and create session
+        var setupToken = context.Request.Query["setup_token"].ToString();
+        if (!string.IsNullOrEmpty(setupToken))
         {
-            if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
+            var sessionId = authService.ValidateSetupToken(setupToken);
+            if (sessionId != null)
             {
-                // Allow configured setup API paths through without auth
-                if (CraftSettings.Auth.SetupAllowedPaths.Exists(p =>
-                    path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
-                {
-                    await next();
-                    return;
-                }
+                authService.SetSessionCookie(context, sessionId);
+                // Redirect to setup page without the token in the URL
+                context.Response.Redirect(setupPath);
+                return;
+            }
+            else
+            {
                 context.Response.StatusCode = 403;
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(
-                    System.Text.Json.JsonSerializer.Serialize(new { setupRequired = true, setupPath }));
+                    System.Text.Json.JsonSerializer.Serialize(new { error = "Invalid or expired setup token" }));
                 return;
             }
-            context.Response.Redirect(setupPath);
-            return;
+        }
+
+        // Check if user has a valid setup session (from setup token)
+        var setupSession = authService.GetSession(context);
+        if (setupSession != null)
+        {
+            context.Items["CraftSession"] = setupSession;
+            // Allow through — user authenticated via setup token
+        }
+        else
+        {
+            // No session — enforce setup redirect/block
+            // Allow the setup page itself, its assets, and whitelisted API endpoints through
+            if (!path.Equals(setupPath, StringComparison.OrdinalIgnoreCase)
+                && !path.StartsWith("/_next/", StringComparison.OrdinalIgnoreCase)
+                && !path.StartsWith("/assets/", StringComparison.OrdinalIgnoreCase)
+                && !path.StartsWith("/.auth/", StringComparison.OrdinalIgnoreCase)
+                && !Path.HasExtension(path))
+            {
+                if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Allow configured setup API paths through without auth
+                    if (CraftSettings.Auth.SetupAllowedPaths.Exists(p =>
+                        path.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        await next();
+                        return;
+                    }
+                    context.Response.StatusCode = 403;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(
+                        System.Text.Json.JsonSerializer.Serialize(new { setupRequired = true, setupPath }));
+                    return;
+                }
+                context.Response.Redirect(setupPath);
+                return;
+            }
         }
     }
 
@@ -993,5 +1028,36 @@ app.MapFallback(async (HttpContext context) =>
     context.Response.Headers.CacheControl = "no-cache, no-store";
     await context.Response.SendFileAsync(indexPath);
 });
+
+// Process pending invites and log setup info if auth is not configured (first-run)
+if (!authService.IsConfigured && !app.Environment.IsDevelopment()
+    && !string.IsNullOrEmpty(CraftSettings.Auth.SetupPath))
+{
+    // Initial invite processing
+    var urls = app.Urls.Any() ? string.Join(", ", app.Urls) : "http://+:8080";
+    await authService.ProcessPendingInvitesAsync(urls);
+
+    logger.LogWarning("╔══════════════════════════════════════════════════════════════╗");
+    logger.LogWarning("║  FIRST-RUN SETUP — Authentication is not configured.       ║");
+    logger.LogWarning("║  Add a user to the '{Table}' table to generate an invite:", authService.UserTableFullName);
+    logger.LogWarning("║    PartitionKey = (any value, e.g. empty string)");
+    logger.LogWarning("║    RowKey       = user@example.com");
+    logger.LogWarning("║    Roles        = [\"superadmin\",\"authenticated\",\"anonymous\"]");
+    logger.LogWarning("║    InviteStatus = PendingInvite");
+    logger.LogWarning("║  CRAFT will generate the invite URL within 30 seconds.     ║");
+    logger.LogWarning("╚══════════════════════════════════════════════════════════════╝");
+
+    // Start background polling for new invite requests
+    _ = Task.Run(async () =>
+    {
+        while (!authService.IsConfigured)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30));
+            if (authService.IsConfigured) break;
+            await authService.ProcessPendingInvitesAsync(urls);
+        }
+        logger.LogInformation("[Auth] Invite polling stopped — auth is now configured");
+    });
+}
 
 app.Run();
