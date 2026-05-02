@@ -576,6 +576,7 @@ var activeRequests = 0;
 // --- Backend Process API ---
 var orchestrator = app.Services.GetRequiredService<OrchestratorService>();
 OrchestratorBridge.Initialize(orchestrator);
+AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 

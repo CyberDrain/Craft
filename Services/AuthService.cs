@@ -12,6 +12,22 @@ using Microsoft.IdentityModel.Tokens;
 namespace CRAFT.Services;
 
 /// <summary>
+/// Static bridge so PowerShell can trigger auth reload without DI.
+/// Call [CRAFT.Services.AuthBridge]::ReloadAuth() from PS after credentials change.
+/// </summary>
+public static class AuthBridge
+{
+    private static AuthService? s_service;
+    public static void Initialize(AuthService service) => s_service = service;
+
+    /// <summary>
+    /// Reloads OIDC configuration after auth credentials are updated.
+    /// Safe to call from PowerShell: [CRAFT.Services.AuthBridge]::ReloadAuth()
+    /// </summary>
+    public static void ReloadAuth() => s_service?.ReloadConfiguration();
+}
+
+/// <summary>
 /// Handles Azure AD OIDC authentication, JWT validation, session management,
 /// and user authorization via a configurable Azure Table.
 /// </summary>
@@ -97,6 +113,20 @@ public class AuthService
   }
 
   // --- OIDC Discovery ---
+
+  /// <summary>
+  /// Resets cached OIDC configuration, cookie key, and allowed users cache.
+  /// Call after auth credentials (env vars) are updated at runtime (e.g. after setup wizard).
+  /// </summary>
+  public void ReloadConfiguration()
+  {
+    _oidcConfigManager = null;
+    _resolvedTenantId = null;
+    _cookieKey = null;
+    _allowedUsersCacheExpiry = DateTime.MinValue;
+    _sessions.Clear();
+    _logger.LogInformation("[Auth] Configuration reloaded — OIDC, sessions, and caches cleared. IsConfigured={IsConfigured}", IsConfigured);
+  }
 
   private ConfigurationManager<OpenIdConnectConfiguration> GetOidcConfigManager()
   {
