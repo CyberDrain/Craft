@@ -337,7 +337,10 @@ public class AuthService
           entity["InviteStatus"] = "Completed";
           entity.Remove("InviteToken");
           entity.Remove("InviteUrl");
-          await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Merge, ct);
+          entity.Remove("InviteExpiresAt");
+          entity.Remove("InviteCreatedAt");
+          // Preserve Roles — only strip invite metadata
+          await client.UpdateEntityAsync(entity, entity.ETag, TableUpdateMode.Replace, ct);
         }
       }
       _logger.LogInformation("[Auth] Invite rows cleaned up (table={Table})", UserTableFullName);

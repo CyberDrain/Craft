@@ -155,7 +155,15 @@ Controls authentication and the dev-mode auto-login principal.
 
   // API paths allowed through without auth when setup redirect is active.
   // Matched as case-insensitive prefixes. Use this to whitelist your setup endpoints.
-  "SetupAllowedPaths": ["/api/ExecSetup", "/api/ExecListAppId"]
+  "SetupAllowedPaths": ["/api/ExecSetup", "/api/ExecListAppId"],
+
+  // When true, any user who authenticates against the configured Azure AD tenant
+  // is allowed in — even if they're not in the allowedUsers table.
+  // Users not in the table get ["authenticated", "anonymous"] as default roles.
+  // The hosted app can then do its own role resolution (e.g. via Entra group mapping).
+  // When false (default), only users explicitly listed in the allowedUsers table can log in.
+  // Override via env var: App__Auth__AllowAllTenantUsers=true
+  "AllowAllTenantUsers": false
 }
 ```
 
@@ -378,7 +386,7 @@ App__Auth__UserStorageConnection = @Microsoft.KeyVault(VaultName=myvault;SecretN
 1. User visits `/login` (or `/.auth/login/aad`) → redirected to Azure AD
 2. Azure AD authenticates user → redirects to `/.auth/callback` with authorization code
 3. CRAFT exchanges the code for tokens, validates the `id_token` JWT signature against Azure AD's published signing keys
-4. User's UPN is checked against the `allowedUsers` Azure Table for role mapping
+4. User's UPN is checked against the `allowedUsers` Azure Table for role mapping (or assigned default roles if `AllowAllTenantUsers` is enabled)
 5. An encrypted session cookie is set (AES-256, derived from `AUTH_SECRET`)
 6. The `x-ms-client-principal` header is injected on subsequent requests (SWA-compatible format)
 
@@ -407,7 +415,10 @@ The `allowedUsers` Azure Table (name configurable via `Auth.UserTableName`) maps
 | `RowKey` | User's UPN / email (e.g. `admin@contoso.com`) |
 | `Roles` | JSON array of role strings: `["admin", "editor"]` |
 
-Roles are cached in-memory for 5 minutes. If a user is not in the table, they are denied access (401).
+Roles are cached in-memory for 5 minutes. If a user is not in the table, behavior depends on `Auth.AllowAllTenantUsers`:
+
+- **`false` (default):** User is denied access (401). Only explicitly listed users can log in.
+- **`true`:** User is allowed in with default roles `["authenticated", "anonymous"]`. The hosted application can perform its own role resolution (e.g. CIPP maps Entra group membership to CIPP roles via `/api/me`). Users explicitly listed in the table still get their table-defined roles.
 
 #### Redirect URIs
 
@@ -455,7 +466,8 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
       "DevRoles": ["superadmin", "admin", "editor", "readonly", "authenticated", "anonymous"],
       "MeEndpointFunction": "me",
       "SetupPath": "/onboardingv2",
-      "SetupAllowedPaths": ["/api/ExecSAMSetup", "/api/ExecCombinedSetup", "/api/ExecListAppId"]
+      "SetupAllowedPaths": ["/api/ExecSAMSetup", "/api/ExecCombinedSetup", "/api/ExecListAppId"],
+      "AllowAllTenantUsers": true
     },
 
     "Scheduler": { "ConfigFile": "CIPPTimers.json" },
