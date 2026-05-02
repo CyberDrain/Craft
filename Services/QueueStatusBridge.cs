@@ -95,9 +95,29 @@ public static class QueueStatusBridge
         return jobs.Select(j => new TaskDetail
         {
             Timestamp = (j.CompletedUtc ?? j.StartedUtc ?? j.QueuedUtc).ToString("O"),
-            Name = j.Name,
+            Name = ExtractTaskDisplayName(j.Name, runName),
             Status = j.Status
         }).ToList();
+    }
+
+    /// <summary>
+    /// Extract a clean display name from the full job name.
+    /// Job names follow pattern: "{RunName}-{FunctionName}_{TenantFilter}"
+    /// We want just the tenant (or meaningful identifier) portion.
+    /// </summary>
+    private static string ExtractTaskDisplayName(string jobName, string runName)
+    {
+        // Strip the run name prefix (e.g. "GraphRequestOrchestrator-guid-")
+        var remaining = jobName;
+        if (jobName.StartsWith(runName + "-", StringComparison.OrdinalIgnoreCase))
+            remaining = jobName[(runName.Length + 1)..];
+
+        // Strip function name prefix (e.g. "ListGraphRequestQueue_") — take everything after first underscore
+        var underscoreIdx = remaining.IndexOf('_');
+        if (underscoreIdx >= 0 && underscoreIdx < remaining.Length - 1)
+            return remaining[(underscoreIdx + 1)..];
+
+        return remaining;
     }
 
     // ── Output Models (match Get-CIPPQueueData shape) ──
@@ -130,7 +150,7 @@ public static class QueueStatusBridge
 
     private static readonly JsonSerializerOptions s_jsonOptions = new()
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNamingPolicy = null,
         WriteIndented = false
     };
 }
