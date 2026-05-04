@@ -17,7 +17,9 @@ public class PowerShellWorkerPool : IDisposable
 
     private readonly ConcurrentDictionary<int, int> _workerFaults = new(); // workerId → consecutive fault count
     private const int MaxConsecutiveFaults = 3;
+    private readonly ManualResetEventSlim _ready = new(false);
 
+    public bool IsReady => _ready.IsSet;
     public int HttpAvailable => _httpPool.Count;
     public int BgAvailable => _bgPool.Count;
     public int HttpPoolSize => _httpPoolSize;
@@ -90,15 +92,28 @@ public class PowerShellWorkerPool : IDisposable
 
         _logger.LogInformation("[System] Pool ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
             _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds);
+        _ready.Set();
     }
+
+    /// <summary>
+    /// Block until the pool has finished initializing, or the timeout expires.
+    /// </summary>
+    public bool WaitForReady(TimeSpan timeout) => _ready.Wait(timeout);
 
     public PowerShellWorker? CheckoutHttp(TimeSpan timeout)
     {
+        // Wait for pool initialization before attempting checkout
+        if (!_ready.IsSet)
+            _ready.Wait(timeout);
         _httpPool.TryTake(out var w, timeout);
         return w;
     }
 
-    public PowerShellWorker CheckoutBackground(CancellationToken ct) => _bgPool.Take(ct);
+    public PowerShellWorker CheckoutBackground(CancellationToken ct)
+    {
+        _ready.Wait(ct);
+        return _bgPool.Take(ct);
+    }
 
     public void Reclaim(PowerShellWorker worker, bool isHttp, bool faulted = false)
     {

@@ -154,6 +154,15 @@ public class AuthService
     _logger.LogInformation("[Auth] Configuration reloaded — OIDC, sessions, and caches cleared. IsConfigured={IsConfigured}", IsConfigured);
   }
 
+  /// <summary>
+  /// Invalidates the allowedUsers cache so it is refreshed on the next auth check.
+  /// </summary>
+  public void InvalidateUserCache()
+  {
+    _allowedUsersCacheExpiry = DateTime.MinValue;
+    _allowedUsersCache.Clear();
+  }
+
   private ConfigurationManager<OpenIdConnectConfiguration> GetOidcConfigManager()
   {
     if (_oidcConfigManager != null) return _oidcConfigManager;

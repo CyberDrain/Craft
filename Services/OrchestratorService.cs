@@ -735,9 +735,13 @@ public class OrchestratorService
         _runStatusTimers.TryRemove(run.Name, out var timer);
         timer?.Dispose();
 
+        var wallDisplay = wallClock.TotalSeconds < 60
+            ? $"{wallClock.TotalSeconds:F1}s"
+            : $"{wallClock.TotalMinutes:F1}min";
+
         _logger.LogInformation(
-            "[Scheduler] Run {Name} finalized: {Status} ({Completed}/{Failed}/{Cancelled}/{Total}) wall={WallMin:F1}min",
-            run.Name, run.Status, completed, failed, cancelled, run.Tasks.Count, wallClock.TotalMinutes);
+            "[Scheduler] Run {Name} finalized: {Status} ({Completed}/{Failed}/{Cancelled}/{Total}) wall={Wall}",
+            run.Name, run.Status, completed, failed, cancelled, run.Tasks.Count, wallDisplay);
 
         // If this was a child run, re-check parent's completion — it may have been
         // waiting for this child to finish before it can finalize and run PostExecution

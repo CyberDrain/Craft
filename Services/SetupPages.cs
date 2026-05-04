@@ -1,0 +1,333 @@
+namespace Craft.Services;
+
+/// <summary>
+/// Embedded HTML pages for the first-run setup wizard.
+/// Uses device code flow for authentication (no redirect URI required).
+/// </summary>
+public static class SetupPages
+{
+    public const string IndexHtml = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CRAFT Setup</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a; color: #e2e8f0; min-height: 100vh;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .container { max-width: 640px; width: 100%; padding: 2rem; }
+        h1 { font-size: 1.75rem; margin-bottom: 0.5rem; color: #f8fafc; }
+        .subtitle { color: #94a3b8; margin-bottom: 2rem; }
+        .card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem;
+            padding: 1.5rem; margin-bottom: 1rem;
+        }
+        .card h2 { font-size: 1.1rem; margin-bottom: 0.5rem; color: #f1f5f9; }
+        .card p { color: #94a3b8; font-size: 0.9rem; margin-bottom: 1rem; }
+        button, .btn {
+            display: inline-block; padding: 0.6rem 1.25rem; border: none;
+            border-radius: 0.5rem; font-size: 0.9rem; font-weight: 600;
+            cursor: pointer; text-decoration: none; transition: background 0.15s;
+        }
+        .btn-primary { background: #3b82f6; color: #fff; }
+        .btn-primary:hover { background: #2563eb; }
+        .btn-primary:disabled { background: #475569; cursor: not-allowed; }
+        .btn-secondary { background: #334155; color: #e2e8f0; }
+        .btn-secondary:hover { background: #475569; }
+        input[type="text"], input[type="password"] {
+            width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #475569;
+            border-radius: 0.375rem; background: #0f172a; color: #e2e8f0;
+            font-size: 0.9rem; margin-bottom: 0.75rem;
+        }
+        input:focus { outline: none; border-color: #3b82f6; }
+        label { display: block; font-size: 0.85rem; color: #94a3b8; margin-bottom: 0.25rem; }
+        .status { margin-top: 1rem; padding: 0.75rem; border-radius: 0.5rem; font-size: 0.85rem; display: none; }
+        .status.info { background: #1e3a5f; border: 1px solid #2563eb; color: #93c5fd; display: block; }
+        .status.success { background: #14532d; border: 1px solid #16a34a; color: #86efac; display: block; }
+        .status.error { background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; display: block; }
+        .steps { list-style: none; margin: 1rem 0; }
+        .steps li { padding: 0.25rem 0; color: #94a3b8; font-size: 0.85rem; }
+        .steps li.done { color: #86efac; }
+        .steps li.active { color: #93c5fd; }
+        .steps li.error { color: #fca5a5; }
+        .steps li::before { content: '○ '; }
+        .steps li.done::before { content: '● '; }
+        .steps li.active::before { content: '◐ '; }
+        .steps li.error::before { content: '✕ '; }
+        .divider { border-top: 1px solid #334155; margin: 1.5rem 0; }
+        .hidden { display: none !important; }
+        .info-banner {
+            background: #1e3a5f; border: 1px solid #2563eb; border-radius: 0.5rem;
+            padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.85rem; color: #93c5fd;
+        }
+        .device-code-box {
+            background: #0f172a; border: 2px solid #3b82f6; border-radius: 0.5rem;
+            padding: 1.25rem; text-align: center; margin: 1rem 0;
+        }
+        .device-code-box .code {
+            font-size: 2rem; font-weight: 700; letter-spacing: 0.15em;
+            color: #f8fafc; font-family: 'Consolas', 'Monaco', monospace;
+        }
+        .device-code-box .hint {
+            font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem;
+        }
+        .device-code-box a { color: #60a5fa; text-decoration: underline; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1 id="page-title">Setup</h1>
+    <p class="subtitle">Configure authentication to get started.</p>
+
+    <div id="status-banner" class="info-banner hidden"></div>
+
+    <!-- Option 1: Automated Setup (Device Code Flow) -->
+    <div class="card" id="auto-section">
+        <h2>Automated Setup</h2>
+        <p>Sign in with a Global Administrator account to automatically create the EasyAuth app registration and configure this App Service.</p>
+
+        <div id="device-code-display" class="hidden">
+            <div class="device-code-box">
+                <div>Go to <a id="device-link" href="https://microsoft.com/devicelogin" target="_blank">microsoft.com/devicelogin</a> and enter:</div>
+                <div class="code" id="device-user-code"></div>
+                <div class="hint">Waiting for you to sign in...</div>
+            </div>
+        </div>
+
+        <ul class="steps" id="auto-steps">
+            <li id="step-login">Sign in with Azure AD</li>
+            <li id="step-app">Create app registration</li>
+            <li id="step-policy">Check app management policies</li>
+            <li id="step-secret">Create client secret</li>
+            <li id="step-configure">Configure App Service</li>
+        </ul>
+        <button class="btn btn-primary" id="btn-auto" onclick="startAutomatedSetup()">Start Setup</button>
+        <div id="auto-status" class="status"></div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- Option 2: Manual Setup -->
+    <div class="card" id="manual-section">
+        <h2>Manual Setup</h2>
+        <p>If you already have an app registration, enter the details below.</p>
+        <details style="margin-bottom: 1rem;">
+            <summary style="cursor: pointer; color: #60a5fa; font-size: 0.85rem;">How to create the app registration manually</summary>
+            <ol style="margin: 0.75rem 0 0.5rem 1.25rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
+                <li>Go to <a href="https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank" style="color: #60a5fa;">Entra ID &gt; App registrations</a> &gt; New registration</li>
+                <li>Name: <strong id="manual-app-name" style="color: #e2e8f0;">Craft-EasyAuth-App</strong></li>
+                <li>Supported account types: <strong style="color: #e2e8f0;">Single tenant</strong></li>
+                <li>Redirect URI: <strong style="color: #e2e8f0;">Web</strong> &mdash; <code id="manual-redirect-uri" style="background: #0f172a; padding: 0.1rem 0.4rem; border-radius: 0.25rem; color: #f8fafc;">{your-app-url}/.auth/login/aad/callback</code></li>
+                <li>After creation, go to <strong style="color: #e2e8f0;">Authentication</strong> &gt; enable <strong style="color: #e2e8f0;">ID tokens</strong> under Implicit grant</li>
+                <li>Go to <strong style="color: #e2e8f0;">Certificates &amp; secrets</strong> &gt; New client secret &gt; copy the <strong style="color: #e2e8f0;">Value</strong> (not the ID)</li>
+                <li>Copy the <strong style="color: #e2e8f0;">Application (client) ID</strong> and <strong style="color: #e2e8f0;">Directory (tenant) ID</strong> from the Overview page</li>
+            </ol>
+            <p style="font-size: 0.8rem; color: #94a3b8;">No API permissions are needed &mdash; this app is only used for EasyAuth sign-in, not for Graph API calls.</p>
+        </details>
+        <label for="manual-appid">Application (Client) ID</label>
+        <input type="text" id="manual-appid" placeholder="00000000-0000-0000-0000-000000000000">
+        <label for="manual-secret">Client Secret</label>
+        <input type="password" id="manual-secret" placeholder="Client secret value">
+        <label for="manual-tenant">Tenant ID</label>
+        <input type="text" id="manual-tenant" placeholder="00000000-0000-0000-0000-000000000000">
+        <button class="btn btn-secondary" id="btn-manual" onclick="submitManual()">Configure</button>
+        <div id="manual-status" class="status"></div>
+    </div>
+</div>
+
+<script>
+    let setupState = {};
+    let pollTimer = null;
+
+    (async function() {
+        try {
+            const res = await fetch('/api/setup/status');
+            setupState = await res.json();
+            document.getElementById('page-title').textContent = setupState.appName + ' Setup';
+            if (setupState.authAppDisplayName) {
+                document.getElementById('manual-app-name').textContent = setupState.authAppDisplayName;
+            }
+            document.getElementById('manual-redirect-uri').textContent = window.location.origin + '/.auth/login/aad/callback';
+            if (setupState.isEasyAuthConfigured) {
+                showBanner('Authentication is already configured. Redirecting...');
+                setTimeout(() => window.location.href = '/', 2000);
+            }
+            if (!setupState.isRunningInAppService || !setupState.hasManagedIdentity) {
+                showBanner('Warning: No managed identity detected. ARM self-configuration may fail. Use manual setup instead.');
+            }
+        } catch (e) {
+            console.error('Failed to load status', e);
+        }
+    })();
+
+    function showBanner(msg) {
+        const el = document.getElementById('status-banner');
+        el.textContent = msg;
+        el.classList.remove('hidden');
+    }
+
+    function setStep(id, state) {
+        document.getElementById(id).className = state;
+    }
+
+    function showStatus(elId, msg, type) {
+        const el = document.getElementById(elId);
+        el.textContent = msg;
+        el.className = 'status ' + type;
+    }
+
+    async function startAutomatedSetup() {
+        const btn = document.getElementById('btn-auto');
+        btn.disabled = true;
+        btn.textContent = 'Requesting code...';
+
+        try {
+            // Step 1: Start device code flow
+            setStep('step-login', 'active');
+            const dcRes = await fetch('/api/setup/device-code', { method: 'POST' });
+            if (!dcRes.ok) throw new Error('Failed to start device code flow: ' + await dcRes.text());
+            const dcData = await dcRes.json();
+
+            // Show the device code to the user
+            document.getElementById('device-user-code').textContent = dcData.userCode;
+            document.getElementById('device-link').href = dcData.verificationUri;
+            document.getElementById('device-code-display').classList.remove('hidden');
+            btn.classList.add('hidden');
+
+            showStatus('auto-status', dcData.message, 'info');
+
+            // Poll for completion
+            const interval = Math.max(dcData.interval || 5, 5) * 1000;
+            const deviceCode = dcData.deviceCode;
+
+            await pollForToken(deviceCode, interval);
+
+        } catch (e) {
+            showStatus('auto-status', 'Error: ' + e.message, 'error');
+            for (const s of ['step-login', 'step-app', 'step-policy', 'step-secret', 'step-configure']) {
+                if (document.getElementById(s).className === 'active') {
+                    setStep(s, 'error');
+                    break;
+                }
+            }
+            btn.disabled = false;
+            btn.textContent = 'Start Setup';
+            btn.classList.remove('hidden');
+        }
+    }
+
+    async function pollForToken(deviceCode, interval) {
+        return new Promise((resolve, reject) => {
+            const poll = async () => {
+                try {
+                    const res = await fetch('/api/setup/device-code-poll', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ deviceCode })
+                    });
+
+                    if (!res.ok) {
+                        const err = await res.text();
+                        reject(new Error(err));
+                        return;
+                    }
+
+                    const data = await res.json();
+                    if (data.pending) {
+                        // Still waiting — poll again
+                        setTimeout(poll, interval);
+                        return;
+                    }
+
+                    // Got the token — proceed with setup
+                    setStep('step-login', 'done');
+                    document.getElementById('device-code-display').classList.add('hidden');
+
+                    await completeSetup(data.accessToken, data.tenantId);
+                    resolve();
+                } catch (e) {
+                    reject(e);
+                }
+            };
+            poll();
+        });
+    }
+
+    async function completeSetup(accessToken, tenantId) {
+        // Step 2-4: Create app registration (includes policy + secret)
+        setStep('step-app', 'active');
+        showStatus('auto-status', 'Creating app registration... This may take a minute if policy exemptions are needed.', 'info');
+
+        const appRes = await fetch('/api/setup/create-auth-app', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accessToken, tenantId, redirectUri: window.location.origin })
+        });
+        if (!appRes.ok) throw new Error('App creation failed: ' + await appRes.text());
+        const appData = await appRes.json();
+        setStep('step-app', 'done');
+        setStep('step-policy', 'done');
+        setStep('step-secret', 'done');
+
+        // Step 5: Configure App Service
+        setStep('step-configure', 'active');
+        showStatus('auto-status', 'Configuring App Service authentication...', 'info');
+
+        const configRes = await fetch('/api/setup/configure', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                appId: appData.appId,
+                clientSecret: appData.clientSecret,
+                tenantId: appData.tenantId
+            })
+        });
+        if (!configRes.ok) throw new Error('Configuration failed: ' + await configRes.text());
+        setStep('step-configure', 'done');
+
+        showStatus('auto-status', 'Setup complete! The app will restart to apply authentication. You will be redirected shortly.', 'success');
+        setTimeout(() => window.location.href = '/', 8000);
+    }
+
+    async function submitManual() {
+        const appId = document.getElementById('manual-appid').value.trim();
+        const secret = document.getElementById('manual-secret').value.trim();
+        const tenantId = document.getElementById('manual-tenant').value.trim();
+
+        if (!appId || !secret || !tenantId) {
+            showStatus('manual-status', 'All fields are required.', 'error');
+            return;
+        }
+
+        const btn = document.getElementById('btn-manual');
+        btn.disabled = true;
+        btn.textContent = 'Configuring...';
+        showStatus('manual-status', 'Configuring App Service...', 'info');
+
+        try {
+            const res = await fetch('/api/setup/manual', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ appId, clientSecret: secret, tenantId })
+            });
+
+            if (!res.ok) throw new Error(await res.text());
+
+            showStatus('manual-status', 'Configuration complete! The app will restart shortly.', 'success');
+            setTimeout(() => window.location.href = '/', 5000);
+        } catch (e) {
+            showStatus('manual-status', 'Failed: ' + e.message, 'error');
+            btn.disabled = false;
+            btn.textContent = 'Configure';
+        }
+    }
+</script>
+</body>
+</html>
+""";
+}

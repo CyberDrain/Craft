@@ -74,6 +74,7 @@ builder.Services.AddSingleton<JobManager>();
 builder.Services.AddSingleton<OrchestratorTableStore>();
 builder.Services.AddSingleton<OrchestratorService>();
 builder.Services.AddSingleton<AuthService>();
+builder.Services.AddSingleton<SetupService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
 builder.Services.AddHostedService<SchedulerService>();
 
@@ -91,13 +92,24 @@ var repo = app.Services.GetRequiredService<ScriptRepository>();
 repo.LoadAll(Path.Combine(AppContext.BaseDirectory, "API"));
 
 var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
-pool.Initialize();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+// Defer pool initialization until after Kestrel is listening.
+// Azure App Service kills containers that don't respond to health probes within 230s;
+// by deferring, the web host can answer probes immediately while workers spin up.
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    Task.Run(() =>
+    {
+        try { pool.Initialize(); }
+        catch (Exception ex) { logger.LogCritical(ex, "[System] Pool initialization failed"); }
+    });
+});
 
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
 var endpoints = psRunner.DiscoverHttpEndpoints();
-var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
 logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
 logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
@@ -113,6 +125,77 @@ if (app.Environment.IsDevelopment())
 
 // Response compression must be before static files
 app.UseResponseCompression();
+
+// Setup mode middleware: when Setup.Enabled and EasyAuth is not yet configured,
+// redirect all frontend requests to /setup and block /api/* except /api/setup/*
+var setupService = app.Services.GetRequiredService<SetupService>();
+if (CraftSettings.Setup.Enabled)
+{
+    app.Use(async (context, next) =>
+    {
+        if (SetupService.IsEasyAuthConfigured())
+        {
+            // EasyAuth is configured — block setup endpoints, pass everything else through
+            var reqPath = context.Request.Path.Value ?? "";
+            if (reqPath.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
+                reqPath.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
+                reqPath.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.StatusCode = 404;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                return;
+            }
+            await next();
+            return;
+        }
+
+        // EasyAuth NOT configured — setup mode is active
+        var path = context.Request.Path.Value ?? "";
+
+        // Allow setup API and setup page through
+        if (path.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+        {
+            await next();
+            return;
+        }
+
+        // Allow dev proxy assets through (HMR, etc.)
+        if (path.StartsWith("/_next/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/__nextjs", StringComparison.OrdinalIgnoreCase))
+        {
+            await next();
+            return;
+        }
+
+        // Allow static assets with file extensions through
+        if (Path.HasExtension(path) &&
+            !path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase) &&
+            !path.StartsWith("/API/", StringComparison.OrdinalIgnoreCase))
+        {
+            await next();
+            return;
+        }
+
+        // Block all other API calls with 503
+        if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/API/", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 503;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync("{\"error\":\"Setup required. Navigate to /setup to configure authentication.\"}");
+            return;
+        }
+
+        // Redirect everything else to /setup
+        context.Response.Redirect("/setup");
+    });
+
+    logger.LogInformation("[Setup] Setup mode enabled — {Status}",
+        SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled" : "awaiting configuration at /setup");
+}
 
 // Dev proxy: in Development mode, proxy frontend requests to `next dev` (hot-reload)
 // instead of serving precompiled static files from Frontend/
@@ -421,16 +504,18 @@ app.MapGet("/.auth/callback", async (HttpContext context) =>
     }
 });
 
-// Logout: clears session and redirects
+// Logout: clears session, invalidates user cache, and redirects
 app.MapGet("/logout", (HttpContext context) =>
 {
     authService.ClearSession(context);
+    authService.InvalidateUserCache();
     return Results.Redirect("/");
 });
 
 app.MapGet("/.auth/logout", (HttpContext context) =>
 {
     authService.ClearSession(context);
+    authService.InvalidateUserCache();
     return Results.Redirect("/");
 });
 
@@ -556,6 +641,87 @@ AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 QueueStatusBridge.Initialize(jobManager);
+
+// --- Setup API (C# direct — no PS) ---
+
+app.MapGet("/setup", (HttpContext context) =>
+{
+    context.Response.ContentType = "text/html; charset=utf-8";
+    return Results.Content(SetupPages.IndexHtml, "text/html");
+});
+
+app.MapGet("/api/setup/status", (HttpContext context) =>
+{
+    var status = setupService.GetStatus();
+    return Results.Json(status);
+});
+
+app.MapPost("/api/setup/device-code", async (HttpContext context) =>
+{
+    var result = await setupService.StartDeviceCodeFlow();
+    return Results.Json(result);
+});
+
+app.MapPost("/api/setup/device-code-poll", async (HttpContext context) =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    var body = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(body);
+    var root = doc.RootElement;
+
+    var deviceCode = root.GetProperty("deviceCode").GetString()!;
+    var result = await setupService.PollDeviceCodeFlow(deviceCode);
+
+    if (result == null)
+        return Results.Json(new { pending = true });
+
+    return Results.Json(new { pending = false, accessToken = result.AccessToken, tenantId = result.TenantId });
+});
+
+app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    var body = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(body);
+    var root = doc.RootElement;
+
+    var accessToken = root.GetProperty("accessToken").GetString()!;
+    var tenantId = root.GetProperty("tenantId").GetString()!;
+    var redirectUri = root.GetProperty("redirectUri").GetString()!;
+
+    var result = await setupService.CreateAuthAppRegistration(accessToken, tenantId, redirectUri);
+    return Results.Json(result);
+});
+
+app.MapPost("/api/setup/configure", async (HttpContext context) =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    var body = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(body);
+    var root = doc.RootElement;
+
+    var appId = root.GetProperty("appId").GetString()!;
+    var clientSecret = root.GetProperty("clientSecret").GetString()!;
+    var tenantId = root.GetProperty("tenantId").GetString()!;
+
+    await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId);
+    return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+});
+
+app.MapPost("/api/setup/manual", async (HttpContext context) =>
+{
+    using var reader = new StreamReader(context.Request.Body);
+    var body = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(body);
+    var root = doc.RootElement;
+
+    var appId = root.GetProperty("appId").GetString()!;
+    var clientSecret = root.GetProperty("clientSecret").GetString()!;
+    var tenantId = root.GetProperty("tenantId").GetString()!;
+
+    await setupService.ConfigureManual(appId, clientSecret, tenantId);
+    return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+});
 
 // --- Job Status API (C# direct — no PS overhead) ---
 

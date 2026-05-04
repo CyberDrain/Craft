@@ -33,6 +33,9 @@ public class CraftSettings
 
     /// <summary>Script repository — where to find PowerShell modules, HTTP endpoints, background scripts.</summary>
     public ScriptRepoSettings Scripts { get; set; } = new();
+
+    /// <summary>Bootstrap setup — built-in first-run wizard for EasyAuth + app registration.</summary>
+    public SetupSettings Setup { get; set; } = new();
 }
 
 /// <summary>
@@ -319,4 +322,35 @@ public class PermissionExtractionSettings
     /// Output file path for the generated permissions map (relative to the API base path).
     /// </summary>
     public string OutputFile { get; set; } = "Config/function-permissions.json";
+}
+
+/// <summary>
+/// Bootstrap setup settings — enables a first-run wizard that creates the EasyAuth
+/// app registration and configures App Service authentication automatically.
+/// When enabled and EasyAuth is not yet configured, CRAFT serves a built-in setup UI
+/// and blocks all application API endpoints until setup is complete.
+/// </summary>
+public class SetupSettings
+{
+    /// <summary>
+    /// Enable the built-in bootstrap setup mode.
+    /// When true, CRAFT checks for EasyAuth configuration at startup and enters
+    /// setup mode if WEBSITE_AUTH_CLIENT_ID is not set.
+    /// When false, setup routes are never registered regardless of auth state.
+    /// </summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// Public client ID used for the PKCE login popup during automated setup.
+    /// Defaults to Microsoft's Azure PowerShell first-party app which supports
+    /// auth code + PKCE without a client secret.
+    /// </summary>
+    public string BootstrapClientId { get; set; } = "1950a258-227b-4e31-a9cf-717495945fc2";
+
+    /// <summary>
+    /// Display name for the created EasyAuth app registration.
+    /// Uses the App.Name setting to generate: "Craft-EasyAuth-{Name}".
+    /// Override this to set a custom name.
+    /// </summary>
+    public string AuthAppDisplayName { get; set; } = "";
 }
