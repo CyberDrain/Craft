@@ -164,7 +164,7 @@ public class SetupService
     /// Handles app management policy exemption if the tenant blocks password creation.
     /// </summary>
     public async Task<AppRegistrationResult> CreateAuthAppRegistration(
-        string accessToken, string tenantId, string redirectUri, CancellationToken ct = default)
+        string accessToken, string tenantId, string redirectUri, bool multiTenant = false, CancellationToken ct = default)
     {
         var authHeaders = new Dictionary<string, string>
         {
@@ -208,7 +208,7 @@ public class SetupService
             var createBody = new
             {
                 displayName = appDisplayName,
-                signInAudience = "AzureADMultipleOrgs",
+                signInAudience = multiTenant ? "AzureADMultipleOrgs" : "AzureADMyOrg",
                 web = new
                 {
                     redirectUris = new[] { callbackUri },
@@ -451,7 +451,7 @@ public class SetupService
     /// Sets environment variables and authsettingsV2 via ARM REST API.
     /// </summary>
     public async Task ConfigureAppServiceAuth(
-        string appId, string clientSecret, string tenantId, CancellationToken ct = default)
+        string appId, string clientSecret, string tenantId, bool multiTenant = false, CancellationToken ct = default)
     {
         var managementToken = await GetManagedIdentityToken("https://management.azure.com/", ct);
         if (managementToken == null)
@@ -511,7 +511,9 @@ public class SetupService
                         {
                             clientId = appId,
                             clientSecretSettingName = "AUTH_SECRET",
-                            openIdIssuer = "https://login.microsoftonline.com/common/v2.0"
+                            openIdIssuer = multiTenant
+                                ? "https://login.microsoftonline.com/common/v2.0"
+                                : $"https://login.microsoftonline.com/{tenantId}/v2.0"
                         },
                         validation = new
                         {
@@ -542,9 +544,9 @@ public class SetupService
     /// and configures the App Service via ARM.
     /// </summary>
     public async Task ConfigureManual(
-        string appId, string clientSecret, string tenantId, CancellationToken ct = default)
+        string appId, string clientSecret, string tenantId, bool multiTenant = false, CancellationToken ct = default)
     {
-        await ConfigureAppServiceAuth(appId, clientSecret, tenantId, ct);
+        await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, ct);
     }
 
     /// <summary>

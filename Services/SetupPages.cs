@@ -61,6 +61,20 @@ public static class SetupPages
         .steps li.error::before { content: '✕ '; }
         .divider { border-top: 1px solid #334155; margin: 1.5rem 0; }
         .hidden { display: none !important; }
+        .toggle-group {
+            display: flex; gap: 0.5rem; margin-bottom: 1rem;
+        }
+        .toggle-group button {
+            flex: 1; padding: 0.5rem; border: 1px solid #475569;
+            border-radius: 0.375rem; background: #0f172a; color: #94a3b8;
+            font-size: 0.85rem; cursor: pointer; transition: all 0.15s;
+        }
+        .toggle-group button.active {
+            background: #1e3a5f; border-color: #3b82f6; color: #93c5fd;
+        }
+        .toggle-hint {
+            font-size: 0.8rem; color: #64748b; margin-bottom: 1rem;
+        }
         .info-banner {
             background: #1e3a5f; border: 1px solid #2563eb; border-radius: 0.5rem;
             padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.85rem; color: #93c5fd;
@@ -91,6 +105,13 @@ public static class SetupPages
         <h2>Automated Setup</h2>
         <p>Sign in with a Global Administrator account to automatically create the EasyAuth app registration and configure this App Service.</p>
 
+        <label style="margin-bottom: 0.25rem;">Tenant Access</label>
+        <div class="toggle-group" id="auto-tenant-toggle">
+            <button type="button" class="active" onclick="setTenantMode('auto', false)">Single Tenant</button>
+            <button type="button" onclick="setTenantMode('auto', true)">Multi-Tenant</button>
+        </div>
+        <div class="toggle-hint" id="auto-tenant-hint">Only users from the tenant you sign in with can access this app.</div>
+
         <div id="device-code-display" class="hidden">
             <div class="device-code-box">
                 <div>Go to <a id="device-link" href="https://microsoft.com/devicelogin" target="_blank">microsoft.com/devicelogin</a> and enter:</div>
@@ -116,6 +137,12 @@ public static class SetupPages
     <div class="card" id="manual-section">
         <h2>Manual Setup</h2>
         <p>If you already have an app registration, enter the details below.</p>
+        <label style="margin-bottom: 0.25rem;">Tenant Access</label>
+        <div class="toggle-group" id="manual-tenant-toggle">
+            <button type="button" class="active" onclick="setTenantMode('manual', false)">Single Tenant</button>
+            <button type="button" onclick="setTenantMode('manual', true)">Multi-Tenant</button>
+        </div>
+        <div class="toggle-hint" id="manual-tenant-hint">Only users from the specified tenant can access this app.</div>
         <details style="margin-bottom: 1rem;">
             <summary style="cursor: pointer; color: #60a5fa; font-size: 0.85rem;">How to create the app registration manually</summary>
             <ol style="margin: 0.75rem 0 0.5rem 1.25rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
@@ -143,6 +170,23 @@ public static class SetupPages
 <script>
     let setupState = {};
     let pollTimer = null;
+    let autoMultiTenant = false;
+    let manualMultiTenant = false;
+
+    function setTenantMode(section, isMulti) {
+        const toggle = document.getElementById(section + '-tenant-toggle');
+        const hint = document.getElementById(section + '-tenant-hint');
+        toggle.children[0].classList.toggle('active', !isMulti);
+        toggle.children[1].classList.toggle('active', isMulti);
+        if (section === 'auto') {
+            autoMultiTenant = isMulti;
+        } else {
+            manualMultiTenant = isMulti;
+        }
+        hint.textContent = isMulti
+            ? 'Users from any Microsoft Entra tenant can sign in to this app.'
+            : 'Only users from ' + (section === 'auto' ? 'the tenant you sign in with' : 'the specified tenant') + ' can access this app.';
+    }
 
     (async function() {
         try {
@@ -266,7 +310,7 @@ public static class SetupPages
         const appRes = await fetch('/api/setup/create-auth-app', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ accessToken, tenantId, redirectUri: window.location.origin })
+            body: JSON.stringify({ accessToken, tenantId, redirectUri: window.location.origin, multiTenant: autoMultiTenant })
         });
         if (!appRes.ok) throw new Error('App creation failed: ' + await appRes.text());
         const appData = await appRes.json();
@@ -284,7 +328,8 @@ public static class SetupPages
             body: JSON.stringify({
                 appId: appData.appId,
                 clientSecret: appData.clientSecret,
-                tenantId: appData.tenantId
+                tenantId: appData.tenantId,
+                multiTenant: autoMultiTenant
             })
         });
         if (!configRes.ok) throw new Error('Configuration failed: ' + await configRes.text());
@@ -313,7 +358,7 @@ public static class SetupPages
             const res = await fetch('/api/setup/manual', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appId, clientSecret: secret, tenantId })
+                body: JSON.stringify({ appId, clientSecret: secret, tenantId, multiTenant: manualMultiTenant })
             });
 
             if (!res.ok) throw new Error(await res.text());

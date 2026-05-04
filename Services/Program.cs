@@ -688,8 +688,9 @@ app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
     var accessToken = root.GetProperty("accessToken").GetString()!;
     var tenantId = root.GetProperty("tenantId").GetString()!;
     var redirectUri = root.GetProperty("redirectUri").GetString()!;
+    var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
 
-    var result = await setupService.CreateAuthAppRegistration(accessToken, tenantId, redirectUri);
+    var result = await setupService.CreateAuthAppRegistration(accessToken, tenantId, redirectUri, multiTenant);
     return Results.Json(result);
 });
 
@@ -703,8 +704,9 @@ app.MapPost("/api/setup/configure", async (HttpContext context) =>
     var appId = root.GetProperty("appId").GetString()!;
     var clientSecret = root.GetProperty("clientSecret").GetString()!;
     var tenantId = root.GetProperty("tenantId").GetString()!;
+    var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
 
-    await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId);
+    await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
 
@@ -718,8 +720,9 @@ app.MapPost("/api/setup/manual", async (HttpContext context) =>
     var appId = root.GetProperty("appId").GetString()!;
     var clientSecret = root.GetProperty("clientSecret").GetString()!;
     var tenantId = root.GetProperty("tenantId").GetString()!;
+    var multiTenant = root.TryGetProperty("multiTenant", out var mt2) && mt2.GetBoolean();
 
-    await setupService.ConfigureManual(appId, clientSecret, tenantId);
+    await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
 
