@@ -53,8 +53,8 @@ public class SetupService
     /// </summary>
     public static bool IsEasyAuthConfigured()
     {
-        var clientId = Environment.GetEnvironmentVariable("WEBSITE_AUTH_CLIENT_ID");
-        return !string.IsNullOrEmpty(clientId);
+        var authEnabled = Environment.GetEnvironmentVariable("WEBSITE_AUTH_ENABLED");
+        return string.Equals(authEnabled, "True", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
