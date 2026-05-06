@@ -135,15 +135,23 @@ if (CraftSettings.Setup.Enabled)
     {
         if (SetupService.IsEasyAuthConfigured())
         {
-            // EasyAuth is configured — block setup endpoints, pass everything else through
+            // EasyAuth is configured — redirect setup pages to /, pass everything else through
             var reqPath = context.Request.Path.Value ?? "";
-            if (reqPath.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
-                reqPath.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
-                reqPath.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+            if (reqPath.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase))
             {
-                context.Response.StatusCode = 404;
-                context.Response.ContentType = "application/json";
-                await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                // Allow health check endpoint through for restart polling
+                if (!reqPath.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = 404;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                    return;
+                }
+            }
+            else if (reqPath.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
+                     reqPath.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Redirect("/");
                 return;
             }
             await next();
@@ -196,6 +204,48 @@ if (CraftSettings.Setup.Enabled)
     logger.LogInformation("[Setup] Setup mode enabled — {Status}",
         SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled" : "awaiting configuration at /setup");
 }
+
+// Startup loading screen: while the worker pool is initializing, serve a loading page
+// for browser requests and 503 for API calls. Health endpoint stays available for polling.
+app.Use(async (context, next) =>
+{
+    if (!pool.IsReady)
+    {
+        var path = context.Request.Path.Value ?? "";
+
+        // Always let the health endpoint through for polling
+        if (path.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
+        {
+            await next();
+            return;
+        }
+
+        // Setup endpoints pass through (handled by setup middleware above)
+        if (path.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+        {
+            await next();
+            return;
+        }
+
+        // API calls get 503
+        if (path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/API/", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 503;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync("{\"error\":\"Application is starting up. Please wait.\"}");
+            return;
+        }
+
+        // Browser requests get the startup loading page
+        context.Response.ContentType = "text/html; charset=utf-8";
+        await context.Response.WriteAsync(SetupPages.StartupHtml);
+        return;
+    }
+    await next();
+});
 
 // Dev proxy: in Development mode, proxy frontend requests to `next dev` (hot-reload)
 // instead of serving precompiled static files from Frontend/
@@ -655,6 +705,8 @@ app.MapGet("/api/setup/status", (HttpContext context) =>
     var status = setupService.GetStatus();
     return Results.Json(status);
 });
+
+app.MapGet("/api/setup/health", () => Results.Json(new { status = "ok", ready = pool.IsReady }));
 
 app.MapPost("/api/setup/device-code", async (HttpContext context) =>
 {

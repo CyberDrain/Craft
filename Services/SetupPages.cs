@@ -148,7 +148,7 @@ public static class SetupPages
             <ol style="margin: 0.75rem 0 0.5rem 1.25rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
                 <li>Go to <a href="https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade" target="_blank" style="color: #60a5fa;">Entra ID &gt; App registrations</a> &gt; New registration</li>
                 <li>Name: <strong id="manual-app-name" style="color: #e2e8f0;">Craft-EasyAuth-App</strong></li>
-                <li>Supported account types: <strong style="color: #e2e8f0;">Single tenant</strong></li>
+                <li>Supported account types: <strong id="manual-account-type" style="color: #e2e8f0;">Accounts in this organizational directory only (Single tenant)</strong></li>
                 <li>Redirect URI: <strong style="color: #e2e8f0;">Web</strong> &mdash; <code id="manual-redirect-uri" style="background: #0f172a; padding: 0.1rem 0.4rem; border-radius: 0.25rem; color: #f8fafc;">{your-app-url}/.auth/login/aad/callback</code></li>
                 <li>After creation, go to <strong style="color: #e2e8f0;">Authentication</strong> &gt; enable <strong style="color: #e2e8f0;">ID tokens</strong> under Implicit grant</li>
                 <li>Go to <strong style="color: #e2e8f0;">Certificates &amp; secrets</strong> &gt; New client secret &gt; copy the <strong style="color: #e2e8f0;">Value</strong> (not the ID)</li>
@@ -186,6 +186,11 @@ public static class SetupPages
         hint.textContent = isMulti
             ? 'Users from any Microsoft Entra tenant can sign in to this app.'
             : 'Only users from ' + (section === 'auto' ? 'the tenant you sign in with' : 'the specified tenant') + ' can access this app.';
+        if (section === 'manual') {
+            document.getElementById('manual-account-type').textContent = isMulti
+                ? 'Accounts in any organizational directory (Multitenant)'
+                : 'Accounts in this organizational directory only (Single tenant)';
+        }
     }
 
     (async function() {
@@ -335,8 +340,8 @@ public static class SetupPages
         if (!configRes.ok) throw new Error('Configuration failed: ' + await configRes.text());
         setStep('step-configure', 'done');
 
-        showStatus('auto-status', 'Setup complete! The app will restart to apply authentication. You will be redirected shortly.', 'success');
-        setTimeout(() => window.location.href = '/', 8000);
+        showStatus('auto-status', 'Setup complete! The application is restarting...', 'success');
+        showRestartScreen();
     }
 
     async function submitManual() {
@@ -363,14 +368,125 @@ public static class SetupPages
 
             if (!res.ok) throw new Error(await res.text());
 
-            showStatus('manual-status', 'Configuration complete! The app will restart shortly.', 'success');
-            setTimeout(() => window.location.href = '/', 5000);
+            showStatus('manual-status', 'Configuration complete! The application is restarting...', 'success');
+            showRestartScreen();
         } catch (e) {
             showStatus('manual-status', 'Failed: ' + e.message, 'error');
             btn.disabled = false;
             btn.textContent = 'Configure';
         }
     }
+    function showRestartScreen() {
+        // Hide setup sections, show restart polling UI
+        document.getElementById('auto-section').classList.add('hidden');
+        document.getElementById('manual-section').classList.add('hidden');
+        document.querySelector('.divider').classList.add('hidden');
+        document.querySelector('.subtitle').textContent = '';
+        document.getElementById('page-title').textContent = 'Restarting...';
+
+        const banner = document.getElementById('status-banner');
+        banner.innerHTML = '<div style="text-align:center;">' +
+            '<div style="margin-bottom:0.75rem;">Authentication has been configured. The application is restarting to apply changes.</div>' +
+            '<div id="restart-spinner" style="font-size:1.5rem;margin-bottom:0.5rem;">&#8987;</div>' +
+            '<div id="restart-status" style="font-size:0.85rem;color:#94a3b8;">Waiting for the application to come back online...</div>' +
+            '</div>';
+        banner.classList.remove('hidden');
+
+        let attempts = 0;
+        const maxAttempts = 120; // 10 min at 5s intervals
+        const pollInterval = 5000;
+
+        const pollRestart = async () => {
+            attempts++;
+            const statusEl = document.getElementById('restart-status');
+            try {
+                const res = await fetch('/api/setup/health', { cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.ready) {
+                        statusEl.textContent = 'Application is ready! Redirecting...';
+                        document.getElementById('restart-spinner').textContent = '\u2705';
+                        setTimeout(() => window.location.href = '/', 1500);
+                        return;
+                    }
+                }
+            } catch (e) {
+                // App still restarting — expected
+            }
+            if (attempts >= maxAttempts) {
+                statusEl.textContent = 'The application is taking longer than expected. Try refreshing the page manually.';
+                document.getElementById('restart-spinner').textContent = '\u26A0\uFE0F';
+                return;
+            }
+            statusEl.textContent = 'Waiting for the application to come back online... (' + attempts + ')';
+            setTimeout(pollRestart, pollInterval);
+        };
+
+        // Start polling after a short delay to let the restart begin
+        setTimeout(pollRestart, 8000);
+    }
+</script>
+</body>
+</html>
+""";
+
+    public const string StartupHtml = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Starting Up</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a; color: #e2e8f0; min-height: 100vh;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .container { max-width: 480px; width: 100%; padding: 2rem; text-align: center; }
+        h1 { font-size: 1.5rem; margin-bottom: 0.75rem; color: #f8fafc; }
+        .spinner { font-size: 2rem; margin-bottom: 1rem; animation: pulse 1.5s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .status { color: #94a3b8; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="spinner">&#9881;</div>
+    <h1>Application Starting</h1>
+    <div class="status" id="status">Initializing, please wait...</div>
+</div>
+<script>
+    let attempts = 0;
+    const maxAttempts = 240;
+    const pollInterval = 3000;
+
+    const poll = async () => {
+        attempts++;
+        const statusEl = document.getElementById('status');
+        try {
+            const res = await fetch('/api/setup/health', { cache: 'no-store' });
+            if (res.ok) {
+                const data = await res.json();
+                if (data.ready) {
+                    statusEl.textContent = 'Ready! Redirecting...';
+                    setTimeout(() => window.location.reload(), 500);
+                    return;
+                }
+            }
+        } catch (e) {
+            // Still starting
+        }
+        if (attempts >= maxAttempts) {
+            statusEl.textContent = 'Startup is taking longer than expected. Try refreshing the page.';
+            return;
+        }
+        statusEl.textContent = 'Initializing, please wait... (' + attempts + ')';
+        setTimeout(poll, pollInterval);
+    };
+
+    setTimeout(poll, 2000);
 </script>
 </body>
 </html>
