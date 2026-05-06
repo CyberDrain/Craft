@@ -1,6 +1,6 @@
-# ── Craft Dev Image ────────────────────────────────────────
+# ── Craft Release Image ────────────────────────────────────
 # CyberDrain Runtime for Apps, Functions, Tasks
-# Dev build — includes Debug symbols for diagnostics.
+# Optimized Release build for production deployments.
 
 FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS build
 WORKDIR /src
@@ -9,7 +9,7 @@ COPY Craft.csproj .
 RUN dotnet restore
 
 COPY . .
-RUN dotnet publish -c Debug -o /app/publish && \
+RUN dotnet publish -c Release -o /app/publish && \
     rm -rf /app/publish/ref \
            /app/publish/cs /app/publish/de /app/publish/es /app/publish/fr \
            /app/publish/it /app/publish/ja /app/publish/ko /app/publish/pl \
@@ -26,7 +26,7 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 COPY --from=build /app/publish .
 
 # ─── Runtime Configuration ────────────────────────────────
-ARG APP_VERSION=dev
+ARG APP_VERSION=latest
 ARG COMMIT_SHA=unknown
 ENV APP_VERSION=$APP_VERSION
 ENV COMMIT_SHA=$COMMIT_SHA
