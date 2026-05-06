@@ -10,26 +10,21 @@ COPY Craft.csproj .
 RUN dotnet restore
 
 COPY . .
-RUN dotnet publish -c Release -o /app/publish
+RUN dotnet publish -c Release -o /app/publish && \
+    # Keep only Linux runtimes (x64 + arm64), remove Windows/macOS/ref/localization
+    cd /app/publish/runtimes && ls | grep -v 'linux' | xargs rm -rf && \
+    rm -rf /app/publish/ref \
+           /app/publish/cs /app/publish/de /app/publish/es /app/publish/fr \
+           /app/publish/it /app/publish/ja /app/publish/ko /app/publish/pl \
+           /app/publish/pt-BR /app/publish/ru /app/publish/tr \
+           /app/publish/zh-Hans /app/publish/zh-Hant
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS runtime
 WORKDIR /app
 
-# Install PowerShell 7.4 from tar.gz (smaller than apt-based install)
-ENV POWERSHELL_VERSION=7.4.15
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends wget ca-certificates libicu72 && \
-    wget -q "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell-${POWERSHELL_VERSION}-linux-x64.tar.gz" \
-         -O /tmp/powershell.tar.gz && \
-    mkdir -p /opt/microsoft/powershell/7 && \
-    tar -xzf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7 && \
-    chmod +x /opt/microsoft/powershell/7/pwsh && \
-    ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh && \
-    rm /tmp/powershell.tar.gz && \
-    apt-get remove -y wget && \
-    apt-get autoremove -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# Copy PowerShell from the SDK build stage (PS is bundled in dotnet/sdk images)
+COPY --from=build /usr/share/powershell /usr/share/powershell
+RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 
 COPY --from=build /app/publish .
 
