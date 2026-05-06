@@ -87,35 +87,48 @@ var httpListener = new HttpDiagnosticListener(httpDiagLogger, slowThresholdMs: 1
 // Must keep reference alive — GC would collect it and stop events
 app.Lifetime.ApplicationStopping.Register(() => httpListener.Dispose());
 
-// Initialize ScriptRepository and WorkerPool
 var repo = app.Services.GetRequiredService<ScriptRepository>();
-repo.LoadAll(Path.Combine(AppContext.BaseDirectory, "API"));
-
 var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
+var cache = app.Services.GetRequiredService<CacheService>();
+var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
 
-// Defer pool initialization until after Kestrel is listening.
+// Endpoints dictionary populated asynchronously after Kestrel starts.
+// The startup middleware blocks all /API/* calls until pool.IsReady,
+// so the route handler won't access this until it's fully populated.
+var endpoints = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+// Defer ALL heavy initialization until after Kestrel is listening.
 // Azure App Service kills containers that don't respond to health probes within 230s;
-// by deferring, the web host can answer probes immediately while workers spin up.
+// by deferring script loading + pool init, the health endpoint and startup loading page
+// respond immediately while initialization happens in the background.
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     Task.Run(() =>
     {
-        try { pool.Initialize(); }
-        catch (Exception ex) { logger.LogCritical(ex, "[System] Pool initialization failed"); }
+        try
+        {
+            // 1. Load scripts — parse .ps1 files, build route table
+            repo.LoadAll(Path.Combine(AppContext.BaseDirectory, "API"));
+
+            // 2. Discover HTTP endpoints from loaded scripts
+            var discovered = psRunner.DiscoverHttpEndpoints();
+            foreach (var kvp in discovered)
+                endpoints[kvp.Key] = kvp.Value;
+
+            logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
+            logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
+                CraftSettings.Worker.HttpPoolSize,
+                CraftSettings.Worker.BgPoolSize,
+                verboseLogging);
+
+            // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
+            pool.Initialize();
+        }
+        catch (Exception ex) { logger.LogCritical(ex, "[System] Initialization failed"); }
     });
 });
-
-var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
-var cache = app.Services.GetRequiredService<CacheService>();
-var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
-var endpoints = psRunner.DiscoverHttpEndpoints();
-
-logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
-logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
-    CraftSettings.Worker.HttpPoolSize,
-    CraftSettings.Worker.BgPoolSize,
-    verboseLogging);
 
 if (app.Environment.IsDevelopment())
 {
