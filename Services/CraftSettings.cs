@@ -327,14 +327,14 @@ public class PermissionExtractionSettings
 /// <summary>
 /// Bootstrap setup settings — enables a first-run wizard that creates the EasyAuth
 /// app registration and configures App Service authentication automatically.
-/// When enabled and EasyAuth is not yet configured, CRAFT serves a built-in setup UI
+/// When enabled and EasyAuth is not yet configured, Craft serves a built-in setup UI
 /// and blocks all application API endpoints until setup is complete.
 /// </summary>
 public class SetupSettings
 {
     /// <summary>
     /// Enable the built-in bootstrap setup mode.
-    /// When true, CRAFT checks for EasyAuth configuration at startup and enters
+    /// When true, Craft checks for EasyAuth configuration at startup and enters
     /// setup mode if WEBSITE_AUTH_CLIENT_ID is not set.
     /// When false, setup routes are never registered regardless of auth state.
     /// </summary>

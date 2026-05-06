@@ -39,7 +39,7 @@ public class SetupService
             PooledConnectionLifetime = TimeSpan.FromMinutes(15)
         };
         s_httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
-        s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("CRAFT-Setup/1.0");
+        s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Craft-Setup/1.0");
     }
 
     public SetupService(ILogger<SetupService> logger, CraftSettings settings)
