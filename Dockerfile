@@ -11,8 +11,6 @@ RUN dotnet restore
 
 COPY . .
 RUN dotnet publish -c Release -o /app/publish && \
-    # Keep only Linux runtimes (x64 + arm64), remove Windows/macOS/ref/localization
-    cd /app/publish/runtimes && ls | grep -v 'linux' | xargs rm -rf && \
     rm -rf /app/publish/ref \
            /app/publish/cs /app/publish/de /app/publish/es /app/publish/fr \
            /app/publish/it /app/publish/ja /app/publish/ko /app/publish/pl \
