@@ -11,8 +11,7 @@ obj/
 .vscode/
 
 # Docker
-Dockerfile
-docker-compose*.yml
+build/
 .dockerignore
 
 # Docs / non-runtime
