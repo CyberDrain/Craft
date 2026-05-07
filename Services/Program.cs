@@ -706,6 +706,7 @@ var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 QueueStatusBridge.Initialize(jobManager);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
+CacheBridge.Initialize(cache);
 
 // --- Setup API (C# direct — no PS) ---
 
