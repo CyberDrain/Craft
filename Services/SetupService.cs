@@ -479,9 +479,29 @@ public class SetupService
         }
 
         // 2. Add the client secret setting (referenced by authsettingsV2 clientSecretSettingName)
-        // Note: WEBSITE_AUTH_CLIENT_ID and WEBSITE_AUTH_AAD_ALLOWED_TENANTS are managed
-        // internally by EasyAuth via authsettingsV2 — setting them here causes a 400 error.
         mergedSettings["AUTH_SECRET"] = clientSecret;
+
+        // Determine effective allowed tenants (always include the setup tenant)
+        var effectiveTenants = new HashSet<string>(_settings.Setup.AllowedTenants, StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrEmpty(tenantId))
+            effectiveTenants.Add(tenantId);
+
+        // If multiple tenants are allowed, issuer must be "common" and we set the
+        // WEBSITE_AUTH_AAD_ALLOWED_TENANTS app setting so EasyAuth checks the tid claim.
+        // A single-tenant issuer would reject tokens from other tenants at the protocol
+        // level before the app setting check ever runs.
+        bool useCommonIssuer = multiTenant || effectiveTenants.Count > 1;
+
+        if (effectiveTenants.Count > 1)
+        {
+            mergedSettings["WEBSITE_AUTH_AAD_ALLOWED_TENANTS"] = string.Join(",", effectiveTenants);
+            _logger.LogInformation("[Setup] Allowed tenants: {Tenants}", string.Join(", ", effectiveTenants));
+        }
+        else
+        {
+            // Single tenant — remove the setting if it was previously set
+            mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
+        }
 
         // 3. PUT merged settings back
         var settingsBody = new { properties = mergedSettings };
@@ -489,19 +509,50 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated: AUTH_SECRET");
+        _logger.LogInformation("[Setup] App settings updated: AUTH_SECRET{Tenants}",
+            effectiveTenants.Count > 1 ? ", WEBSITE_AUTH_AAD_ALLOWED_TENANTS" : "");
 
         // 4. Configure authsettingsV2
+        var globalValidation = new Dictionary<string, object>
+        {
+            ["unauthenticatedClientAction"] = _settings.Setup.UnauthenticatedClientAction,
+            ["redirectToProvider"] = "azureactivedirectory"
+        };
+
+        if (_settings.Setup.ExcludedPaths.Count > 0)
+        {
+            globalValidation["excludedPaths"] = _settings.Setup.ExcludedPaths;
+            _logger.LogInformation("[Setup] Excluded paths: {Paths}", string.Join(", ", _settings.Setup.ExcludedPaths));
+        }
+
+        // Build allowed audiences: always include api://{appId}, plus any extras from config
+        var audiences = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { $"api://{appId}" };
+        foreach (var aud in _settings.Setup.AllowedAudiences)
+        {
+            if (!string.IsNullOrWhiteSpace(aud))
+                audiences.Add(aud);
+        }
+
+        var aadValidation = new Dictionary<string, object>
+        {
+            ["allowedAudiences"] = audiences.ToArray()
+        };
+
+        if (_settings.Setup.AllowedApplications.Count > 0)
+        {
+            aadValidation["defaultAuthorizationPolicy"] = new
+            {
+                allowedApplications = _settings.Setup.AllowedApplications
+            };
+            _logger.LogInformation("[Setup] Allowed applications: {Apps}", string.Join(", ", _settings.Setup.AllowedApplications));
+        }
+
         var authConfig = new
         {
             properties = new
             {
                 platform = new { enabled = true },
-                globalValidation = new
-                {
-                    unauthenticatedClientAction = "RedirectToLoginPage",
-                    redirectToProvider = "azureactivedirectory"
-                },
+                globalValidation,
                 identityProviders = new
                 {
                     azureActiveDirectory = new
@@ -511,14 +562,11 @@ public class SetupService
                         {
                             clientId = appId,
                             clientSecretSettingName = "AUTH_SECRET",
-                            openIdIssuer = multiTenant
+                            openIdIssuer = useCommonIssuer
                                 ? "https://login.microsoftonline.com/common/v2.0"
                                 : $"https://login.microsoftonline.com/{tenantId}/v2.0"
                         },
-                        validation = new
-                        {
-                            allowedAudiences = new[] { $"api://{appId}" }
-                        }
+                        validation = aadValidation
                     }
                 },
                 login = new

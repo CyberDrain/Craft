@@ -76,7 +76,8 @@ builder.Services.AddSingleton<OrchestratorService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<SetupService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
-builder.Services.AddHostedService<SchedulerService>();
+builder.Services.AddSingleton<SchedulerService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
 
 var app = builder.Build();
 
@@ -704,6 +705,7 @@ AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 QueueStatusBridge.Initialize(jobManager);
+SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 
 // --- Setup API (C# direct — no PS) ---
 

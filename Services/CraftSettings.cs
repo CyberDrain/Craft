@@ -210,6 +210,14 @@ public class SchedulerSettings
 
     /// <summary>How often (in seconds) the scheduler checks for due tasks.</summary>
     public int CheckIntervalSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// IANA or Windows timezone ID for tasks with TZOffset=true.
+    /// Overridable via env var App__Scheduler__Timezone (or CraftTZ at startup).
+    /// When empty, all cron evaluation uses UTC.
+    /// Examples: "America/New_York", "Europe/London", "Eastern Standard Time"
+    /// </summary>
+    public string Timezone { get; set; } = "";
 }
 
 /// <summary>
@@ -353,4 +361,47 @@ public class SetupSettings
     /// Override this to set a custom name.
     /// </summary>
     public string AuthAppDisplayName { get; set; } = "";
+
+    /// <summary>
+    /// Action taken when an unauthenticated request arrives.
+    /// Applied to globalValidation.unauthenticatedClientAction in authsettingsV2.
+    /// Valid values: RedirectToLoginPage, AllowAnonymous, RejectWith401, RejectWith404.
+    /// Default is RedirectToLoginPage (suitable for web UIs); APIs should use RejectWith401.
+    /// </summary>
+    public string UnauthenticatedClientAction { get; set; } = "RedirectToLoginPage";
+
+    /// <summary>
+    /// Paths excluded from EasyAuth authentication (e.g. webhook endpoints).
+    /// Applied to globalValidation.excludedPaths in authsettingsV2.
+    /// Supports App Service glob patterns (e.g. "/api/Public*").
+    /// </summary>
+    public List<string> ExcludedPaths { get; set; } = [];
+
+    /// <summary>
+    /// Client application IDs allowed to call the app with access tokens.
+    /// Applied to identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications.
+    /// When empty, no application-level restriction is applied (any valid token for the audience is accepted).
+    /// </summary>
+    public List<string> AllowedApplications { get; set; } = [];
+
+    /// <summary>
+    /// Additional allowed token audiences beyond the auto-generated "api://{appId}".
+    /// Applied to identityProviders.azureActiveDirectory.validation.allowedAudiences.
+    /// The app's own "api://{appId}" is always included automatically.
+    /// </summary>
+    public List<string> AllowedAudiences { get; set; } = [];
+
+    /// <summary>
+    /// Tenant IDs allowed to authenticate. Controls both the issuer URL and the
+    /// WEBSITE_AUTH_AAD_ALLOWED_TENANTS app setting.
+    ///
+    /// Behavior:
+    ///   - Empty (default): single-tenant — issuer is set to the setup tenant ID.
+    ///   - One entry: single-tenant — issuer is set to that tenant ID.
+    ///   - Multiple entries: issuer is set to "common" and WEBSITE_AUTH_AAD_ALLOWED_TENANTS
+    ///     is set to the comma-separated list (Azure enforces the tid claim check).
+    ///
+    /// The tenant from the setup flow is always included automatically.
+    /// </summary>
+    public List<string> AllowedTenants { get; set; } = [];
 }
