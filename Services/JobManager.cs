@@ -32,6 +32,7 @@ public class JobSummary
 public class JobRunSummary
 {
     public string Name { get; set; } = string.Empty;
+    public string? Reference { get; set; }
     public int Priority { get; set; }
     public int Total { get; set; }
     public int Queued { get; set; }

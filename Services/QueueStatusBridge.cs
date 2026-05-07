@@ -10,8 +10,13 @@ namespace Craft.Services;
 public static class QueueStatusBridge
 {
     private static JobManager? s_jobManager;
+    private static OrchestratorService? s_orchestratorService;
 
-    public static void Initialize(JobManager jobManager) => s_jobManager = jobManager;
+    public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null)
+    {
+        s_jobManager = jobManager;
+        s_orchestratorService = orchestratorService;
+    }
 
     /// <summary>
     /// Get queue/run status in the format expected by the CIPP frontend.
@@ -25,16 +30,41 @@ public static class QueueStatusBridge
     {
         if (s_jobManager == null) return "[]";
 
-        var lookup = queueId ?? reference;
+        // PowerShell converts $null to "" when calling .NET string parameters,
+        // so treat empty strings the same as null.
+        var effectiveQueueId = string.IsNullOrEmpty(queueId) ? null : queueId;
+        var effectiveReference = string.IsNullOrEmpty(reference) ? null : reference;
+        var lookup = effectiveQueueId ?? effectiveReference;
         var summaries = s_jobManager.GetRunSummaries();
 
         if (!string.IsNullOrEmpty(lookup))
         {
-            // Match by run name — try exact match first, then contains
-            summaries = summaries
-                .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase)
-                         || s.Name.Contains(lookup, StringComparison.OrdinalIgnoreCase))
+            // Try exact match on run name first
+            var matched = summaries
+                .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase))
                 .ToList();
+
+            // If no exact match, try matching by Reference via orchestrator service
+            if (matched.Count == 0 && s_orchestratorService != null)
+            {
+                var runName = s_orchestratorService.FindRunByReference(lookup);
+                if (runName != null)
+                {
+                    matched = summaries
+                        .Where(s => s.Name.Equals(runName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+            }
+
+            // Last resort: match run names ending with the lookup (QueueId is often the GUID suffix)
+            if (matched.Count == 0)
+            {
+                matched = summaries
+                    .Where(s => s.Name.EndsWith(lookup, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+            }
+
+            summaries = matched;
         }
         else
         {
@@ -57,7 +87,7 @@ public static class QueueStatusBridge
                 RowKey = s.Name,
                 Name = s.Name,
                 Link = "",
-                Reference = s.Name,
+                Reference = s_orchestratorService?.GetRunReference(s.Name) ?? s.Name,
                 TotalTasks = s.Total,
                 CompletedTasks = completedTasks,
                 RunningTasks = s.Running,

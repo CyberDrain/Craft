@@ -22,7 +22,8 @@ function Invoke-CraftTask {
     }
 
     $PushFunction = "Push-$FunctionName"
-    Write-Information "Dispatching task to $PushFunction for $($Item.TenantFilter ?? 'unknown')"
+    $TenantLabel = $Item.TenantFilter ?? $Item.QueueName ?? $Item.defaultDomainName ?? $(if ($Item.Tenant -is [string]) { $Item.Tenant } elseif ($Item.Tenant.defaultDomainName) { $Item.Tenant.defaultDomainName } else { 'unknown' })
+    Write-Information "Dispatching task to $PushFunction for $TenantLabel"
 
     $Result = & $PushFunction -Item ([PSCustomObject]$Item)
 
@@ -31,5 +32,5 @@ function Invoke-CraftTask {
         ConvertTo-Json -InputObject @($Result) -Depth 20 -Compress
     }
 
-    Write-Information "Completed task $PushFunction for $($Item.TenantFilter ?? 'unknown')"
+    Write-Information "Completed task $PushFunction for $TenantLabel"
 }

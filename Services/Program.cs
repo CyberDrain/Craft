@@ -234,10 +234,11 @@ app.Use(async (context, next) =>
             return;
         }
 
-        // Setup endpoints pass through (handled by setup middleware above)
-        if (path.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
+        // Setup endpoints pass through only when setup mode is enabled
+        if (CraftSettings.Setup.Enabled &&
+            (path.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase) ||
             path.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
-            path.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
+            path.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase)))
         {
             await next();
             return;
@@ -704,12 +705,17 @@ OrchestratorBridge.Initialize(orchestrator);
 AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
-QueueStatusBridge.Initialize(jobManager);
+QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>());
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 
 // --- Setup API (C# direct — no PS) ---
 
+// Health endpoint always available — used by startup loading screen for readiness polling
+app.MapGet("/api/setup/health", () => Results.Json(new { status = "ok", ready = pool.IsReady }));
+
+if (CraftSettings.Setup.Enabled)
+{
 app.MapGet("/setup", (HttpContext context) =>
 {
     context.Response.ContentType = "text/html; charset=utf-8";
@@ -721,8 +727,6 @@ app.MapGet("/api/setup/status", (HttpContext context) =>
     var status = setupService.GetStatus();
     return Results.Json(status);
 });
-
-app.MapGet("/api/setup/health", () => Results.Json(new { status = "ok", ready = pool.IsReady }));
 
 app.MapPost("/api/setup/device-code", async (HttpContext context) =>
 {
@@ -793,6 +797,7 @@ app.MapPost("/api/setup/manual", async (HttpContext context) =>
     await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
+} // end Setup.Enabled
 
 // --- Job Status API (C# direct — no PS overhead) ---
 
