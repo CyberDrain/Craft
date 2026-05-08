@@ -212,7 +212,14 @@ public class SchedulerSettings
     public int CheckIntervalSeconds { get; set; } = 30;
 
     /// <summary>
-    /// IANA or Windows timezone ID for tasks with TZOffset=true.
+    /// When true, applies the configured timezone to ALL scheduler tasks,
+    /// regardless of individual TZOffset settings. When false (default),
+    /// only tasks with TZOffset=true use the configured timezone.
+    /// </summary>
+    public bool ApplyTZOffset { get; set; } = false;
+
+    /// <summary>
+    /// IANA or Windows timezone ID for timezone-aware cron evaluation.
     /// Overridable via env var App__Scheduler__Timezone (or CraftTZ at startup).
     /// When empty, all cron evaluation uses UTC.
     /// Examples: "America/New_York", "Europe/London", "Eastern Standard Time"

@@ -126,7 +126,7 @@ public class SchedulerService : BackgroundService
                 {
                     var cronExpression = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
                     var lastRun = _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue);
-                    var tz = task.TZOffset ? _configuredTz : TimeZoneInfo.Utc;
+                    var tz = (task.TZOffset || _settings.Scheduler.ApplyTZOffset) ? _configuredTz : TimeZoneInfo.Utc;
                     var nextOccurrence = cronExpression.GetNextOccurrence(lastRun, tz);
 
                     if (nextOccurrence.HasValue && nextOccurrence.Value <= now)
@@ -266,10 +266,10 @@ public class SchedulerService : BackgroundService
         _logger.LogInformation("[Scheduler] Timezone changed to: {TZ} (UTC{Offset})",
             tz.Id, tz.BaseUtcOffset.ToString(@"hh\:mm"));
 
-        // Reseed TZOffset tasks to "now" so the next evaluation uses the new timezone
+        // Reseed affected tasks to "now" so the next evaluation uses the new timezone
         // without double-firing or skipping.
         var now = DateTimeOffset.UtcNow;
-        foreach (var task in _tasks.Where(t => t.TZOffset))
+        foreach (var task in _tasks.Where(t => t.TZOffset || _settings.Scheduler.ApplyTZOffset))
         {
             _lastRun[task.Id] = now;
         }
