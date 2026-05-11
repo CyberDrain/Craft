@@ -18,8 +18,12 @@ public class PowerShellWorkerPool : IDisposable
     private readonly ConcurrentDictionary<int, int> _workerFaults = new(); // workerId → consecutive fault count
     private const int MaxConsecutiveFaults = 3;
     private readonly ManualResetEventSlim _ready = new(false);
+    private readonly ManualResetEventSlim _httpReady = new(false);
+    private readonly ManualResetEventSlim _bgReady = new(false);
+    private ExportedModuleState? _httpClonedState;  // Cached state from first HTTP worker
+    private ExportedModuleState? _bgClonedState;    // Cached state from first BG worker
 
-    public bool IsReady => _ready.IsSet;
+    public bool IsReady => _httpReady.IsSet;
     public int HttpAvailable => _httpPool.Count;
     public int BgAvailable => _bgPool.Count;
     public int HttpPoolSize => _httpPoolSize;
@@ -55,63 +59,278 @@ public class PowerShellWorkerPool : IDisposable
             }
         }
 
-        var httpISS = BuildISS(isHttp: true);
-        var bgISS = BuildISS(isHttp: false);
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        StartupInfoBridge.SetCpuCount(Environment.ProcessorCount);
+        StartupInfoBridge.SetPoolConfig(_httpPoolSize, _bgPoolSize);
 
-        // First HTTP worker must init sequentially — warmup scripts set process-level state
-        // (env vars, auth tokens, caches) that subsequent workers benefit from.
-        var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
-        firstWorker.Initialize(_repo, _apiBasePath, _settings);
-        if (_settings.Worker.WarmupScripts.Count > 0)
+        var warmupMode = _settings.Worker.WarmupMode?.Trim() ?? "AfterReady";
+        var hasWarmup = _settings.Worker.WarmupScripts.Count > 0;
+        if (hasWarmup)
+            _logger.LogInformation("[System] WarmupMode: {Mode} ({Count} scripts)", warmupMode, _settings.Worker.WarmupScripts.Count);
+        StartupInfoBridge.SetWarmupMode(warmupMode);
+
+        var httpModuleList = _settings.Worker.HttpModules;
+        var bgModuleList = _settings.Worker.BgModules;
+        var httpHasFilter = httpModuleList.Count > 0;
+        var bgHasFilter = bgModuleList.Count > 0;
+        bool separateModuleLists = httpHasFilter || bgHasFilter;
+
+        // Log module filtering config
+        if (httpHasFilter)
+            _logger.LogInformation("[System] HTTP workers: loading {Count} modules: {Modules}", httpModuleList.Count, string.Join(", ", httpModuleList));
+        if (bgHasFilter)
+            _logger.LogInformation("[System] BG workers: loading {Count} modules: {Modules}", bgModuleList.Count, string.Join(", ", bgModuleList));
+
+        // Compute shared modules (intersection of HTTP and BG lists)
+        var sharedModules = httpHasFilter && bgHasFilter
+            ? httpModuleList.Intersect(bgModuleList, StringComparer.OrdinalIgnoreCase).ToList()
+            : new List<string>();
+        var httpOnlyModules = httpHasFilter
+            ? httpModuleList.Except(sharedModules, StringComparer.OrdinalIgnoreCase).ToList()
+            : new List<string>();
+        var bgOnlyModules = bgHasFilter
+            ? bgModuleList.Except(sharedModules, StringComparer.OrdinalIgnoreCase).ToList()
+            : new List<string>();
+
+        bool useSharedBase = sharedModules.Count > 0 && (httpOnlyModules.Count > 0 || bgOnlyModules.Count > 0);
+
+        if (useSharedBase)
+            InitializeWithSharedBase(sw, sharedModules, httpOnlyModules, bgOnlyModules, warmupMode);
+        else
+            InitializeSimple(sw, separateModuleLists, warmupMode);
+    }
+
+    /// <summary>
+    /// Shared-base initialization: parse shared modules once in a base worker,
+    /// then create HTTP and BG first-workers in parallel by cloning the base
+    /// and adding only their unique modules via ISS ImportPSModule.
+    /// </summary>
+    private void InitializeWithSharedBase(System.Diagnostics.Stopwatch sw,
+        List<string> sharedModules, List<string> httpOnlyModules, List<string> bgOnlyModules, string warmupMode)
+    {
+        StartupInfoBridge.SetModuleCounts(sharedModules.Count, httpOnlyModules.Count, bgOnlyModules.Count);
+        _logger.LogInformation("[System] Shared base: {Shared} shared, {HttpOnly} HTTP-only, {BgOnly} BG-only modules",
+            sharedModules.Count, httpOnlyModules.Count, bgOnlyModules.Count);
+
+        // ── Base worker: parse shared modules ──────────────────────────────
+        var baseISS = BuildISSForModules(sharedModules);
+        var baseWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), baseISS, _logger);
+        baseWorker.Initialize(_repo, _apiBasePath, _settings);
+
+        var baseMs = sw.ElapsedMilliseconds;
+        _logger.LogInformation("[System] Base worker ready in {Ms}ms, exporting shared state", baseMs);
+
+        var baseState = baseWorker.ExportModuleState();
+        StartupInfoBridge.SetBaseWorkerDone(baseMs, baseState.Functions.Count);
+        _logger.LogInformation("[System] Base state: {FnCount} functions, {VarCount} variables, {BinCount} binary modules",
+            baseState.Functions.Count, baseState.Variables.Count, baseState.BinaryModulePaths.Count);
+
+        // Done with base worker — dispose it
+        baseWorker.Dispose();
+
+        // ── HTTP first-worker (cloned base + HTTP-only modules) ────────────
+        var httpISS = BuildClonedISSWithModules(baseState, httpOnlyModules);
+        var firstHttpWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
+        firstHttpWorker.Initialize(_repo, _apiBasePath, _settings);
+        var httpState = firstHttpWorker.ExportModuleState();
+
+        _httpClonedState = httpState.MergeWith(baseState);
+
+        // BeforeReady: warmup runs BEFORE signaling HTTP ready
+        if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
+            RunWarmup(firstHttpWorker, sw);
+
+        _httpPool.Add(firstHttpWorker);
+
+        // Signal HTTP ready — one worker can serve requests
+        _httpReady.Set();
+        _ready.Set();
+        StartupInfoBridge.SetHttpReady(sw.ElapsedMilliseconds, _httpClonedState.Functions.Count);
+        _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests ({FnCount} functions)",
+            sw.ElapsedMilliseconds, _httpClonedState.Functions.Count);
+
+        // AfterReady: warmup runs AFTER signaling HTTP ready, on first HTTP worker
+        if (warmupMode.Equals("AfterReady", StringComparison.OrdinalIgnoreCase))
+            RunWarmup(firstHttpWorker, sw);
+
+        // Clone remaining HTTP workers (API already serving with first worker)
+        if (_httpPoolSize > 1)
         {
-            var warmSw = System.Diagnostics.Stopwatch.StartNew();
-            firstWorker.Warmup(_settings);
-            _logger.LogInformation("[System] Pre-warm completed in {Ms}ms", warmSw.ElapsedMilliseconds);
+            var clonedHttpISS = BuildClonedISS(_httpClonedState);
+            var httpRemaining = new List<PowerShellWorker>();
+            for (int i = 1; i < _httpPoolSize; i++)
+                httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+
+            Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            foreach (var w in httpRemaining)
+                _httpPool.Add(w);
+
+            StartupInfoBridge.SetHttpPoolFull(sw.ElapsedMilliseconds);
+            _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
+                _httpPoolSize, sw.ElapsedMilliseconds);
         }
+
+        // ── BG first-worker (cloned base + BG-only modules) ────────────────
+        var bgISS = BuildClonedISSWithModules(baseState, bgOnlyModules);
+        var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger);
+        firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
+        var bgState = firstBgWorker.ExportModuleState();
+
+        _bgClonedState = bgState.MergeWith(baseState);
+
+        // Background: warmup runs on the first BG worker — HTTP pool unaffected
+        if (warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
+            RunWarmup(firstBgWorker, sw);
+
+        _bgPool.Add(firstBgWorker);
+
+        StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
+        _logger.LogInformation("[System] BG first worker ready in {Ms}ms — {FnCount} functions",
+            sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
+
+        // Clone remaining BG workers
+        if (_bgPoolSize > 1)
+        {
+            var clonedBgISS = BuildClonedISS(_bgClonedState);
+            var bgRemaining = new List<PowerShellWorker>();
+            for (int i = 1; i < _bgPoolSize; i++)
+                bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+
+            Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            foreach (var w in bgRemaining)
+                _bgPool.Add(w);
+        }
+
+        _bgReady.Set();
+        StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
+        _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms (base: {BaseMs}ms)",
+            _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds, baseMs);
+    }
+
+    /// <summary>
+    /// Simple initialization (no shared base): same-module or single-list config.
+    /// Falls back to sequential first-worker + clone pattern.
+    /// </summary>
+    private void InitializeSimple(System.Diagnostics.Stopwatch sw, bool separateModuleLists, string warmupMode)
+    {
+        // First HTTP worker: full module import
+        var fullHttpISS = BuildISS(isHttp: true);
+        var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullHttpISS, _logger);
+        firstWorker.Initialize(_repo, _apiBasePath, _settings);
+
+        _httpClonedState = firstWorker.ExportModuleState();
+
+        // BeforeReady: warmup runs BEFORE signaling HTTP ready
+        if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
+            RunWarmup(firstWorker, sw);
+
         _httpPool.Add(firstWorker);
 
-        // Remaining workers can init in parallel — ISS is a thread-safe template,
-        // and each runspace gets its own isolated session state.
-        var remaining = new List<(PowerShellWorker worker, bool isHttp)>();
-        for (int i = 1; i < _httpPoolSize; i++)
-            remaining.Add((new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger), true));
-        for (int i = 0; i < _bgPoolSize; i++)
-            remaining.Add((new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger), false));
+        // Signal HTTP ready — one worker can serve requests
+        _httpReady.Set();
+        _ready.Set();
+        var firstWorkerMs = sw.ElapsedMilliseconds;
+        StartupInfoBridge.SetHttpReady(firstWorkerMs, _httpClonedState.Functions.Count);
+        _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests", firstWorkerMs);
 
-        Parallel.ForEach(remaining, entry =>
-        {
-            entry.worker.Initialize(_repo, _apiBasePath, _settings);
-        });
+        // AfterReady: warmup runs AFTER signaling HTTP ready, on first HTTP worker
+        if (warmupMode.Equals("AfterReady", StringComparison.OrdinalIgnoreCase))
+            RunWarmup(firstWorker, sw);
 
-        foreach (var entry in remaining)
+        // Clone remaining HTTP workers (API already serving with first worker)
+        if (_httpPoolSize > 1)
         {
-            if (entry.isHttp) _httpPool.Add(entry.worker);
-            else _bgPool.Add(entry.worker);
+            var clonedHttpISS = BuildClonedISS(_httpClonedState);
+            var httpRemaining = new List<PowerShellWorker>();
+            for (int i = 1; i < _httpPoolSize; i++)
+                httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+
+            Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            foreach (var w in httpRemaining)
+                _httpPool.Add(w);
+
+            _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
+                _httpPoolSize, sw.ElapsedMilliseconds);
         }
 
-        _logger.LogInformation("[System] Pool ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
+        // BG workers
+        if (separateModuleLists)
+        {
+            var bgSw = System.Diagnostics.Stopwatch.StartNew();
+            var fullBgISS = BuildISS(isHttp: false);
+            var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullBgISS, _logger);
+            firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
+            _bgClonedState = firstBgWorker.ExportModuleState();
+
+            // Background: warmup runs on the first BG worker — HTTP pool unaffected
+            if (warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
+                RunWarmup(firstBgWorker, sw);
+
+            _bgPool.Add(firstBgWorker);
+            StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
+            _logger.LogInformation("[System] First BG worker ready in {Ms}ms — BG state: {FnCount} functions, {VarCount} variables",
+                bgSw.ElapsedMilliseconds, _bgClonedState.Functions.Count, _bgClonedState.Variables.Count);
+        }
+        else
+        {
+            _bgClonedState = _httpClonedState;
+        }
+
+        var clonedBgISS = BuildClonedISS(_bgClonedState);
+        var bgStart = separateModuleLists ? 1 : 0;
+        var bgRemaining = new List<PowerShellWorker>();
+        for (int i = bgStart; i < _bgPoolSize; i++)
+            bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+
+        if (bgRemaining.Count > 0)
+        {
+            Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            foreach (var w in bgRemaining)
+                _bgPool.Add(w);
+        }
+
+        _bgReady.Set();
+        StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
+        _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
             _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds);
-        _ready.Set();
+    }
+
+    /// <summary>
+    /// Run configured warmup scripts on a worker. Sets process-level env vars
+    /// (visible to all workers) and primes caches. Non-fatal on failure.
+    /// </summary>
+    private void RunWarmup(PowerShellWorker worker, System.Diagnostics.Stopwatch sw)
+    {
+        if (_settings.Worker.WarmupScripts.Count == 0) return;
+
+        var warmSw = System.Diagnostics.Stopwatch.StartNew();
+        worker.Warmup(_settings);
+        _logger.LogInformation("[System] Warmup completed in {Ms}ms (at {Total}ms)", warmSw.ElapsedMilliseconds, sw.ElapsedMilliseconds);
+        StartupInfoBridge.SetWarmupDone(warmSw.ElapsedMilliseconds);
     }
 
     /// <summary>
     /// Block until the pool has finished initializing, or the timeout expires.
     /// </summary>
-    public bool WaitForReady(TimeSpan timeout) => _ready.Wait(timeout);
+    public bool WaitForReady(TimeSpan timeout) => _httpReady.Wait(timeout);
+
+    /// <summary>
+    /// Block until the BG worker pool is ready (scheduler/background tasks should wait on this).
+    /// </summary>
+    public bool WaitForBgReady(TimeSpan timeout) => _bgReady.Wait(timeout);
 
     public PowerShellWorker? CheckoutHttp(TimeSpan timeout)
     {
-        // Wait for pool initialization before attempting checkout
-        if (!_ready.IsSet)
-            _ready.Wait(timeout);
+        // Wait for HTTP pool initialization before attempting checkout
+        if (!_httpReady.IsSet)
+            _httpReady.Wait(timeout);
         _httpPool.TryTake(out var w, timeout);
         return w;
     }
 
     public PowerShellWorker CheckoutBackground(CancellationToken ct)
     {
-        _ready.Wait(ct);
+        _bgReady.Wait(ct);
         return _bgPool.Take(ct);
     }
 
@@ -125,7 +344,8 @@ public class PowerShellWorkerPool : IDisposable
                 _logger.LogWarning("[Pool] Worker W{Id} hit {Faults} consecutive faults, replacing", worker.Id, faults);
                 _workerFaults.TryRemove(worker.Id, out _);
                 worker.Dispose();
-                var iss = BuildISS(isHttp: isHttp);
+                var cloned = isHttp ? _httpClonedState : _bgClonedState;
+                var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: isHttp);
                 worker = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
                 worker.Initialize(_repo, _apiBasePath, _settings);
             }
@@ -140,6 +360,16 @@ public class PowerShellWorkerPool : IDisposable
 
     private InitialSessionState BuildISS(bool isHttp)
     {
+        var allowList = isHttp ? _settings.Worker.HttpModules : _settings.Worker.BgModules;
+        return BuildISSForModules(allowList.Count > 0 ? allowList : null);
+    }
+
+    /// <summary>
+    /// Build an ISS that imports only the specified modules.
+    /// If moduleList is null, imports all modules (minus SkipModules).
+    /// </summary>
+    private InitialSessionState BuildISSForModules(List<string>? moduleList)
+    {
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
             iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
@@ -148,7 +378,9 @@ public class PowerShellWorkerPool : IDisposable
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
 
-        // Import all modules via ISS
+        var hasAllowList = moduleList != null && moduleList.Count > 0;
+
+        // Import modules via ISS — filtered by allow list when configured
         var modulesPath = Path.Combine(_apiBasePath, "Modules");
         if (Directory.Exists(modulesPath))
         {
@@ -156,6 +388,8 @@ public class PowerShellWorkerPool : IDisposable
             {
                 var moduleName = Path.GetFileName(moduleDir);
                 if (_settings.Worker.SkipModules.Contains(moduleName, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                if (hasAllowList && !moduleList!.Contains(moduleName, StringComparer.OrdinalIgnoreCase))
                     continue;
 
                 var manifest = FindModuleManifest(moduleDir, moduleName);
@@ -165,6 +399,98 @@ public class PowerShellWorkerPool : IDisposable
                 }
             }
         }
+        return iss;
+    }
+
+    /// <summary>
+    /// Build an ISS from a cloned base state plus additional modules via ImportPSModule.
+    /// The base functions are injected as SessionStateFunctionEntry (no re-parsing),
+    /// then the additional modules are imported normally (only they get parsed).
+    /// </summary>
+    private InitialSessionState BuildClonedISSWithModules(ExportedModuleState baseState, List<string> additionalModules)
+    {
+        var iss = InitialSessionState.CreateDefault();
+        if (OperatingSystem.IsWindows())
+            iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+
+        foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
+            iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
+
+        // Inject pre-parsed functions from the base state
+        foreach (var (name, definition, _) in baseState.Functions)
+        {
+            try { iss.Commands.Add(new SessionStateFunctionEntry(name, definition)); }
+            catch { }
+        }
+
+        // Inject exported variables from base
+        foreach (var (name, value) in baseState.Variables)
+            iss.Variables.Add(new SessionStateVariableEntry(name, value, null));
+
+        // Import binary modules from base
+        foreach (var path in baseState.BinaryModulePaths)
+            iss.ImportPSModule(new[] { path });
+
+        // Import additional type-specific modules (only these get parsed by PS)
+        var modulesPath = Path.Combine(_apiBasePath, "Modules");
+        if (Directory.Exists(modulesPath))
+        {
+            foreach (var moduleName in additionalModules)
+            {
+                if (_settings.Worker.SkipModules.Contains(moduleName, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                var moduleDir = Path.Combine(modulesPath, moduleName);
+                if (!Directory.Exists(moduleDir)) continue;
+
+                var manifest = FindModuleManifest(moduleDir, moduleName);
+                if (manifest != null)
+                    iss.ImportPSModule(new[] { manifest });
+            }
+        }
+
+        return iss;
+    }
+
+    /// <summary>
+    /// Build an ISS using pre-parsed function definitions from an existing worker.
+    /// Skips file I/O and AST parsing for script modules — functions are injected directly.
+    /// Binary modules still need native import as they contain compiled cmdlets.
+    /// </summary>
+    private InitialSessionState BuildClonedISS(ExportedModuleState state)
+    {
+        var iss = InitialSessionState.CreateDefault();
+        if (OperatingSystem.IsWindows())
+            iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+
+        // Copy environment variables
+        foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
+            iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
+
+        // Inject pre-parsed functions — this is the big win, no .psm1 parsing needed
+        foreach (var (name, definition, _) in state.Functions)
+        {
+            try
+            {
+                iss.Commands.Add(new SessionStateFunctionEntry(name, definition));
+            }
+            catch
+            {
+                // Skip functions that can't be re-parsed (shouldn't happen with valid definitions)
+            }
+        }
+
+        // Inject exported variables
+        foreach (var (name, value) in state.Variables)
+        {
+            iss.Variables.Add(new SessionStateVariableEntry(name, value, null));
+        }
+
+        // Binary modules must still be imported natively (they contain compiled cmdlets)
+        foreach (var path in state.BinaryModulePaths)
+        {
+            iss.ImportPSModule(new[] { path });
+        }
+
         return iss;
     }
 

@@ -255,7 +255,7 @@ public class SetupService
     /// <summary>
     /// Checks if the tenant's default app management policy blocks credential creation.
     /// If it does, creates or assigns a "{Name} Exemption Policy" for the app.
-    /// Port of Update-AppManagementPolicy from CIPP-API PowerShell.
+    /// Mirrors the Update-AppManagementPolicy pattern from PowerShell.
     /// </summary>
     private async Task EnsurePolicyExemption(
         string accessToken, string appId, string appObjectId, CancellationToken ct)
@@ -479,9 +479,15 @@ public class SetupService
         }
 
         // 2. Add the client secret setting (referenced by authsettingsV2 clientSecretSettingName)
-        // Note: WEBSITE_AUTH_CLIENT_ID and WEBSITE_AUTH_AAD_ALLOWED_TENANTS are managed
-        // internally by EasyAuth via authsettingsV2 — setting them here causes a 400 error.
         mergedSettings["AUTH_SECRET"] = clientSecret;
+
+        // Determine effective allowed tenants (always include the setup tenant)
+        bool useCommonIssuer = multiTenant;
+
+        // Always remove WEBSITE_AUTH_AAD_ALLOWED_TENANTS — we rely on the issuer URL
+        // for tenant restriction ("Use default restrictions based on issuer" in the portal).
+        // Multi-tenant uses common/v2.0 issuer, single-tenant uses {tenantId}/v2.0.
+        mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
 
         // 3. PUT merged settings back
         var settingsBody = new { properties = mergedSettings };
@@ -489,19 +495,51 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated: AUTH_SECRET");
+        _logger.LogInformation("[Setup] App settings updated (AUTH_SECRET set, WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
 
         // 4. Configure authsettingsV2
+        var globalValidation = new Dictionary<string, object>
+        {
+            ["unauthenticatedClientAction"] = _settings.Setup.UnauthenticatedClientAction,
+            ["redirectToProvider"] = "azureactivedirectory"
+        };
+
+        if (_settings.Setup.ExcludedPaths.Count > 0)
+        {
+            globalValidation["excludedPaths"] = _settings.Setup.ExcludedPaths;
+            _logger.LogInformation("[Setup] Excluded paths: {Paths}", string.Join(", ", _settings.Setup.ExcludedPaths));
+        }
+
+        // Build allowed audiences: always include api://{appId}, plus any extras from config
+        var audiences = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { $"api://{appId}" };
+        foreach (var aud in _settings.Setup.AllowedAudiences)
+        {
+            if (!string.IsNullOrWhiteSpace(aud))
+                audiences.Add(aud);
+        }
+
+        var aadValidation = new Dictionary<string, object>
+        {
+            ["allowedAudiences"] = audiences.ToArray()
+        };
+
+        // Always restrict to specific client applications — include the app's own ID
+        // plus any extras from config. This sets the "Client application requirement"
+        // to "Allow requests from specific client applications" in EasyAuth.
+        var allowedApps = new HashSet<string>(_settings.Setup.AllowedApplications, StringComparer.OrdinalIgnoreCase) { appId };
+        aadValidation["defaultAuthorizationPolicy"] = new
+        {
+            allowedPrincipals = new { },
+            allowedApplications = allowedApps.ToArray()
+        };
+        _logger.LogInformation("[Setup] Allowed client applications: {Apps}", string.Join(", ", allowedApps));
+
         var authConfig = new
         {
             properties = new
             {
                 platform = new { enabled = true },
-                globalValidation = new
-                {
-                    unauthenticatedClientAction = "RedirectToLoginPage",
-                    redirectToProvider = "azureactivedirectory"
-                },
+                globalValidation,
                 identityProviders = new
                 {
                     azureActiveDirectory = new
@@ -511,14 +549,11 @@ public class SetupService
                         {
                             clientId = appId,
                             clientSecretSettingName = "AUTH_SECRET",
-                            openIdIssuer = multiTenant
+                            openIdIssuer = useCommonIssuer
                                 ? "https://login.microsoftonline.com/common/v2.0"
                                 : $"https://login.microsoftonline.com/{tenantId}/v2.0"
                         },
-                        validation = new
-                        {
-                            allowedAudiences = new[] { $"api://{appId}" }
-                        }
+                        validation = aadValidation
                     }
                 },
                 login = new
@@ -548,6 +583,8 @@ public class SetupService
     {
         await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, ct);
     }
+
+    // ── Status ──
 
     /// <summary>
     /// Returns setup status information.

@@ -17,11 +17,12 @@ public static class OrchestratorBridge
     public static void Initialize(OrchestratorService service) => s_service = service;
 
     public static void QueueOrchestration(string name, string batchJson, int priority,
-        string? postExecFunctionName = null, string? postExecParametersJson = null)
+        string? postExecFunctionName = null, string? postExecParametersJson = null,
+        string? reference = null)
     {
         var parentRunName = OperationContext.Current?.RunName;
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
-            postExecFunctionName, postExecParametersJson, parentRunName));
+            postExecFunctionName, postExecParametersJson, parentRunName, reference));
     }
 
     /// <summary>
@@ -38,7 +39,7 @@ public static class OrchestratorBridge
                 {
                     s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                         p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                        p.ParentRunName)
+                        p.ParentRunName, p.Reference)
                         .GetAwaiter().GetResult();
 
                     // Register as child run if parent is still active
@@ -67,7 +68,7 @@ public static class OrchestratorBridge
                 {
                     await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                         p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                        p.ParentRunName);
+                        p.ParentRunName, p.Reference);
 
                     // Register as child run if parent is still active
                     if (!string.IsNullOrEmpty(p.ParentRunName))
@@ -83,7 +84,8 @@ public static class OrchestratorBridge
     }
 
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
-        string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName);
+        string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
+        string? Reference = null);
 
     private static readonly ConcurrentQueue<PendingPlannerRun> s_pendingPlanners = new();
 
@@ -210,6 +212,24 @@ public class OrchestratorService
     private readonly ConcurrentDictionary<string, ConcurrentBag<string>> _childRuns = new();
     private readonly ConcurrentDictionary<string, Timer> _runStatusTimers = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledRuns = new();
+
+    /// <summary>
+    /// Get the Reference for a given run name, or null if not found/no reference set.
+    /// </summary>
+    public string? GetRunReference(string runName)
+    {
+        return _activeRuns.TryGetValue(runName, out var run) ? run.Reference : null;
+    }
+
+    /// <summary>
+    /// Find a run name by its Reference value (exact match).
+    /// </summary>
+    public string? FindRunByReference(string reference)
+    {
+        return _activeRuns.Values
+            .FirstOrDefault(r => string.Equals(r.Reference, reference, StringComparison.OrdinalIgnoreCase))
+            ?.Name;
+    }
 
     private static readonly JsonSerializerOptions s_jsonOptions = new()
     {
@@ -476,7 +496,7 @@ public class OrchestratorService
     /// </summary>
     public async Task StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
-        string? parentRunName = null)
+        string? parentRunName = null, string? reference = null)
     {
         if (!_activePlanners.TryAdd(name, true))
         {
@@ -518,6 +538,7 @@ public class OrchestratorService
             var run = new OrchestratorRun
             {
                 Name = name,
+                Reference = reference,
                 Status = "Running",
                 Priority = priority,
                 StartedUtc = DateTime.UtcNow,
@@ -1015,6 +1036,7 @@ public class OrchestratorService
 public class OrchestratorRun
 {
     public string Name { get; set; } = string.Empty;
+    public string? Reference { get; set; }
     public string Status { get; set; } = "Pending";
     public int Priority { get; set; } = 2;
     public DateTime StartedUtc { get; set; }

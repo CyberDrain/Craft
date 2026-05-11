@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace Craft.Services;
@@ -10,8 +11,32 @@ namespace Craft.Services;
 public static class QueueStatusBridge
 {
     private static JobManager? s_jobManager;
+    private static OrchestratorService? s_orchestratorService;
 
-    public static void Initialize(JobManager jobManager) => s_jobManager = jobManager;
+    /// <summary>
+    /// Maps QueueId (GUID) or Reference to friendly display metadata (Name, Link).
+    /// Populated by New-CippQueueEntry in CIPPNG mode.
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, QueueMetadata> s_queueMetadata = new(StringComparer.OrdinalIgnoreCase);
+
+    public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null)
+    {
+        s_jobManager = jobManager;
+        s_orchestratorService = orchestratorService;
+    }
+
+    /// <summary>
+    /// Register friendly queue metadata from PowerShell (New-CippQueueEntry).
+    /// PS usage: [Craft.Services.QueueStatusBridge]::RegisterQueueMetadata($QueueId, $Name, $Link, $Reference)
+    /// </summary>
+    public static void RegisterQueueMetadata(string queueId, string name, string link, string reference)
+    {
+        var meta = new QueueMetadata { Name = name, Link = link ?? "", Reference = reference ?? "" };
+        if (!string.IsNullOrEmpty(queueId))
+            s_queueMetadata[queueId] = meta;
+        if (!string.IsNullOrEmpty(reference))
+            s_queueMetadata[reference] = meta;
+    }
 
     /// <summary>
     /// Get queue/run status in the format expected by the CIPP frontend.
@@ -25,16 +50,41 @@ public static class QueueStatusBridge
     {
         if (s_jobManager == null) return "[]";
 
-        var lookup = queueId ?? reference;
+        // PowerShell converts $null to "" when calling .NET string parameters,
+        // so treat empty strings the same as null.
+        var effectiveQueueId = string.IsNullOrEmpty(queueId) ? null : queueId;
+        var effectiveReference = string.IsNullOrEmpty(reference) ? null : reference;
+        var lookup = effectiveQueueId ?? effectiveReference;
         var summaries = s_jobManager.GetRunSummaries();
 
         if (!string.IsNullOrEmpty(lookup))
         {
-            // Match by run name — try exact match first, then contains
-            summaries = summaries
-                .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase)
-                         || s.Name.Contains(lookup, StringComparison.OrdinalIgnoreCase))
+            // Try exact match on run name first
+            var matched = summaries
+                .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase))
                 .ToList();
+
+            // If no exact match, try matching by Reference via orchestrator service
+            if (matched.Count == 0 && s_orchestratorService != null)
+            {
+                var runName = s_orchestratorService.FindRunByReference(lookup);
+                if (runName != null)
+                {
+                    matched = summaries
+                        .Where(s => s.Name.Equals(runName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+            }
+
+            // Last resort: match run names ending with the lookup (QueueId is often the GUID suffix)
+            if (matched.Count == 0)
+            {
+                matched = summaries
+                    .Where(s => s.Name.EndsWith(lookup, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+            }
+
+            summaries = matched;
         }
         else
         {
@@ -50,14 +100,27 @@ public static class QueueStatusBridge
             var completedTasks = s.Completed + s.Failed;
             var total = Math.Max(s.Total, 1);
             var status = DeriveStatus(s);
+            var runReference = s_orchestratorService?.GetRunReference(s.Name) ?? s.Name;
+
+            // Look up friendly metadata by reference, then by run name,
+            // then by QueueId GUID suffix (run names follow "OrchestratorName-<GUID>" pattern)
+            s_queueMetadata.TryGetValue(runReference, out var meta);
+            if (meta == null)
+                s_queueMetadata.TryGetValue(s.Name, out meta);
+            if (meta == null && s.Name.Length > 36)
+            {
+                var guidSuffix = s.Name[^36..];
+                if (Guid.TryParse(guidSuffix, out _))
+                    s_queueMetadata.TryGetValue(guidSuffix, out meta);
+            }
 
             return new QueueStatusEntry
             {
                 PartitionKey = "CippQueue",
                 RowKey = s.Name,
-                Name = s.Name,
-                Link = "",
-                Reference = s.Name,
+                Name = meta?.Name ?? s.Name,
+                Link = meta?.Link ?? "",
+                Reference = runReference,
                 TotalTasks = s.Total,
                 CompletedTasks = completedTasks,
                 RunningTasks = s.Running,
@@ -153,4 +216,11 @@ public static class QueueStatusBridge
         PropertyNamingPolicy = null,
         WriteIndented = false
     };
+
+    private class QueueMetadata
+    {
+        public string Name { get; set; } = "";
+        public string Link { get; set; } = "";
+        public string Reference { get; set; } = "";
+    }
 }

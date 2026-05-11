@@ -4,6 +4,29 @@ using Cronos;
 namespace Craft.Services;
 
 /// <summary>
+/// Static bridge so PowerShell can query/set the scheduler timezone without DI.
+/// PS usage: [Craft.Services.SchedulerBridge]::SetTimezone("America/New_York")
+///           [Craft.Services.SchedulerBridge]::GetTimezone()
+/// </summary>
+public static class SchedulerBridge
+{
+    private static SchedulerService? s_service;
+
+    public static void Initialize(SchedulerService service) => s_service = service;
+
+    /// <summary>
+    /// Validate and apply a new timezone. Throws if the ID is invalid.
+    /// All tasks with TZOffset=true will use the new timezone on the next evaluation cycle.
+    /// </summary>
+    public static void SetTimezone(string timezoneId) =>
+        (s_service ?? throw new InvalidOperationException("SchedulerService not initialized"))
+            .SetTimezone(timezoneId);
+
+    /// <summary>Returns the current timezone ID, or empty string if UTC.</summary>
+    public static string GetTimezone() => s_service?.GetTimezone() ?? "";
+}
+
+/// <summary>
 /// Mirrors a single entry from CIPPTimers.json.
 /// Type is inferred from the Command name: "*Orchestrator*" → fan-out/fan-in,
 /// everything else → simple scheduled script.
@@ -19,6 +42,13 @@ public class SchedulerTask
     public bool RunOnProcessor { get; set; }
     public bool IsSystem { get; set; }
     public string? PreferredProcessor { get; set; }
+
+    /// <summary>
+    /// When true, cron evaluation uses the configured timezone (env:CraftTZ / App:Scheduler:Timezone)
+    /// instead of UTC. This lets operators write cron expressions in local time while Cronos
+    /// handles DST transitions automatically.
+    /// </summary>
+    public bool TZOffset { get; set; }
 
     /// <summary>
     /// Explicit override for orchestrator detection. When set in CIPPTimers.json,
@@ -39,8 +69,10 @@ public class SchedulerService : BackgroundService
     private readonly OrchestratorService _orchestrator;
     private readonly JobManager _jobManager;
     private readonly CraftSettings _settings;
+    private readonly PowerShellWorkerPool _pool;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
+    private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
 
     /// <summary>Expose loaded tasks for the API layer.</summary>
     public IReadOnlyList<SchedulerTask> Tasks => _tasks;
@@ -51,7 +83,8 @@ public class SchedulerService : BackgroundService
         BackgroundTaskLimiter limiter,
         OrchestratorService orchestrator,
         JobManager jobManager,
-        CraftSettings settings)
+        CraftSettings settings,
+        PowerShellWorkerPool pool)
     {
         _logger = logger;
         _psRunner = psRunner;
@@ -59,12 +92,24 @@ public class SchedulerService : BackgroundService
         _orchestrator = orchestrator;
         _jobManager = jobManager;
         _settings = settings;
+        _pool = pool;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[Scheduler] Service starting");
+        _logger.LogInformation("[Scheduler] Waiting for worker pool to be ready");
+        try
+        {
+            await Task.Run(() => _pool.WaitForBgReady(Timeout.InfiniteTimeSpan), stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+        _logger.LogInformation("[Scheduler] Worker pool ready — service starting");
+
         LoadConfig();
+        ResolveTimezone();
 
         // Seed all tasks with "now" so we never catch up on missed runs from before startup.
         // Only cron ticks that occur AFTER this moment will fire.
@@ -94,7 +139,8 @@ public class SchedulerService : BackgroundService
                 {
                     var cronExpression = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
                     var lastRun = _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue);
-                    var nextOccurrence = cronExpression.GetNextOccurrence(lastRun, TimeZoneInfo.Utc);
+                    var tz = (task.TZOffset || _settings.Scheduler.ApplyTZOffset) ? _configuredTz : TimeZoneInfo.Utc;
+                    var nextOccurrence = cronExpression.GetNextOccurrence(lastRun, tz);
 
                     if (nextOccurrence.HasValue && nextOccurrence.Value <= now)
                     {
@@ -181,6 +227,86 @@ public class SchedulerService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "[Scheduler] Failed to load config from {Path}", path);
+        }
+    }
+
+    /// <summary>
+    /// Resolve the configured timezone from env:CraftTZ (priority) or App:Scheduler:Timezone.
+    /// Falls back to UTC if unset or invalid.
+    /// </summary>
+    private void ResolveTimezone()
+    {
+        var tzId = Environment.GetEnvironmentVariable("CraftTZ");
+        if (string.IsNullOrWhiteSpace(tzId))
+        {
+            tzId = _settings.Scheduler.Timezone;
+        }
+
+        if (string.IsNullOrWhiteSpace(tzId))
+        {
+            _configuredTz = TimeZoneInfo.Utc;
+            _logger.LogInformation("[Scheduler] No timezone configured, using UTC");
+            return;
+        }
+
+        if (TryFindTimezone(tzId, out var tz))
+        {
+            _configuredTz = tz;
+            _logger.LogInformation("[Scheduler] Using timezone: {TZ} (UTC{Offset})",
+                tz.Id, tz.BaseUtcOffset.ToString(@"hh\:mm"));
+        }
+        else
+        {
+            _configuredTz = TimeZoneInfo.Utc;
+            _logger.LogError("[Scheduler] Invalid timezone '{TZ}', falling back to UTC", tzId);
+        }
+    }
+
+    /// <summary>
+    /// Validate and apply a new timezone at runtime.
+    /// Reseeds _lastRun for TZOffset tasks to prevent spurious fires after the switch.
+    /// Callable from PowerShell via [Craft.Services.SchedulerBridge]::SetTimezone("America/New_York")
+    /// </summary>
+    public void SetTimezone(string timezoneId)
+    {
+        if (string.IsNullOrWhiteSpace(timezoneId))
+            throw new ArgumentException("Timezone ID cannot be empty.", nameof(timezoneId));
+
+        if (!TryFindTimezone(timezoneId, out var tz))
+            throw new ArgumentException($"Unknown timezone: '{timezoneId}'", nameof(timezoneId));
+
+        _configuredTz = tz;
+        _logger.LogInformation("[Scheduler] Timezone changed to: {TZ} (UTC{Offset})",
+            tz.Id, tz.BaseUtcOffset.ToString(@"hh\:mm"));
+
+        // Reseed affected tasks to "now" so the next evaluation uses the new timezone
+        // without double-firing or skipping.
+        var now = DateTimeOffset.UtcNow;
+        foreach (var task in _tasks.Where(t => t.TZOffset || _settings.Scheduler.ApplyTZOffset))
+        {
+            _lastRun[task.Id] = now;
+        }
+    }
+
+    /// <summary>Returns the current timezone ID, or empty string if UTC.</summary>
+    public string GetTimezone() =>
+        _configuredTz.Equals(TimeZoneInfo.Utc) ? "" : _configuredTz.Id;
+
+    /// <summary>
+    /// Try to find a TimeZoneInfo by IANA ID first, then Windows ID.
+    /// Cronos + .NET 6+ on Linux use IANA; Windows uses Windows IDs.
+    /// </summary>
+    private static bool TryFindTimezone(string id, out TimeZoneInfo tz)
+    {
+        try
+        {
+            tz = TimeZoneInfo.FindSystemTimeZoneById(id);
+            return true;
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            tz = TimeZoneInfo.Utc;
+            return false;
         }
     }
 

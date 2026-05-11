@@ -16,6 +16,15 @@ public class CraftSettings
     /// <summary>Display name of the hosted application (used in logs and diagnostics).</summary>
     public string Name { get; set; } = "App";
 
+    /// <summary>
+    /// Controls when Kestrel starts accepting connections (when Azure marks the container as started).
+    /// - Immediate: Kestrel starts first, init runs in background (default — shows loading page quickly)
+    /// - HttpReady: Kestrel starts after HTTP worker pool is ready (API can serve on first request)
+    /// - AllReady: Kestrel starts after all worker pools (HTTP + BG) are fully initialized
+    /// Azure App Service has a 230s startup timeout — if init exceeds this, the container is killed.
+    /// </summary>
+    public string ReadinessMode { get; set; } = "Immediate";
+
     /// <summary>Worker configuration for the PowerShell runspace pools.</summary>
     public WorkerSettings Worker { get; set; } = new();
 
@@ -64,11 +73,34 @@ public class WorkerSettings
     public List<string> RootPathVars { get; set; } = [];
 
     /// <summary>
-    /// PowerShell scripts to run once on the first worker for process-level warmup.
-    /// Runs sequentially after module import. Errors are non-fatal (logged as warnings).
-    /// Example: ["Get-MyAppAuth | Out-Null", "Initialize-ConnectionPool"]
+    /// PowerShell scripts to run once on a worker after module import for process-level warmup.
+    /// Typically used for credential loading (Key Vault), cache priming, or connection setup.
+    /// Errors are non-fatal (logged as warnings). Env vars set here are process-level and
+    /// visible to all workers.
+    /// Example: ["Initialize-CIPPAuth | Out-Null", "Get-Tenants -IncludeErrors | Out-Null"]
     /// </summary>
     public List<string> WarmupScripts { get; set; } = [];
+
+    /// <summary>
+    /// Controls when WarmupScripts run relative to the HTTP ready signal.
+    ///
+    /// "BeforeReady" — Runs on the first HTTP worker BEFORE signaling HTTP ready.
+    ///                  Guarantees warmup is complete before any request is served.
+    ///                  Adds warmup time (~8-10s) to HTTP ready latency.
+    ///                  Best when: requests will fail without warmup state (e.g. env vars).
+    ///
+    /// "AfterReady"  — (default) Runs on the first HTTP worker AFTER signaling HTTP ready.
+    ///                  HTTP starts accepting requests immediately; warmup runs in parallel.
+    ///                  The first worker is briefly unavailable during warmup (pool has 1 less).
+    ///                  Best when: warmup is idempotent and can race with early requests.
+    ///
+    /// "Background"  — Runs on the first BG worker during background pool initialization.
+    ///                  HTTP pool is completely unaffected. Warmup happens ~15-20s after
+    ///                  HTTP ready (when BG first-worker comes up).
+    ///                  Best when: warmup state isn't needed for HTTP requests, or callers
+    ///                  handle missing state gracefully (e.g. lazy credential loading).
+    /// </summary>
+    public string WarmupMode { get; set; } = "AfterReady";
 
     /// <summary>
     /// Assemblies (.dll) to load into each runspace, relative to the API base path.
@@ -93,6 +125,20 @@ public class WorkerSettings
     /// Module names to skip during ISS import (e.g. test modules, legacy entrypoints).
     /// </summary>
     public List<string> SkipModules { get; set; } = [];
+
+    /// <summary>
+    /// Module names to load for HTTP workers. If empty, loads all modules (minus SkipModules).
+    /// When specified, only these modules are imported into HTTP worker runspaces.
+    /// Example: ["CIPPCore", "CIPPHTTP", "AzBobbyTables"]
+    /// </summary>
+    public List<string> HttpModules { get; set; } = [];
+
+    /// <summary>
+    /// Module names to load for background workers. If empty, loads all modules (minus SkipModules).
+    /// When specified, only these modules are imported into BG worker runspaces.
+    /// Example: ["CIPPCore", "CIPPStandards", "CIPPAlerts", "AzBobbyTables"]
+    /// </summary>
+    public List<string> BgModules { get; set; } = [];
 
     /// <summary>
     /// JSON files to preload into PowerShell variables at worker init.
@@ -170,8 +216,10 @@ public class AuthSettings
 
     /// <summary>
     /// Roles assigned to the dev-mode auto-login principal.
+    /// Default: empty — set via appsettings (e.g. ["superadmin", "authenticated", "anonymous"]).
+    /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.
     /// </summary>
-    public List<string> DevRoles { get; set; } = ["superadmin", "authenticated", "anonymous"];
+    public List<string> DevRoles { get; set; } = [];
 
     /// <summary>User ID for the dev-mode auto-login principal.</summary>
     public string DevUserId { get; set; } = "00000000-0000-0000-0000-000000000000";
@@ -210,6 +258,21 @@ public class SchedulerSettings
 
     /// <summary>How often (in seconds) the scheduler checks for due tasks.</summary>
     public int CheckIntervalSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// When true, applies the configured timezone to ALL scheduler tasks,
+    /// regardless of individual TZOffset settings. When false (default),
+    /// only tasks with TZOffset=true use the configured timezone.
+    /// </summary>
+    public bool ApplyTZOffset { get; set; } = false;
+
+    /// <summary>
+    /// IANA or Windows timezone ID for timezone-aware cron evaluation.
+    /// Overridable via env var App__Scheduler__Timezone (or CraftTZ at startup).
+    /// When empty, all cron evaluation uses UTC.
+    /// Examples: "America/New_York", "Europe/London", "Eastern Standard Time"
+    /// </summary>
+    public string Timezone { get; set; } = "";
 }
 
 /// <summary>
@@ -334,11 +397,19 @@ public class SetupSettings
 {
     /// <summary>
     /// Enable the built-in bootstrap setup mode.
-    /// When true, Craft checks for EasyAuth configuration at startup and enters
-    /// setup mode if WEBSITE_AUTH_CLIENT_ID is not set.
+    /// When true, Craft registers setup routes and middleware.
     /// When false, setup routes are never registered regardless of auth state.
     /// </summary>
     public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// When true, the setup wizard activates automatically if EasyAuth is not configured.
+    /// When false, the child app must explicitly call
+    /// [Craft.Services.AppLifecycleBridge]::RequestSetupMode() to activate setup mode.
+    /// This lets the child app decide when setup is appropriate (e.g. after checking
+    /// for existing credentials that can be migrated automatically).
+    /// </summary>
+    public bool AutoActivate { get; set; } = true;
 
     /// <summary>
     /// Public client ID used for the PKCE login popup during automated setup.
@@ -353,4 +424,47 @@ public class SetupSettings
     /// Override this to set a custom name.
     /// </summary>
     public string AuthAppDisplayName { get; set; } = "";
+
+    /// <summary>
+    /// Action taken when an unauthenticated request arrives.
+    /// Applied to globalValidation.unauthenticatedClientAction in authsettingsV2.
+    /// Valid values: RedirectToLoginPage, AllowAnonymous, RejectWith401, RejectWith404.
+    /// Default is RedirectToLoginPage (suitable for web UIs); APIs should use RejectWith401.
+    /// </summary>
+    public string UnauthenticatedClientAction { get; set; } = "RedirectToLoginPage";
+
+    /// <summary>
+    /// Paths excluded from EasyAuth authentication (e.g. webhook endpoints).
+    /// Applied to globalValidation.excludedPaths in authsettingsV2.
+    /// Supports App Service glob patterns (e.g. "/api/Public*").
+    /// </summary>
+    public List<string> ExcludedPaths { get; set; } = [];
+
+    /// <summary>
+    /// Client application IDs allowed to call the app with access tokens.
+    /// Applied to identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications.
+    /// When empty, no application-level restriction is applied (any valid token for the audience is accepted).
+    /// </summary>
+    public List<string> AllowedApplications { get; set; } = [];
+
+    /// <summary>
+    /// Additional allowed token audiences beyond the auto-generated "api://{appId}".
+    /// Applied to identityProviders.azureActiveDirectory.validation.allowedAudiences.
+    /// The app's own "api://{appId}" is always included automatically.
+    /// </summary>
+    public List<string> AllowedAudiences { get; set; } = [];
+
+    /// <summary>
+    /// Tenant IDs allowed to authenticate. Controls both the issuer URL and the
+    /// WEBSITE_AUTH_AAD_ALLOWED_TENANTS app setting.
+    ///
+    /// Behavior:
+    ///   - Empty (default): single-tenant — issuer is set to the setup tenant ID.
+    ///   - One entry: single-tenant — issuer is set to that tenant ID.
+    ///   - Multiple entries: issuer is set to "common" and WEBSITE_AUTH_AAD_ALLOWED_TENANTS
+    ///     is set to the comma-separated list (Azure enforces the tid claim check).
+    ///
+    /// The tenant from the setup flow is always included automatically.
+    /// </summary>
+    public List<string> AllowedTenants { get; set; } = [];
 }

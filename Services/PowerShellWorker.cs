@@ -80,7 +80,8 @@ class HttpResponseContext {
             RunScript($"$env:{key} = '{resolvedValue}'");
         }
 
-        // Inject shared caches into module scopes from config
+        // Inject shared caches into module scopes from config.
+        // On cloned workers (no modules loaded), falls back to global scope.
         foreach (var injection in settings.Worker.ModuleInjections)
         {
             if (string.IsNullOrEmpty(injection.Module) || string.IsNullOrEmpty(injection.Variable))
@@ -88,10 +89,13 @@ class HttpResponseContext {
             var cacheKey = string.IsNullOrEmpty(injection.CacheKey) ? injection.Variable : injection.CacheKey;
             RunScript($@"
 $__cache = [Craft.Services.PowerShellRunnerService]::GetSharedCache('{cacheKey}')
-& (Get-Module {injection.Module}) {{
-    $script:{injection.Variable} = $args[0]
-}} $__cache
-Remove-Variable __cache -ErrorAction SilentlyContinue
+$__mod = Get-Module '{injection.Module}' -ErrorAction SilentlyContinue
+if ($__mod) {{
+    & $__mod {{ $script:{injection.Variable} = $args[0] }} $__cache
+}} else {{
+    $global:{injection.Variable} = $__cache
+}}
+Remove-Variable __cache, __mod -ErrorAction SilentlyContinue
 ");
         }
 
@@ -293,5 +297,146 @@ try {{
 ");
     }
 
+    /// <summary>
+    /// Export all functions, variables, and aliases from this worker's loaded modules
+    /// so they can be injected into a cloned ISS for faster worker init.
+    /// Must be called after Initialize() completes.
+    /// </summary>
+    public ExportedModuleState ExportModuleState()
+    {
+        var state = new ExportedModuleState();
+
+        // Get all loaded modules and extract their exported functions
+        _pwsh.AddScript(@"
+            Get-Module | ForEach-Object {
+                $mod = $_
+                $mod.ExportedFunctions.Values | ForEach-Object {
+                    [PSCustomObject]@{
+                        Module = $mod.Name
+                        Name = $_.Name
+                        Definition = $_.Definition
+                    }
+                }
+            }
+        ");
+        var functions = _pwsh.Invoke();
+        _pwsh.Commands.Clear();
+        _pwsh.Streams.ClearStreams();
+
+        foreach (var fn in functions)
+        {
+            var name = fn.Properties["Name"]?.Value?.ToString();
+            var definition = fn.Properties["Definition"]?.Value?.ToString();
+            var module = fn.Properties["Module"]?.Value?.ToString();
+            if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(definition))
+                state.Functions.Add((name, definition, module ?? ""));
+        }
+
+        // Get module-level variables that need to be preserved
+        _pwsh.AddScript(@"
+            Get-Module | ForEach-Object {
+                $mod = $_
+                $mod.ExportedVariables.Values | ForEach-Object {
+                    [PSCustomObject]@{
+                        Module = $mod.Name
+                        Name = $_.Name
+                        Value = $_.Value
+                    }
+                }
+            }
+        ");
+        var variables = _pwsh.Invoke();
+        _pwsh.Commands.Clear();
+        _pwsh.Streams.ClearStreams();
+
+        foreach (var v in variables)
+        {
+            var name = v.Properties["Name"]?.Value?.ToString();
+            var value = v.Properties["Value"]?.Value;
+            if (!string.IsNullOrEmpty(name))
+                state.Variables.Add((name, value));
+        }
+
+        // Get loaded module paths for modules that need native import
+        // (binary modules with cmdlets can't be cloned via function entries)
+        _pwsh.AddScript(@"
+            Get-Module | Where-Object { $_.ModuleType -eq 'Binary' } | ForEach-Object {
+                $_.Path
+            }
+        ");
+        var binaryModules = _pwsh.Invoke();
+        _pwsh.Commands.Clear();
+        _pwsh.Streams.ClearStreams();
+
+        foreach (var bm in binaryModules)
+        {
+            var path = bm.BaseObject?.ToString();
+            if (!string.IsNullOrEmpty(path))
+                state.BinaryModulePaths.Add(path);
+        }
+
+        return state;
+    }
+
     public void Dispose() => _pwsh.Dispose();
+}
+
+/// <summary>
+/// Holds exported state from a fully-initialized worker for cloning into new ISS templates.
+/// </summary>
+public class ExportedModuleState
+{
+    public List<(string Name, string Definition, string Module)> Functions { get; } = new();
+    public List<(string Name, object? Value)> Variables { get; } = new();
+    public List<string> BinaryModulePaths { get; } = new();
+
+    /// <summary>
+    /// Merge a base state with this (overlay) state. Overlay functions win on name collision.
+    /// Returns a new ExportedModuleState containing the union.
+    /// </summary>
+    public ExportedModuleState MergeWith(ExportedModuleState baseState)
+    {
+        var merged = new ExportedModuleState();
+
+        // Start with base functions, then overlay (branch wins on collision)
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var fn in Functions)
+        {
+            merged.Functions.Add(fn);
+            seen.Add(fn.Name);
+        }
+        foreach (var fn in baseState.Functions)
+        {
+            if (!seen.Contains(fn.Name))
+                merged.Functions.Add(fn);
+        }
+
+        // Merge variables (overlay wins)
+        var seenVars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var v in Variables)
+        {
+            merged.Variables.Add(v);
+            seenVars.Add(v.Name);
+        }
+        foreach (var v in baseState.Variables)
+        {
+            if (!seenVars.Contains(v.Name))
+                merged.Variables.Add(v);
+        }
+
+        // Merge binary module paths (deduplicate)
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in BinaryModulePaths)
+        {
+            merged.BinaryModulePaths.Add(p);
+            seenPaths.Add(p);
+        }
+        foreach (var p in baseState.BinaryModulePaths)
+        {
+            if (!seenPaths.Contains(p))
+                merged.BinaryModulePaths.Add(p);
+        }
+
+        return merged;
+    }
 }
