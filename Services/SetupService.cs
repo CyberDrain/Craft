@@ -255,7 +255,7 @@ public class SetupService
     /// <summary>
     /// Checks if the tenant's default app management policy blocks credential creation.
     /// If it does, creates or assigns a "{Name} Exemption Policy" for the app.
-    /// Port of Update-AppManagementPolicy from CIPP-API PowerShell.
+    /// Mirrors the Update-AppManagementPolicy pattern from PowerShell.
     /// </summary>
     private async Task EnsurePolicyExemption(
         string accessToken, string appId, string appObjectId, CancellationToken ct)
@@ -482,26 +482,12 @@ public class SetupService
         mergedSettings["AUTH_SECRET"] = clientSecret;
 
         // Determine effective allowed tenants (always include the setup tenant)
-        var effectiveTenants = new HashSet<string>(_settings.Setup.AllowedTenants, StringComparer.OrdinalIgnoreCase);
-        if (!string.IsNullOrEmpty(tenantId))
-            effectiveTenants.Add(tenantId);
+        bool useCommonIssuer = multiTenant;
 
-        // If multiple tenants are allowed, issuer must be "common" and we set the
-        // WEBSITE_AUTH_AAD_ALLOWED_TENANTS app setting so EasyAuth checks the tid claim.
-        // A single-tenant issuer would reject tokens from other tenants at the protocol
-        // level before the app setting check ever runs.
-        bool useCommonIssuer = multiTenant || effectiveTenants.Count > 1;
-
-        if (effectiveTenants.Count > 1)
-        {
-            mergedSettings["WEBSITE_AUTH_AAD_ALLOWED_TENANTS"] = string.Join(",", effectiveTenants);
-            _logger.LogInformation("[Setup] Allowed tenants: {Tenants}", string.Join(", ", effectiveTenants));
-        }
-        else
-        {
-            // Single tenant — remove the setting if it was previously set
-            mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
-        }
+        // Always remove WEBSITE_AUTH_AAD_ALLOWED_TENANTS — we rely on the issuer URL
+        // for tenant restriction ("Use default restrictions based on issuer" in the portal).
+        // Multi-tenant uses common/v2.0 issuer, single-tenant uses {tenantId}/v2.0.
+        mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
 
         // 3. PUT merged settings back
         var settingsBody = new { properties = mergedSettings };
@@ -509,8 +495,7 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated: AUTH_SECRET{Tenants}",
-            effectiveTenants.Count > 1 ? ", WEBSITE_AUTH_AAD_ALLOWED_TENANTS" : "");
+        _logger.LogInformation("[Setup] App settings updated (AUTH_SECRET set, WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
 
         // 4. Configure authsettingsV2
         var globalValidation = new Dictionary<string, object>
@@ -538,14 +523,16 @@ public class SetupService
             ["allowedAudiences"] = audiences.ToArray()
         };
 
-        if (_settings.Setup.AllowedApplications.Count > 0)
+        // Always restrict to specific client applications — include the app's own ID
+        // plus any extras from config. This sets the "Client application requirement"
+        // to "Allow requests from specific client applications" in EasyAuth.
+        var allowedApps = new HashSet<string>(_settings.Setup.AllowedApplications, StringComparer.OrdinalIgnoreCase) { appId };
+        aadValidation["defaultAuthorizationPolicy"] = new
         {
-            aadValidation["defaultAuthorizationPolicy"] = new
-            {
-                allowedApplications = _settings.Setup.AllowedApplications
-            };
-            _logger.LogInformation("[Setup] Allowed applications: {Apps}", string.Join(", ", _settings.Setup.AllowedApplications));
-        }
+            allowedPrincipals = new { },
+            allowedApplications = allowedApps.ToArray()
+        };
+        _logger.LogInformation("[Setup] Allowed client applications: {Apps}", string.Join(", ", allowedApps));
 
         var authConfig = new
         {
@@ -596,6 +583,8 @@ public class SetupService
     {
         await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, ct);
     }
+
+    // ── Status ──
 
     /// <summary>
     /// Returns setup status information.

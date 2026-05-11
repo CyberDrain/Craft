@@ -69,6 +69,7 @@ public class SchedulerService : BackgroundService
     private readonly OrchestratorService _orchestrator;
     private readonly JobManager _jobManager;
     private readonly CraftSettings _settings;
+    private readonly PowerShellWorkerPool _pool;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
     private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
@@ -82,7 +83,8 @@ public class SchedulerService : BackgroundService
         BackgroundTaskLimiter limiter,
         OrchestratorService orchestrator,
         JobManager jobManager,
-        CraftSettings settings)
+        CraftSettings settings,
+        PowerShellWorkerPool pool)
     {
         _logger = logger;
         _psRunner = psRunner;
@@ -90,11 +92,22 @@ public class SchedulerService : BackgroundService
         _orchestrator = orchestrator;
         _jobManager = jobManager;
         _settings = settings;
+        _pool = pool;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[Scheduler] Service starting");
+        _logger.LogInformation("[Scheduler] Waiting for worker pool to be ready");
+        try
+        {
+            await Task.Run(() => _pool.WaitForBgReady(Timeout.InfiniteTimeSpan), stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+        _logger.LogInformation("[Scheduler] Worker pool ready — service starting");
+
         LoadConfig();
         ResolveTimezone();
 

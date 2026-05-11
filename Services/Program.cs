@@ -100,36 +100,98 @@ var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
 // so the route handler won't access this until it's fully populated.
 var endpoints = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-// Defer ALL heavy initialization until after Kestrel is listening.
-// Azure App Service kills containers that don't respond to health probes within 230s;
-// by deferring script loading + pool init, the health endpoint and startup loading page
-// respond immediately while initialization happens in the background.
-app.Lifetime.ApplicationStarted.Register(() =>
+// Readiness mode determines when Kestrel starts accepting connections:
+// - Immediate: Kestrel starts first, init runs in background (loading page responds to Azure probes)
+// - HttpReady: init runs before Kestrel, Kestrel starts once HTTP pool has a worker
+// - AllReady:  init runs before Kestrel, Kestrel starts once all pools are fully initialized
+var readinessMode = CraftSettings.ReadinessMode?.Trim() ?? "Immediate";
+
+// Safety: on B1 (single vCPU, slow-tier CPU), init can take 150-200s+ — dangerously
+// close to Azure's 230s container startup timeout. Auto-downgrade to Immediate to avoid kills.
+// We check both CPU count and WEBSITE_SKU because premium single-vCPU plans (e.g. P0v3)
+// are fast enough to init within the timeout despite having only 1 core.
+var websiteSku = Environment.GetEnvironmentVariable("WEBSITE_SKU") ?? "";
+var isSlowSingleCore = Environment.ProcessorCount <= 1
+    && websiteSku.StartsWith("Basic", StringComparison.OrdinalIgnoreCase);
+
+if (!readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase) && isSlowSingleCore)
 {
-    Task.Run(() =>
+    logger.LogWarning("[System] ReadinessMode '{Mode}' overridden to 'Immediate' — single vCPU on Basic SKU, " +
+        "blocking Kestrel during init risks hitting Azure's 230s startup timeout", readinessMode);
+    readinessMode = "Immediate";
+}
+
+logger.LogInformation("[System] Readiness mode: {Mode}", readinessMode);
+StartupInfoBridge.SetReadinessMode(readinessMode);
+
+void RunInitialization()
+{
+    // 1. Load scripts — parse .ps1 files, build route table
+    repo.LoadAll(Path.Combine(AppContext.BaseDirectory, "API"));
+
+    // 2. Discover HTTP endpoints from loaded scripts
+    var discovered = psRunner.DiscoverHttpEndpoints();
+    foreach (var kvp in discovered)
+        endpoints[kvp.Key] = kvp.Value;
+
+    logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
+    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
+        CraftSettings.Worker.HttpPoolSize,
+        CraftSettings.Worker.BgPoolSize,
+        verboseLogging);
+
+    // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
+    pool.Initialize();
+}
+
+if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
+{
+    // Defer init until after Kestrel is listening — Azure probe gets a fast 200,
+    // users see a loading page while workers initialize in the background.
+    app.Lifetime.ApplicationStarted.Register(() =>
     {
-        try
+        Task.Run(() =>
         {
-            // 1. Load scripts — parse .ps1 files, build route table
-            repo.LoadAll(Path.Combine(AppContext.BaseDirectory, "API"));
-
-            // 2. Discover HTTP endpoints from loaded scripts
-            var discovered = psRunner.DiscoverHttpEndpoints();
-            foreach (var kvp in discovered)
-                endpoints[kvp.Key] = kvp.Value;
-
-            logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
-            logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
-                CraftSettings.Worker.HttpPoolSize,
-                CraftSettings.Worker.BgPoolSize,
-                verboseLogging);
-
-            // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
-            pool.Initialize();
-        }
+            try { RunInitialization(); }
+            catch (Exception ex) { logger.LogCritical(ex, "[System] Initialization failed"); }
+        });
+    });
+}
+else if (readinessMode.Equals("HttpReady", StringComparison.OrdinalIgnoreCase))
+{
+    // Run init synchronously before Kestrel starts. pool.Initialize() signals _httpReady
+    // after the first HTTP worker is in the pool, but Kestrel won't start until Initialize()
+    // returns (which is after all pools are done). To start Kestrel at HTTP-ready, run init
+    // on a background thread and wait only for HTTP readiness.
+    var initTask = Task.Run(() =>
+    {
+        try { RunInitialization(); }
         catch (Exception ex) { logger.LogCritical(ex, "[System] Initialization failed"); }
     });
-});
+    // Block app.Run() until HTTP pool signals ready
+    pool.WaitForReady(Timeout.InfiniteTimeSpan);
+    logger.LogInformation("[System] HTTP pool ready — starting Kestrel (BG init continues in background)");
+}
+else if (readinessMode.Equals("AllReady", StringComparison.OrdinalIgnoreCase))
+{
+    // Run full init synchronously before Kestrel starts — container won't respond
+    // to any requests until all workers (HTTP + BG) are initialized.
+    try { RunInitialization(); }
+    catch (Exception ex) { logger.LogCritical(ex, "[System] Initialization failed"); }
+    logger.LogInformation("[System] All pools ready — starting Kestrel");
+}
+else
+{
+    logger.LogWarning("[System] Unknown ReadinessMode '{Mode}', falling back to Immediate", readinessMode);
+    app.Lifetime.ApplicationStarted.Register(() =>
+    {
+        Task.Run(() =>
+        {
+            try { RunInitialization(); }
+            catch (Exception ex) { logger.LogCritical(ex, "[System] Initialization failed"); }
+        });
+    });
+}
 
 if (app.Environment.IsDevelopment())
 {
@@ -140,11 +202,16 @@ if (app.Environment.IsDevelopment())
 // Response compression must be before static files
 app.UseResponseCompression();
 
-// Setup mode middleware: when Setup.Enabled and EasyAuth is not yet configured,
-// redirect all frontend requests to /setup and block /api/* except /api/setup/*
+// Setup mode middleware: when Setup.Enabled, register setup route guards.
+// If AutoActivate is true, setup mode activates automatically when EasyAuth is not configured.
+// If AutoActivate is false, the child app must call AppLifecycleBridge.RequestSetupMode()
+// to explicitly enable the setup wizard (e.g. after checking for existing credentials).
 var setupService = app.Services.GetRequiredService<SetupService>();
+
 if (CraftSettings.Setup.Enabled)
 {
+    var autoActivate = CraftSettings.Setup.AutoActivate;
+
     app.Use(async (context, next) =>
     {
         if (SetupService.IsEasyAuthConfigured())
@@ -172,7 +239,18 @@ if (CraftSettings.Setup.Enabled)
             return;
         }
 
-        // EasyAuth NOT configured — setup mode is active
+        // EasyAuth NOT configured — check whether setup mode should be active.
+        // AutoActivate: always active. Otherwise: only after child app calls RequestSetupMode().
+        var setupActive = autoActivate || AppLifecycleBridge.IsSetupModeRequested();
+        if (!setupActive)
+        {
+            // Setup not yet requested by child app — let requests through normally
+            // (the startup loading middleware will handle the "pool not ready" case)
+            await next();
+            return;
+        }
+
+        // Setup mode is active
         var path = context.Request.Path.Value ?? "";
 
         // Allow setup API and setup page through
@@ -215,8 +293,11 @@ if (CraftSettings.Setup.Enabled)
         context.Response.Redirect("/setup");
     });
 
-    logger.LogInformation("[Setup] Setup mode enabled — {Status}",
-        SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled" : "awaiting configuration at /setup");
+    logger.LogInformation("[Setup] Setup mode enabled (AutoActivate={AutoActivate}) — {Status}",
+        autoActivate,
+        SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled"
+            : autoActivate ? "awaiting configuration at /setup"
+            : "waiting for child app to call RequestSetupMode()");
 }
 
 // Startup loading screen: while the worker pool is initializing, serve a loading page
@@ -708,11 +789,41 @@ QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTas
 QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>());
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
+AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
 
 // --- Setup API (C# direct — no PS) ---
 
 // Health endpoint always available — used by startup loading screen for readiness polling
-app.MapGet("/api/setup/health", () => Results.Json(new { status = "ok", ready = pool.IsReady }));
+app.MapGet("/api/setup/health", () =>
+{
+    var info = StartupInfoBridge.GetInfo();
+    return Results.Json(new
+    {
+        status = "ok",
+        ready = pool.IsReady,
+        phase = info.Phase,
+        startup = new
+        {
+            readinessMode = info.ReadinessMode,
+            warmupMode = info.WarmupMode,
+            cpuCount = info.CpuCount,
+            httpPoolSize = info.HttpPoolSize,
+            bgPoolSize = info.BgPoolSize,
+            sharedModules = info.SharedModuleCount,
+            httpOnlyModules = info.HttpOnlyModuleCount,
+            bgOnlyModules = info.BgOnlyModuleCount,
+            warmupMs = info.WarmupMs,
+            baseWorkerMs = info.BaseWorkerMs,
+            baseFunctions = info.BaseFunctionCount,
+            httpReadyMs = info.HttpReadyMs,
+            httpFunctions = info.HttpFunctionCount,
+            httpPoolFullMs = info.HttpPoolFullMs,
+            bgReadyMs = info.BgReadyMs,
+            bgFunctions = info.BgFunctionCount,
+            fullyReadyMs = info.FullyReadyMs
+        }
+    });
+});
 
 if (CraftSettings.Setup.Enabled)
 {
