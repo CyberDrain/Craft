@@ -28,8 +28,10 @@ COPY --from=build /app/publish .
 # ─── Runtime Configuration ────────────────────────────────
 ARG APP_VERSION=latest
 ARG COMMIT_SHA=unknown
+ARG IMAGE_TAG=latest
 ENV APP_VERSION=$APP_VERSION
 ENV COMMIT_SHA=$COMMIT_SHA
+ENV IMAGE_TAG=$IMAGE_TAG
 
 ENV CRAFT_VERBOSE="false"
 EXPOSE 8080

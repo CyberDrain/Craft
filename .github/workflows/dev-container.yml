@@ -41,6 +41,7 @@ jobs:
           build-args: |
             APP_VERSION=dev
             COMMIT_SHA=${{ github.sha }}
+            IMAGE_TAG=dev
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
