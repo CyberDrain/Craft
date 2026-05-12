@@ -25,6 +25,12 @@ public static class AuthBridge
     /// Safe to call from PowerShell: [Craft.Services.AuthBridge]::ReloadAuth()
     /// </summary>
     public static void ReloadAuth() => s_service?.ReloadConfiguration();
+
+    /// <summary>
+    /// Invalidates the allowedUsers cache so changes take effect immediately.
+    /// Safe to call from PowerShell: [Craft.Services.AuthBridge]::InvalidateUsers()
+    /// </summary>
+    public static void InvalidateUsers() => s_service?.InvalidateUserCache();
 }
 
 /// <summary>
