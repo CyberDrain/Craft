@@ -28,11 +28,12 @@ var showDebug = string.Equals(
     Environment.GetEnvironmentVariable("ShowDebug") ?? "false",
     "true", StringComparison.OrdinalIgnoreCase);
 
-// File logging — writes to /log.txt (or current directory on Windows)
-var logFilePath = OperatingSystem.IsLinux() ? "/log.txt" : Path.Combine(AppContext.BaseDirectory, "log.txt");
-var logFileStream = new FileStream(logFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
-var logFileWriter = new StreamWriter(logFileStream) { AutoFlush = true };
-builder.Logging.AddProvider(new FileLoggerProvider(logFileWriter, verboseLogging));
+// File logging with rotation — configured via App:FileLogging section
+var fileLoggingSettings = new FileLoggingSettings();
+builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
+var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, verboseLogging);
+builder.Logging.AddProvider(fileLoggerProvider);
+LogBridge.Initialize(fileLoggerProvider);
 
 // Console: timestamps + suppress Debug unless ShowDebug is set
 builder.Logging.AddSimpleConsole(options =>
@@ -362,13 +363,11 @@ if (devFrontendUrl != null)
         var reqPath = context.Request.Path.Value ?? "";
         // Proxy to Next.js: /_next/*, /__nextjs, and any non-API path with a file extension
         // (e.g. /version.json, /manifest.json, /favicon.ico) that doesn't exist in Frontend/
-        // Exclude server-local files like /log.txt
         var shouldProxy = reqPath.StartsWith("/_next/") || reqPath.StartsWith("/__nextjs")
             || (Path.HasExtension(reqPath)
                 && !reqPath.StartsWith("/API/", StringComparison.OrdinalIgnoreCase)
                 && !reqPath.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
-                && !reqPath.StartsWith("/.auth/", StringComparison.OrdinalIgnoreCase)
-                && !reqPath.Equals("/log.txt", StringComparison.OrdinalIgnoreCase));
+                && !reqPath.StartsWith("/.auth/", StringComparison.OrdinalIgnoreCase));
         if (shouldProxy)
         {
             try
@@ -1229,33 +1228,6 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
         requestSw.Stop();
         logger.LogDebug("[HTTP] /API/{Endpoint} done {ElapsedMs}ms remaining={Remaining}",
             endpoint, requestSw.ElapsedMilliseconds, remaining);
-    }
-});
-
-// Serve the log file
-app.MapGet("/log.txt", async (HttpContext context) =>
-{
-    if (!File.Exists(logFilePath))
-    {
-        context.Response.StatusCode = 404;
-        await context.Response.WriteAsync("No log file found");
-        return;
-    }
-    context.Response.ContentType = "text/plain; charset=utf-8";
-    // Tail support: ?tail=N returns just the last N lines
-    var tailParam = context.Request.Query["tail"].ToString();
-    if (int.TryParse(tailParam, out var tailLines) && tailLines > 0)
-    {
-        using var fs = new FileStream(logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(fs);
-        var allLines = (await reader.ReadToEndAsync()).Split('\n');
-        var start = Math.Max(0, allLines.Length - tailLines);
-        await context.Response.WriteAsync(string.Join('\n', allLines[start..]));
-    }
-    else
-    {
-        using var fs = new FileStream(logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        await fs.CopyToAsync(context.Response.Body);
     }
 });
 

@@ -40,6 +40,9 @@ public class CraftSettings
     /// <summary>Response cache configuration.</summary>
     public CacheSettings Cache { get; set; } = new();
 
+    /// <summary>File-backed log output with size-based rotation.</summary>
+    public FileLoggingSettings FileLogging { get; set; } = new();
+
     /// <summary>Script repository — where to find PowerShell modules, HTTP endpoints, background scripts.</summary>
     public ScriptRepoSettings Scripts { get; set; } = new();
 
@@ -306,6 +309,51 @@ public class OrchestratorSettings
 
     /// <summary>Maximum number of times a task can be interrupted before being marked Failed.</summary>
     public int MaxRetries { get; set; } = 3;
+}
+
+/// <summary>
+/// File-backed logging with size-based rotation.
+/// Logs are written to {Directory}/{FilePrefix}.log and rotated to
+/// {FilePrefix}.1.log, {FilePrefix}.2.log, etc. when MaxFileSizeMB is exceeded.
+/// Oldest files beyond MaxFileCount are automatically deleted.
+/// </summary>
+public class FileLoggingSettings
+{
+    /// <summary>
+    /// Directory for log files. On Linux defaults to "/logs", on Windows to "{BaseDirectory}/logs".
+    /// Override via App__FileLogging__Directory env var.
+    /// </summary>
+    public string Directory { get; set; } = "";
+
+    /// <summary>
+    /// Filename prefix for log files. Files are named: {prefix}.log (current),
+    /// {prefix}.1.log (previous), {prefix}.2.log, etc.
+    /// </summary>
+    public string FilePrefix { get; set; } = "craft";
+
+    /// <summary>Maximum size in MB before rotating the current log file.</summary>
+    public int MaxFileSizeMB { get; set; } = 25;
+
+    /// <summary>Maximum number of rotated log files to retain. Oldest are deleted first.</summary>
+    public int MaxFileCount { get; set; } = 10;
+
+    /// <summary>
+    /// Timestamp format for log entries. Must be a valid .NET DateTime format string.
+    /// Default includes full date for accurate log filtering.
+    /// </summary>
+    public string TimestampFormat { get; set; } = "yyyy-MM-dd HH:mm:ss.fff";
+
+    /// <summary>
+    /// Include the logger category name in log output.
+    /// When true:  "2026-05-13 10:30:00.000 [INF] [Microsoft.AspNetCore.Routing] Matched endpoint"
+    /// When false: "2026-05-13 10:30:00.000 [INF] Matched endpoint"
+    /// </summary>
+    public bool IncludeCategory { get; set; } = false;
+
+    /// <summary>Resolved directory path, applying platform defaults when Directory is empty.</summary>
+    internal string ResolvedDirectory => !string.IsNullOrEmpty(Directory)
+        ? Directory
+        : OperatingSystem.IsLinux() ? "/logs" : Path.Combine(AppContext.BaseDirectory, "logs");
 }
 
 /// <summary>
