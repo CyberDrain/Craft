@@ -341,7 +341,7 @@ public class FileLoggingSettings
     /// Timestamp format for log entries. Must be a valid .NET DateTime format string.
     /// Default includes full date for accurate log filtering.
     /// </summary>
-    public string TimestampFormat { get; set; } = "yyyy-MM-dd HH:mm:ss.fff";
+    public string TimestampFormat { get; set; } = "yyyy-MM-ddTHH:mm:ss.fffZ";
 
     /// <summary>
     /// Include the logger category name in log output.

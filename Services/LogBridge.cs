@@ -63,13 +63,17 @@ public static class LogBridge
     /// Continuation lines (exception details starting with whitespace) are kept with their parent entry.
     /// </summary>
     /// <param name="tail">Number of matching lines to return from end (0 = all).</param>
-    /// <param name="level">Filter by log level: DBG, INF, WRN, ERR, CRT.</param>
+    /// <param name="level">Filter by log level(s): "ERR" or "ERR,CRT" (comma-separated).</param>
     /// <param name="search">Case-insensitive text search within log messages.</param>
     /// <param name="file">Specific log file name (e.g. "craft.1.log"). Null = current.</param>
     /// <param name="from">Include only entries at or after this UTC time. Null = no lower bound.</param>
     /// <param name="to">Include only entries at or before this UTC time. Null = no upper bound.</param>
+    /// <param name="exclude">Case-insensitive text to exclude from results.</param>
+    /// <param name="regexPattern">Regex pattern to match against the message portion of the line.</param>
+    /// <param name="sortNewestFirst">When true, return results newest-first (default: false, oldest-first).</param>
     public static string[] ReadLog(int tail = 0, string? level = null, string? search = null,
-        string? file = null, DateTime? from = null, DateTime? to = null)
+        string? file = null, DateTime? from = null, DateTime? to = null,
+        string? exclude = null, string? regexPattern = null, bool sortNewestFirst = false)
     {
         var filePath = ResolveLogFilePath(file);
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
@@ -87,13 +91,26 @@ public static class LogBridge
             return Array.Empty<string>();
         }
 
-        var hasFilter = !string.IsNullOrEmpty(level) || !string.IsNullOrEmpty(search)
-            || from.HasValue || to.HasValue;
+        // Parse multi-level filter once
+        string[]? levels = null;
+        if (!string.IsNullOrEmpty(level))
+            levels = level.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
-        if (!hasFilter && tail <= 0)
+        // Compile regex once if provided
+        System.Text.RegularExpressions.Regex? regex = null;
+        if (!string.IsNullOrEmpty(regexPattern))
+        {
+            try { regex = new System.Text.RegularExpressions.Regex(regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled); }
+            catch { /* invalid regex — skip filter */ }
+        }
+
+        var hasFilter = levels != null || !string.IsNullOrEmpty(search)
+            || from.HasValue || to.HasValue || !string.IsNullOrEmpty(exclude) || regex != null;
+
+        if (!hasFilter && tail <= 0 && !sortNewestFirst)
             return allLines;
 
-        if (!hasFilter)
+        if (!hasFilter && !sortNewestFirst)
         {
             var start = Math.Max(0, allLines.Length - tail);
             return allLines[start..];
@@ -119,12 +136,20 @@ public static class LogBridge
             }
 
             // Main log line — check filters
-            lastMainLineMatched = MatchesFilters(line, level, search, from, to);
+            lastMainLineMatched = MatchesFilters(line, levels, search, from, to, exclude, regex);
             if (lastMainLineMatched) filtered.Add(line);
         }
 
+        if (sortNewestFirst)
+            filtered.Reverse();
+
         if (tail > 0 && filtered.Count > tail)
-            return filtered.GetRange(filtered.Count - tail, tail).ToArray();
+        {
+            // When sorted newest-first, take from the start; otherwise from the end
+            return sortNewestFirst
+                ? filtered.GetRange(0, tail).ToArray()
+                : filtered.GetRange(filtered.Count - tail, tail).ToArray();
+        }
 
         return filtered.ToArray();
     }
@@ -169,7 +194,8 @@ public static class LogBridge
     /// PS: [Craft.Services.LogBridge]::SearchAllFiles('timeout', 'ERR')
     /// </summary>
     public static string[] SearchAllFiles(string? search = null, string? level = null,
-        DateTime? from = null, DateTime? to = null, int tail = 0)
+        DateTime? from = null, DateTime? to = null, int tail = 0,
+        string? exclude = null, string? regexPattern = null, bool sortNewestFirst = false)
     {
         var files = GetLogFiles();
         if (files.Length == 0) return Array.Empty<string>();
@@ -182,12 +208,19 @@ public static class LogBridge
 
         foreach (var logFile in orderedFiles)
         {
-            var lines = ReadLog(0, level, search, logFile.Name, from, to);
+            var lines = ReadLog(0, level, search, logFile.Name, from, to, exclude, regexPattern);
             allResults.AddRange(lines);
         }
 
+        if (sortNewestFirst)
+            allResults.Reverse();
+
         if (tail > 0 && allResults.Count > tail)
-            return allResults.GetRange(allResults.Count - tail, tail).ToArray();
+        {
+            return sortNewestFirst
+                ? allResults.GetRange(0, tail).ToArray()
+                : allResults.GetRange(allResults.Count - tail, tail).ToArray();
+        }
 
         return allResults.ToArray();
     }
@@ -248,8 +281,9 @@ public static class LogBridge
             : null;
     }
 
-    private static bool MatchesFilters(string line, string? level, string? search,
-        DateTime? from = null, DateTime? to = null)
+    private static bool MatchesFilters(string line, string[]? levels, string? search,
+        DateTime? from = null, DateTime? to = null,
+        string? exclude = null, System.Text.RegularExpressions.Regex? regex = null)
     {
         // Time range filter — parse timestamp from start of line
         if (from.HasValue || to.HasValue)
@@ -267,20 +301,37 @@ public static class LogBridge
             }
         }
 
-        if (!string.IsNullOrEmpty(level))
+        if (levels != null && levels.Length > 0)
         {
             var bracketStart = line.IndexOf('[');
             if (bracketStart < 0) return false;
             var bracketEnd = line.IndexOf(']', bracketStart);
             if (bracketEnd < 0) return false;
             var lineLevel = line.AsSpan(bracketStart + 1, bracketEnd - bracketStart - 1);
-            if (!lineLevel.Equals(level.AsSpan(), StringComparison.OrdinalIgnoreCase))
-                return false;
+            bool matched = false;
+            foreach (var lvl in levels)
+            {
+                if (lineLevel.Equals(lvl.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                { matched = true; break; }
+            }
+            if (!matched) return false;
         }
 
         if (!string.IsNullOrEmpty(search))
         {
             if (!line.Contains(search, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        if (!string.IsNullOrEmpty(exclude))
+        {
+            if (line.Contains(exclude, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        if (regex != null)
+        {
+            if (!regex.IsMatch(line))
                 return false;
         }
 
@@ -295,14 +346,24 @@ public static class LogBridge
     {
         if (line.Length < 12) return null;
 
-        // Try full datetime format: "2026-05-13 10:30:00.000 [...]"
+        // Try ISO 8601 UTC format: "2026-05-13T10:30:00.000Z [...]"
+        if (line.Length >= 24 && line[4] == '-' && line[7] == '-' && line[10] == 'T')
+        {
+            if (DateTime.TryParseExact(line.AsSpan(0, 24), "yyyy-MM-ddTHH:mm:ss.fffZ",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var fullDt))
+                return fullDt;
+        }
+
+        // Legacy format: "2026-05-13 10:30:00.000 [...]"
         if (line.Length >= 23 && line[4] == '-' && line[7] == '-' && line[10] == ' ')
         {
             if (DateTime.TryParseExact(line.AsSpan(0, 23), "yyyy-MM-dd HH:mm:ss.fff",
                 System.Globalization.CultureInfo.InvariantCulture,
                 System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
-                out var fullDt))
-                return fullDt;
+                out var fullDt2))
+                return fullDt2;
         }
 
         // Try time-only format (legacy): "10:30:00.000 [...]"

@@ -38,7 +38,7 @@ LogBridge.Initialize(fileLoggerProvider);
 // Console: timestamps + suppress Debug unless ShowDebug is set
 builder.Logging.AddSimpleConsole(options =>
 {
-    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+    options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
     options.SingleLine = true;
 });
 if (!showDebug)
