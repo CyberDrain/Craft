@@ -350,10 +350,36 @@ public class FileLoggingSettings
     /// </summary>
     public bool IncludeCategory { get; set; } = false;
 
+    /// <summary>
+    /// Minimum log level for file and console output AND PowerShell stream capture.
+    /// Controls which PS preference variables are set to 'Continue' in runspaces:
+    ///   - "Error"       → only Write-Error captured
+    ///   - "Warning"     → Write-Error, Write-Warning
+    ///   - "Information" → (default) Write-Error, Write-Warning, Write-Information/Write-Host
+    ///   - "Debug"       → all above + Write-Debug (also suppresses ASP.NET framework noise filtering)
+    ///   - "Trace"       → all above + Write-Verbose
+    /// Also overridable via CRAFT_LOG_LEVEL environment variable.
+    /// </summary>
+    public string LogLevel { get; set; } = "Information";
+
     /// <summary>Resolved directory path, applying platform defaults when Directory is empty.</summary>
     internal string ResolvedDirectory => !string.IsNullOrEmpty(Directory)
         ? Directory
         : OperatingSystem.IsLinux() ? "/logs" : Path.Combine(AppContext.BaseDirectory, "logs");
+
+    /// <summary>Parse the configured LogLevel string into a .NET LogLevel enum value.</summary>
+    internal Microsoft.Extensions.Logging.LogLevel ParsedLogLevel
+    {
+        get
+        {
+            // Allow env var override
+            var envLevel = Environment.GetEnvironmentVariable("CRAFT_LOG_LEVEL");
+            var level = !string.IsNullOrEmpty(envLevel) ? envLevel : LogLevel;
+            return Enum.TryParse<Microsoft.Extensions.Logging.LogLevel>(level, ignoreCase: true, out var parsed)
+                ? parsed
+                : Microsoft.Extensions.Logging.LogLevel.Information;
+        }
+    }
 }
 
 /// <summary>

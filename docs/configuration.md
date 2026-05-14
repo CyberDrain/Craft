@@ -27,7 +27,7 @@ In Docker Compose:
 environment:
   - App__Worker__BgPoolSize=8
   - App__Worker__HttpPoolSize=3
-  - CRAFT_VERBOSE=true
+  - CRAFT_LOG_LEVEL=Debug
 ```
 
 ## Full Settings Reference
@@ -312,12 +312,11 @@ These are process-level variables read directly (not part of `App:*`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CRAFT_VERBOSE` | `false` | Enable verbose logging (Information level for all categories) |
+| `CRAFT_LOG_LEVEL` | `Information` | Minimum log level for file/console output and PowerShell stream capture. Values: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`. At `Debug`, Write-Debug is captured; at `Trace`, Write-Verbose is also captured. Overrides `App:FileLogging:LogLevel` in appsettings. |
 | `CRAFT_ROOT` | *(auto-set)* | API base path — set automatically, available as `$env:CRAFT_ROOT` in PS |
 | `CRAFT_DEV_FRONTEND_URL` | `http://localhost:3000` | Dev mode: proxy frontend requests to this URL (hot-reload) |
 | `AzureWebJobsStorage` | *(required)* | Azure Storage connection string for Table Storage |
-| `ASPNETCORE_ENVIRONMENT` | `Production` | `Development` enables dev auth, verbose errors, frontend proxy |
-| `ShowDebug` | `false` | Show Debug-level PS messages in console (very noisy) |
+| `ASPNETCORE_ENVIRONMENT` | `Production` | `Development` enables dev auth, dev errors, frontend proxy |
 
 ### Authentication Environment Variables
 

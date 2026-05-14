@@ -202,6 +202,12 @@ public class PowerShellRunnerService : IDisposable
             foreach (var info in worker.Streams.Information)
                 _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, entry.FunctionName, info.ToString());
+            foreach (var debug in worker.Streams.Debug)
+                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, entry.FunctionName, debug.ToString());
+            foreach (var verbose in worker.Streams.Verbose)
+                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, entry.FunctionName, verbose.ToString());
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -253,6 +259,8 @@ public class PowerShellRunnerService : IDisposable
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onWarning = null;
         EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         var exceptionOccurred = false;
         try
         {
@@ -281,9 +289,23 @@ public class PowerShellRunnerService : IDisposable
                 _logger.LogInformation("[Scheduler] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, functionName, records[args.Index].ToString());
             };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[Scheduler] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[Scheduler] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
             worker.Streams.Error.DataAdded += onError;
             worker.Streams.Warning.DataAdded += onWarning;
             worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
 
             var psParams = new Dictionary<string, object?>();
             if (parameters != null)
@@ -313,6 +335,8 @@ public class PowerShellRunnerService : IDisposable
             if (onError != null) worker.Streams.Error.DataAdded -= onError;
             if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+            if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+            if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
             _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
         }
     }
@@ -337,6 +361,8 @@ public class PowerShellRunnerService : IDisposable
         using var opScope = OperationContext.Set(invocation);
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             var resolvedName = _repo.GetByName(functionName)?.FunctionName ?? functionName;
@@ -357,8 +383,22 @@ public class PowerShellRunnerService : IDisposable
                 _logger.LogInformation("[Planner] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, functionName, records[args.Index].ToString());
             };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[Planner] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[Planner] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
             worker.Streams.Error.DataAdded += onError;
             worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
 
             var psParams = new Dictionary<string, object?>();
             if (parameters != null)
@@ -387,6 +427,8 @@ public class PowerShellRunnerService : IDisposable
         {
             if (onError != null) worker.Streams.Error.DataAdded -= onError;
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+            if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+            if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
             _pool.Reclaim(worker, isHttp: false);
         }
     }

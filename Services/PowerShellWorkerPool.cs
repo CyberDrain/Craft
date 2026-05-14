@@ -378,6 +378,14 @@ public class PowerShellWorkerPool : IDisposable
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
 
+        // Set PowerShell preference variables based on configured log level.
+        // This controls which PS streams actually produce records for CRAFT to capture.
+        var logLevel = _settings.FileLogging.ParsedLogLevel;
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
+
         var hasAllowList = moduleList != null && moduleList.Count > 0;
 
         // Import modules via ISS — filtered by allow list when configured
@@ -415,6 +423,13 @@ public class PowerShellWorkerPool : IDisposable
 
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
+
+        // Set PowerShell preference variables based on configured log level
+        var logLevel = _settings.FileLogging.ParsedLogLevel;
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
 
         // Inject pre-parsed functions from the base state
         foreach (var (name, definition, _) in baseState.Functions)

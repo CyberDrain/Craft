@@ -17,20 +17,20 @@ public sealed class FileLoggerProvider : ILoggerProvider
     private readonly string _filePrefix;
     private readonly long _maxFileBytes;
     private readonly int _maxFileCount;
-    private readonly bool _verbose;
+    private readonly LogLevel _minLevel;
     private readonly string _timestampFormat;
     private readonly bool _includeCategory;
 
     private StreamWriter? _writer;
     private long _currentFileSize;
 
-    public FileLoggerProvider(FileLoggingSettings settings, bool verbose = false)
+    public FileLoggerProvider(FileLoggingSettings settings, LogLevel minLevel = LogLevel.Information)
     {
         _directory = settings.ResolvedDirectory;
         _filePrefix = settings.FilePrefix;
         _maxFileBytes = settings.MaxFileSizeMB * 1024L * 1024L;
         _maxFileCount = settings.MaxFileCount;
-        _verbose = verbose;
+        _minLevel = minLevel;
         _timestampFormat = settings.TimestampFormat;
         _includeCategory = settings.IncludeCategory;
 
@@ -150,11 +150,13 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
         public bool IsEnabled(LogLevel logLevel)
         {
-            if (_provider._verbose) return logLevel >= LogLevel.Debug;
-            // In non-verbose, suppress Debug entirely and suppress noisy ASP.NET categories
-            if (logLevel <= LogLevel.Debug) return false;
-            foreach (var prefix in s_suppressedPrefixes)
-                if (_category.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+            if (logLevel < _provider._minLevel) return false;
+            // Suppress noisy framework categories unless at Debug or lower
+            if (_provider._minLevel > LogLevel.Debug)
+            {
+                foreach (var prefix in s_suppressedPrefixes)
+                    if (_category.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return false;
+            }
             return true;
         }
 

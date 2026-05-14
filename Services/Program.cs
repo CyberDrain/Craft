@@ -19,36 +19,30 @@ builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 
-// Verbose logging controlled by environment variable
-var verboseLogging = string.Equals(
-    Environment.GetEnvironmentVariable("CRAFT_VERBOSE") ?? "false",
-    "true", StringComparison.OrdinalIgnoreCase);
-// ShowDebug: show Debug-level messages in console (noisy, off by default)
-var showDebug = string.Equals(
-    Environment.GetEnvironmentVariable("ShowDebug") ?? "false",
-    "true", StringComparison.OrdinalIgnoreCase);
-
-// File logging with rotation — configured via App:FileLogging section
+// Resolve the configured log level (supports CRAFT_LOG_LEVEL env var override)
 var fileLoggingSettings = new FileLoggingSettings();
 builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
-var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, verboseLogging);
+var configuredLogLevel = fileLoggingSettings.ParsedLogLevel;
+
+// File logging with rotation
+var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, configuredLogLevel);
 builder.Logging.AddProvider(fileLoggerProvider);
 LogBridge.Initialize(fileLoggerProvider);
 
-// Console: timestamps + suppress Debug unless ShowDebug is set
+// Console: timestamps + respect configured level
 builder.Logging.AddSimpleConsole(options =>
 {
     options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
     options.SingleLine = true;
 });
-if (!showDebug)
+if (configuredLogLevel > LogLevel.Debug)
 {
     builder.Logging.AddFilter<Microsoft.Extensions.Logging.Console.ConsoleLoggerProvider>(
         level => level >= LogLevel.Information);
 }
 
-// Suppress noisy ASP.NET framework logging unless verbose
-if (!verboseLogging)
+// Suppress noisy ASP.NET framework logging unless at Debug level or lower
+if (configuredLogLevel > LogLevel.Debug)
 {
     builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
     builder.Logging.AddFilter("Microsoft.Hosting", LogLevel.Warning);
@@ -136,10 +130,10 @@ void RunInitialization()
         endpoints[kvp.Key] = kvp.Value;
 
     logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
-    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
+    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} LogLevel={LogLevel}",
         CraftSettings.Worker.HttpPoolSize,
         CraftSettings.Worker.BgPoolSize,
-        verboseLogging);
+        configuredLogLevel);
 
     // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
     pool.Initialize();
