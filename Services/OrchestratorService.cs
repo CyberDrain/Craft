@@ -591,7 +591,6 @@ public class OrchestratorService
             name: $"{run.Name}-{task.Id}",
             priority: priority,
             runName: run.Name,
-            id: $"{run.Name}-{task.Id}",
             work: async (jobCt) =>
             {
                 // Check if run was cancelled while this job was queued
@@ -806,7 +805,6 @@ public class OrchestratorService
             name: $"{run.Name}-PostExec",
             priority: run.Priority,
             runName: run.Name,
-            id: $"{run.Name}-PostExec_{Guid.NewGuid():N}",
             work: async (jobCt) =>
             {
                 // Mark PostExec as Running
