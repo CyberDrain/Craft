@@ -146,6 +146,41 @@ public class BackgroundTaskLimiter : IDisposable
         await RunAsync(async () => { await work(); return 0; }, taskName, ct);
     }
 
+    /// <summary>
+    /// Acquire a concurrency slot from the limiter. The caller MUST call <see cref="ReleaseSlot"/>
+    /// when the work is done. This is the split version of <see cref="RunAsync{T}"/> for use by
+    /// JobManager, which needs to own the work lifecycle separately from slot acquisition.
+    /// The limiter's waiting/active counters and scale-up pressure tracking are updated.
+    /// </summary>
+    public async Task AcquireAsync(string taskName, CancellationToken ct = default)
+    {
+        Interlocked.Increment(ref _waiting);
+        _logger.LogDebug("Limiter slot requested: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
+            taskName, _active, _waiting, _currentMax);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await _semaphore.WaitAsync(ct);
+        sw.Stop();
+
+        Interlocked.Decrement(ref _waiting);
+        Interlocked.Increment(ref _active);
+
+        if (sw.ElapsedMilliseconds > 500)
+        {
+            _logger.LogInformation("Limiter slot acquired after {WaitMs}ms: {Task} ({Active} active, {Waiting} waiting)",
+                sw.ElapsedMilliseconds, taskName, _active, _waiting);
+        }
+    }
+
+    /// <summary>
+    /// Release a concurrency slot previously acquired via <see cref="AcquireAsync"/>.
+    /// </summary>
+    public void ReleaseSlot()
+    {
+        Interlocked.Decrement(ref _active);
+        _semaphore.Release();
+    }
+
     private void MonitorCallback(object? state)
     {
         var waiting = _waiting;

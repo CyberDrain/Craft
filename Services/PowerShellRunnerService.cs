@@ -69,6 +69,7 @@ public class PowerShellRunnerService : IDisposable
             };
 
             // Call New-CippCoreRequest which handles "me" internally via Test-CIPPAccess
+            WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
             var results = await worker.InvokeAsync("New-CippCoreRequest", parameters);
 
             foreach (var error in worker.Streams.Error)
@@ -128,11 +129,12 @@ public class PowerShellRunnerService : IDisposable
 
     /// <summary>
     /// Execute an HTTP endpoint script with a pre-captured request snapshot.
-    /// Used for background cache refresh. Runs on the background pool.
+    /// Used for background cache refresh. Runs on the HTTP pool since HTTP
+    /// endpoint functions require HTTP-specific modules.
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpScript(string route, Hashtable requestSnapshot)
     {
-        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: false);
+        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: true);
     }
 
     private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp)
@@ -188,6 +190,7 @@ public class PowerShellRunnerService : IDisposable
                 Category = "HTTP"
             };
             using var opScope = OperationContext.Set(invocation);
+            WorkerMetricsBridge.RecordFunction(worker.Id, entry.FunctionName);
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} starting on {Worker}",
                 poolLabel, invocation.Id, entry.FunctionName, invocation.WorkerId);
 
@@ -248,6 +251,7 @@ public class PowerShellRunnerService : IDisposable
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
+        var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
@@ -255,6 +259,9 @@ public class PowerShellRunnerService : IDisposable
             Category = "Job"
         };
         using var opScope = OperationContext.Set(invocation);
+        // Show the job name (e.g. "CIPPDBCacheRun-Graph_tenant.com") rather than
+        // the generic function name (e.g. "Invoke-CraftTask") in worker metrics
+        WorkerMetricsBridge.RecordFunction(worker.Id, parentFunction ?? functionName);
 
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onWarning = null;
@@ -352,6 +359,7 @@ public class PowerShellRunnerService : IDisposable
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
+        var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
@@ -359,6 +367,7 @@ public class PowerShellRunnerService : IDisposable
             Category = "Planner"
         };
         using var opScope = OperationContext.Set(invocation);
+        WorkerMetricsBridge.RecordFunction(worker.Id, parentFunction ?? functionName);
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onInfo = null;
         EventHandler<DataAddedEventArgs>? onDebug = null;

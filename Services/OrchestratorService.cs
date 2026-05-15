@@ -806,7 +806,7 @@ public class OrchestratorService
             name: $"{run.Name}-PostExec",
             priority: run.Priority,
             runName: run.Name,
-            id: $"{run.Name}-PostExec",
+            id: $"{run.Name}-PostExec_{Guid.NewGuid():N}",
             work: async (jobCt) =>
             {
                 // Mark PostExec as Running

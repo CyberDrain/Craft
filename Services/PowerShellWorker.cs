@@ -23,6 +23,9 @@ public class PowerShellWorker : IDisposable
 
     public int Id { get; }
 
+    /// <summary>Stopwatch timestamp set at checkout for elapsed-time tracking.</summary>
+    internal long CheckoutTimestamp;
+
     public PowerShellWorker(int id, InitialSessionState iss, ILogger logger)
     {
         Id = id;

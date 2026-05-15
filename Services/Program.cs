@@ -780,6 +780,7 @@ AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>());
+WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundTaskLimiter>(), jobManager);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
