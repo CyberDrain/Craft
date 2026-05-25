@@ -41,6 +41,25 @@ public class PowerShellRunnerService : IDisposable
         SharedCaches.GetOrAdd(name, _ => Hashtable.Synchronized(new Hashtable()));
 
     /// <summary>
+    /// Set a process-level environment variable from any worker runspace.
+    /// The value is visible to ALL workers via $env:NAME because it calls
+    /// Environment.SetEnvironmentVariable at the .NET level, bypassing any
+    /// runspace-scoped isolation.
+    /// <para>
+    /// PS usage: [Craft.Services.PowerShellRunnerService]::SetProcessEnvVar('CIPP_TIMEZONE', 'America/New_York')
+    /// </para>
+    /// </summary>
+    public static void SetProcessEnvVar(string name, string? value) =>
+        Environment.SetEnvironmentVariable(name, value);
+
+    /// <summary>
+    /// Read a process-level environment variable. Convenience wrapper so callers
+    /// don't need to reference [System.Environment] directly.
+    /// </summary>
+    public static string? GetProcessEnvVar(string name) =>
+        Environment.GetEnvironmentVariable(name);
+
+    /// <summary>
     /// Execute an HTTP request through the PS pipeline for endpoints not in the route table
     /// (e.g., "me" which is handled by New-CippCoreRequest / Test-CIPPAccess directly).
     /// </summary>
