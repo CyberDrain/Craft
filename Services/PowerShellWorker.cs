@@ -177,21 +177,32 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     /// <summary>
     /// Async invoke — does not block a ThreadPool thread during PS execution.
     /// Includes post-invocation cleanup matching Azure Functions' ResetRunspace.
+    /// When a cancellation token is provided and fires, the PowerShell pipeline is
+    /// stopped via <see cref="PowerShell.Stop"/> and an <see cref="OperationCanceledException"/> is thrown.
     /// </summary>
-    public async Task<Collection<PSObject>> InvokeAsync(string functionName, Dictionary<string, object?> parameters)
+    public async Task<Collection<PSObject>> InvokeAsync(string functionName, Dictionary<string, object?> parameters,
+        CancellationToken ct = default)
     {
+        CancellationTokenRegistration? registration = null;
         try
         {
             _pwsh.AddCommand(functionName);
             foreach (var p in parameters)
                 _pwsh.AddParameter(p.Key, p.Value);
 
+            // Register cancellation callback to stop the PS pipeline
+            if (ct.CanBeCanceled)
+                registration = ct.Register(() => _pwsh.Stop());
+
             var asyncResult = _pwsh.BeginInvoke();
             var results = await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
+
+            ct.ThrowIfCancellationRequested();
             return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
         }
         finally
         {
+            registration?.Dispose();
             Cleanup();
         }
     }
@@ -199,8 +210,10 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     /// <summary>
     /// Invoke a bare script (no function definition) — for timer scripts etc.
     /// </summary>
-    public async Task<Collection<PSObject>> InvokeScriptAsync(ScriptBlock scriptBlock, Dictionary<string, object?>? parameters = null)
+    public async Task<Collection<PSObject>> InvokeScriptAsync(ScriptBlock scriptBlock,
+        Dictionary<string, object?>? parameters = null, CancellationToken ct = default)
     {
+        CancellationTokenRegistration? registration = null;
         try
         {
             _pwsh.AddScript("& $args[0]").AddArgument(scriptBlock);
@@ -208,12 +221,18 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
                 foreach (var p in parameters)
                     _pwsh.AddParameter(p.Key, p.Value);
 
+            if (ct.CanBeCanceled)
+                registration = ct.Register(() => _pwsh.Stop());
+
             var asyncResult = _pwsh.BeginInvoke();
             var results = await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
+
+            ct.ThrowIfCancellationRequested();
             return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
         }
         finally
         {
+            registration?.Dispose();
             Cleanup();
         }
     }
@@ -309,15 +328,30 @@ try {{
     {
         var state = new ExportedModuleState();
 
-        // Get all loaded modules and extract their exported functions
+        // Get all loaded modules and extract their exported functions,
+        // plus detect modules that have private (non-exported) functions
         _pwsh.AddScript(@"
             Get-Module | ForEach-Object {
                 $mod = $_
+                $hasPrivate = $false
+                # Compare all commands in the module against exported functions
+                $allCommands = & $mod { Get-Command -Module $mod.Name -CommandType Function -ErrorAction SilentlyContinue }
+                $exportedNames = [System.Collections.Generic.HashSet[string]]::new(
+                    [StringComparer]::OrdinalIgnoreCase)
+                $mod.ExportedFunctions.Values | ForEach-Object { $null = $exportedNames.Add($_.Name) }
+                foreach ($cmd in $allCommands) {
+                    if (-not $exportedNames.Contains($cmd.Name)) {
+                        $hasPrivate = $true
+                        break
+                    }
+                }
                 $mod.ExportedFunctions.Values | ForEach-Object {
                     [PSCustomObject]@{
                         Module = $mod.Name
                         Name = $_.Name
                         Definition = $_.Definition
+                        HasPrivateFunctions = $hasPrivate
+                        ModulePath = $mod.Path
                     }
                 }
             }
@@ -326,6 +360,7 @@ try {{
         _pwsh.Commands.Clear();
         _pwsh.Streams.ClearStreams();
 
+        var modulesWithPrivate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var fn in functions)
         {
             var name = fn.Properties["Name"]?.Value?.ToString();
@@ -333,7 +368,16 @@ try {{
             var module = fn.Properties["Module"]?.Value?.ToString();
             if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(definition))
                 state.Functions.Add((name, definition, module ?? ""));
+
+            // Track modules that have private functions — these need native import on cloned workers
+            if (fn.Properties["HasPrivateFunctions"]?.Value is true)
+            {
+                var modPath = fn.Properties["ModulePath"]?.Value?.ToString();
+                if (!string.IsNullOrEmpty(modPath) && !string.IsNullOrEmpty(module))
+                    modulesWithPrivate.Add(modPath);
+            }
         }
+        state.NativeImportModulePaths.UnionWith(modulesWithPrivate);
 
         // Get module-level variables that need to be preserved
         _pwsh.AddScript(@"
@@ -392,6 +436,11 @@ public class ExportedModuleState
     public List<(string Name, string Definition, string Module)> Functions { get; } = new();
     public List<(string Name, object? Value)> Variables { get; } = new();
     public List<string> BinaryModulePaths { get; } = new();
+    /// <summary>
+    /// Module manifest paths for modules that have private (non-exported) functions.
+    /// These must be imported natively on cloned workers to preserve module scope.
+    /// </summary>
+    public HashSet<string> NativeImportModulePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Merge a base state with this (overlay) state. Overlay functions win on name collision.
@@ -439,6 +488,10 @@ public class ExportedModuleState
             if (!seenPaths.Contains(p))
                 merged.BinaryModulePaths.Add(p);
         }
+
+        // Merge native import module paths
+        merged.NativeImportModulePaths.UnionWith(NativeImportModulePaths);
+        merged.NativeImportModulePaths.UnionWith(baseState.NativeImportModulePaths);
 
         return merged;
     }

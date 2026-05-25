@@ -138,22 +138,19 @@ public class PowerShellWorkerPool : IDisposable
 
         _httpClonedState = httpState.MergeWith(baseState);
 
-        // BeforeReady: warmup runs BEFORE signaling HTTP ready
-        if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
+        // Run warmup before signaling ready (BeforeReady and AfterReady both run here;
+        // Background mode runs warmup on the first BG worker instead)
+        if (!warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
             RunWarmup(firstHttpWorker, sw);
 
         AddToHttpPool(firstHttpWorker);
 
-        // Signal HTTP ready — one worker can serve requests
+        // Signal HTTP ready — one worker can serve requests (warmup already complete)
         _httpReady.Set();
         _ready.Set();
         StartupInfoBridge.SetHttpReady(sw.ElapsedMilliseconds, _httpClonedState.Functions.Count);
         _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests ({FnCount} functions)",
             sw.ElapsedMilliseconds, _httpClonedState.Functions.Count);
-
-        // AfterReady: warmup runs AFTER signaling HTTP ready, on first HTTP worker
-        if (warmupMode.Equals("AfterReady", StringComparison.OrdinalIgnoreCase))
-            RunWarmup(firstHttpWorker, sw);
 
         // Clone remaining HTTP workers (API already serving with first worker)
         if (_httpPoolSize > 1)
@@ -226,22 +223,19 @@ public class PowerShellWorkerPool : IDisposable
 
         _httpClonedState = firstWorker.ExportModuleState();
 
-        // BeforeReady: warmup runs BEFORE signaling HTTP ready
-        if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
+        // Run warmup before signaling ready (BeforeReady and AfterReady both run here;
+        // Background mode runs warmup on the first BG worker instead)
+        if (!warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
             RunWarmup(firstWorker, sw);
 
         AddToHttpPool(firstWorker);
 
-        // Signal HTTP ready — one worker can serve requests
+        // Signal HTTP ready — one worker can serve requests (warmup already complete)
         _httpReady.Set();
         _ready.Set();
         var firstWorkerMs = sw.ElapsedMilliseconds;
         StartupInfoBridge.SetHttpReady(firstWorkerMs, _httpClonedState.Functions.Count);
         _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests", firstWorkerMs);
-
-        // AfterReady: warmup runs AFTER signaling HTTP ready, on first HTTP worker
-        if (warmupMode.Equals("AfterReady", StringComparison.OrdinalIgnoreCase))
-            RunWarmup(firstWorker, sw);
 
         // Clone remaining HTTP workers (API already serving with first worker)
         if (_httpPoolSize > 1)
@@ -481,9 +475,15 @@ public class PowerShellWorkerPool : IDisposable
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
             iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
 
-        // Inject pre-parsed functions from the base state
-        foreach (var (name, definition, _) in baseState.Functions)
+        // Determine which modules need native import (they have private functions)
+        var nativeModules = new HashSet<string>(baseState.NativeImportModulePaths.Select(Path.GetFileNameWithoutExtension)!,
+            StringComparer.OrdinalIgnoreCase);
+
+        // Inject pre-parsed functions from the base state (skip natively-imported modules)
+        foreach (var (name, definition, module) in baseState.Functions)
         {
+            if (nativeModules.Contains(module))
+                continue;
             try { iss.Commands.Add(new SessionStateFunctionEntry(name, definition)); }
             catch { }
         }
@@ -494,6 +494,10 @@ public class PowerShellWorkerPool : IDisposable
 
         // Import binary modules from base
         foreach (var path in baseState.BinaryModulePaths)
+            iss.ImportPSModule(new[] { path });
+
+        // Import modules that have private functions natively
+        foreach (var path in baseState.NativeImportModulePaths)
             iss.ImportPSModule(new[] { path });
 
         // Import additional type-specific modules (only these get parsed by PS)
@@ -519,7 +523,7 @@ public class PowerShellWorkerPool : IDisposable
     /// <summary>
     /// Build an ISS using pre-parsed function definitions from an existing worker.
     /// Skips file I/O and AST parsing for script modules — functions are injected directly.
-    /// Binary modules still need native import as they contain compiled cmdlets.
+    /// Binary modules and modules with private functions still need native import.
     /// </summary>
     private InitialSessionState BuildClonedISS(ExportedModuleState state)
     {
@@ -531,9 +535,16 @@ public class PowerShellWorkerPool : IDisposable
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
 
-        // Inject pre-parsed functions — this is the big win, no .psm1 parsing needed
-        foreach (var (name, definition, _) in state.Functions)
+        // Determine which modules need native import (they have private functions)
+        var nativeModules = new HashSet<string>(state.NativeImportModulePaths.Select(Path.GetFileNameWithoutExtension)!,
+            StringComparer.OrdinalIgnoreCase);
+
+        // Inject pre-parsed functions — this is the big win, no .psm1 parsing needed.
+        // Skip functions from modules that will be natively imported (they bring their own).
+        foreach (var (name, definition, module) in state.Functions)
         {
+            if (nativeModules.Contains(module))
+                continue;
             try
             {
                 iss.Commands.Add(new SessionStateFunctionEntry(name, definition));
@@ -552,6 +563,13 @@ public class PowerShellWorkerPool : IDisposable
 
         // Binary modules must still be imported natively (they contain compiled cmdlets)
         foreach (var path in state.BinaryModulePaths)
+        {
+            iss.ImportPSModule(new[] { path });
+        }
+
+        // Import modules that have private functions — cloning only captures exported
+        // functions, so these modules need full import to preserve private function scope
+        foreach (var path in state.NativeImportModulePaths)
         {
             iss.ImportPSModule(new[] { path });
         }

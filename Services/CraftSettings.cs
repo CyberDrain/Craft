@@ -68,6 +68,20 @@ public class WorkerSettings
     public int BgPoolSize { get; set; } = 4;
 
     /// <summary>
+    /// Maximum execution time in seconds for a single HTTP request handler.
+    /// When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+    /// 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints.
+    /// </summary>
+    public int HttpTimeoutSeconds { get; set; } = 0;
+
+    /// <summary>
+    /// Maximum execution time in seconds for a single background job (scheduler, orchestrator task).
+    /// When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+    /// 0 = no timeout (default). Recommended: 600-3600 for background jobs.
+    /// </summary>
+    public int BgTimeoutSeconds { get; set; } = 0;
+
+    /// <summary>
     /// Environment variables to inject into every PowerShell runspace.
     /// Use "{ApiBasePath}" as a placeholder — it will be replaced with the resolved API directory at startup.
     /// Example: { "MyAppRoot": "{ApiBasePath}", "AppMode": "container" }
