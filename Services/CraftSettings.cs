@@ -48,6 +48,12 @@ public class CraftSettings
 
     /// <summary>Bootstrap setup — built-in first-run wizard for EasyAuth + app registration.</summary>
     public SetupSettings Setup { get; set; } = new();
+
+    /// <summary>Historical stats collection — rolling time-series of worker/job metrics.</summary>
+    public StatsHistorySettings StatsHistory { get; set; } = new();
+
+    /// <summary>Container restart tracking — detects crash loops and forces worker reallocation.</summary>
+    public ContainerHealthSettings ContainerHealth { get; set; } = new();
 }
 
 /// <summary>
@@ -541,4 +547,32 @@ public class SetupSettings
     /// The tenant from the setup flow is always included automatically.
     /// </summary>
     public List<string> AllowedTenants { get; set; } = [];
+}
+
+/// <summary>
+/// Container health monitoring — tracks restart count on persistent storage (/home)
+/// to detect crash loops and force Azure to provision a new worker instance.
+/// </summary>
+public class ContainerHealthSettings
+{
+    /// <summary>
+    /// Maximum consecutive restarts of the same instance within the time window
+    /// before blocking Kestrel startup. Azure's health probe will then time out,
+    /// forcing the platform to reallocate to a new worker.
+    /// Set to 0 to disable crash-loop detection.
+    /// </summary>
+    public int MaxRestarts { get; set; } = 3;
+
+    /// <summary>
+    /// Time window in minutes. Only restarts within this window are counted.
+    /// Restarts outside the window reset the counter.
+    /// </summary>
+    public int WindowMinutes { get; set; } = 30;
+
+    /// <summary>
+    /// Directory for the restart tracker file. Defaults to /home/craft on Linux
+    /// (Azure Files persistent mount). Leave empty to use the platform default.
+    /// Set to an explicit path to override, or set MaxRestarts to 0 to disable.
+    /// </summary>
+    public string TrackerDirectory { get; set; } = "";
 }

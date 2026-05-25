@@ -73,6 +73,14 @@ builder.Services.AddSingleton<SetupService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
 builder.Services.AddSingleton<SchedulerService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
+builder.Services.AddSingleton<StatsHistoryService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
+builder.Services.AddSingleton(sp =>
+{
+    var settings = sp.GetRequiredService<IOptions<CraftSettings>>().Value.ContainerHealth;
+    var monitorLogger = sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContainerHealthMonitor>();
+    return new ContainerHealthMonitor(monitorLogger, settings);
+});
 
 var app = builder.Build();
 
@@ -89,6 +97,22 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
+
+// --- Container health monitoring ---
+// Track restart attempts on persistent storage (/home) to detect crash loops.
+// If the same instance has crashed too many times, block Kestrel so Azure provisions a new worker.
+var healthMonitor = app.Services.GetRequiredService<ContainerHealthMonitor>();
+if (CraftSettings.ContainerHealth.MaxRestarts > 0)
+{
+    healthMonitor.RecordStartupAttempt();
+    if (healthMonitor.ShouldBlockStartup)
+    {
+        // Block indefinitely — Azure's warmup probe will time out (WEBSITES_CONTAINER_START_TIME_LIMIT)
+        // and the platform will eventually reallocate to a new worker instance.
+        logger.LogCritical("[Health] Startup blocked due to crash loop — waiting for Azure to provision a new worker");
+        await Task.Delay(Timeout.Infinite);
+    }
+}
 
 // Endpoints dictionary populated asynchronously after Kestrel starts.
 // The startup middleware blocks all /API/* calls until pool.IsReady,
@@ -137,6 +161,9 @@ void RunInitialization()
 
     // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
     pool.Initialize();
+
+    // Pool is ready — clear the restart counter so we don't carry stale crash state
+    healthMonitor.ClearRestartCounter();
 }
 
 if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
@@ -783,6 +810,7 @@ QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<Orchest
 WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundTaskLimiter>(), jobManager);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
+StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
 AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
 
 // --- Setup API (C# direct — no PS) ---
