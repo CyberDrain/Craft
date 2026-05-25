@@ -43,6 +43,21 @@ public class JobRunSummary
     public DateTime? CompletedUtc { get; set; }
 }
 
+public class JobDetail
+{
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public string? RunName { get; set; }
+    public int Priority { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public DateTime QueuedUtc { get; set; }
+    public DateTime? StartedUtc { get; set; }
+    public DateTime? CompletedUtc { get; set; }
+    public string? LastError { get; set; }
+    public double WaitSeconds { get; set; }
+    public double? DurationSeconds { get; set; }
+}
+
 /// <summary>
 /// Priority-aware job queue with concurrency control.
 ///
@@ -53,10 +68,11 @@ public class JobRunSummary
 ///   - All jobs are tracked with timing and status for API queries
 ///   - Old completed jobs are cleaned up every 5 minutes
 ///
-/// Priority levels (convention — callers can use any int):
-///   0 = Critical (audit logs — every 15 min, must jump the queue)
-///   1 = High     (standards — every 12 hours)
-///   2 = Normal   (DB cache, tests — nightly batch)
+/// Priority levels (lower = higher priority, callers can use any int):
+///   0-1 = Critical (system cleanup, user tasks)
+///   2-3 = High     (audit logs, webhooks)
+///   4-5 = Normal   (standards, drift, cache)
+///   6+  = Low      (alerts, DB cache, tests, extensions)
 ///
 /// How priority dispatch works:
 ///   The dispatch loop waits for both an item AND a concurrency slot.
@@ -68,18 +84,20 @@ public class JobRunSummary
 public class JobManager : BackgroundService
 {
     private readonly ILogger<JobManager> _logger;
+    private readonly BackgroundTaskLimiter _limiter;
 
     // ── Priority queue ──
     private readonly PriorityQueue<QueuedJob, int> _pendingQueue = new();
     private readonly object _queueLock = new();
     private readonly SemaphoreSlim _itemAvailable = new(0);
 
-    // ── Concurrency ──
-    private readonly SemaphoreSlim _concurrencyGate;
+    // ── Concurrency (tracked locally for API queries; actual gating is via _limiter) ──
     private int _activeCount;
 
     // ── Tracking ──
     private readonly ConcurrentDictionary<string, JobRecord> _jobs = new();
+    private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
+    private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
     private long _totalProcessed;
 
     // ── Cleanup ──
@@ -93,15 +111,15 @@ public class JobManager : BackgroundService
     public int ActiveCount => _activeCount;
     public int QueuedCount { get { lock (_queueLock) return _pendingQueue.Count; } }
 
-    public JobManager(ILogger<JobManager> logger, IConfiguration configuration)
+    public JobManager(ILogger<JobManager> logger, CraftSettings settings, BackgroundTaskLimiter limiter)
     {
         _logger = logger;
-        MaxConcurrency = Math.Max(1, configuration.GetValue("PowerShell:BgPoolSize", 4));
-        _concurrencyGate = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
+        _limiter = limiter;
+        MaxConcurrency = Math.Max(1, settings.Worker.BgPoolSize);
 
         _cleanupTimer = new Timer(_ => CleanupOldJobs(), null, CleanupInterval, CleanupInterval);
 
-        _logger.LogInformation("[JobManager] Initialized: maxConcurrency={Max}", MaxConcurrency);
+        _logger.LogInformation("[JobManager] Initialized: maxConcurrency={Max} (gated by BackgroundTaskLimiter)", MaxConcurrency);
     }
 
     /// <summary>
@@ -129,6 +147,7 @@ public class JobManager : BackgroundService
         };
 
         _jobs.TryAdd(jobId, record);
+        _pendingWork.TryAdd(jobId, work);
 
         lock (_queueLock)
         {
@@ -156,8 +175,17 @@ public class JobManager : BackgroundService
                 // 1. Wait for at least one item in the queue
                 await _itemAvailable.WaitAsync(ct);
 
-                // 2. Wait for a concurrency slot (blocks until a running job completes)
-                await _concurrencyGate.WaitAsync(ct);
+                // 2. Peek the name for logging, then wait for a limiter slot.
+                //    The limiter starts at baseline concurrency (e.g. 2-4) and
+                //    only scales up after sustained backlog — this prevents
+                //    instantly saturating all BG workers on startup.
+                string peekName;
+                lock (_queueLock)
+                {
+                    _pendingQueue.TryPeek(out var peeked, out _);
+                    peekName = peeked?.Record.Name ?? "unknown";
+                }
+                await _limiter.AcquireAsync(peekName, ct);
 
                 // 3. Dequeue highest priority item (lowest int wins)
                 QueuedJob? job;
@@ -168,9 +196,19 @@ public class JobManager : BackgroundService
 
                 if (job == null)
                 {
-                    _concurrencyGate.Release();
+                    _limiter.ReleaseSlot();
                     continue;
                 }
+
+                // Skip cancelled jobs — release the slot and move on
+                if (_cancelledJobIds.TryRemove(job.Record.Id, out _))
+                {
+                    _limiter.ReleaseSlot();
+                    continue;
+                }
+
+                // Remove from pending work ref (no longer re-prioritizable)
+                _pendingWork.TryRemove(job.Record.Id, out _);
 
                 Interlocked.Increment(ref _activeCount);
 
@@ -232,7 +270,7 @@ public class JobManager : BackgroundService
         {
             Interlocked.Decrement(ref _activeCount);
             Interlocked.Increment(ref _totalProcessed);
-            _concurrencyGate.Release();
+            _limiter.ReleaseSlot();
         }
     }
 
@@ -337,9 +375,137 @@ public class JobManager : BackgroundService
     public override void Dispose()
     {
         _cleanupTimer.Dispose();
-        _concurrencyGate.Dispose();
         _itemAvailable.Dispose();
         base.Dispose();
+    }
+
+    // ─── Job Management ───
+
+    /// <summary>Cancel a queued job (running jobs cannot be cancelled via this method).</summary>
+    public bool CancelJob(string jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return false;
+        if (record.Status != "Queued") return false;
+
+        record.Status = "Cancelled";
+        record.CompletedUtc = DateTime.UtcNow;
+        record.LastError = "Cancelled by user";
+        _cancelledJobIds.TryAdd(jobId, true);
+        _logger.LogInformation("[JobManager] Cancelled: {Name} ({Id})", record.Name, jobId);
+        return true;
+    }
+
+    /// <summary>Cancel all queued jobs in a run group.</summary>
+    public int CancelRun(string runName)
+    {
+        var cancelled = 0;
+        foreach (var record in _jobs.Values.Where(j => j.RunName == runName && j.Status == "Queued"))
+        {
+            record.Status = "Cancelled";
+            record.CompletedUtc = DateTime.UtcNow;
+            record.LastError = "Run cancelled by user";
+            _cancelledJobIds.TryAdd(record.Id, true);
+            cancelled++;
+        }
+        if (cancelled > 0)
+            _logger.LogInformation("[JobManager] Cancelled run {Run}: {Count} jobs", runName, cancelled);
+        return cancelled;
+    }
+
+    /// <summary>Remove a completed/failed/cancelled job from tracking.</summary>
+    public bool DeleteJob(string jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return false;
+        if (record.Status is "Queued" or "Running") return false; // Must cancel first
+        _jobs.TryRemove(jobId, out _);
+        return true;
+    }
+
+    /// <summary>Clear all completed/failed/cancelled jobs from tracking.</summary>
+    public int PurgeCompleted()
+    {
+        var toRemove = _jobs.Values
+            .Where(j => j.Status is "Completed" or "Failed" or "Cancelled")
+            .Select(j => j.Id)
+            .ToList();
+        foreach (var id in toRemove)
+            _jobs.TryRemove(id, out _);
+        return toRemove.Count;
+    }
+
+    /// <summary>
+    /// Change a queued job's priority. Updates the record immediately.
+    /// The PriorityQueue doesn't support re-ordering, so the job is cancelled
+    /// and re-enqueued with the new priority (preserving the original work function).
+    /// </summary>
+    public bool ChangePriority(string jobId, int newPriority)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return false;
+        if (record.Status != "Queued") return false;
+
+        // Find and remove the old entry by marking it cancelled, then re-enqueue
+        // with the new priority using a stored work reference
+        if (_pendingWork.TryRemove(jobId, out var work))
+        {
+            _cancelledJobIds.TryAdd(jobId, true);
+
+            // Update the record's priority
+            record.Priority = newPriority;
+
+            // Re-enqueue with new priority
+            lock (_queueLock)
+            {
+                _pendingQueue.Enqueue(new QueuedJob(record, work), newPriority);
+            }
+            _itemAvailable.Release();
+
+            // Remove from cancelled set so the re-queued entry won't be skipped
+            _cancelledJobIds.TryRemove(jobId, out _);
+
+            _logger.LogInformation("[JobManager] Reprioritized: {Name} → P{Priority}", record.Name, newPriority);
+            return true;
+        }
+
+        // Fallback: just update the record (work ref not found — already dispatched from queue)
+        record.Priority = newPriority;
+        _logger.LogInformation("[JobManager] Priority updated (display only): {Name} → P{Priority}", record.Name, newPriority);
+        return true;
+    }
+
+    /// <summary>Get detailed job list with queue wait times.</summary>
+    public List<JobDetail> GetJobDetails(string? runName = null, string? status = null, int limit = 100)
+    {
+        var now = DateTime.UtcNow;
+        var query = _jobs.Values.AsEnumerable();
+
+        if (!string.IsNullOrEmpty(runName))
+            query = query.Where(j => string.Equals(j.RunName, runName, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrEmpty(status))
+            query = query.Where(j => string.Equals(j.Status, status, StringComparison.OrdinalIgnoreCase));
+
+        return query
+            .OrderBy(j => j.Priority)
+            .ThenBy(j => j.QueuedUtc)
+            .Take(limit)
+            .Select(j => new JobDetail
+            {
+                Id = j.Id,
+                Name = j.Name,
+                RunName = j.RunName,
+                Priority = j.Priority,
+                Status = j.Status,
+                QueuedUtc = j.QueuedUtc,
+                StartedUtc = j.StartedUtc,
+                CompletedUtc = j.CompletedUtc,
+                LastError = j.LastError,
+                WaitSeconds = j.Status == "Queued" ? (now - j.QueuedUtc).TotalSeconds
+                            : j.StartedUtc.HasValue ? (j.StartedUtc.Value - j.QueuedUtc).TotalSeconds
+                            : 0,
+                DurationSeconds = j.Status == "Running" && j.StartedUtc.HasValue ? (now - j.StartedUtc.Value).TotalSeconds
+                                : j.CompletedUtc.HasValue && j.StartedUtc.HasValue ? (j.CompletedUtc.Value - j.StartedUtc.Value).TotalSeconds
+                                : null,
+            })
+            .ToList();
     }
 
     // ── Internal Types ──

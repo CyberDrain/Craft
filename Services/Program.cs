@@ -19,35 +19,30 @@ builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 
-// Verbose logging controlled by environment variable
-var verboseLogging = string.Equals(
-    Environment.GetEnvironmentVariable("CRAFT_VERBOSE") ?? "false",
-    "true", StringComparison.OrdinalIgnoreCase);
-// ShowDebug: show Debug-level messages in console (noisy, off by default)
-var showDebug = string.Equals(
-    Environment.GetEnvironmentVariable("ShowDebug") ?? "false",
-    "true", StringComparison.OrdinalIgnoreCase);
+// Resolve the configured log level (supports CRAFT_LOG_LEVEL env var override)
+var fileLoggingSettings = new FileLoggingSettings();
+builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
+var configuredLogLevel = fileLoggingSettings.ParsedLogLevel;
 
-// File logging — writes to /log.txt (or current directory on Windows)
-var logFilePath = OperatingSystem.IsLinux() ? "/log.txt" : Path.Combine(AppContext.BaseDirectory, "log.txt");
-var logFileStream = new FileStream(logFilePath, FileMode.Create, FileAccess.Write, FileShare.Read);
-var logFileWriter = new StreamWriter(logFileStream) { AutoFlush = true };
-builder.Logging.AddProvider(new FileLoggerProvider(logFileWriter, verboseLogging));
+// File logging with rotation
+var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, configuredLogLevel);
+builder.Logging.AddProvider(fileLoggerProvider);
+LogBridge.Initialize(fileLoggerProvider);
 
-// Console: timestamps + suppress Debug unless ShowDebug is set
+// Console: timestamps + respect configured level
 builder.Logging.AddSimpleConsole(options =>
 {
-    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+    options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
     options.SingleLine = true;
 });
-if (!showDebug)
+if (configuredLogLevel > LogLevel.Debug)
 {
     builder.Logging.AddFilter<Microsoft.Extensions.Logging.Console.ConsoleLoggerProvider>(
         level => level >= LogLevel.Information);
 }
 
-// Suppress noisy ASP.NET framework logging unless verbose
-if (!verboseLogging)
+// Suppress noisy ASP.NET framework logging unless at Debug level or lower
+if (configuredLogLevel > LogLevel.Debug)
 {
     builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
     builder.Logging.AddFilter("Microsoft.Hosting", LogLevel.Warning);
@@ -78,6 +73,14 @@ builder.Services.AddSingleton<SetupService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
 builder.Services.AddSingleton<SchedulerService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
+builder.Services.AddSingleton<StatsHistoryService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
+builder.Services.AddSingleton(sp =>
+{
+    var settings = sp.GetRequiredService<IOptions<CraftSettings>>().Value.ContainerHealth;
+    var monitorLogger = sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContainerHealthMonitor>();
+    return new ContainerHealthMonitor(monitorLogger, settings);
+});
 
 var app = builder.Build();
 
@@ -94,6 +97,22 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
+
+// --- Container health monitoring ---
+// Track restart attempts on persistent storage (/home) to detect crash loops.
+// If the same instance has crashed too many times, block Kestrel so Azure provisions a new worker.
+var healthMonitor = app.Services.GetRequiredService<ContainerHealthMonitor>();
+if (CraftSettings.ContainerHealth.MaxRestarts > 0)
+{
+    healthMonitor.RecordStartupAttempt();
+    if (healthMonitor.ShouldBlockStartup)
+    {
+        // Block indefinitely — Azure's warmup probe will time out (WEBSITES_CONTAINER_START_TIME_LIMIT)
+        // and the platform will eventually reallocate to a new worker instance.
+        logger.LogCritical("[Health] Startup blocked due to crash loop — waiting for Azure to provision a new worker");
+        await Task.Delay(Timeout.Infinite);
+    }
+}
 
 // Endpoints dictionary populated asynchronously after Kestrel starts.
 // The startup middleware blocks all /API/* calls until pool.IsReady,
@@ -135,13 +154,16 @@ void RunInitialization()
         endpoints[kvp.Key] = kvp.Value;
 
     logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
-    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} verbose={Verbose}",
+    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} LogLevel={LogLevel}",
         CraftSettings.Worker.HttpPoolSize,
         CraftSettings.Worker.BgPoolSize,
-        verboseLogging);
+        configuredLogLevel);
 
     // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
     pool.Initialize();
+
+    // Pool is ready — clear the restart counter so we don't carry stale crash state
+    healthMonitor.ClearRestartCounter();
 }
 
 if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
@@ -362,13 +384,11 @@ if (devFrontendUrl != null)
         var reqPath = context.Request.Path.Value ?? "";
         // Proxy to Next.js: /_next/*, /__nextjs, and any non-API path with a file extension
         // (e.g. /version.json, /manifest.json, /favicon.ico) that doesn't exist in Frontend/
-        // Exclude server-local files like /log.txt
         var shouldProxy = reqPath.StartsWith("/_next/") || reqPath.StartsWith("/__nextjs")
             || (Path.HasExtension(reqPath)
                 && !reqPath.StartsWith("/API/", StringComparison.OrdinalIgnoreCase)
                 && !reqPath.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
-                && !reqPath.StartsWith("/.auth/", StringComparison.OrdinalIgnoreCase)
-                && !reqPath.Equals("/log.txt", StringComparison.OrdinalIgnoreCase));
+                && !reqPath.StartsWith("/.auth/", StringComparison.OrdinalIgnoreCase));
         if (shouldProxy)
         {
             try
@@ -787,8 +807,10 @@ AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
 QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>());
+WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundTaskLimiter>(), jobManager);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
+StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
 AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
 
 // --- Setup API (C# direct — no PS) ---
@@ -1229,33 +1251,6 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
         requestSw.Stop();
         logger.LogDebug("[HTTP] /API/{Endpoint} done {ElapsedMs}ms remaining={Remaining}",
             endpoint, requestSw.ElapsedMilliseconds, remaining);
-    }
-});
-
-// Serve the log file
-app.MapGet("/log.txt", async (HttpContext context) =>
-{
-    if (!File.Exists(logFilePath))
-    {
-        context.Response.StatusCode = 404;
-        await context.Response.WriteAsync("No log file found");
-        return;
-    }
-    context.Response.ContentType = "text/plain; charset=utf-8";
-    // Tail support: ?tail=N returns just the last N lines
-    var tailParam = context.Request.Query["tail"].ToString();
-    if (int.TryParse(tailParam, out var tailLines) && tailLines > 0)
-    {
-        using var fs = new FileStream(logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(fs);
-        var allLines = (await reader.ReadToEndAsync()).Split('\n');
-        var start = Math.Max(0, allLines.Length - tailLines);
-        await context.Response.WriteAsync(string.Join('\n', allLines[start..]));
-    }
-    else
-    {
-        using var fs = new FileStream(logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        await fs.CopyToAsync(context.Response.Body);
     }
 });
 

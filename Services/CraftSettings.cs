@@ -40,11 +40,20 @@ public class CraftSettings
     /// <summary>Response cache configuration.</summary>
     public CacheSettings Cache { get; set; } = new();
 
+    /// <summary>File-backed log output with size-based rotation.</summary>
+    public FileLoggingSettings FileLogging { get; set; } = new();
+
     /// <summary>Script repository — where to find PowerShell modules, HTTP endpoints, background scripts.</summary>
     public ScriptRepoSettings Scripts { get; set; } = new();
 
     /// <summary>Bootstrap setup — built-in first-run wizard for EasyAuth + app registration.</summary>
     public SetupSettings Setup { get; set; } = new();
+
+    /// <summary>Historical stats collection — rolling time-series of worker/job metrics.</summary>
+    public StatsHistorySettings StatsHistory { get; set; } = new();
+
+    /// <summary>Container restart tracking — detects crash loops and forces worker reallocation.</summary>
+    public ContainerHealthSettings ContainerHealth { get; set; } = new();
 }
 
 /// <summary>
@@ -309,6 +318,77 @@ public class OrchestratorSettings
 }
 
 /// <summary>
+/// File-backed logging with size-based rotation.
+/// Logs are written to {Directory}/{FilePrefix}.log and rotated to
+/// {FilePrefix}.1.log, {FilePrefix}.2.log, etc. when MaxFileSizeMB is exceeded.
+/// Oldest files beyond MaxFileCount are automatically deleted.
+/// </summary>
+public class FileLoggingSettings
+{
+    /// <summary>
+    /// Directory for log files. On Linux defaults to "/logs", on Windows to "{BaseDirectory}/logs".
+    /// Override via App__FileLogging__Directory env var.
+    /// </summary>
+    public string Directory { get; set; } = "";
+
+    /// <summary>
+    /// Filename prefix for log files. Files are named: {prefix}.log (current),
+    /// {prefix}.1.log (previous), {prefix}.2.log, etc.
+    /// </summary>
+    public string FilePrefix { get; set; } = "craft";
+
+    /// <summary>Maximum size in MB before rotating the current log file.</summary>
+    public int MaxFileSizeMB { get; set; } = 25;
+
+    /// <summary>Maximum number of rotated log files to retain. Oldest are deleted first.</summary>
+    public int MaxFileCount { get; set; } = 10;
+
+    /// <summary>
+    /// Timestamp format for log entries. Must be a valid .NET DateTime format string.
+    /// Default includes full date for accurate log filtering.
+    /// </summary>
+    public string TimestampFormat { get; set; } = "yyyy-MM-ddTHH:mm:ss.fffZ";
+
+    /// <summary>
+    /// Include the logger category name in log output.
+    /// When true:  "2026-05-13 10:30:00.000 [INF] [Microsoft.AspNetCore.Routing] Matched endpoint"
+    /// When false: "2026-05-13 10:30:00.000 [INF] Matched endpoint"
+    /// </summary>
+    public bool IncludeCategory { get; set; } = false;
+
+    /// <summary>
+    /// Minimum log level for file and console output AND PowerShell stream capture.
+    /// Controls which PS preference variables are set to 'Continue' in runspaces:
+    ///   - "Error"       → only Write-Error captured
+    ///   - "Warning"     → Write-Error, Write-Warning
+    ///   - "Information" → (default) Write-Error, Write-Warning, Write-Information/Write-Host
+    ///   - "Debug"       → all above + Write-Debug (also suppresses ASP.NET framework noise filtering)
+    ///   - "Trace"       → all above + Write-Verbose
+    /// Also overridable via CRAFT_LOG_LEVEL environment variable.
+    /// </summary>
+    public string LogLevel { get; set; } = "Information";
+
+    /// <summary>Resolved directory path, applying platform defaults when Directory is empty.</summary>
+    internal string ResolvedDirectory => !string.IsNullOrEmpty(Directory)
+        ? Directory
+        : OperatingSystem.IsLinux() ? "/logs" : Path.Combine(AppContext.BaseDirectory, "logs");
+
+    /// <summary>Parse the configured LogLevel string into a .NET LogLevel enum value.</summary>
+    internal Microsoft.Extensions.Logging.LogLevel ParsedLogLevel
+    {
+        get
+        {
+            // Allow env var override
+            var envLevel = Environment.GetEnvironmentVariable("CRAFT_LOG_LEVEL");
+            var level = !string.IsNullOrEmpty(envLevel) ? envLevel : LogLevel;
+            return Enum.TryParse<Microsoft.Extensions.Logging.LogLevel>(level, ignoreCase: true, out var parsed)
+                ? parsed
+                : Microsoft.Extensions.Logging.LogLevel.Information;
+        }
+    }
+}
+
+/// <summary>
 /// Response cache settings.
 /// </summary>
 public class CacheSettings
@@ -467,4 +547,32 @@ public class SetupSettings
     /// The tenant from the setup flow is always included automatically.
     /// </summary>
     public List<string> AllowedTenants { get; set; } = [];
+}
+
+/// <summary>
+/// Container health monitoring — tracks restart count on persistent storage (/home)
+/// to detect crash loops and force Azure to provision a new worker instance.
+/// </summary>
+public class ContainerHealthSettings
+{
+    /// <summary>
+    /// Maximum consecutive restarts of the same instance within the time window
+    /// before blocking Kestrel startup. Azure's health probe will then time out,
+    /// forcing the platform to reallocate to a new worker.
+    /// Set to 0 to disable crash-loop detection.
+    /// </summary>
+    public int MaxRestarts { get; set; } = 3;
+
+    /// <summary>
+    /// Time window in minutes. Only restarts within this window are counted.
+    /// Restarts outside the window reset the counter.
+    /// </summary>
+    public int WindowMinutes { get; set; } = 30;
+
+    /// <summary>
+    /// Directory for the restart tracker file. Defaults to /home/craft on Linux
+    /// (Azure Files persistent mount). Leave empty to use the platform default.
+    /// Set to an explicit path to override, or set MaxRestarts to 0 to disable.
+    /// </summary>
+    public string TrackerDirectory { get; set; } = "";
 }

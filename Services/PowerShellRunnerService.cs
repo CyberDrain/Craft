@@ -69,6 +69,7 @@ public class PowerShellRunnerService : IDisposable
             };
 
             // Call New-CippCoreRequest which handles "me" internally via Test-CIPPAccess
+            WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
             var results = await worker.InvokeAsync("New-CippCoreRequest", parameters);
 
             foreach (var error in worker.Streams.Error)
@@ -128,11 +129,12 @@ public class PowerShellRunnerService : IDisposable
 
     /// <summary>
     /// Execute an HTTP endpoint script with a pre-captured request snapshot.
-    /// Used for background cache refresh. Runs on the background pool.
+    /// Used for background cache refresh. Runs on the HTTP pool since HTTP
+    /// endpoint functions require HTTP-specific modules.
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpScript(string route, Hashtable requestSnapshot)
     {
-        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: false);
+        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: true);
     }
 
     private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp)
@@ -188,6 +190,7 @@ public class PowerShellRunnerService : IDisposable
                 Category = "HTTP"
             };
             using var opScope = OperationContext.Set(invocation);
+            WorkerMetricsBridge.RecordFunction(worker.Id, entry.FunctionName);
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} starting on {Worker}",
                 poolLabel, invocation.Id, entry.FunctionName, invocation.WorkerId);
 
@@ -202,6 +205,12 @@ public class PowerShellRunnerService : IDisposable
             foreach (var info in worker.Streams.Information)
                 _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, entry.FunctionName, info.ToString());
+            foreach (var debug in worker.Streams.Debug)
+                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, entry.FunctionName, debug.ToString());
+            foreach (var verbose in worker.Streams.Verbose)
+                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, entry.FunctionName, verbose.ToString());
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -242,6 +251,7 @@ public class PowerShellRunnerService : IDisposable
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
+        var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
@@ -249,10 +259,15 @@ public class PowerShellRunnerService : IDisposable
             Category = "Job"
         };
         using var opScope = OperationContext.Set(invocation);
+        // Show the job name (e.g. "CIPPDBCacheRun-Graph_tenant.com") rather than
+        // the generic function name (e.g. "Invoke-CraftTask") in worker metrics
+        WorkerMetricsBridge.RecordFunction(worker.Id, parentFunction ?? functionName);
 
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onWarning = null;
         EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         var exceptionOccurred = false;
         try
         {
@@ -281,9 +296,23 @@ public class PowerShellRunnerService : IDisposable
                 _logger.LogInformation("[Scheduler] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, functionName, records[args.Index].ToString());
             };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[Scheduler] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[Scheduler] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
             worker.Streams.Error.DataAdded += onError;
             worker.Streams.Warning.DataAdded += onWarning;
             worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
 
             var psParams = new Dictionary<string, object?>();
             if (parameters != null)
@@ -313,6 +342,8 @@ public class PowerShellRunnerService : IDisposable
             if (onError != null) worker.Streams.Error.DataAdded -= onError;
             if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+            if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+            if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
             _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
         }
     }
@@ -328,6 +359,7 @@ public class PowerShellRunnerService : IDisposable
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
+        var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
@@ -335,8 +367,11 @@ public class PowerShellRunnerService : IDisposable
             Category = "Planner"
         };
         using var opScope = OperationContext.Set(invocation);
+        WorkerMetricsBridge.RecordFunction(worker.Id, parentFunction ?? functionName);
         EventHandler<DataAddedEventArgs>? onError = null;
         EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             var resolvedName = _repo.GetByName(functionName)?.FunctionName ?? functionName;
@@ -357,8 +392,22 @@ public class PowerShellRunnerService : IDisposable
                 _logger.LogInformation("[Planner] {InvocationId} PS {Function}: {Info}",
                     invocation.Id, functionName, records[args.Index].ToString());
             };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[Planner] {InvocationId} PS debug in {Function}: {Debug}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[Planner] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invocation.Id, functionName, records[args.Index].ToString());
+            };
             worker.Streams.Error.DataAdded += onError;
             worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
 
             var psParams = new Dictionary<string, object?>();
             if (parameters != null)
@@ -387,6 +436,8 @@ public class PowerShellRunnerService : IDisposable
         {
             if (onError != null) worker.Streams.Error.DataAdded -= onError;
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+            if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+            if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
             _pool.Reclaim(worker, isHttp: false);
         }
     }

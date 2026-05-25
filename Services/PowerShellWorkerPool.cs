@@ -14,6 +14,8 @@ public class PowerShellWorkerPool : IDisposable
     private readonly int _httpPoolSize;
     private readonly int _bgPoolSize;
     private int _nextId;
+    private readonly List<int> _httpWorkerIds = new();
+    private readonly List<int> _bgWorkerIds = new();
 
     private readonly ConcurrentDictionary<int, int> _workerFaults = new(); // workerId → consecutive fault count
     private const int MaxConsecutiveFaults = 3;
@@ -140,7 +142,7 @@ public class PowerShellWorkerPool : IDisposable
         if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
             RunWarmup(firstHttpWorker, sw);
 
-        _httpPool.Add(firstHttpWorker);
+        AddToHttpPool(firstHttpWorker);
 
         // Signal HTTP ready — one worker can serve requests
         _httpReady.Set();
@@ -163,7 +165,7 @@ public class PowerShellWorkerPool : IDisposable
 
             Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
             foreach (var w in httpRemaining)
-                _httpPool.Add(w);
+                AddToHttpPool(w);
 
             StartupInfoBridge.SetHttpPoolFull(sw.ElapsedMilliseconds);
             _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
@@ -182,7 +184,7 @@ public class PowerShellWorkerPool : IDisposable
         if (warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
             RunWarmup(firstBgWorker, sw);
 
-        _bgPool.Add(firstBgWorker);
+        AddToBgPool(firstBgWorker);
 
         StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
         _logger.LogInformation("[System] BG first worker ready in {Ms}ms — {FnCount} functions",
@@ -198,10 +200,14 @@ public class PowerShellWorkerPool : IDisposable
 
             Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
             foreach (var w in bgRemaining)
-                _bgPool.Add(w);
+                AddToBgPool(w);
         }
 
         _bgReady.Set();
+
+        // Pre-register all workers in metrics bridge so they appear in snapshots before first use
+        RegisterAllWorkers();
+
         StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
         _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms (base: {BaseMs}ms)",
             _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds, baseMs);
@@ -224,7 +230,7 @@ public class PowerShellWorkerPool : IDisposable
         if (warmupMode.Equals("BeforeReady", StringComparison.OrdinalIgnoreCase))
             RunWarmup(firstWorker, sw);
 
-        _httpPool.Add(firstWorker);
+        AddToHttpPool(firstWorker);
 
         // Signal HTTP ready — one worker can serve requests
         _httpReady.Set();
@@ -247,7 +253,7 @@ public class PowerShellWorkerPool : IDisposable
 
             Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
             foreach (var w in httpRemaining)
-                _httpPool.Add(w);
+                AddToHttpPool(w);
 
             _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
                 _httpPoolSize, sw.ElapsedMilliseconds);
@@ -266,7 +272,7 @@ public class PowerShellWorkerPool : IDisposable
             if (warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
                 RunWarmup(firstBgWorker, sw);
 
-            _bgPool.Add(firstBgWorker);
+            AddToBgPool(firstBgWorker);
             StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
             _logger.LogInformation("[System] First BG worker ready in {Ms}ms — BG state: {FnCount} functions, {VarCount} variables",
                 bgSw.ElapsedMilliseconds, _bgClonedState.Functions.Count, _bgClonedState.Variables.Count);
@@ -286,10 +292,14 @@ public class PowerShellWorkerPool : IDisposable
         {
             Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
             foreach (var w in bgRemaining)
-                _bgPool.Add(w);
+                AddToBgPool(w);
         }
 
         _bgReady.Set();
+
+        // Pre-register all workers in metrics bridge so they appear in snapshots before first use
+        RegisterAllWorkers();
+
         StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
         _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
             _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds);
@@ -310,6 +320,30 @@ public class PowerShellWorkerPool : IDisposable
     }
 
     /// <summary>
+    /// Pre-register all pool workers with WorkerMetricsBridge so they appear
+    /// in snapshots even before their first checkout.
+    /// </summary>
+    private void RegisterAllWorkers()
+    {
+        foreach (var id in _httpWorkerIds)
+            WorkerMetricsBridge.RegisterWorker(id, isHttp: true);
+        foreach (var id in _bgWorkerIds)
+            WorkerMetricsBridge.RegisterWorker(id, isHttp: false);
+    }
+
+    private void AddToHttpPool(PowerShellWorker worker)
+    {
+        _httpPool.Add(worker);
+        _httpWorkerIds.Add(worker.Id);
+    }
+
+    private void AddToBgPool(PowerShellWorker worker)
+    {
+        _bgPool.Add(worker);
+        _bgWorkerIds.Add(worker.Id);
+    }
+
+    /// <summary>
     /// Block until the pool has finished initializing, or the timeout expires.
     /// </summary>
     public bool WaitForReady(TimeSpan timeout) => _httpReady.Wait(timeout);
@@ -324,18 +358,33 @@ public class PowerShellWorkerPool : IDisposable
         // Wait for HTTP pool initialization before attempting checkout
         if (!_httpReady.IsSet)
             _httpReady.Wait(timeout);
-        _httpPool.TryTake(out var w, timeout);
-        return w;
+        if (_httpPool.TryTake(out var w, timeout))
+        {
+            w.CheckoutTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            WorkerMetricsBridge.RecordCheckout(w.Id, isHttp: true);
+            return w;
+        }
+        return null;
     }
 
     public PowerShellWorker CheckoutBackground(CancellationToken ct)
     {
         _bgReady.Wait(ct);
-        return _bgPool.Take(ct);
+        var w = _bgPool.Take(ct);
+        w.CheckoutTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        WorkerMetricsBridge.RecordCheckout(w.Id, isHttp: false);
+        return w;
     }
 
     public void Reclaim(PowerShellWorker worker, bool isHttp, bool faulted = false)
     {
+        // Track elapsed time since checkout
+        var elapsedMs = worker.CheckoutTimestamp > 0
+            ? (long)System.Diagnostics.Stopwatch.GetElapsedTime(worker.CheckoutTimestamp).TotalMilliseconds
+            : 0;
+        WorkerMetricsBridge.RecordReclaim(worker.Id, faulted, elapsedMs);
+        worker.CheckoutTimestamp = 0;
+
         if (faulted)
         {
             var faults = _workerFaults.AddOrUpdate(worker.Id, 1, (_, c) => c + 1);
@@ -348,6 +397,7 @@ public class PowerShellWorkerPool : IDisposable
                 var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: isHttp);
                 worker = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
                 worker.Initialize(_repo, _apiBasePath, _settings);
+                WorkerMetricsBridge.RegisterWorker(worker.Id, isHttp);
             }
         }
         else
@@ -377,6 +427,14 @@ public class PowerShellWorkerPool : IDisposable
         // Copy environment variables into the runspace
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
+
+        // Set PowerShell preference variables based on configured log level.
+        // This controls which PS streams actually produce records for CRAFT to capture.
+        var logLevel = _settings.FileLogging.ParsedLogLevel;
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
 
         var hasAllowList = moduleList != null && moduleList.Count > 0;
 
@@ -415,6 +473,13 @@ public class PowerShellWorkerPool : IDisposable
 
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
+
+        // Set PowerShell preference variables based on configured log level
+        var logLevel = _settings.FileLogging.ParsedLogLevel;
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+        if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
 
         // Inject pre-parsed functions from the base state
         foreach (var (name, definition, _) in baseState.Functions)
