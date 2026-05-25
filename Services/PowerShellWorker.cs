@@ -309,14 +309,24 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         if (settings.Worker.WarmupScripts.Count == 0) return;
 
         var combinedScript = string.Join("\n", settings.Worker.WarmupScripts);
-        RunScript($@"
+        _pwsh.AddScript($@"
 try {{
     {combinedScript}
 }} catch {{
-    # Non-fatal — first request will pay the cold start instead
     Write-Warning ""Warmup failed: $_""
 }}
-");
+").Invoke();
+
+        // Surface warmup diagnostics before clearing streams — RunScript discards them.
+        foreach (var warn in _pwsh.Streams.Warning)
+            _logger?.LogWarning("[Warmup] {Message}", warn.Message);
+        foreach (var info in _pwsh.Streams.Information)
+            _logger?.LogInformation("[Warmup] {Message}", info.MessageData);
+        foreach (var err in _pwsh.Streams.Error)
+            _logger?.LogError("[Warmup] {Error}", err.Exception?.Message ?? err.ToString());
+
+        _pwsh.Commands.Clear();
+        _pwsh.Streams.ClearStreams();
     }
 
     /// <summary>
