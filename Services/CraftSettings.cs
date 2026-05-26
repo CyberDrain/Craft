@@ -25,6 +25,20 @@ public class CraftSettings
     /// </summary>
     public string ReadinessMode { get; set; } = "Immediate";
 
+    /// <summary>
+    /// Kestrel request timeout in seconds. Controls how long Kestrel will wait for a complete request
+    /// (headers + body) before aborting. Does NOT control how long the PowerShell script can run —
+    /// use Worker.HttpTimeoutSeconds for that.
+    /// 
+    /// If not explicitly set (or set to 0):
+    ///   - Derives from Worker.HttpTimeoutSeconds if > 0
+    ///   - Otherwise defaults to 0 (no timeout)
+    /// 
+    /// Recommended: Set slightly higher than HttpTimeoutSeconds to give the worker time to respond
+    /// before Kestrel drops the connection. Example: HttpTimeoutSeconds=120, KestrelTimeoutSeconds=130.
+    /// </summary>
+    public int KestrelTimeoutSeconds { get; set; } = 0;
+
     /// <summary>Worker configuration for the PowerShell runspace pools.</summary>
     public WorkerSettings Worker { get; set; } = new();
 

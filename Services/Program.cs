@@ -19,6 +19,49 @@ builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 
+// Bind configuration directly for early access (avoid BuildServiceProvider warning)
+var craftSettings = new CraftSettings();
+builder.Configuration.GetSection("App").Bind(craftSettings);
+
+// Configure Kestrel timeout
+// If KestrelTimeoutSeconds is explicitly set, use it.
+// Otherwise, derive from HttpTimeoutSeconds if > 0, else default to 0 (no timeout).
+var kestrelTimeout = craftSettings.KestrelTimeoutSeconds;
+if (kestrelTimeout == 0 && craftSettings.Worker.HttpTimeoutSeconds > 0)
+{
+    kestrelTimeout = craftSettings.Worker.HttpTimeoutSeconds;
+}
+
+if (kestrelTimeout > 0)
+{
+    builder.WebHost.ConfigureKestrel(options =>
+    {
+        // Request timeout settings
+        options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(kestrelTimeout);
+        options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(30, kestrelTimeout));
+
+        // HTTP/2 settings for better multiplexing
+        options.Limits.Http2.MaxStreamsPerConnection = 100;
+        options.Limits.Http2.HeaderTableSize = 4096;
+        options.Limits.Http2.MaxFrameSize = 16384;
+        options.Limits.Http2.MaxRequestHeaderFieldSize = 8192;
+        options.Limits.Http2.InitialConnectionWindowSize = 131072;
+        options.Limits.Http2.InitialStreamWindowSize = 98304;
+
+        // Connection limits (adjust based on expected load)
+        options.Limits.MaxConcurrentConnections = null;  // null = unlimited (let OS handle)
+        options.Limits.MaxConcurrentUpgradedConnections = null;
+
+        // Prevent slow-loris attacks — minimum data rates
+        options.Limits.MinRequestBodyDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
+            bytesPerSecond: 240,   // 240 bytes/sec minimum
+            gracePeriod: TimeSpan.FromSeconds(5));
+        options.Limits.MinResponseDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
+            bytesPerSecond: 240,
+            gracePeriod: TimeSpan.FromSeconds(5));
+    });
+}
+
 // Resolve the configured log level (supports CRAFT_LOG_LEVEL env var override)
 var fileLoggingSettings = new FileLoggingSettings();
 builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
@@ -56,7 +99,17 @@ builder.Services.AddResponseCompression(options =>
     options.Providers.Add<BrotliCompressionProvider>();
     options.Providers.Add<GzipCompressionProvider>();
     options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
-        new[] { "application/json", "text/json" });
+        new[] { "application/json", "text/json", "application/javascript", "text/javascript" });
+});
+
+// Configure compression levels for better performance/size tradeoff
+builder.Services.Configure<BrotliCompressionProviderOptions>(options =>
+{
+    options.Level = System.IO.Compression.CompressionLevel.Fastest;
+});
+builder.Services.Configure<GzipCompressionProviderOptions>(options =>
+{
+    options.Level = System.IO.Compression.CompressionLevel.Fastest;
 });
 
 // Register services
@@ -434,18 +487,39 @@ if (Directory.Exists(frontendPath))
     {
         FileProvider = frontendFileProvider,
         ServeUnknownFileTypes = false,
+        HttpsCompression = Microsoft.AspNetCore.Http.Features.HttpsCompressionMode.Compress,
         OnPrepareResponse = ctx =>
         {
             var path = ctx.Context.Request.Path.Value ?? "";
+            var headers = ctx.Context.Response.Headers;
+
             if (path.StartsWith("/_next/static/") || path.EndsWith(".js") || path.EndsWith(".css"))
             {
                 // Immutable hashed assets — cache for 6 months (matches SWA config)
-                ctx.Context.Response.Headers.CacheControl = "public, max-age=15770000, immutable";
+                headers.CacheControl = "public, max-age=15770000, immutable";
+                // ETag not needed for immutable assets but doesn't hurt
+                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
             }
             else if (path.EndsWith(".png") || path.EndsWith(".jpg") || path.EndsWith(".gif") ||
-                     path.EndsWith(".ico") || path.EndsWith(".svg") || path.EndsWith(".xml"))
+                     path.EndsWith(".ico") || path.EndsWith(".svg") || path.EndsWith(".xml") ||
+                     path.EndsWith(".webp") || path.EndsWith(".woff") || path.EndsWith(".woff2"))
             {
-                ctx.Context.Response.Headers.CacheControl = "public, max-age=15770000, must-revalidate";
+                // Static assets with validation — cache for 6 months
+                headers.CacheControl = "public, max-age=15770000, must-revalidate";
+                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
+            }
+            else if (path.EndsWith(".json") && !path.Contains("/api/", StringComparison.OrdinalIgnoreCase))
+            {
+                // JSON files (manifests, configs) — short cache with validation
+                headers.CacheControl = "public, max-age=3600, must-revalidate";
+                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
+            }
+            else
+            {
+                // HTML and other files — no cache by default
+                headers.CacheControl = "no-cache, no-store, must-revalidate";
+                headers.Pragma = "no-cache";
+                headers.Expires = "0";
             }
         }
     });
