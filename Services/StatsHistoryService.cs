@@ -126,6 +126,20 @@ public class StatsHistoryService : BackgroundService
             LimiterWaiting = limiter.Waiting,
             LimiterCurrentMax = limiter.CurrentMax,
             IsHttpThrottled = limiter.IsHttpThrottled,
+
+            // Memory — current state
+            HeapMB = snapshot.Memory.HeapMB,
+            RssMB = snapshot.Memory.RssMB,
+            CommittedMB = snapshot.Memory.CommittedMB,
+            ContainerLimitMB = snapshot.Memory.ContainerLimitMB,
+            GCHeapLimitMB = snapshot.Memory.GCHeapLimitMB,
+            MemoryUsagePct = snapshot.Memory.UsagePct,
+            GC0 = snapshot.Memory.GC0,
+            GC1 = snapshot.Memory.GC1,
+            GC2 = snapshot.Memory.GC2,
+
+            // CPU — delta-computed by WorkerMetricsBridge
+            CpuPct = snapshot.Memory.CpuPct,
         };
 
         // Compute deltas (invocations/faults since last sample)
@@ -312,6 +326,20 @@ public class StatsDataPoint
     public int LimiterWaiting { get; set; }
     public int LimiterCurrentMax { get; set; }
     public bool IsHttpThrottled { get; set; }
+
+    // ── Memory (current state) ──
+    public long HeapMB { get; set; }
+    public long RssMB { get; set; }
+    public long CommittedMB { get; set; }
+    public long ContainerLimitMB { get; set; }
+    public long GCHeapLimitMB { get; set; }
+    public double MemoryUsagePct { get; set; }
+    public int GC0 { get; set; }
+    public int GC1 { get; set; }
+    public int GC2 { get; set; }
+
+    // ── CPU (delta-computed) ──
+    public double CpuPct { get; set; }
 }
 
 /// <summary>Configuration for stats history collection.</summary>

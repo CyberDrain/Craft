@@ -140,6 +140,13 @@ public class WorkerSettings
     public string WarmupMode { get; set; } = "AfterReady";
 
     /// <summary>
+    /// Recycle (dispose + replace) a worker after this many invocations to reclaim
+    /// native memory leaked by the PowerShell runtime. 0 = never recycle (default).
+    /// Recommended: 100-500 for long-running workloads.
+    /// </summary>
+    public int RecycleAfterInvocations { get; set; } = 0;
+
+    /// <summary>
     /// Assemblies (.dll) to load into each runspace, relative to the API base path.
     /// Example: ["Shared/MyLib/bin/MyLib.dll"]
     /// </summary>

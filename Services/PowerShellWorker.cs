@@ -26,6 +26,9 @@ public class PowerShellWorker : IDisposable
     /// <summary>Stopwatch timestamp set at checkout for elapsed-time tracking.</summary>
     internal long CheckoutTimestamp;
 
+    /// <summary>Number of completed invocations on this worker (incremented at reclaim).</summary>
+    internal int InvocationCount;
+
     public PowerShellWorker(int id, InitialSessionState iss, ILogger logger)
     {
         Id = id;

@@ -331,7 +331,7 @@ public class JobManager : BackgroundService
         if (!string.IsNullOrEmpty(status))
             query = query.Where(j => string.Equals(j.Status, status, StringComparison.OrdinalIgnoreCase));
 
-        query = query.OrderBy(j => j.Priority).ThenBy(j => j.QueuedUtc);
+        query = query.OrderByDescending(j => j.QueuedUtc);
 
         if (limit.HasValue)
             query = query.Take(limit.Value);
@@ -367,7 +367,7 @@ public class JobManager : BackgroundService
                 _jobs.TryRemove(id, out _);
         }
 
-        if (toRemove.Count > 0)
+        if (toRemove.Count > 0 || _jobs.Count > MaxTrackedJobs)
             _logger.LogDebug("[JobManager] Cleaned up {Count} old jobs, tracking {Total}",
                 toRemove.Count, _jobs.Count);
     }
@@ -419,18 +419,6 @@ public class JobManager : BackgroundService
         if (record.Status is "Queued" or "Running") return false; // Must cancel first
         _jobs.TryRemove(jobId, out _);
         return true;
-    }
-
-    /// <summary>Clear all completed/failed/cancelled jobs from tracking.</summary>
-    public int PurgeCompleted()
-    {
-        var toRemove = _jobs.Values
-            .Where(j => j.Status is "Completed" or "Failed" or "Cancelled")
-            .Select(j => j.Id)
-            .ToList();
-        foreach (var id in toRemove)
-            _jobs.TryRemove(id, out _);
-        return toRemove.Count;
     }
 
     /// <summary>

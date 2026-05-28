@@ -1,33 +1,39 @@
 namespace Craft.Services;
 
 /// <summary>
-/// Gates all background (non-HTTP) work behind a dynamic concurrency semaphore
+/// Gates all background (non-HTTP) work behind a dynamic concurrency gate
 /// that responds to both BG queue pressure and HTTP pool pressure.
 ///
 /// Design:
 ///   - Starts at a configurable baseline concurrency (default: ProcessorCount clamped 2-4).
-///   - A monitor timer checks every 30s and adjusts concurrency based on two signals:
+///   - A monitor timer checks every 10s and adjusts concurrency based on two signals:
 ///
 ///   BG scale-up: if BG tasks have been queued (waiting) for a sustained period,
 ///     doubles concurrency up to the ceiling.
 ///   BG scale-down: when queue drains to 0 active + 0 waiting, scales back to baseline.
 ///
 ///   HTTP pressure throttle: if the number of busy HTTP workers meets or exceeds
-///     HttpPressureThreshold for a sustained period, BG concurrency is reduced to 1
+///     HttpPressureThreshold for a sustained period, BG concurrency is reduced to 2
 ///     to give HTTP maximum CPU headroom. When HTTP pressure drops, BG concurrency
 ///     restores to baseline.
 ///
 ///   - Ceiling is capped to BgPoolSize (the real bottleneck).
 ///   - HTTP paths (ExecuteHttpScript) must NOT go through this limiter.
+///
+/// Implementation:
+///   Uses a counter-based gate (_active vs _currentMax) with a FIFO waiter queue
+///   instead of SemaphoreSlim. This eliminates permit-leak bugs that occur when
+///   scaling down while tasks are running — there are no permits to leak, just a
+///   threshold comparison under a single lock.
 /// </summary>
 public class BackgroundTaskLimiter : IDisposable
 {
     private readonly ILogger<BackgroundTaskLimiter> _logger;
     private readonly PowerShellWorkerPool _pool;
-    private readonly object _scaleLock = new();
+    private readonly object _gateLock = new();
+    private readonly LinkedList<TaskCompletionSource<bool>> _waiters = new();
     private readonly Timer _monitorTimer;
 
-    private SemaphoreSlim _semaphore;
     private int _currentMax;
     private int _active;
     private int _waiting;
@@ -42,7 +48,7 @@ public class BackgroundTaskLimiter : IDisposable
     /// <summary>
     /// Number of busy HTTP workers that triggers BG throttling.
     /// When HttpPoolSize - HttpAvailable >= this value for HttpPressureSeconds,
-    /// BG concurrency drops to 1.
+    /// BG concurrency drops to 2.
     /// Default: half of HttpPoolSize (e.g. 2 on a 4-worker pool).
     /// Set to 0 to disable HTTP pressure throttling.
     /// </summary>
@@ -87,7 +93,6 @@ public class BackgroundTaskLimiter : IDisposable
             configuration.GetValue("BackgroundHttpPressureAfterSeconds", 10));
 
         _currentMax = BaseConcurrency;
-        _semaphore = new SemaphoreSlim(BaseConcurrency, CeilingConcurrency);
 
         // Monitor timer: checks queue and HTTP pressure every 10s
         _monitorTimer = new Timer(MonitorCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
@@ -100,39 +105,31 @@ public class BackgroundTaskLimiter : IDisposable
 
     /// <summary>
     /// Run a background task with concurrency limiting.
-    /// With BeginInvoke-based execution, work() is truly async (no blocked threads),
-    /// so Task.Run and thread priority manipulation are no longer needed.
     /// </summary>
     public async Task<T> RunAsync<T>(Func<Task<T>> work, string taskName, CancellationToken ct = default)
     {
-        Interlocked.Increment(ref _waiting);
-        _logger.LogDebug("Background task queued: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
-            taskName, _active, _waiting, _currentMax);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await AcquireAsync(taskName, ct);
+        sw.Stop();
 
-        var queueSw = System.Diagnostics.Stopwatch.StartNew();
-        await _semaphore.WaitAsync(ct);
-        queueSw.Stop();
-        Interlocked.Decrement(ref _waiting);
-        Interlocked.Increment(ref _active);
         try
         {
-            if (queueSw.ElapsedMilliseconds > 500)
+            if (sw.ElapsedMilliseconds > 500)
             {
                 _logger.LogInformation("Background task started after {QueueMs}ms wait: {Task} ({Active} active, {Waiting} waiting)",
-                    queueSw.ElapsedMilliseconds, taskName, _active, _waiting);
+                    sw.ElapsedMilliseconds, taskName, _active, _waiting);
             }
             else
             {
                 _logger.LogDebug("Background task starting: {Task} ({Active} active, {Waiting} waiting, {Max} max, waited {QueueMs}ms)",
-                    taskName, _active, _waiting, _currentMax, queueSw.ElapsedMilliseconds);
+                    taskName, _active, _waiting, _currentMax, sw.ElapsedMilliseconds);
             }
 
             return await work();
         }
         finally
         {
-            Interlocked.Decrement(ref _active);
-            _semaphore.Release();
+            ReleaseSlot();
             _logger.LogDebug("Background task completed: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
                 taskName, _active, _waiting, _currentMax);
         }
@@ -150,21 +147,51 @@ public class BackgroundTaskLimiter : IDisposable
     /// Acquire a concurrency slot from the limiter. The caller MUST call <see cref="ReleaseSlot"/>
     /// when the work is done. This is the split version of <see cref="RunAsync{T}"/> for use by
     /// JobManager, which needs to own the work lifecycle separately from slot acquisition.
-    /// The limiter's waiting/active counters and scale-up pressure tracking are updated.
     /// </summary>
     public async Task AcquireAsync(string taskName, CancellationToken ct = default)
     {
-        Interlocked.Increment(ref _waiting);
+        LinkedListNode<TaskCompletionSource<bool>>? node = null;
+
+        lock (_gateLock)
+        {
+            if (_active < _currentMax)
+            {
+                // Slot available — grant immediately
+                _active++;
+                _logger.LogDebug("Limiter slot granted immediately: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
+                    taskName, _active, _waiting, _currentMax);
+                return;
+            }
+
+            // No slot available — enqueue a FIFO waiter
+            _waiting++;
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            node = _waiters.AddLast(tcs);
+        }
+
         _logger.LogDebug("Limiter slot requested: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
             taskName, _active, _waiting, _currentMax);
 
+        // Register cancellation to remove from queue without granting
+        using var ctr = ct.Register(() =>
+        {
+            lock (_gateLock)
+            {
+                // Only cancel if still in the queue (not yet granted)
+                if (node.List != null)
+                {
+                    _waiters.Remove(node);
+                    _waiting--;
+                    node.Value.TrySetCanceled(ct);
+                }
+            }
+        });
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        await _semaphore.WaitAsync(ct);
+        await node.Value.Task; // completes when granted or throws if cancelled
         sw.Stop();
 
-        Interlocked.Decrement(ref _waiting);
-        Interlocked.Increment(ref _active);
-
+        // Slot was granted — _active incremented and _waiting decremented by granter
         if (sw.ElapsedMilliseconds > 500)
         {
             _logger.LogInformation("Limiter slot acquired after {WaitMs}ms: {Task} ({Active} active, {Waiting} waiting)",
@@ -177,8 +204,33 @@ public class BackgroundTaskLimiter : IDisposable
     /// </summary>
     public void ReleaseSlot()
     {
-        Interlocked.Decrement(ref _active);
-        _semaphore.Release();
+        lock (_gateLock)
+        {
+            _active--;
+            GrantWaiters();
+        }
+    }
+
+    /// <summary>
+    /// Grant slots to queued waiters while capacity allows. Must be called under <see cref="_gateLock"/>.
+    /// </summary>
+    private void GrantWaiters()
+    {
+        while (_active < _currentMax && _waiters.Count > 0)
+        {
+            var node = _waiters.First!;
+            _waiters.RemoveFirst();
+
+            if (node.Value.TrySetResult(true))
+            {
+                // Successfully granted — transfer from waiting to active
+                _active++;
+                _waiting--;
+            }
+            // If TrySetResult failed, the waiter was cancelled — its cancellation
+            // handler already decremented _waiting and removed it from the list.
+            // The node is stale; move to next.
+        }
     }
 
     private void MonitorCallback(object? state)
@@ -188,8 +240,9 @@ public class BackgroundTaskLimiter : IDisposable
 
         if (active > 0 || waiting > 0)
         {
-            _logger.LogDebug("[System] Limiter: {Active} active {Waiting} waiting max={Max} httpThrottled={Throttled} heap={HeapMB}MB",
-                active, waiting, _currentMax, _httpThrottled, GC.GetTotalMemory(false) / (1024 * 1024));
+            var memSnapshot = GetMemorySnapshot();
+            _logger.LogDebug("[System] Limiter: {Active} active {Waiting} waiting max={Max} httpThrottled={Throttled} {Memory}",
+                active, waiting, _currentMax, _httpThrottled, memSnapshot);
         }
 
         // ── HTTP pressure check ────────────────────────────────────────
@@ -243,7 +296,7 @@ public class BackgroundTaskLimiter : IDisposable
             _logger.LogInformation("[System] Limiter: HTTP pressure relieved, restoring BG to baseline={Base}", BaseConcurrency);
             _httpThrottled = false;
             _httpPressureSince = null;
-            RestoreToBaseline();
+            ScaleUp(BaseConcurrency);
         }
         else if (!underPressure)
         {
@@ -251,67 +304,99 @@ public class BackgroundTaskLimiter : IDisposable
         }
     }
 
+    /// <summary>
+    /// Double concurrency up to the ceiling. Wakes queued waiters if capacity opens.
+    /// </summary>
     private void ScaleUp()
     {
-        lock (_scaleLock)
+        lock (_gateLock)
         {
             if (_currentMax >= CeilingConcurrency) return;
 
-            var newMax = Math.Min(_currentMax * 2, CeilingConcurrency);
-            var slotsToAdd = newMax - _currentMax;
-
-            // Release extra slots into the semaphore to increase capacity
-            _semaphore.Release(slotsToAdd);
-            _currentMax = newMax;
-            _queuePressureSince = null; // reset timer for next doubling
+            var oldMax = _currentMax;
+            _currentMax = Math.Min(_currentMax * 2, CeilingConcurrency);
+            _queuePressureSince = null;
 
             _logger.LogInformation("[System] Limiter scaled UP: {OldMax} -> {NewMax} ({Waiting} waiting)",
-                _currentMax / 2, _currentMax, _waiting);
+                oldMax, _currentMax, _waiting);
+
+            GrantWaiters();
         }
     }
 
+    /// <summary>
+    /// Set concurrency to a specific target (for restoring after HTTP pressure).
+    /// Wakes queued waiters if the new target is higher than the current max.
+    /// </summary>
+    private void ScaleUp(int target)
+    {
+        lock (_gateLock)
+        {
+            if (_currentMax >= target) return;
+
+            var oldMax = _currentMax;
+            _currentMax = Math.Min(target, CeilingConcurrency);
+
+            _logger.LogInformation("[System] Limiter restored: {OldMax} -> {NewMax}", oldMax, _currentMax);
+
+            GrantWaiters();
+        }
+    }
+
+    /// <summary>
+    /// Reduce the concurrency limit. Existing tasks complete naturally — no forceful
+    /// eviction. New tasks simply won't be admitted until _active drops below _currentMax.
+    /// This is inherently safe: there are no semaphore permits to leak.
+    /// </summary>
     private void ScaleDown(int target, string reason)
     {
-        lock (_scaleLock)
+        lock (_gateLock)
         {
             if (_currentMax <= target) return;
 
             var oldMax = _currentMax;
-            var slotsToRemove = _currentMax - target;
-
-            // Absorb excess slots by waiting on the semaphore without releasing.
-            // Non-blocking when active==0; best-effort when tasks are running.
-            for (var i = 0; i < slotsToRemove; i++)
-            {
-                if (!_semaphore.Wait(0)) break;
-            }
-
             _currentMax = target;
             _queuePressureSince = null;
 
-            _logger.LogInformation("[System] Limiter scaled DOWN: {OldMax} -> {NewMax} ({Reason})",
-                oldMax, _currentMax, reason);
+            _logger.LogInformation("[System] Limiter scaled DOWN: {OldMax} -> {NewMax} ({Reason}, {Active} active will drain naturally)",
+                oldMax, _currentMax, reason, _active);
         }
     }
 
-    private void RestoreToBaseline()
+    /// <summary>
+    /// Build a compact memory snapshot string for log output.
+    /// Shows GC heap, process working set (RSS), committed bytes, and GC generation counts.
+    /// The working set is what the container cgroup tracks — heap alone can be misleading
+    /// because unmanaged allocations (HTTP/TLS buffers, PS engine state) are invisible to GC.
+    /// </summary>
+    internal static string GetMemorySnapshot()
     {
-        lock (_scaleLock)
-        {
-            if (_currentMax >= BaseConcurrency) return;
+        var heapBytes = GC.GetTotalMemory(false);
+        var workingSet = Environment.WorkingSet;
+        var gcInfo = GC.GetGCMemoryInfo();
+        var gen0 = GC.CollectionCount(0);
+        var gen1 = GC.CollectionCount(1);
+        var gen2 = GC.CollectionCount(2);
 
-            var slotsToAdd = BaseConcurrency - _currentMax;
-            _semaphore.Release(slotsToAdd);
-            _currentMax = BaseConcurrency;
-
-            _logger.LogInformation("[System] Limiter restored to baseline: {Max}", _currentMax);
-        }
+        return $"heap={heapBytes / (1024 * 1024)}MB rss={workingSet / (1024 * 1024)}MB " +
+               $"committed={gcInfo.TotalCommittedBytes / (1024 * 1024)}MB " +
+               $"gc=[{gen0}/{gen1}/{gen2}]";
     }
 
     public void Dispose()
     {
         _monitorTimer.Dispose();
-        _semaphore.Dispose();
+        // Cancel all queued waiters
+        lock (_gateLock)
+        {
+            while (_waiters.Count > 0)
+            {
+                var node = _waiters.First!;
+                _waiters.RemoveFirst();
+                _waiting--;
+                node.Value.TrySetCanceled();
+            }
+        }
         GC.SuppressFinalize(this);
     }
 }
