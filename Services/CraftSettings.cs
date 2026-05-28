@@ -25,6 +25,20 @@ public class CraftSettings
     /// </summary>
     public string ReadinessMode { get; set; } = "Immediate";
 
+    /// <summary>
+    /// Kestrel request timeout in seconds. Controls how long Kestrel will wait for a complete request
+    /// (headers + body) before aborting. Does NOT control how long the PowerShell script can run —
+    /// use Worker.HttpTimeoutSeconds for that.
+    /// 
+    /// If not explicitly set (or set to 0):
+    ///   - Derives from Worker.HttpTimeoutSeconds if > 0
+    ///   - Otherwise defaults to 0 (no timeout)
+    /// 
+    /// Recommended: Set slightly higher than HttpTimeoutSeconds to give the worker time to respond
+    /// before Kestrel drops the connection. Example: HttpTimeoutSeconds=120, KestrelTimeoutSeconds=130.
+    /// </summary>
+    public int KestrelTimeoutSeconds { get; set; } = 0;
+
     /// <summary>Worker configuration for the PowerShell runspace pools.</summary>
     public WorkerSettings Worker { get; set; } = new();
 
@@ -66,6 +80,20 @@ public class WorkerSettings
 
     /// <summary>Number of workers reserved for background jobs (scheduler, orchestrator, queue).</summary>
     public int BgPoolSize { get; set; } = 4;
+
+    /// <summary>
+    /// Maximum execution time in seconds for a single HTTP request handler.
+    /// When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+    /// 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints.
+    /// </summary>
+    public int HttpTimeoutSeconds { get; set; } = 0;
+
+    /// <summary>
+    /// Maximum execution time in seconds for a single background job (scheduler, orchestrator task).
+    /// When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+    /// 0 = no timeout (default). Recommended: 600-3600 for background jobs.
+    /// </summary>
+    public int BgTimeoutSeconds { get; set; } = 0;
 
     /// <summary>
     /// Environment variables to inject into every PowerShell runspace.
@@ -110,6 +138,13 @@ public class WorkerSettings
     ///                  handle missing state gracefully (e.g. lazy credential loading).
     /// </summary>
     public string WarmupMode { get; set; } = "AfterReady";
+
+    /// <summary>
+    /// Recycle (dispose + replace) a worker after this many invocations to reclaim
+    /// native memory leaked by the PowerShell runtime. 0 = never recycle (default).
+    /// Recommended: 100-500 for long-running workloads.
+    /// </summary>
+    public int RecycleAfterInvocations { get; set; } = 0;
 
     /// <summary>
     /// Assemblies (.dll) to load into each runspace, relative to the API base path.

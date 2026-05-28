@@ -37,7 +37,20 @@ environment:
 ```jsonc
 {
   "App": {
-    "Name": "MyApp"  // Display name used in logs and diagnostics
+    "Name": "MyApp",  // Display name used in logs and diagnostics
+
+    // Controls when Kestrel starts accepting connections:
+    // "Immediate" — Kestrel starts first, init runs in background (default, fast startup)
+    // "HttpReady"  — Kestrel starts after HTTP worker pool is ready
+    // "AllReady"   — Kestrel starts after all worker pools are fully initialized
+    "ReadinessMode": "Immediate",
+
+    // Kestrel request timeout (seconds). Controls how long Kestrel waits for a complete
+    // request (headers + body) before aborting. Does NOT control PowerShell execution time.
+    // If not set (or 0): derives from Worker.HttpTimeoutSeconds if > 0, else no timeout.
+    // Recommended: set slightly higher than HttpTimeoutSeconds to give workers time to respond.
+    // Example: HttpTimeoutSeconds=120, KestrelTimeoutSeconds=130
+    "KestrelTimeoutSeconds": 0
   }
 }
 ```
@@ -57,6 +70,16 @@ Controls the PowerShell runspace pools that execute all scripts.
   // Number of background workers for scheduler, orchestrator, and queue tasks.
   // Higher = more parallel orchestrator tasks, but more memory.
   "BgPoolSize": 4,
+
+  // Maximum execution time (seconds) for HTTP request handlers.
+  // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+  // 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints.
+  "HttpTimeoutSeconds": 0,
+
+  // Maximum execution time (seconds) for background jobs (scheduler, orchestrator tasks).
+  // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
+  // 0 = no timeout (default). Recommended: 600-3600 for background jobs.
+  "BgTimeoutSeconds": 0,
 
   // Extra env vars injected into every runspace.
   // Use "{ApiBasePath}" as a placeholder — replaced with the resolved API directory.

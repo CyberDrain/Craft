@@ -364,6 +364,88 @@ public class OrchestratorTableStore
     }
 
     /// <summary>
+    /// Stream all result JSON strings for a run directly to a file, reassembling
+    /// any chunked/multi-row results on the fly. Avoids loading all results into
+    /// a single in-memory string (which can be 50-150 MB for large runs).
+    /// Writes a JSON array: [{result1},{result2},...]
+    /// </summary>
+    public async Task StreamResultsToFileAsync(string runName, string filePath)
+    {
+        // Load all result entities for this run
+        var allEntities = new List<TableEntity>();
+        await foreach (var entity in _resultsTable.QueryAsync<TableEntity>(
+            filter: $"PartitionKey eq '{EscapeFilter(runName)}'"))
+        {
+            allEntities.Add(entity);
+        }
+
+        // Group: standalone rows vs parts of a multi-row result
+        var standalone = new Dictionary<string, List<TableEntity>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var entity in allEntities)
+        {
+            var originalId = entity.GetString("OriginalEntityId");
+            var key = !string.IsNullOrEmpty(originalId) ? originalId : entity.RowKey;
+
+            if (!standalone.TryGetValue(key, out var group))
+            {
+                group = new List<TableEntity>();
+                standalone[key] = group;
+            }
+            group.Add(entity);
+        }
+
+        await using var writer = new StreamWriter(filePath, append: false, Encoding.UTF8, bufferSize: 65536);
+        await writer.WriteAsync('[');
+        var first = true;
+
+        foreach (var (_, entities) in standalone)
+        {
+            var sorted = entities
+                .OrderBy(e => e.GetInt32("PartIndex") ?? 0)
+                .ToList();
+
+            var totalChunks = sorted
+                .Select(e => e.GetInt32("ResultChunkCount"))
+                .FirstOrDefault(c => c.HasValue) ?? 0;
+
+            if (totalChunks == 0)
+            {
+                var json = sorted[0].GetString("ResultJson");
+                if (!string.IsNullOrEmpty(json))
+                {
+                    if (!first) await writer.WriteAsync(',');
+                    await writer.WriteAsync(json);
+                    first = false;
+                }
+                continue;
+            }
+
+            // Reassemble chunks and write directly to file
+            if (!first) await writer.WriteAsync(',');
+            for (int i = 0; i < totalChunks; i++)
+            {
+                var propName = $"ResultJson_{i}";
+                foreach (var entity in sorted)
+                {
+                    var chunk = entity.GetString(propName);
+                    if (chunk != null)
+                    {
+                        await writer.WriteAsync(chunk);
+                        break;
+                    }
+                }
+            }
+            first = false;
+        }
+
+        await writer.WriteAsync(']');
+
+        _logger.LogInformation("[OrchestratorStore] Streamed {Count} results to {Path} for run {Name}",
+            standalone.Count, filePath, runName);
+    }
+
+    /// <summary>
     /// Delete all entities across the 3 tables for a completed run.
     /// Called after PostExec completes or after retention period expires.
     /// </summary>

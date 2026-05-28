@@ -12,6 +12,7 @@ public class PowerShellRunnerService : IDisposable
     private readonly ILogger<PowerShellRunnerService> _logger;
     private readonly PowerShellWorkerPool _pool;
     private readonly ScriptRepository _repo;
+    private readonly WorkerSettings _workerSettings;
 
     // Static JsonSerializerOptions — allocated once, reused everywhere
     private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = false };
@@ -23,11 +24,13 @@ public class PowerShellRunnerService : IDisposable
     public PowerShellRunnerService(
         ILogger<PowerShellRunnerService> logger,
         PowerShellWorkerPool pool,
-        ScriptRepository repo)
+        ScriptRepository repo,
+        CraftSettings settings)
     {
         _logger = logger;
         _pool = pool;
         _repo = repo;
+        _workerSettings = settings.Worker;
     }
 
     /// <summary>
@@ -36,6 +39,25 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public static Hashtable GetSharedCache(string name) =>
         SharedCaches.GetOrAdd(name, _ => Hashtable.Synchronized(new Hashtable()));
+
+    /// <summary>
+    /// Set a process-level environment variable from any worker runspace.
+    /// The value is visible to ALL workers via $env:NAME because it calls
+    /// Environment.SetEnvironmentVariable at the .NET level, bypassing any
+    /// runspace-scoped isolation.
+    /// <para>
+    /// PS usage: [Craft.Services.PowerShellRunnerService]::SetProcessEnvVar('CIPP_TIMEZONE', 'America/New_York')
+    /// </para>
+    /// </summary>
+    public static void SetProcessEnvVar(string name, string? value) =>
+        Environment.SetEnvironmentVariable(name, value);
+
+    /// <summary>
+    /// Read a process-level environment variable. Convenience wrapper so callers
+    /// don't need to reference [System.Environment] directly.
+    /// </summary>
+    public static string? GetProcessEnvVar(string name) =>
+        Environment.GetEnvironmentVariable(name);
 
     /// <summary>
     /// Execute an HTTP request through the PS pipeline for endpoints not in the route table
@@ -70,7 +92,11 @@ public class PowerShellRunnerService : IDisposable
 
             // Call New-CippCoreRequest which handles "me" internally via Test-CIPPAccess
             WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
-            var results = await worker.InvokeAsync("New-CippCoreRequest", parameters);
+
+            using var cts = _workerSettings.HttpTimeoutSeconds > 0
+                ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.HttpTimeoutSeconds))
+                : null;
+            var results = await worker.InvokeAsync("New-CippCoreRequest", parameters, cts?.Token ?? default);
 
             foreach (var error in worker.Streams.Error)
                 _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, error.ToString());
@@ -84,6 +110,17 @@ public class PowerShellRunnerService : IDisposable
             QueueBridge.DrainPending();
 
             return response;
+        }
+        catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
+        {
+            sw.Stop();
+            _logger.LogWarning("[HTTP] {Endpoint} timed out after {Ms}ms (limit: {Limit}s)",
+                endpoint, sw.ElapsedMilliseconds, _workerSettings.HttpTimeoutSeconds);
+            return new ScriptResult
+            {
+                StatusCode = 504,
+                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {_workerSettings.HttpTimeoutSeconds}s" }, s_jsonOptions)
+            };
         }
         catch (Exception ex)
         {
@@ -194,7 +231,11 @@ public class PowerShellRunnerService : IDisposable
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} starting on {Worker}",
                 poolLabel, invocation.Id, entry.FunctionName, invocation.WorkerId);
 
-            var results = await worker.InvokeAsync(entry.FunctionName, parameters);
+            var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
+            using var cts = timeoutSeconds > 0
+                ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds))
+                : null;
+            var results = await worker.InvokeAsync(entry.FunctionName, parameters, cts?.Token ?? default);
 
             foreach (var error in worker.Streams.Error)
                 _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
@@ -222,6 +263,18 @@ public class PowerShellRunnerService : IDisposable
             QueueBridge.DrainPending();
 
             return response;
+        }
+        catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
+        {
+            sw.Stop();
+            var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
+            _logger.LogWarning("[{Pool}] {Function} timed out after {Ms}ms (limit: {Limit}s)",
+                poolLabel, entry?.FunctionName ?? route, sw.ElapsedMilliseconds, timeoutSeconds);
+            return new ScriptResult
+            {
+                StatusCode = 504,
+                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {timeoutSeconds}s" }, s_jsonOptions)
+            };
         }
         catch (Exception ex)
         {
@@ -319,7 +372,10 @@ public class PowerShellRunnerService : IDisposable
                 foreach (var p in parameters)
                     psParams[p.Key] = UnwrapJsonElement(p.Value);
 
-            await worker.InvokeAsync(resolvedName, psParams);
+            using var cts = _workerSettings.BgTimeoutSeconds > 0
+                ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.BgTimeoutSeconds))
+                : null;
+            await worker.InvokeAsync(resolvedName, psParams, cts?.Token ?? default);
 
             sw.Stop();
             _logger.LogInformation("[Scheduler] {InvocationId} {Function} completed {Ms}ms",
@@ -328,6 +384,14 @@ public class PowerShellRunnerService : IDisposable
             // Process any orchestrator/queue triggers queued during execution
             await OrchestratorBridge.DrainPendingAsync();
             QueueBridge.DrainPending();
+        }
+        catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
+        {
+            sw.Stop();
+            exceptionOccurred = true;
+            _logger.LogWarning("[Scheduler] {InvocationId} {Function} timed out after {Ms}ms (limit: {Limit}s)",
+                invocation.Id, functionName, sw.ElapsedMilliseconds, _workerSettings.BgTimeoutSeconds);
+            throw new TimeoutException($"Background job '{functionName}' timed out after {_workerSettings.BgTimeoutSeconds}s");
         }
         catch (Exception ex)
         {
@@ -414,7 +478,10 @@ public class PowerShellRunnerService : IDisposable
                 foreach (var p in parameters)
                     psParams[p.Key] = p.Value;
 
-            var results = await worker.InvokeAsync(resolvedName, psParams);
+            using var cts = _workerSettings.BgTimeoutSeconds > 0
+                ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.BgTimeoutSeconds))
+                : null;
+            var results = await worker.InvokeAsync(resolvedName, psParams, cts?.Token ?? default);
 
             // Process any orchestrator/queue triggers queued during execution
             await OrchestratorBridge.DrainPendingAsync();
@@ -424,6 +491,13 @@ public class PowerShellRunnerService : IDisposable
             _logger.LogInformation("[Planner] {InvocationId} {Function} completed {Ms}ms",
                 invocation.Id, functionName, sw.ElapsedMilliseconds);
             return string.Join("\n", (results ?? new Collection<PSObject>()).Select(r => r?.ToString() ?? ""));
+        }
+        catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
+        {
+            sw.Stop();
+            _logger.LogWarning("[Planner] {InvocationId} {Function} timed out after {Ms}ms (limit: {Limit}s)",
+                invocation.Id, functionName, sw.ElapsedMilliseconds, _workerSettings.BgTimeoutSeconds);
+            throw new TimeoutException($"Planner script '{functionName}' timed out after {_workerSettings.BgTimeoutSeconds}s");
         }
         catch (Exception ex)
         {

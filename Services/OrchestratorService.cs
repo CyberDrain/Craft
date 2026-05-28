@@ -603,6 +603,7 @@ public class OrchestratorService
                             task.Status = "Cancelled";
                             task.LastError = "Cancelled by user";
                             task.CompletedUtc = DateTime.UtcNow;
+                            task.Parameters = null!;
                             CheckRunCompletion(run);
                         }
                     }
@@ -640,6 +641,9 @@ public class OrchestratorService
                     {
                         task.Status = "Completed";
                         task.CompletedUtc = DateTime.UtcNow;
+                        // Release parameters — they are persisted in Table Storage and no longer
+                        // needed in-memory. For 738-task runs this frees significant Gen2 memory.
+                        task.Parameters = null!;
                         CheckRunCompletion(run);
                     }
                     await _store.UpsertTaskAsync(run.Name, task);
@@ -660,6 +664,8 @@ public class OrchestratorService
                         task.Status = "Failed";
                         task.LastError = ex.Message;
                         task.CompletedUtc = DateTime.UtcNow;
+                        // Release parameters on failure too — Table Storage has the full state
+                        task.Parameters = null!;
                         CheckRunCompletion(run);
                     }
                     await _store.UpsertTaskAsync(run.Name, task);
@@ -682,11 +688,12 @@ public class OrchestratorService
             running = run.Tasks.Count(t => t.Status == "Running");
             pending = run.Tasks.Count(t => t.Status == "Pending");
         }
+        var memSnapshot = BackgroundTaskLimiter.GetMemorySnapshot();
         _logger.LogInformation(
-            "[Scheduler] Run {Name} T+{Elapsed:F1}min: {Completed}/{Total} done {Running} running {Pending} pending {Failed} failed jobs={Active}a/{Queued}q heap={HeapMB}MB",
+            "[Scheduler] Run {Name} T+{Elapsed:F1}min: {Completed}/{Total} done {Running} running {Pending} pending {Failed} failed jobs={Active}a/{Queued}q {Memory}",
             run.Name, elapsed.TotalMinutes, completed, run.Tasks.Count, running, pending, failed,
             _jobManager.ActiveCount, _jobManager.QueuedCount,
-            GC.GetTotalMemory(false) / (1024 * 1024));
+            memSnapshot);
     }
 
     private void CheckRunCompletion(OrchestratorRun run)
@@ -760,8 +767,9 @@ public class OrchestratorService
             : $"{wallClock.TotalMinutes:F1}min";
 
         _logger.LogInformation(
-            "[Scheduler] Run {Name} finalized: {Status} ({Completed}/{Failed}/{Cancelled}/{Total}) wall={Wall}",
-            run.Name, run.Status, completed, failed, cancelled, run.Tasks.Count, wallDisplay);
+            "[Scheduler] Run {Name} finalized: {Status} ({Completed}/{Failed}/{Cancelled}/{Total}) wall={Wall} {Memory}",
+            run.Name, run.Status, completed, failed, cancelled, run.Tasks.Count, wallDisplay,
+            BackgroundTaskLimiter.GetMemorySnapshot());
 
         // If this was a child run, re-check parent's completion — it may have been
         // waiting for this child to finish before it can finalize and run PostExecution
@@ -798,8 +806,8 @@ public class OrchestratorService
         }
 
         _logger.LogInformation(
-            "[Orchestrator] Dispatching PostExecution Push-{Function} for run {Name}",
-            run.PostExecFunctionName, run.Name);
+            "[Orchestrator] Dispatching PostExecution Push-{Function} for run {Name} {Memory}",
+            run.PostExecFunctionName, run.Name, BackgroundTaskLimiter.GetMemorySnapshot());
 
         _jobManager.Enqueue(
             name: $"{run.Name}-PostExec",
@@ -811,11 +819,27 @@ public class OrchestratorService
                 run.PostExecStatus = "Running";
                 await _store.UpsertRunAsync(run);
 
+                // Stream results to a temp file instead of building a massive in-memory string
+                // from the full entity list. For large runs (738+ tasks), the aggregated JSON can
+                // be 50-150 MB. Streaming to file first means we only ever hold ONE copy of the
+                // data (the file read), not two (entity list + serialized JSON).
+                var tempFile = Path.Combine(Path.GetTempPath(), $"craft-postexec-{Guid.NewGuid():N}.json");
                 try
                 {
-                    // Collect results from table and pass as JSON parameter
-                    var storedResults = await _store.GetResultsAsync(run.Name);
-                    var resultsJson = "[" + string.Join(",", storedResults) + "]";
+                    await _store.StreamResultsToFileAsync(run.Name, tempFile);
+                    var fileSize = new FileInfo(tempFile).Length;
+                    var fileSizeMB = fileSize / (1024.0 * 1024.0);
+                    _logger.LogInformation(
+                        "[Orchestrator] PostExec results for {Name}: {SizeMB:F1}MB streamed to temp file {Memory}",
+                        run.Name, fileSizeMB, BackgroundTaskLimiter.GetMemorySnapshot());
+
+                    // Read the file content and pass as ResultsJson — this keeps the PS interface
+                    // unchanged so no consumer (Push-*) code needs modification.
+                    var resultsJson = await File.ReadAllTextAsync(tempFile, jobCt);
+
+                    // Delete the temp file immediately to free disk — we have the string now
+                    try { File.Delete(tempFile); tempFile = null; }
+                    catch { /* will retry in finally */ }
 
                     var parameters = new Dictionary<string, object>
                     {
@@ -848,6 +872,15 @@ public class OrchestratorService
                     _logger.LogError(ex, "[Orchestrator] PostExecution Push-{Function} failed for run {Name}",
                         run.PostExecFunctionName, run.Name);
                     throw;
+                }
+                finally
+                {
+                    // Clean up temp file if it still exists (early delete may have succeeded)
+                    if (tempFile != null)
+                    {
+                        try { if (File.Exists(tempFile)) File.Delete(tempFile); }
+                        catch (Exception ex) { _logger.LogDebug(ex, "[Orchestrator] Failed to delete temp file {Path}", tempFile); }
+                    }
                 }
             }
         );

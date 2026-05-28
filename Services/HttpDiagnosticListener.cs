@@ -17,8 +17,10 @@ public sealed class HttpDiagnosticListener : EventListener,
     private readonly ILogger _logger;
     private readonly int _slowThresholdMs;
 
-    // In-flight HTTP requests captured at Start, keyed by Activity.Id
-    private readonly ConcurrentDictionary<string, (HttpRequestMessage Request, string? BodyPreview, long StartTicks, string? OpId)> _inflight = new();
+    // In-flight HTTP requests: stores only lightweight primitives (method, URL, body preview),
+    // NOT the live HttpRequestMessage — holding a reference to that prevents GC of the entire
+    // request pipeline (content streams, TLS buffers, socket state) for the request's duration.
+    private readonly ConcurrentDictionary<string, (string Method, string Url, string? BodyPreview, long StartTicks, string? OpId)> _inflight = new();
 
     // Track DNS resolution timing
     private readonly ConcurrentDictionary<string, long> _dnsInFlight = new();
@@ -195,7 +197,9 @@ public sealed class HttpDiagnosticListener : EventListener,
             catch { /* stream may not be readable */ }
         }
 
-        _inflight[key] = (request, bodyPreview, Stopwatch.GetTimestamp(), OperationContext.Display);
+        // Store only primitives — do NOT retain the HttpRequestMessage reference.
+        // Holding it alive prevents GC of content streams, TLS buffers, and socket state.
+        _inflight[key] = (request.Method.Method, request.RequestUri?.ToString() ?? "?", bodyPreview, Stopwatch.GetTimestamp(), OperationContext.Display);
     }
 
     private static readonly Regex s_batchOpRegex = new(@"(PUT|PATCH|DELETE|POST|MERGE)\s+(\S+)", RegexOptions.Compiled);
@@ -273,20 +277,17 @@ public sealed class HttpDiagnosticListener : EventListener,
             var elapsedMs = GetElapsedMs(entry.StartTicks);
             if (elapsedMs >= _slowThresholdMs)
             {
-                var req = entry.Request;
-                var method = req.Method.Method;
-                var url = req.RequestUri?.ToString() ?? "???";
                 var op = entry.OpId ?? OperationContext.Display;
 
                 if (entry.BodyPreview != null)
                 {
                     _logger.LogWarning("[HTTP-SLOW] {Url} took {Elapsed}ms | {Op} | {Method} | {Body}",
-                        url, elapsedMs, op, method, entry.BodyPreview);
+                        entry.Url, elapsedMs, op, entry.Method, entry.BodyPreview);
                 }
                 else
                 {
                     _logger.LogWarning("[HTTP-SLOW] {Url} took {Elapsed}ms | {Op} | {Method}",
-                        url, elapsedMs, op, method);
+                        entry.Url, elapsedMs, op, entry.Method);
                 }
             }
         }
