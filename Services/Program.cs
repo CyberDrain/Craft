@@ -930,9 +930,9 @@ app.MapGet("/setup", (HttpContext context) =>
     return Results.Content(SetupPages.IndexHtml, "text/html");
 });
 
-app.MapGet("/api/setup/status", (HttpContext context) =>
+app.MapGet("/api/setup/status", async (HttpContext context) =>
 {
-    var status = setupService.GetStatus();
+    var status = await setupService.GetStatus(context.RequestAborted);
     return Results.Json(status);
 });
 
@@ -1004,6 +1004,25 @@ app.MapPost("/api/setup/manual", async (HttpContext context) =>
 
     await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+});
+
+app.MapPost("/api/setup/seed-user", async (HttpContext context) =>
+{
+    try
+    {
+        using var reader = new StreamReader(context.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        var upn = root.GetProperty("upn").GetString()!;
+        await setupService.SeedFirstUser(upn, context.RequestAborted);
+        return Results.Json(new { success = true, message = $"Superadmin user {upn} added successfully." });
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { success = false, message = ex.Message }, statusCode: 400);
+    }
 });
 } // end Setup.Enabled
 
