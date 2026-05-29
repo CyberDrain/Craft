@@ -216,8 +216,7 @@ public static class SetupPages
             }
             document.getElementById('manual-redirect-uri').textContent = window.location.origin + '/.auth/login/aad/callback';
             if (setupState.isEasyAuthConfigured) {
-                showBanner('Authentication is already configured. Redirecting...');
-                setTimeout(() => window.location.href = '/', 2000);
+                showBanner('Authentication is already configured. This page will redirect shortly.');
                 return;
             }
             if (!setupState.isRunningInAppService || !setupState.hasManagedIdentity) {
@@ -459,57 +458,52 @@ public static class SetupPages
         }
     }
     function showRestartScreen() {
-        // Stop background status polling — restart screen has its own polling
+        // Stop background status polling
         clearInterval(statusPollTimer);
-        // Hide setup sections, show restart polling UI
+        // Hide setup sections, show restart status
         document.getElementById('user-section').classList.add('hidden');
         document.getElementById('auto-section').classList.add('hidden');
         document.getElementById('manual-section').classList.add('hidden');
         document.getElementById('divider-user').classList.add('hidden');
         document.getElementById('divider-auth').classList.add('hidden');
         document.querySelector('.subtitle').textContent = '';
-        document.getElementById('page-title').textContent = 'Restarting...';
+        document.getElementById('page-title').textContent = 'Setup Complete';
 
         const banner = document.getElementById('status-banner');
         banner.innerHTML = '<div style="text-align:center;">' +
             '<div style="margin-bottom:0.75rem;">Authentication has been configured. The application is restarting to apply changes.</div>' +
             '<div id="restart-spinner" style="font-size:1.5rem;margin-bottom:0.5rem;">&#8987;</div>' +
-            '<div id="restart-status" style="font-size:0.85rem;color:#94a3b8;">Waiting for the application to come back online...</div>' +
+            '<div id="restart-status" style="font-size:0.85rem;color:#94a3b8;">Waiting for the new container to come online...</div>' +
             '</div>';
         banner.classList.remove('hidden');
 
-        let attempts = 0;
-        const maxAttempts = 120; // 10 min at 5s intervals
+        // Poll /api/setup/status — once the new container comes online with EasyAuth
+        // configured, isEasyAuthConfigured will be true and setup mode will no longer
+        // be active. At that point redirect to / and let the app take over.
         const pollInterval = 5000;
-
         const pollRestart = async () => {
-            attempts++;
-            const statusEl = document.getElementById('restart-status');
             try {
-                const res = await fetch('/api/setup/health', { cache: 'no-store' });
+                const res = await fetch('/api/setup/status', { cache: 'no-store' });
                 if (res.ok) {
                     const data = await res.json();
-                    if (data.ready) {
-                        statusEl.textContent = 'Application is ready! Redirecting...';
+                    if (data.isEasyAuthConfigured && !data.isSetupCompleted) {
+                        // New container is online with EasyAuth active — redirect to app
+                        document.getElementById('restart-status').textContent = 'Application is ready!';
                         document.getElementById('restart-spinner').textContent = '\u2705';
-                        setTimeout(() => window.location.href = '/', 1500);
+                        setTimeout(() => window.location.href = '/', 1000);
                         return;
                     }
+                    // Still on the old container (isSetupCompleted=true) — keep waiting
+                    document.getElementById('restart-status').textContent = 'Auth configured, waiting for container restart...';
                 }
             } catch (e) {
-                // App still restarting — expected
+                // Container is cycling — expected during restart
+                document.getElementById('restart-status').textContent = 'Container restarting...';
             }
-            if (attempts >= maxAttempts) {
-                statusEl.textContent = 'The application is taking longer than expected. Try refreshing the page manually.';
-                document.getElementById('restart-spinner').textContent = '\u26A0\uFE0F';
-                return;
-            }
-            statusEl.textContent = 'Waiting for the application to come back online... (' + attempts + ')';
             setTimeout(pollRestart, pollInterval);
         };
 
-        // Start polling after a short delay to let the restart begin
-        setTimeout(pollRestart, 8000);
+        setTimeout(pollRestart, 5000);
     }
 </script>
 </body>
