@@ -518,15 +518,6 @@ public class SetupSettings
     public bool Enabled { get; set; } = false;
 
     /// <summary>
-    /// When true, the setup wizard activates automatically if EasyAuth is not configured.
-    /// When false, the child app must explicitly call
-    /// [Craft.Services.AppLifecycleBridge]::RequestSetupMode() to activate setup mode.
-    /// This lets the child app decide when setup is appropriate (e.g. after checking
-    /// for existing credentials that can be migrated automatically).
-    /// </summary>
-    public bool AutoActivate { get; set; } = true;
-
-    /// <summary>
     /// Public client ID used for the PKCE login popup during automated setup.
     /// Defaults to Microsoft's Azure PowerShell first-party app which supports
     /// auth code + PKCE without a client secret.
@@ -582,6 +573,20 @@ public class SetupSettings
     /// The tenant from the setup flow is always included automatically.
     /// </summary>
     public List<string> AllowedTenants { get; set; } = [];
+
+    /// <summary>
+    /// When set, the EasyAuth client secret is stored in Azure Key Vault instead of
+    /// directly in the app setting. The app setting AUTH_SECRET is then written as a
+    /// Key Vault reference (@Microsoft.KeyVault(SecretUri=...)).
+    ///
+    /// Value is the Key Vault name (e.g. "my-vault" → https://my-vault.vault.azure.net).
+    /// If set to the literal string "auto", the site name (WEBSITE_SITE_NAME) is used
+    /// as the vault name.
+    ///
+    /// The managed identity must have Secret Set permission on the vault.
+    /// When empty (default), the secret is stored directly in the app setting.
+    /// </summary>
+    public string KeyVaultName { get; set; } = "";
 }
 
 /// <summary>

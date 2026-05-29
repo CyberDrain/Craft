@@ -91,6 +91,7 @@ public static class SetupPages
             font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem;
         }
         .device-code-box a { color: #60a5fa; text-decoration: underline; }
+        .disabled-section { opacity: 0.4; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -100,9 +101,21 @@ public static class SetupPages
 
     <div id="status-banner" class="info-banner hidden"></div>
 
-    <!-- Option 1: Automated Setup (Device Code Flow) -->
-    <div class="card" id="auto-section">
-        <h2>Automated Setup</h2>
+    <!-- Step 1: First User -->
+    <div class="card" id="user-section">
+        <h2>Step 1: First User</h2>
+        <p>Add the first superadmin user before configuring authentication. This user will have full access to the application.</p>
+        <label for="seed-upn">User Principal Name (email)</label>
+        <input type="text" id="seed-upn" placeholder="admin@contoso.com">
+        <button class="btn btn-primary" id="btn-seed" onclick="seedFirstUser()" disabled>Add Superadmin</button>
+        <div id="seed-status" class="status"></div>
+    </div>
+
+    <div class="divider" id="divider-user"></div>
+
+    <!-- Step 2: Automated Setup (Device Code Flow) -->
+    <div class="card disabled-section" id="auto-section">
+        <h2>Step 2a: Automated Setup</h2>
         <p>Sign in with a Global Administrator account to automatically create the EasyAuth app registration and configure this App Service.</p>
 
         <label style="margin-bottom: 0.25rem;">Tenant Access</label>
@@ -131,11 +144,11 @@ public static class SetupPages
         <div id="auto-status" class="status"></div>
     </div>
 
-    <div class="divider"></div>
+    <div class="divider" id="divider-auth"></div>
 
-    <!-- Option 2: Manual Setup -->
-    <div class="card" id="manual-section">
-        <h2>Manual Setup</h2>
+    <!-- Step 2b: Manual Setup -->
+    <div class="card disabled-section" id="manual-section">
+        <h2>Step 2b: Manual Setup</h2>
         <p>If you already have an app registration, enter the details below.</p>
         <label style="margin-bottom: 0.25rem;">Tenant Access</label>
         <div class="toggle-group" id="manual-tenant-toggle">
@@ -205,14 +218,83 @@ public static class SetupPages
             if (setupState.isEasyAuthConfigured) {
                 showBanner('Authentication is already configured. Redirecting...');
                 setTimeout(() => window.location.href = '/', 2000);
+                return;
             }
             if (!setupState.isRunningInAppService || !setupState.hasManagedIdentity) {
                 showBanner('Warning: No managed identity detected. ARM self-configuration may fail. Use manual setup instead.');
+            }
+
+            // Handle user table status
+            const us = setupState.usersStatus;
+            if (!us || !us.connected) {
+                // Connection error — disable user section
+                document.getElementById('btn-seed').disabled = true;
+                showStatus('seed-status', 'Cannot connect to storage: ' + (us?.error || 'Unknown error'), 'error');
+            } else if (us.hasUsers) {
+                // Users already exist — skip to auth setup
+                document.getElementById('user-section').classList.add('disabled-section');
+                showStatus('seed-status', 'Users already exist in the table. Proceed to authentication setup below.', 'success');
+                enableAuthSections();
+            } else {
+                // No users — enable the seed form, keep auth disabled
+                document.getElementById('btn-seed').disabled = false;
             }
         } catch (e) {
             console.error('Failed to load status', e);
         }
     })();
+
+    // Background poll — detect setup completion from any session
+    let statusPollTimer = setInterval(async () => {
+        try {
+            const res = await fetch('/api/setup/status', { cache: 'no-store' });
+            if (!res.ok) return;
+            const status = await res.json();
+            if (status.isSetupCompleted || status.isEasyAuthConfigured) {
+                clearInterval(statusPollTimer);
+                showRestartScreen();
+            }
+        } catch (e) {
+            // Setup endpoint may be unavailable during restart — ignore
+        }
+    }, 5000);
+
+    function enableAuthSections() {
+        document.getElementById('auto-section').classList.remove('disabled-section');
+        document.getElementById('manual-section').classList.remove('disabled-section');
+    }
+
+    async function seedFirstUser() {
+        const upn = document.getElementById('seed-upn').value.trim();
+        if (!upn) {
+            showStatus('seed-status', 'Please enter a valid email address.', 'error');
+            return;
+        }
+
+        const btn = document.getElementById('btn-seed');
+        btn.disabled = true;
+        btn.textContent = 'Adding user...';
+        showStatus('seed-status', 'Adding superadmin user...', 'info');
+
+        try {
+            const res = await fetch('/api/setup/seed-user', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ upn })
+            });
+
+            const data = await res.json();
+            if (!res.ok || !data.success) throw new Error(data.message || 'Failed to add user');
+
+            showStatus('seed-status', data.message, 'success');
+            document.getElementById('user-section').classList.add('disabled-section');
+            enableAuthSections();
+        } catch (e) {
+            showStatus('seed-status', 'Error: ' + e.message, 'error');
+            btn.disabled = false;
+            btn.textContent = 'Add Superadmin';
+        }
+    }
 
     function showBanner(msg) {
         const el = document.getElementById('status-banner');
@@ -377,10 +459,14 @@ public static class SetupPages
         }
     }
     function showRestartScreen() {
+        // Stop background status polling — restart screen has its own polling
+        clearInterval(statusPollTimer);
         // Hide setup sections, show restart polling UI
+        document.getElementById('user-section').classList.add('hidden');
         document.getElementById('auto-section').classList.add('hidden');
         document.getElementById('manual-section').classList.add('hidden');
-        document.querySelector('.divider').classList.add('hidden');
+        document.getElementById('divider-user').classList.add('hidden');
+        document.getElementById('divider-auth').classList.add('hidden');
         document.querySelector('.subtitle').textContent = '';
         document.getElementById('page-title').textContent = 'Restarting...';
 

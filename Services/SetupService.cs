@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Azure.Data.Tables;
 
 namespace Craft.Services;
 
@@ -478,8 +479,30 @@ public class SetupService
             }
         }
 
-        // 2. Add the client secret setting (referenced by authsettingsV2 clientSecretSettingName)
-        mergedSettings["AUTH_SECRET"] = clientSecret;
+        // 2. Store the client secret — either directly or via Key Vault reference
+        var kvName = _settings.Setup.KeyVaultName;
+        if (!string.IsNullOrEmpty(kvName))
+        {
+            if (kvName.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                kvName = siteName;
+
+            // Store secret in Key Vault via REST API
+            var vaultToken = await GetManagedIdentityToken("https://vault.azure.net", ct)
+                ?? throw new InvalidOperationException("Cannot get Key Vault token — ensure the managed identity has Secret Set permission on the vault");
+
+            var kvSecretUrl = $"https://{kvName}.vault.azure.net/secrets/AUTH-SECRET?api-version=7.4";
+            var kvBody = new { value = clientSecret };
+            await KeyVaultRequest(HttpMethod.Put, kvSecretUrl, vaultToken, kvBody, ct);
+
+            // Set app setting as a KV reference
+            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName=AUTH-SECRET)";
+            _logger.LogInformation("[Setup] Client secret stored in Key Vault '{VaultName}', app setting set as KV reference", kvName);
+        }
+        else
+        {
+            // Store secret directly in app setting (default)
+            mergedSettings["AUTH_SECRET"] = clientSecret;
+        }
 
         // Determine effective allowed tenants (always include the setup tenant)
         bool useCommonIssuer = multiTenant;
@@ -495,7 +518,7 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated (AUTH_SECRET set, WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
+        _logger.LogInformation("[Setup] App settings updated (WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
 
         // 4. Configure authsettingsV2
         var globalValidation = new Dictionary<string, object>
@@ -584,25 +607,132 @@ public class SetupService
         await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, ct);
     }
 
+    // ── First User Seeding ──
+
+    /// <summary>
+    /// Resolves the storage connection string for the allowedUsers table.
+    /// Same logic as AuthService — uses Auth.UserStorageConnection if set,
+    /// falls back to AzureWebJobsStorage, then dev storage.
+    /// </summary>
+    private string StorageConnectionString =>
+        (!string.IsNullOrEmpty(_settings.Auth.UserStorageConnection)
+            ? _settings.Auth.UserStorageConnection
+            : Environment.GetEnvironmentVariable("AzureWebJobsStorage"))
+        ?? "UseDevelopmentStorage=true";
+
+    /// <summary>
+    /// Resolves the user table name with the same sanitization as AuthService.
+    /// </summary>
+    private string ResolveUserTableName()
+    {
+        var raw = _settings.Auth.UserTableName;
+        var sanitized = new string(raw.Where(char.IsLetterOrDigit).ToArray());
+        if (sanitized.Length > 63) sanitized = sanitized[..63];
+        if (sanitized.Length < 3) sanitized = "allowedUsers";
+        return sanitized;
+    }
+
+    /// <summary>
+    /// Checks the allowedUsers table status: whether it's reachable and whether
+    /// it already contains any users.
+    /// </summary>
+    public async Task<AllowedUsersStatus> CheckAllowedUsersStatus(CancellationToken ct = default)
+    {
+        try
+        {
+            var tableName = ResolveUserTableName();
+            var client = new TableClient(StorageConnectionString, tableName);
+            await client.CreateIfNotExistsAsync(cancellationToken: ct);
+
+            var count = 0;
+            await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+            {
+                if (!entity.RowKey.StartsWith("_"))
+                {
+                    count++;
+                    if (count > 0) break; // We only need to know if any exist
+                }
+            }
+
+            return new AllowedUsersStatus
+            {
+                Connected = true,
+                HasUsers = count > 0
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Setup] Failed to check allowedUsers table");
+            return new AllowedUsersStatus
+            {
+                Connected = false,
+                HasUsers = false,
+                Error = ex.Message
+            };
+        }
+    }
+
+    /// <summary>
+    /// Seeds the first superadmin user into the allowedUsers table.
+    /// Only works when the table is empty — refuses if users already exist.
+    /// Uses the same entity schema as CIPP-API's Invoke-ExecCIPPUsers.
+    /// </summary>
+    public async Task SeedFirstUser(string upn, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(upn))
+            throw new ArgumentException("UPN (email) is required.");
+
+        upn = upn.Trim().ToLower();
+
+        var tableName = ResolveUserTableName();
+        var client = new TableClient(StorageConnectionString, tableName);
+        await client.CreateIfNotExistsAsync(cancellationToken: ct);
+
+        // Guard: refuse if the table already has users
+        await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+        {
+            if (!entity.RowKey.StartsWith("_"))
+                throw new InvalidOperationException("The allowed users table already contains users. First-user seeding is only available on an empty table.");
+        }
+
+        var roles = new[] { "superadmin" };
+        var rolesJson = JsonSerializer.Serialize(roles);
+
+        var userEntity = new TableEntity("User", upn)
+        {
+            ["Roles"] = rolesJson,
+            ["ManualRoles"] = rolesJson,
+            ["AutoRoles"] = "[]",
+            ["Source"] = "Manual"
+        };
+
+        await client.UpsertEntityAsync(userEntity, TableUpdateMode.Replace, ct);
+        _logger.LogInformation("[Setup] Seeded first superadmin user: {Upn}", upn);
+    }
+
     // ── Status ──
 
     /// <summary>
     /// Returns setup status information.
     /// </summary>
-    public SetupStatus GetStatus()
+    public async Task<SetupStatus> GetStatus(CancellationToken ct = default)
     {
         var isConfigured = IsEasyAuthConfigured();
         var siteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME");
         var hasManagedIdentity = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("IDENTITY_ENDPOINT"));
+        var usersStatus = await CheckAllowedUsersStatus(ct);
 
         return new SetupStatus
         {
             IsEasyAuthConfigured = isConfigured,
+            IsSetupCompleted = AppLifecycleBridge.IsSetupCompleted(),
+            SetupCompletedReason = AppLifecycleBridge.GetSetupCompletedReason(),
             IsRunningInAppService = !string.IsNullOrEmpty(siteName),
             HasManagedIdentity = hasManagedIdentity,
             AppName = _settings.Name,
             AuthAppDisplayName = ResolveAuthAppDisplayName(),
-            BootstrapClientId = _settings.Setup.BootstrapClientId
+            BootstrapClientId = _settings.Setup.BootstrapClientId,
+            UsersStatus = usersStatus
         };
     }
 
@@ -811,6 +941,25 @@ public class SetupService
         return doc.RootElement.Clone();
     }
 
+    private async Task KeyVaultRequest(
+        HttpMethod method, string url, string accessToken, object body, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(method, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+        var json = JsonSerializer.Serialize(body);
+        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        var response = await s_httpClient.SendAsync(request, ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+            _logger.LogError("[Setup] Key Vault {Method} {Url} failed: {Status} {Body}",
+                method, url, response.StatusCode, responseBody);
+            throw new HttpRequestException($"Key Vault {method} {url} failed: {response.StatusCode}");
+        }
+    }
+
     // ── Result Models ──
 
     public class TokenExchangeResult
@@ -831,11 +980,21 @@ public class SetupService
     public class SetupStatus
     {
         public bool IsEasyAuthConfigured { get; set; }
+        public bool IsSetupCompleted { get; set; }
+        public string? SetupCompletedReason { get; set; }
         public bool IsRunningInAppService { get; set; }
         public bool HasManagedIdentity { get; set; }
         public string AppName { get; set; } = "";
         public string AuthAppDisplayName { get; set; } = "";
         public string BootstrapClientId { get; set; } = "";
+        public AllowedUsersStatus UsersStatus { get; set; } = new();
+    }
+
+    public class AllowedUsersStatus
+    {
+        public bool Connected { get; set; }
+        public bool HasUsers { get; set; }
+        public string? Error { get; set; }
     }
 
     public class DeviceCodeResponse

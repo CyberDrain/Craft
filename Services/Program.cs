@@ -278,15 +278,12 @@ if (app.Environment.IsDevelopment())
 app.UseResponseCompression();
 
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
-// If AutoActivate is true, setup mode activates automatically when EasyAuth is not configured.
-// If AutoActivate is false, the child app must call AppLifecycleBridge.RequestSetupMode()
-// to explicitly enable the setup wizard (e.g. after checking for existing credentials).
+// The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
+// setup wizard (e.g. after determining it cannot auto-configure from existing credentials).
 var setupService = app.Services.GetRequiredService<SetupService>();
 
 if (CraftSettings.Setup.Enabled)
 {
-    var autoActivate = CraftSettings.Setup.AutoActivate;
-
     app.Use(async (context, next) =>
     {
         if (SetupService.IsEasyAuthConfigured())
@@ -314,10 +311,8 @@ if (CraftSettings.Setup.Enabled)
             return;
         }
 
-        // EasyAuth NOT configured — check whether setup mode should be active.
-        // AutoActivate: always active. Otherwise: only after child app calls RequestSetupMode().
-        var setupActive = autoActivate || AppLifecycleBridge.IsSetupModeRequested();
-        if (!setupActive)
+        // EasyAuth NOT configured — setup mode only active after child app calls RequestSetupMode().
+        if (!AppLifecycleBridge.IsSetupModeRequested())
         {
             // Setup not yet requested by child app — let requests through normally
             // (the startup loading middleware will handle the "pool not ready" case)
@@ -368,10 +363,8 @@ if (CraftSettings.Setup.Enabled)
         context.Response.Redirect("/setup");
     });
 
-    logger.LogInformation("[Setup] Setup mode enabled (AutoActivate={AutoActivate}) — {Status}",
-        autoActivate,
+    logger.LogInformation("[Setup] Setup mode enabled — {Status}",
         SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled"
-            : autoActivate ? "awaiting configuration at /setup"
             : "waiting for child app to call RequestSetupMode()");
 }
 
@@ -930,9 +923,9 @@ app.MapGet("/setup", (HttpContext context) =>
     return Results.Content(SetupPages.IndexHtml, "text/html");
 });
 
-app.MapGet("/api/setup/status", (HttpContext context) =>
+app.MapGet("/api/setup/status", async (HttpContext context) =>
 {
-    var status = setupService.GetStatus();
+    var status = await setupService.GetStatus(context.RequestAborted);
     return Results.Json(status);
 });
 
@@ -976,6 +969,9 @@ app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
 
 app.MapPost("/api/setup/configure", async (HttpContext context) =>
 {
+    if (AppLifecycleBridge.IsSetupCompleted())
+        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
     using var doc = System.Text.Json.JsonDocument.Parse(body);
@@ -987,11 +983,15 @@ app.MapPost("/api/setup/configure", async (HttpContext context) =>
     var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
 
     await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
+    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via automated setup");
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
 
 app.MapPost("/api/setup/manual", async (HttpContext context) =>
 {
+    if (AppLifecycleBridge.IsSetupCompleted())
+        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
     using var doc = System.Text.Json.JsonDocument.Parse(body);
@@ -1003,7 +1003,27 @@ app.MapPost("/api/setup/manual", async (HttpContext context) =>
     var multiTenant = root.TryGetProperty("multiTenant", out var mt2) && mt2.GetBoolean();
 
     await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
+    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via manual setup");
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+});
+
+app.MapPost("/api/setup/seed-user", async (HttpContext context) =>
+{
+    try
+    {
+        using var reader = new StreamReader(context.Request.Body);
+        var body = await reader.ReadToEndAsync();
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        var upn = root.GetProperty("upn").GetString()!;
+        await setupService.SeedFirstUser(upn, context.RequestAborted);
+        return Results.Json(new { success = true, message = $"Superadmin user {upn} added successfully." });
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { success = false, message = ex.Message }, statusCode: 400);
+    }
 });
 } // end Setup.Enabled
 
