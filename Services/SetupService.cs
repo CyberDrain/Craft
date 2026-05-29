@@ -479,8 +479,30 @@ public class SetupService
             }
         }
 
-        // 2. Add the client secret setting (referenced by authsettingsV2 clientSecretSettingName)
-        mergedSettings["AUTH_SECRET"] = clientSecret;
+        // 2. Store the client secret — either directly or via Key Vault reference
+        var kvName = _settings.Setup.KeyVaultName;
+        if (!string.IsNullOrEmpty(kvName))
+        {
+            if (kvName.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                kvName = siteName;
+
+            // Store secret in Key Vault via REST API
+            var vaultToken = await GetManagedIdentityToken("https://vault.azure.net", ct)
+                ?? throw new InvalidOperationException("Cannot get Key Vault token — ensure the managed identity has Secret Set permission on the vault");
+
+            var kvSecretUrl = $"https://{kvName}.vault.azure.net/secrets/AUTH-SECRET?api-version=7.4";
+            var kvBody = new { value = clientSecret };
+            await KeyVaultRequest(HttpMethod.Put, kvSecretUrl, vaultToken, kvBody, ct);
+
+            // Set app setting as a KV reference
+            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName=AUTH-SECRET)";
+            _logger.LogInformation("[Setup] Client secret stored in Key Vault '{VaultName}', app setting set as KV reference", kvName);
+        }
+        else
+        {
+            // Store secret directly in app setting (default)
+            mergedSettings["AUTH_SECRET"] = clientSecret;
+        }
 
         // Determine effective allowed tenants (always include the setup tenant)
         bool useCommonIssuer = multiTenant;
@@ -496,7 +518,7 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated (AUTH_SECRET set, WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
+        _logger.LogInformation("[Setup] App settings updated (WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
 
         // 4. Configure authsettingsV2
         var globalValidation = new Dictionary<string, object>
@@ -703,6 +725,8 @@ public class SetupService
         return new SetupStatus
         {
             IsEasyAuthConfigured = isConfigured,
+            IsSetupCompleted = AppLifecycleBridge.IsSetupCompleted(),
+            SetupCompletedReason = AppLifecycleBridge.GetSetupCompletedReason(),
             IsRunningInAppService = !string.IsNullOrEmpty(siteName),
             HasManagedIdentity = hasManagedIdentity,
             AppName = _settings.Name,
@@ -917,6 +941,25 @@ public class SetupService
         return doc.RootElement.Clone();
     }
 
+    private async Task KeyVaultRequest(
+        HttpMethod method, string url, string accessToken, object body, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(method, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+        var json = JsonSerializer.Serialize(body);
+        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        var response = await s_httpClient.SendAsync(request, ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            var responseBody = await response.Content.ReadAsStringAsync(ct);
+            _logger.LogError("[Setup] Key Vault {Method} {Url} failed: {Status} {Body}",
+                method, url, response.StatusCode, responseBody);
+            throw new HttpRequestException($"Key Vault {method} {url} failed: {response.StatusCode}");
+        }
+    }
+
     // ── Result Models ──
 
     public class TokenExchangeResult
@@ -937,6 +980,8 @@ public class SetupService
     public class SetupStatus
     {
         public bool IsEasyAuthConfigured { get; set; }
+        public bool IsSetupCompleted { get; set; }
+        public string? SetupCompletedReason { get; set; }
         public bool IsRunningInAppService { get; set; }
         public bool HasManagedIdentity { get; set; }
         public string AppName { get; set; } = "";

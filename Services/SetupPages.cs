@@ -244,6 +244,21 @@ public static class SetupPages
         }
     })();
 
+    // Background poll — detect setup completion from any session
+    let statusPollTimer = setInterval(async () => {
+        try {
+            const res = await fetch('/api/setup/status', { cache: 'no-store' });
+            if (!res.ok) return;
+            const status = await res.json();
+            if (status.isSetupCompleted || status.isEasyAuthConfigured) {
+                clearInterval(statusPollTimer);
+                showRestartScreen();
+            }
+        } catch (e) {
+            // Setup endpoint may be unavailable during restart — ignore
+        }
+    }, 5000);
+
     function enableAuthSections() {
         document.getElementById('auto-section').classList.remove('disabled-section');
         document.getElementById('manual-section').classList.remove('disabled-section');
@@ -444,6 +459,8 @@ public static class SetupPages
         }
     }
     function showRestartScreen() {
+        // Stop background status polling — restart screen has its own polling
+        clearInterval(statusPollTimer);
         // Hide setup sections, show restart polling UI
         document.getElementById('user-section').classList.add('hidden');
         document.getElementById('auto-section').classList.add('hidden');

@@ -43,6 +43,8 @@ public static class AppLifecycleBridge
 
     // --- Setup mode gating ---
     private static volatile bool s_setupModeRequested;
+    private static volatile bool s_setupCompleted;
+    private static string? s_setupCompletedReason;
 
     /// <summary>
     /// Explicitly enables the Craft setup wizard. Call this from the child app
@@ -60,4 +62,26 @@ public static class AppLifecycleBridge
     /// Used by the setup middleware to determine whether to activate the setup wizard.
     /// </summary>
     public static bool IsSetupModeRequested() => s_setupModeRequested;
+
+    /// <summary>
+    /// Marks setup as completed — credentials have been applied and the app is
+    /// pending restart. Prevents duplicate credential submissions and lets all
+    /// setup page instances detect completion via status polling.
+    /// </summary>
+    public static void MarkSetupCompleted(string reason = "Setup credentials applied")
+    {
+        s_setupCompleted = true;
+        s_setupCompletedReason = reason;
+        s_logger?.LogInformation("[Lifecycle] Setup marked as completed: {Reason}", reason);
+    }
+
+    /// <summary>
+    /// Returns true if setup credentials have already been applied this session.
+    /// </summary>
+    public static bool IsSetupCompleted() => s_setupCompleted;
+
+    /// <summary>
+    /// Returns the reason setup was completed, or null if not yet completed.
+    /// </summary>
+    public static string? GetSetupCompletedReason() => s_setupCompletedReason;
 }

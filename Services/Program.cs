@@ -969,6 +969,9 @@ app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
 
 app.MapPost("/api/setup/configure", async (HttpContext context) =>
 {
+    if (AppLifecycleBridge.IsSetupCompleted())
+        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
     using var doc = System.Text.Json.JsonDocument.Parse(body);
@@ -980,11 +983,15 @@ app.MapPost("/api/setup/configure", async (HttpContext context) =>
     var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
 
     await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
+    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via automated setup");
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
 
 app.MapPost("/api/setup/manual", async (HttpContext context) =>
 {
+    if (AppLifecycleBridge.IsSetupCompleted())
+        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
     using var reader = new StreamReader(context.Request.Body);
     var body = await reader.ReadToEndAsync();
     using var doc = System.Text.Json.JsonDocument.Parse(body);
@@ -996,6 +1003,7 @@ app.MapPost("/api/setup/manual", async (HttpContext context) =>
     var multiTenant = root.TryGetProperty("multiTenant", out var mt2) && mt2.GetBoolean();
 
     await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
+    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via manual setup");
     return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
 });
 

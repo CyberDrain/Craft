@@ -573,6 +573,20 @@ public class SetupSettings
     /// The tenant from the setup flow is always included automatically.
     /// </summary>
     public List<string> AllowedTenants { get; set; } = [];
+
+    /// <summary>
+    /// When set, the EasyAuth client secret is stored in Azure Key Vault instead of
+    /// directly in the app setting. The app setting AUTH_SECRET is then written as a
+    /// Key Vault reference (@Microsoft.KeyVault(SecretUri=...)).
+    ///
+    /// Value is the Key Vault name (e.g. "my-vault" → https://my-vault.vault.azure.net).
+    /// If set to the literal string "auto", the site name (WEBSITE_SITE_NAME) is used
+    /// as the vault name.
+    ///
+    /// The managed identity must have Secret Set permission on the vault.
+    /// When empty (default), the secret is stored directly in the app setting.
+    /// </summary>
+    public string KeyVaultName { get; set; } = "";
 }
 
 /// <summary>
