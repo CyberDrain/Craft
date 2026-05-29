@@ -57,7 +57,7 @@ public static class AppLifecycleBridge
 
     /// <summary>
     /// Returns true if the child app has explicitly requested setup mode.
-    /// Used by the setup middleware when AutoActivate is false.
+    /// Used by the setup middleware to determine whether to activate the setup wizard.
     /// </summary>
     public static bool IsSetupModeRequested() => s_setupModeRequested;
 }

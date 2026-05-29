@@ -278,15 +278,12 @@ if (app.Environment.IsDevelopment())
 app.UseResponseCompression();
 
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
-// If AutoActivate is true, setup mode activates automatically when EasyAuth is not configured.
-// If AutoActivate is false, the child app must call AppLifecycleBridge.RequestSetupMode()
-// to explicitly enable the setup wizard (e.g. after checking for existing credentials).
+// The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
+// setup wizard (e.g. after determining it cannot auto-configure from existing credentials).
 var setupService = app.Services.GetRequiredService<SetupService>();
 
 if (CraftSettings.Setup.Enabled)
 {
-    var autoActivate = CraftSettings.Setup.AutoActivate;
-
     app.Use(async (context, next) =>
     {
         if (SetupService.IsEasyAuthConfigured())
@@ -314,10 +311,8 @@ if (CraftSettings.Setup.Enabled)
             return;
         }
 
-        // EasyAuth NOT configured — check whether setup mode should be active.
-        // AutoActivate: always active. Otherwise: only after child app calls RequestSetupMode().
-        var setupActive = autoActivate || AppLifecycleBridge.IsSetupModeRequested();
-        if (!setupActive)
+        // EasyAuth NOT configured — setup mode only active after child app calls RequestSetupMode().
+        if (!AppLifecycleBridge.IsSetupModeRequested())
         {
             // Setup not yet requested by child app — let requests through normally
             // (the startup loading middleware will handle the "pool not ready" case)
@@ -368,10 +363,8 @@ if (CraftSettings.Setup.Enabled)
         context.Response.Redirect("/setup");
     });
 
-    logger.LogInformation("[Setup] Setup mode enabled (AutoActivate={AutoActivate}) — {Status}",
-        autoActivate,
+    logger.LogInformation("[Setup] Setup mode enabled — {Status}",
         SetupService.IsEasyAuthConfigured() ? "EasyAuth already configured, setup endpoints disabled"
-            : autoActivate ? "awaiting configuration at /setup"
             : "waiting for child app to call RequestSetupMode()");
 }
 
