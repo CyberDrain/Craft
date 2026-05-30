@@ -18,6 +18,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: dev
 
       - name: Set lower case image name
         run: echo "IMAGE_NAME_LC=${REPO,,}" >> $GITHUB_ENV
