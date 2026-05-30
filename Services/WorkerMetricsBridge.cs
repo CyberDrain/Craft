@@ -28,6 +28,17 @@ public static class WorkerMetricsBridge
     private static readonly DateTime s_startTimeUtc = DateTime.UtcNow;
     private static long s_globalInvocations;
 
+    // Retired-worker totals: when a worker is recycled, its accumulated counters are
+    // moved here so pool aggregates remain monotonic across recycles. Without these,
+    // pool.TotalInvocations would drop on recycle and StatsHistoryService deltas
+    // (BgInvocations, BgBusyMs) would go negative.
+    private static long s_retiredHttpInvocations;
+    private static long s_retiredHttpBusyMs;
+    private static long s_retiredHttpFaults;
+    private static long s_retiredBgInvocations;
+    private static long s_retiredBgBusyMs;
+    private static long s_retiredBgFaults;
+
     public static void Initialize(PowerShellWorkerPool pool, BackgroundTaskLimiter limiter, JobManager jobManager, ILogger? logger = null)
     {
         s_pool = pool;
@@ -48,7 +59,26 @@ public static class WorkerMetricsBridge
     /// <summary>Remove a worker's stats when it is recycled/replaced.</summary>
     public static void DeregisterWorker(int workerId)
     {
-        s_workerStats.TryRemove(workerId, out _);
+        // Accumulate the retiring worker's totals into the per-pool "retired" buckets
+        // so pool-level sums (and delta-based history) stay monotonic across recycles.
+        if (s_workerStats.TryRemove(workerId, out var stats))
+        {
+            var inv = Interlocked.Read(ref stats._totalInvocations);
+            var busy = Interlocked.Read(ref stats._totalBusyMs);
+            var faults = Interlocked.Read(ref stats._totalFaults);
+            if (stats.IsHttp)
+            {
+                Interlocked.Add(ref s_retiredHttpInvocations, inv);
+                Interlocked.Add(ref s_retiredHttpBusyMs, busy);
+                Interlocked.Add(ref s_retiredHttpFaults, faults);
+            }
+            else
+            {
+                Interlocked.Add(ref s_retiredBgInvocations, inv);
+                Interlocked.Add(ref s_retiredBgBusyMs, busy);
+                Interlocked.Add(ref s_retiredBgFaults, faults);
+            }
+        }
     }
 
     /// <summary>Record that a worker was checked out (started processing).</summary>
@@ -135,9 +165,15 @@ public static class WorkerMetricsBridge
                 Workers = bgWorkers,
             };
 
-            // Aggregate pool-level stats
-            AggregatePoolStats(snapshot.HttpPool, httpWorkers);
-            AggregatePoolStats(snapshot.BgPool, bgWorkers);
+            // Aggregate pool-level stats (live workers + retired buckets so totals are monotonic)
+            AggregatePoolStats(snapshot.HttpPool, httpWorkers,
+                Interlocked.Read(ref s_retiredHttpInvocations),
+                Interlocked.Read(ref s_retiredHttpBusyMs),
+                Interlocked.Read(ref s_retiredHttpFaults));
+            AggregatePoolStats(snapshot.BgPool, bgWorkers,
+                Interlocked.Read(ref s_retiredBgInvocations),
+                Interlocked.Read(ref s_retiredBgBusyMs),
+                Interlocked.Read(ref s_retiredBgFaults));
         }
 
         if (s_limiter != null)
@@ -490,13 +526,22 @@ public static class WorkerMetricsBridge
         };
     }
 
-    private static void AggregatePoolStats(PoolMetrics pool, List<WorkerDetail> workers)
+    private static void AggregatePoolStats(PoolMetrics pool, List<WorkerDetail> workers,
+        long retiredInvocations, long retiredBusyMs, long retiredFaults)
     {
-        if (workers.Count == 0) return;
-        pool.TotalInvocations = workers.Sum(w => w.TotalInvocations);
-        pool.TotalBusyMs = workers.Sum(w => w.TotalBusyMs);
-        pool.TotalFaults = workers.Sum(w => w.TotalFaults);
-        pool.AvgUtilizationPct = Math.Round(workers.Average(w => w.UtilizationPct), 1);
+        // Sum live workers and add retired-worker totals (workers that were recycled out
+        // of the pool). Without the retired buckets, recycling a worker would decrease
+        // pool.TotalInvocations and break delta-based history (StatsHistoryService).
+        var liveInv = workers.Sum(w => w.TotalInvocations);
+        var liveBusy = workers.Sum(w => w.TotalBusyMs);
+        var liveFaults = workers.Sum(w => w.TotalFaults);
+
+        pool.TotalInvocations = liveInv + retiredInvocations;
+        pool.TotalBusyMs = liveBusy + retiredBusyMs;
+        pool.TotalFaults = liveFaults + retiredFaults;
+        pool.AvgUtilizationPct = workers.Count > 0
+            ? Math.Round(workers.Average(w => w.UtilizationPct), 1)
+            : 0;
         pool.AvgDurationMs = pool.TotalInvocations > 0
             ? pool.TotalBusyMs / pool.TotalInvocations
             : 0;

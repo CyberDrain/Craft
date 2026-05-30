@@ -607,8 +607,7 @@ public class OrchestratorService
                             CheckRunCompletion(run);
                         }
                     }
-                    await _store.UpsertTaskAsync(run.Name, task);
-                    await _store.UpsertRunAsync(run);
+                    PersistTaskAndRunAsync(run, task);
                     return;
                 }
 
@@ -616,6 +615,7 @@ public class OrchestratorService
                 {
                     task.Status = "Running";
                 }
+                // Pre-script "Running" write is awaited — it's the durability marker for crash recovery.
                 await _store.UpsertTaskAsync(run.Name, task);
 
                 try
@@ -646,8 +646,11 @@ public class OrchestratorService
                         task.Parameters = null!;
                         CheckRunCompletion(run);
                     }
-                    await _store.UpsertTaskAsync(run.Name, task);
-                    await _store.UpsertRunAsync(run);
+                    // Post-script writes are fire-and-forget so the JobManager slot releases
+                    // immediately and the dispatch loop can hand the worker to the next task.
+                    // Crash recovery still works: the next startup re-reads task state from the
+                    // table and re-runs anything not marked Completed (idempotent).
+                    PersistTaskAndRunAsync(run, task);
 
                     _logger.LogDebug("[Scheduler] Task completed: {TaskId}", task.Id);
                 }
@@ -668,13 +671,30 @@ public class OrchestratorService
                         task.Parameters = null!;
                         CheckRunCompletion(run);
                     }
-                    await _store.UpsertTaskAsync(run.Name, task);
-                    await _store.UpsertRunAsync(run);
+                    PersistTaskAndRunAsync(run, task);
                     _logger.LogError(ex, "[Scheduler] Task failed: {TaskId}", task.Id);
                     throw; // Let JobManager also track the failure
                 }
             }
         );
+    }
+
+    /// <summary>
+    /// Fire-and-forget persistence of task + run state. Callers do not await this — it lets the
+    /// JobManager slot release immediately so the dispatch loop can hand the worker to the next
+    /// task. Errors are logged; on host crash, ResumeInterruptedRunsAsync re-derives state from
+    /// whatever made it to the table (writes are idempotent).
+    /// </summary>
+    private void PersistTaskAndRunAsync(OrchestratorRun run, OrchestratorTaskItem task)
+    {
+        _ = Task.Run(async () =>
+        {
+            try { await _store.UpsertTaskAsync(run.Name, task); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[Scheduler] Background UpsertTask failed for {Run}/{Task}", run.Name, task.Id); }
+
+            try { await _store.UpsertRunAsync(run); }
+            catch (Exception ex) { _logger.LogWarning(ex, "[Scheduler] Background UpsertRun failed for {Run}", run.Name); }
+        });
     }
 
     private void LogRunStatus(OrchestratorRun run)
