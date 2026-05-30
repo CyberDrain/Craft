@@ -12,8 +12,6 @@ obj/
 
 # Docker
 build/
-!build/sshd_config
-!build/entrypoint.sh
 .dockerignore
 
 # Docs / non-runtime

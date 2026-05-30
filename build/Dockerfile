@@ -29,8 +29,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-server \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd
-COPY build/sshd_config /etc/ssh/sshd_config
-COPY build/entrypoint.sh /entrypoint.sh
+COPY docker/sshd_config /etc/ssh/sshd_config
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 COPY --from=build /app/publish .
