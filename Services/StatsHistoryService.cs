@@ -132,6 +132,8 @@ public class StatsHistoryService : BackgroundService
             RssMB = snapshot.Memory.RssMB,
             CommittedMB = snapshot.Memory.CommittedMB,
             ContainerLimitMB = snapshot.Memory.ContainerLimitMB,
+            ContainerUsedMB = snapshot.Memory.ContainerUsedMB,
+            OtherRssMB = snapshot.Memory.OtherRssMB,
             GCHeapLimitMB = snapshot.Memory.GCHeapLimitMB,
             MemoryUsagePct = snapshot.Memory.UsagePct,
             GC0 = snapshot.Memory.GC0,
@@ -140,6 +142,8 @@ public class StatsHistoryService : BackgroundService
 
             // CPU — delta-computed by WorkerMetricsBridge
             CpuPct = snapshot.Memory.CpuPct,
+            ContainerCpuPct = snapshot.Memory.ContainerCpuPct,
+            OtherCpuPct = snapshot.Memory.OtherCpuPct,
         };
 
         // Compute deltas (invocations/faults since last sample)
@@ -332,6 +336,8 @@ public class StatsDataPoint
     public long RssMB { get; set; }
     public long CommittedMB { get; set; }
     public long ContainerLimitMB { get; set; }
+    public long ContainerUsedMB { get; set; }
+    public long OtherRssMB { get; set; }
     public long GCHeapLimitMB { get; set; }
     public double MemoryUsagePct { get; set; }
     public int GC0 { get; set; }
@@ -340,6 +346,8 @@ public class StatsDataPoint
 
     // ── CPU (delta-computed) ──
     public double CpuPct { get; set; }
+    public double ContainerCpuPct { get; set; }
+    public double OtherCpuPct { get; set; }
 }
 
 /// <summary>Configuration for stats history collection.</summary>

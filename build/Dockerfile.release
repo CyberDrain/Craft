@@ -23,6 +23,17 @@ WORKDIR /app
 COPY --from=build /usr/share/powershell /usr/share/powershell
 RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 
+# Optional SSH server for Azure App Service SCM access. Installed unconditionally
+# but NOT started — the entrypoint launches sshd only when CRAFT_SSH_ENABLED=true.
+# Adds ~12MB to the image. Uses Azure's standard port 2222 and root login.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd
+COPY build/sshd_config /etc/ssh/sshd_config
+COPY build/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 COPY --from=build /app/publish .
 
 # ─── Runtime Configuration ────────────────────────────────
@@ -34,7 +45,9 @@ ENV COMMIT_SHA=$COMMIT_SHA
 ENV IMAGE_TAG=$IMAGE_TAG
 
 ENV CRAFT_VERBOSE="false"
-EXPOSE 8080
+# SSH is opt-in. Set CRAFT_SSH_ENABLED=true at runtime to start sshd on port 2222.
+ENV CRAFT_SSH_ENABLED="false"
+EXPOSE 8080 2222
 ENV ASPNETCORE_URLS=http://+:8080
 
-ENTRYPOINT ["dotnet", "Craft.dll"]
+ENTRYPOINT ["/entrypoint.sh"]
