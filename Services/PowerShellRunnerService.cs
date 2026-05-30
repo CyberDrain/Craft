@@ -294,6 +294,26 @@ public class PowerShellRunnerService : IDisposable
     }
 
     /// <summary>
+    /// Drain pending orchestrator/queue triggers off the calling thread. Bridges are thread-safe
+    /// concurrent queues, so multiple in-flight drain calls are fine — each TryDequeue serialises.
+    /// </summary>
+    private void DrainBridgesInBackground()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await OrchestratorBridge.DrainPendingAsync();
+                QueueBridge.DrainPending();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Scheduler] Background bridge drain failed");
+            }
+        });
+    }
+
+    /// <summary>
     /// Execute a script by function name (for scheduler / orchestrator). No HTTP context needed.
     /// Runs on the background pool.
     /// </summary>
@@ -380,10 +400,6 @@ public class PowerShellRunnerService : IDisposable
             sw.Stop();
             _logger.LogInformation("[Scheduler] {InvocationId} {Function} completed {Ms}ms",
                 invocation.Id, functionName, sw.ElapsedMilliseconds);
-
-            // Process any orchestrator/queue triggers queued during execution
-            await OrchestratorBridge.DrainPendingAsync();
-            QueueBridge.DrainPending();
         }
         catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
         {
@@ -410,6 +426,11 @@ public class PowerShellRunnerService : IDisposable
             if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
             _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
         }
+
+        // Worker has been returned to the pool — drain any orchestrator/queue triggers
+        // the script enqueued in the background so the next job can grab the worker now
+        // instead of waiting for child-run table writes.
+        DrainBridgesInBackground();
     }
 
     /// <summary>
@@ -483,14 +504,14 @@ public class PowerShellRunnerService : IDisposable
                 : null;
             var results = await worker.InvokeAsync(resolvedName, psParams, cts?.Token ?? default);
 
-            // Process any orchestrator/queue triggers queued during execution
-            await OrchestratorBridge.DrainPendingAsync();
-            QueueBridge.DrainPending();
-
             sw.Stop();
             _logger.LogInformation("[Planner] {InvocationId} {Function} completed {Ms}ms",
                 invocation.Id, functionName, sw.ElapsedMilliseconds);
-            return string.Join("\n", (results ?? new Collection<PSObject>()).Select(r => r?.ToString() ?? ""));
+            var output = string.Join("\n", (results ?? new Collection<PSObject>()).Select(r => r?.ToString() ?? ""));
+            // Drain triggered child orchestrators/queue commands after returning — they should
+            // not block the planner's caller. (Note: Reclaim still happens in finally below.)
+            DrainBridgesInBackground();
+            return output;
         }
         catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
         {

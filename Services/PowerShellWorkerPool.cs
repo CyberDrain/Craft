@@ -440,13 +440,32 @@ public class PowerShellWorkerPool : IDisposable
             var oldId = worker.Id;
             WorkerMetricsBridge.DeregisterWorker(oldId);
             worker.Dispose();
-            var cloned = isHttp ? _httpClonedState : _bgClonedState;
-            var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: isHttp);
-            worker = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
-            worker.Initialize(_repo, _apiBasePath, _settings);
-            WorkerMetricsBridge.RegisterWorker(worker.Id, isHttp);
-            _logger.LogInformation("[Pool] Replaced W{OldId} → W{NewId} ({Type})",
-                oldId, worker.Id, isHttp ? "HTTP" : "BG");
+
+            // Build the replacement off the calling thread so the dispatch loop is not held
+            // for the 6-13s ISS rebuild + Initialize() cost. Capacity briefly drops by 1 (the
+            // pool is short one worker until this Task completes), but the thread that just
+            // finished a task returns to the dispatch loop immediately.
+            var ish = isHttp;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var cloned = ish ? _httpClonedState : _bgClonedState;
+                    var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: ish);
+                    var fresh = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
+                    fresh.Initialize(_repo, _apiBasePath, _settings);
+                    WorkerMetricsBridge.RegisterWorker(fresh.Id, ish);
+                    if (ish) _httpPool.Add(fresh); else _bgPool.Add(fresh);
+                    _logger.LogInformation("[Pool] Replaced W{OldId} → W{NewId} ({Type}) (background recycle)",
+                        oldId, fresh.Id, ish ? "HTTP" : "BG");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "[Pool] Background recycle failed for W{OldId} ({Type}); pool capacity reduced by 1",
+                        oldId, ish ? "HTTP" : "BG");
+                }
+            });
+            return;
         }
 
         if (isHttp) _httpPool.Add(worker); else _bgPool.Add(worker);
