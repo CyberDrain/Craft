@@ -105,16 +105,39 @@ Remove-Variable __cache, __mod -ErrorAction SilentlyContinue
 ");
         }
 
-        // Load shared assemblies from config
+        // Load shared assemblies from config.
+        // ISS-level registration happens in PowerShellWorkerPool.RegisterSharedAssemblies(); this
+        // runtime LoadFile is a defence-in-depth fallback that surfaces any load failure to the log
+        // (RunScript silently swallows streams, so we run a labelled invocation here instead).
         foreach (var asmRelPath in settings.Worker.SharedAssemblies)
         {
+            if (string.IsNullOrWhiteSpace(asmRelPath)) continue;
             var asmPath = Path.Combine(apiBasePath, asmRelPath).Replace("\\", "/");
-            RunScript($@"
-if (Test-Path '{asmPath}') {{
-    if (-not ([System.AppDomain]::CurrentDomain.GetAssemblies().Location -contains '{asmPath}')) {{
+            var asmLabel = Path.GetFileNameWithoutExtension(asmPath);
+            try
+            {
+                _pwsh.AddScript($@"
+if (Test-Path -LiteralPath '{asmPath}') {{
+    if (-not ([System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {{ $_.Location -ieq '{asmPath}' }})) {{
         [void][Reflection.Assembly]::LoadFile('{asmPath}')
     }}
-}}");
+    [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {{ $_.Location -ieq '{asmPath}' }} | Select-Object -First 1 -ExpandProperty FullName
+}} else {{
+    Write-Error ""SharedAssembly not found: {asmPath}""
+}}").Invoke();
+
+                foreach (var err in _pwsh.Streams.Error)
+                    _logger.LogError("Worker{Id}: SharedAssembly '{Label}' load error: {Error}", Id, asmLabel, err.ToString());
+                foreach (var warn in _pwsh.Streams.Warning)
+                    _logger.LogWarning("Worker{Id}: SharedAssembly '{Label}' warning: {Message}", Id, asmLabel, warn.Message);
+
+                _logger.LogDebug("Worker{Id}: SharedAssembly '{Label}' available at {Path}", Id, asmLabel, asmPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Worker{Id}: SharedAssembly '{Label}' load threw", Id, asmLabel);
+            }
+            finally { _pwsh.Commands.Clear(); _pwsh.Streams.ClearStreams(); }
         }
 
         // Deploy background scripts as Function:\ items.

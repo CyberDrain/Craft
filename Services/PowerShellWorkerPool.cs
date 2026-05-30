@@ -459,6 +459,43 @@ public class PowerShellWorkerPool : IDisposable
     }
 
     /// <summary>
+    /// Register configured SharedAssemblies on the InitialSessionState so the runspace's
+    /// type resolver knows about them from creation. This complements the runtime
+    /// [Reflection.Assembly]::LoadFile script in PowerShellWorker.Initialize() and ensures
+    /// type literals (e.g. [CIPP.TestDataCache]) resolve in cloned/recycled runspaces.
+    /// Logs each path so silent load failures during cold-start become observable.
+    /// </summary>
+    private void RegisterSharedAssemblies(InitialSessionState iss, string buildContext)
+    {
+        if (_settings.Worker.SharedAssemblies.Count == 0) return;
+
+        foreach (var asmRelPath in _settings.Worker.SharedAssemblies)
+        {
+            if (string.IsNullOrWhiteSpace(asmRelPath)) continue;
+
+            var asmPath = Path.GetFullPath(Path.Combine(_apiBasePath, asmRelPath));
+            if (!File.Exists(asmPath))
+            {
+                _logger.LogError("[Pool] SharedAssembly missing for {Context}: {Path}", buildContext, asmPath);
+                continue;
+            }
+
+            try
+            {
+                var asmName = Path.GetFileNameWithoutExtension(asmPath);
+                iss.Assemblies.Add(new SessionStateAssemblyEntry(asmName, asmPath));
+                _logger.LogDebug("[Pool] SharedAssembly registered for {Context}: {Name} ({Path})",
+                    buildContext, asmName, asmPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Pool] SharedAssembly registration failed for {Context}: {Path}",
+                    buildContext, asmPath);
+            }
+        }
+    }
+
+    /// <summary>
     /// Build an ISS that imports only the specified modules.
     /// If moduleList is null, imports all modules (minus SkipModules).
     /// </summary>
@@ -467,6 +504,8 @@ public class PowerShellWorkerPool : IDisposable
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
             iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+
+        RegisterSharedAssemblies(iss, "BuildISSForModules");
 
         // Copy environment variables into the runspace
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
@@ -514,6 +553,8 @@ public class PowerShellWorkerPool : IDisposable
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
             iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+
+        RegisterSharedAssemblies(iss, "BuildClonedISSWithModules");
 
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
@@ -580,6 +621,8 @@ public class PowerShellWorkerPool : IDisposable
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
             iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+
+        RegisterSharedAssemblies(iss, "BuildClonedISS");
 
         // Copy environment variables
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
