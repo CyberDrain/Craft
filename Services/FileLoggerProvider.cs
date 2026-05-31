@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using System.Globalization;
+using System.Threading.Channels;
 
 namespace Craft.Services;
 
@@ -9,10 +10,15 @@ namespace Craft.Services;
 ///
 /// File naming: {prefix}.log (current), {prefix}.1.log (previous), {prefix}.2.log, etc.
 /// Older rotated files have higher numbers. Files beyond MaxFileCount are deleted.
+///
+/// Producer-side <see cref="WriteLine"/> is non-blocking: log entries are pushed onto
+/// an unbounded channel and a single background consumer task performs the actual
+/// file writes. The consumer flushes once per drain burst, so a 1000-line burst
+/// yields a single flush — under sustained load the queue grows briefly while the
+/// consumer drains it as fast as the disk allows. Nothing is ever dropped.
 /// </summary>
 public sealed class FileLoggerProvider : ILoggerProvider
 {
-    private readonly object _lock = new();
     private readonly string _directory;
     private readonly string _filePrefix;
     private readonly long _maxFileBytes;
@@ -23,6 +29,11 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
     private StreamWriter? _writer;
     private long _currentFileSize;
+
+    private readonly Channel<LogItem> _channel;
+    private readonly Task _consumerTask;
+
+    private readonly record struct LogItem(string Line, string? ExLine, TaskCompletionSource? RotateSignal);
 
     public FileLoggerProvider(FileLoggingSettings settings, LogLevel minLevel = LogLevel.Information)
     {
@@ -36,6 +47,13 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
         Directory.CreateDirectory(_directory);
         OpenCurrentFile();
+
+        _channel = Channel.CreateUnbounded<LogItem>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,
+        });
+        _consumerTask = Task.Run(ConsumeLoopAsync);
     }
 
     /// <summary>Path to the currently active log file.</summary>
@@ -51,37 +69,85 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
     public void Dispose()
     {
-        lock (_lock) { _writer?.Dispose(); _writer = null; }
+        try
+        {
+            _channel.Writer.TryComplete();
+            _consumerTask.Wait(TimeSpan.FromSeconds(2));
+        }
+        catch { /* swallow — shutdown must not throw */ }
+        try { _writer?.Dispose(); } catch { }
+        _writer = null;
     }
 
-    /// <summary>Force an immediate log rotation regardless of file size.</summary>
+    /// <summary>
+    /// Force an immediate log rotation regardless of file size. The request is
+    /// dispatched to the consumer thread; this call blocks up to 5 seconds for it
+    /// to complete so callers (admin endpoints) can rely on the rotation being done.
+    /// </summary>
     internal void ForceRotate()
     {
-        lock (_lock) { Rotate(); }
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_channel.Writer.TryWrite(new LogItem(string.Empty, null, tcs)))
+            return; // channel completed (shutdown) — nothing to do
+        try { tcs.Task.Wait(TimeSpan.FromSeconds(5)); } catch { }
     }
 
+    /// <summary>
+    /// Producer-side enqueue. Non-blocking; safe to call from any thread under any
+    /// lock. Silently no-ops if the channel has been completed (shutdown).
+    /// </summary>
     internal void WriteLine(string line, string? exceptionLine)
     {
-        lock (_lock)
+        _channel.Writer.TryWrite(new LogItem(line, exceptionLine, null));
+    }
+
+    /// <summary>
+    /// Single-consumer drain loop. Flushes the writer once per drain burst so a
+    /// large logging burst maps to one flush, while a slow trickle still gets
+    /// per-message durability — without ever blocking the producers.
+    /// </summary>
+    private async Task ConsumeLoopAsync()
+    {
+        var reader = _channel.Reader;
+        try
+        {
+            while (await reader.WaitToReadAsync().ConfigureAwait(false))
+            {
+                while (reader.TryRead(out var item))
+                {
+                    if (item.RotateSignal is not null)
+                    {
+                        try { Rotate(); }
+                        finally { item.RotateSignal.TrySetResult(); }
+                        continue;
+                    }
+                    WriteToFile(item.Line, item.ExLine);
+                }
+                try { _writer?.Flush(); } catch { }
+            }
+        }
+        catch { /* logging failures must never crash the host */ }
+        finally { try { _writer?.Flush(); } catch { } }
+    }
+
+    private void WriteToFile(string line, string? exceptionLine)
+    {
+        try
         {
             if (_writer == null) return;
+            _writer.WriteLine(line);
+            _currentFileSize += line.Length + Environment.NewLine.Length;
 
-            try
+            if (exceptionLine != null)
             {
-                _writer.WriteLine(line);
-                _currentFileSize += line.Length + Environment.NewLine.Length;
-
-                if (exceptionLine != null)
-                {
-                    _writer.WriteLine(exceptionLine);
-                    _currentFileSize += exceptionLine.Length + Environment.NewLine.Length;
-                }
-
-                if (_currentFileSize >= _maxFileBytes)
-                    Rotate();
+                _writer.WriteLine(exceptionLine);
+                _currentFileSize += exceptionLine.Length + Environment.NewLine.Length;
             }
-            catch { /* don't let logging failures crash the app */ }
+
+            if (_currentFileSize >= _maxFileBytes)
+                Rotate();
         }
+        catch { /* don't let logging failures crash the app */ }
     }
 
     private void OpenCurrentFile()
@@ -89,7 +155,8 @@ public sealed class FileLoggerProvider : ILoggerProvider
         var path = CurrentFilePath;
         var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
         _currentFileSize = stream.Length;
-        _writer = new StreamWriter(stream) { AutoFlush = true };
+        // AutoFlush removed: the consumer loop flushes once per drain burst.
+        _writer = new StreamWriter(stream);
     }
 
     private void Rotate()

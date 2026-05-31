@@ -31,8 +31,9 @@ public class StatsHistoryService : BackgroundService
     private long _prevJobsFailed;
     private bool _hasPrevious;
 
-    private int _ticksSinceFlush;
-    private const int FlushEveryNTicks = 10; // flush to disk every 10 samples
+    private int _ticksSinceCompact;
+    private const int CompactEveryNTicks = 60; // rewrite file (apply retention) every 60 samples (~1h at 60s)
+    private long _appendedSinceLoad;
 
     private static readonly JsonSerializerOptions s_jsonOptions = new()
     {
@@ -47,7 +48,7 @@ public class StatsHistoryService : BackgroundService
         _settings = settings;
 
         var dataDir = Path.Combine(AppContext.BaseDirectory, "_data");
-        _dataFilePath = Path.Combine(dataDir, "stats-history.json");
+        _dataFilePath = Path.Combine(dataDir, "stats-history.jsonl");
     }
 
     public int SampleIntervalSeconds => _settings.StatsHistory.SampleIntervalSeconds;
@@ -70,13 +71,14 @@ public class StatsHistoryService : BackgroundService
         {
             try
             {
-                CollectSample();
+                var point = CollectSample();
+                AppendPointToDisk(point);
 
-                _ticksSinceFlush++;
-                if (_ticksSinceFlush >= FlushEveryNTicks)
+                _ticksSinceCompact++;
+                if (_ticksSinceCompact >= CompactEveryNTicks)
                 {
-                    FlushToDisk();
-                    _ticksSinceFlush = 0;
+                    CompactFile();
+                    _ticksSinceCompact = 0;
                 }
             }
             catch (Exception ex)
@@ -85,12 +87,12 @@ public class StatsHistoryService : BackgroundService
             }
         }
 
-        // Final flush on shutdown
-        FlushToDisk();
+        // Final compaction on shutdown so retention is applied before we exit
+        try { CompactFile(); } catch { }
     }
 
     /// <summary>Take a metrics snapshot and record a data point with delta computation.</summary>
-    private void CollectSample()
+    private StatsDataPoint CollectSample()
     {
         var snapshot = WorkerMetricsBridge.GetSnapshot();
         var now = DateTime.UtcNow;
@@ -175,6 +177,7 @@ public class StatsHistoryService : BackgroundService
             _history.Add(point);
             PruneOldEntries(now);
         }
+        return point;
     }
 
     /// <summary>Remove entries older than the retention window.</summary>
@@ -235,9 +238,33 @@ public class StatsHistoryService : BackgroundService
         }
     }
 
-    // ── Disk persistence ──
+    // ── Disk persistence (JSONL append-only + periodic compaction) ──
 
-    private void FlushToDisk()
+    /// <summary>Append a single sample as one JSON line. O(1) write, no full-file rewrite.</summary>
+    private void AppendPointToDisk(StatsDataPoint point)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(_dataFilePath)!;
+            if (!Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            var line = JsonSerializer.Serialize(point, s_jsonOptions);
+            File.AppendAllText(_dataFilePath, line + "\n");
+            Interlocked.Increment(ref _appendedSinceLoad);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[StatsHistory] Failed to append sample to disk");
+        }
+    }
+
+    /// <summary>
+    /// Rewrite the JSONL file from the in-memory (already-pruned) buffer. This bounds
+    /// disk size to the retention window and reclaims space from expired samples.
+    /// Uses a temp file + atomic move so a crash mid-rewrite cannot corrupt history.
+    /// </summary>
+    private void CompactFile()
     {
         try
         {
@@ -251,12 +278,21 @@ public class StatsHistoryService : BackgroundService
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
 
-            var json = JsonSerializer.Serialize(snapshot, s_jsonOptions);
-            File.WriteAllText(_dataFilePath, json);
+            var tmp = _dataFilePath + ".tmp";
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var sw = new StreamWriter(fs))
+            {
+                foreach (var p in snapshot)
+                {
+                    sw.WriteLine(JsonSerializer.Serialize(p, s_jsonOptions));
+                }
+            }
+            File.Move(tmp, _dataFilePath, overwrite: true);
+            Interlocked.Exchange(ref _appendedSinceLoad, 0);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[StatsHistory] Failed to flush to disk");
+            _logger.LogWarning(ex, "[StatsHistory] Failed to compact history file");
         }
     }
 
@@ -264,23 +300,55 @@ public class StatsHistoryService : BackgroundService
     {
         try
         {
-            if (!File.Exists(_dataFilePath)) return;
-
-            var json = File.ReadAllText(_dataFilePath);
-            var loaded = JsonSerializer.Deserialize<List<StatsDataPoint>>(json, s_jsonOptions);
-            if (loaded == null || loaded.Count == 0) return;
+            if (!File.Exists(_dataFilePath))
+            {
+                // Migrate legacy single-blob file if present
+                var legacy = Path.ChangeExtension(_dataFilePath, ".json");
+                if (File.Exists(legacy))
+                {
+                    var legacyJson = File.ReadAllText(legacy);
+                    var legacyLoaded = JsonSerializer.Deserialize<List<StatsDataPoint>>(legacyJson, s_jsonOptions);
+                    if (legacyLoaded != null && legacyLoaded.Count > 0)
+                    {
+                        lock (_lock)
+                        {
+                            _history.Clear();
+                            _history.AddRange(legacyLoaded.Where(p => p.TimestampUtc >= DateTime.UtcNow.AddDays(-RetentionDays)));
+                        }
+                        CompactFile();
+                        try { File.Delete(legacy); } catch { }
+                        _logger.LogInformation("[StatsHistory] Migrated {Count} points from legacy stats-history.json", _history.Count);
+                    }
+                }
+                return;
+            }
 
             var cutoff = DateTime.UtcNow.AddDays(-RetentionDays);
-            var valid = loaded.Where(p => p.TimestampUtc >= cutoff).ToList();
+            var loaded = new List<StatsDataPoint>();
+            var pruned = 0;
+
+            foreach (var raw in File.ReadLines(_dataFilePath))
+            {
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+                StatsDataPoint? p;
+                try { p = JsonSerializer.Deserialize<StatsDataPoint>(raw, s_jsonOptions); }
+                catch { continue; } // skip a torn last line from a crash
+                if (p == null) continue;
+                if (p.TimestampUtc < cutoff) { pruned++; continue; }
+                loaded.Add(p);
+            }
 
             lock (_lock)
             {
                 _history.Clear();
-                _history.AddRange(valid);
+                _history.AddRange(loaded);
             }
 
             _logger.LogInformation("[StatsHistory] Loaded {Count} data points from disk (pruned {Pruned} expired)",
-                valid.Count, loaded.Count - valid.Count);
+                loaded.Count, pruned);
+
+            // If we pruned anything on load, compact immediately to reclaim space.
+            if (pruned > 0) CompactFile();
         }
         catch (Exception ex)
         {
