@@ -25,8 +25,9 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 
 # Optional SSH server for Azure App Service SCM access. Installed unconditionally
 # but NOT started — the entrypoint launches sshd only when CRAFT_SSH_ENABLED=true.
+# Also installs libmimalloc; see Dockerfile.release for the full rationale.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server \
+ && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd
 COPY docker/sshd_config /etc/ssh/sshd_config
@@ -46,6 +47,14 @@ ENV IMAGE_TAG=$IMAGE_TAG
 ENV CRAFT_VERBOSE="false"
 # SSH is opt-in. Set CRAFT_SSH_ENABLED=true at runtime to start sshd on port 2222.
 ENV CRAFT_SSH_ENABLED="false"
+
+# ── Memory & runtime tuning (kept in sync with Dockerfile.release) ──
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2
+ENV MALLOC_ARENA_MAX=2
+ENV POWERSHELL_TELEMETRY_OPTOUT=1
+ENV POWERSHELL_UPDATECHECK=Off
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+
 EXPOSE 8080 2222
 ENV ASPNETCORE_URLS=http://+:8080
 

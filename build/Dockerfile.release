@@ -26,8 +26,16 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 # Optional SSH server for Azure App Service SCM access. Installed unconditionally
 # but NOT started — the entrypoint launches sshd only when CRAFT_SSH_ENABLED=true.
 # Adds ~12MB to the image. Uses Azure's standard port 2222 and root login.
+#
+# Also installs libmimalloc — a drop-in malloc replacement that returns freed
+# memory to the OS far more aggressively than glibc malloc. PowerShell runspaces
+# allocate-and-free in patterns that glibc holds onto indefinitely (per-thread
+# arenas + low trim threshold), causing RSS to climb well past the actual live
+# working set. Preloading mimalloc typically reclaims 20–40% RSS on long-lived
+# .NET-on-Linux hosts that spawn child processes. LD_PRELOAD propagates to
+# child pwsh runspaces automatically, which is exactly what we want here.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server \
+ && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd
 COPY docker/sshd_config /etc/ssh/sshd_config
@@ -47,6 +55,19 @@ ENV IMAGE_TAG=$IMAGE_TAG
 ENV CRAFT_VERBOSE="false"
 # SSH is opt-in. Set CRAFT_SSH_ENABLED=true at runtime to start sshd on port 2222.
 ENV CRAFT_SSH_ENABLED="false"
+
+# ── Memory & runtime tuning ──
+# mimalloc preload — see install step above for rationale.
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2
+# Cap glibc per-thread arenas. Even with mimalloc preloaded, anything that
+# bypasses LD_PRELOAD (vDSO, some syscalls, statically-linked helpers) still
+# uses glibc; capping arenas to 2 prevents fragmentation when that happens.
+ENV MALLOC_ARENA_MAX=2
+# Suppress PowerShell + .NET CLI background work in every runspace.
+ENV POWERSHELL_TELEMETRY_OPTOUT=1
+ENV POWERSHELL_UPDATECHECK=Off
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
+
 EXPOSE 8080 2222
 ENV ASPNETCORE_URLS=http://+:8080
 
