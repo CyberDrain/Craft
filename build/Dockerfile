@@ -37,7 +37,7 @@ RUN chmod +x /entrypoint.sh
 COPY --from=build /app/publish .
 
 # ─── Runtime Configuration ────────────────────────────────
-ARG APP_VERSION=dev
+ARG APP_VERSION=0.0.0-local
 ARG COMMIT_SHA=unknown
 ARG IMAGE_TAG=dev
 ENV APP_VERSION=$APP_VERSION
