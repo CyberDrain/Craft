@@ -88,6 +88,9 @@ public static class WorkerMetricsBridge
         stats.IsHttp = isHttp;
         stats.LastCheckoutUtc = DateTime.UtcNow;
         stats.IsBusy = true;
+        // Capture per-thread allocation baseline so RecordReclaim can compute the delta
+        // attributable to this invocation. Sub-100ns intrinsic, no syscall.
+        stats.CheckoutAllocBytes = GC.GetAllocatedBytesForCurrentThread();
         Interlocked.Increment(ref stats._totalInvocations);
     }
 
@@ -102,6 +105,17 @@ public static class WorkerMetricsBridge
 
         Interlocked.Add(ref stats._totalBusyMs, elapsedMs);
         if (faulted) Interlocked.Increment(ref stats._totalFaults);
+
+        // Allocation delta attributable to this invocation.
+        // Same-thread comparison; if PowerShell hopped threads (rare for sync runspaces)
+        // the delta could be slightly off but still useful as a directional signal.
+        var allocEnd = GC.GetAllocatedBytesForCurrentThread();
+        var allocDelta = allocEnd - stats.CheckoutAllocBytes;
+        if (allocDelta > 0)
+        {
+            Interlocked.Add(ref stats._totalAllocBytes, allocDelta);
+            stats.LastAllocBytes = allocDelta;
+        }
 
         // Track min/max/recent durations
         UpdateDurationStats(stats, elapsedMs);
@@ -212,22 +226,34 @@ public static class WorkerMetricsBridge
         // TotalAvailableMemoryBytes reflects the GC heap hard limit when one is set
         // (e.g. DOTNET_GCHeapHardLimitPercent), not the actual container memory.
         // Read the real cgroup limit so the dashboard shows container-level usage.
-        var containerBytes = GetContainerMemoryLimit() ?? gcInfo.TotalAvailableMemoryBytes;
+        var containerLimit = GetContainerMemoryLimit() ?? gcInfo.TotalAvailableMemoryBytes;
+        var containerUsed = GetContainerMemoryUsage() ?? workingSet;
+        var containerCpuPct = GetContainerCpuPct();
+        var processCpuPct = GetCpuPct();
+        // "Other" = container total minus our process. On a single-process container this
+        // is mostly page cache + kernel accounting; with sidecars it is real.
+        var otherRss = Math.Max(0, containerUsed - workingSet);
+        var otherCpu = Math.Max(0, containerCpuPct - processCpuPct);
 
         snapshot.Memory = new MemoryMetrics
         {
             HeapMB = heapBytes / (1024 * 1024),
             RssMB = workingSet / (1024 * 1024),
             CommittedMB = gcInfo.TotalCommittedBytes / (1024 * 1024),
-            ContainerLimitMB = containerBytes / (1024 * 1024),
+            ContainerLimitMB = containerLimit / (1024 * 1024),
+            ContainerUsedMB = containerUsed / (1024 * 1024),
+            ContainerFreeMB = Math.Max(0, (containerLimit - containerUsed) / (1024 * 1024)),
+            OtherRssMB = otherRss / (1024 * 1024),
             GCHeapLimitMB = gcInfo.TotalAvailableMemoryBytes / (1024 * 1024),
-            UsagePct = containerBytes > 0
-                ? Math.Round(workingSet * 100.0 / containerBytes, 1)
+            UsagePct = containerLimit > 0
+                ? Math.Round(containerUsed * 100.0 / containerLimit, 1)
                 : 0,
             GC0 = GC.CollectionCount(0),
             GC1 = GC.CollectionCount(1),
             GC2 = GC.CollectionCount(2),
-            CpuPct = GetCpuPct(),
+            CpuPct = processCpuPct,
+            ContainerCpuPct = containerCpuPct,
+            OtherCpuPct = Math.Round(otherCpu, 1),
         };
 
         return snapshot;
@@ -295,6 +321,95 @@ public static class WorkerMetricsBridge
         catch { /* not in a container or no permissions */ }
 
         return null;
+    }
+
+    /// <summary>
+    /// Read actual container RSS (everything inside the cgroup, including page cache and
+    /// any sidecar processes). Returns null on non-Linux. Single file read.
+    /// </summary>
+    private static long? GetContainerMemoryUsage()
+    {
+        try
+        {
+            const string cgroupV2 = "/sys/fs/cgroup/memory.current";
+            if (File.Exists(cgroupV2))
+            {
+                var text = File.ReadAllText(cgroupV2).Trim();
+                if (long.TryParse(text, out var bytes)) return bytes;
+            }
+            const string cgroupV1 = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
+            if (File.Exists(cgroupV1))
+            {
+                var text = File.ReadAllText(cgroupV1).Trim();
+                if (long.TryParse(text, out var bytes)) return bytes;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static long s_prevContainerCpuUsec;
+    private static DateTime s_prevContainerCpuSampleUtc = DateTime.MinValue;
+    private static double s_lastContainerCpuPct;
+    private static readonly object s_containerCpuLock = new();
+
+    /// <summary>
+    /// Read total CPU usage across the container cgroup. Returns 0 on non-Linux. Same
+    /// 500ms minimum-window guard as GetCpuPct so consecutive calls are cheap.
+    /// </summary>
+    private static double GetContainerCpuPct()
+    {
+        lock (s_containerCpuLock)
+        {
+            var now = DateTime.UtcNow;
+            var elapsed = now - s_prevContainerCpuSampleUtc;
+            if (s_prevContainerCpuSampleUtc != DateTime.MinValue && elapsed.TotalMilliseconds < 500)
+                return s_lastContainerCpuPct;
+
+            long? usec = null;
+            try
+            {
+                const string cgroupV2 = "/sys/fs/cgroup/cpu.stat";
+                if (File.Exists(cgroupV2))
+                {
+                    foreach (var line in File.ReadAllLines(cgroupV2))
+                    {
+                        if (line.StartsWith("usage_usec ", StringComparison.Ordinal) &&
+                            long.TryParse(line.AsSpan("usage_usec ".Length), out var v))
+                        {
+                            usec = v;
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    const string cgroupV1 = "/sys/fs/cgroup/cpuacct/cpuacct.usage";
+                    if (File.Exists(cgroupV1))
+                    {
+                        var text = File.ReadAllText(cgroupV1).Trim();
+                        if (long.TryParse(text, out var ns)) usec = ns / 1000;
+                    }
+                }
+            }
+            catch { }
+
+            if (!usec.HasValue) return 0;
+
+            if (s_prevContainerCpuSampleUtc == DateTime.MinValue)
+            {
+                s_prevContainerCpuUsec = usec.Value;
+                s_prevContainerCpuSampleUtc = now;
+                return 0;
+            }
+
+            var cpuDeltaMs = (usec.Value - s_prevContainerCpuUsec) / 1000.0;
+            s_lastContainerCpuPct = Math.Round(
+                cpuDeltaMs / (elapsed.TotalMilliseconds * s_processorCount) * 100, 1);
+            s_prevContainerCpuUsec = usec.Value;
+            s_prevContainerCpuSampleUtc = now;
+            return s_lastContainerCpuPct;
+        }
     }
 
     /// <summary>
@@ -505,21 +620,28 @@ public static class WorkerMetricsBridge
         var utilizationPct = uptimeMs > 0
             ? Math.Round(Interlocked.Read(ref stats._totalBusyMs) * 100.0 / uptimeMs, 1)
             : 0;
+        var totalAlloc = Interlocked.Read(ref stats._totalAllocBytes);
+        var totalInv = Interlocked.Read(ref stats._totalInvocations);
 
         return new WorkerDetail
         {
             WorkerId = stats.WorkerId,
             IsBusy = stats.IsBusy,
             CurrentFunction = stats.IsBusy ? stats.CurrentFunction : null,
-            TotalInvocations = Interlocked.Read(ref stats._totalInvocations),
+            TotalInvocations = totalInv,
             TotalBusyMs = Interlocked.Read(ref stats._totalBusyMs),
             TotalFaults = Interlocked.Read(ref stats._totalFaults),
             UtilizationPct = utilizationPct,
             LastDurationMs = stats.LastDurationMs,
             MinDurationMs = stats.MinDurationMs == long.MaxValue ? 0 : stats.MinDurationMs,
             MaxDurationMs = stats.MaxDurationMs,
-            AvgDurationMs = Interlocked.Read(ref stats._totalInvocations) > 0
-                ? Interlocked.Read(ref stats._totalBusyMs) / Interlocked.Read(ref stats._totalInvocations)
+            AvgDurationMs = totalInv > 0
+                ? Interlocked.Read(ref stats._totalBusyMs) / totalInv
+                : 0,
+            TotalAllocMB = Math.Round(totalAlloc / (1024.0 * 1024), 2),
+            LastAllocMB = Math.Round(stats.LastAllocBytes / (1024.0 * 1024), 2),
+            AvgAllocMB = totalInv > 0
+                ? Math.Round(totalAlloc / (1024.0 * 1024) / totalInv, 2)
                 : 0,
             LastCheckoutUtc = stats.LastCheckoutUtc,
             LastReclaimUtc = stats.LastReclaimUtc,
@@ -608,11 +730,14 @@ public class WorkerStats
     public long LastDurationMs;
     public long MinDurationMs = long.MaxValue;
     public long MaxDurationMs;
+    public long CheckoutAllocBytes;
+    public long LastAllocBytes;
 
     // Interlocked fields
     internal long _totalInvocations;
     internal long _totalBusyMs;
     internal long _totalFaults;
+    internal long _totalAllocBytes;
 }
 
 public class WorkerMetricsSnapshot
@@ -652,6 +777,9 @@ public class WorkerDetail
     public long MinDurationMs { get; set; }
     public long MaxDurationMs { get; set; }
     public long AvgDurationMs { get; set; }
+    public double TotalAllocMB { get; set; }
+    public double LastAllocMB { get; set; }
+    public double AvgAllocMB { get; set; }
     public DateTime? LastCheckoutUtc { get; set; }
     public DateTime? LastReclaimUtc { get; set; }
 }
@@ -683,12 +811,17 @@ public class MemoryMetrics
     public long RssMB { get; set; }
     public long CommittedMB { get; set; }
     public long ContainerLimitMB { get; set; }
+    public long ContainerUsedMB { get; set; }
+    public long ContainerFreeMB { get; set; }
+    public long OtherRssMB { get; set; }
     public long GCHeapLimitMB { get; set; }
     public double UsagePct { get; set; }
     public int GC0 { get; set; }
     public int GC1 { get; set; }
     public int GC2 { get; set; }
     public double CpuPct { get; set; }
+    public double ContainerCpuPct { get; set; }
+    public double OtherCpuPct { get; set; }
 }
 
 public class WorkerSummary
