@@ -26,7 +26,8 @@ jobs:
       - name: Resolve version from latest release tag
         id: version
         run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          TAG=$(git tag --sort=-v:refname | head -1)
+          TAG=${TAG:-v0.0.0}
           BASE="${TAG#v}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           echo "app_version=${BASE}-dev.${SHORT_SHA}" >> $GITHUB_OUTPUT
