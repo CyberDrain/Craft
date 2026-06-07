@@ -292,14 +292,30 @@ if (CraftSettings.Setup.Enabled)
             var reqPath = context.Request.Path.Value ?? "";
             if (reqPath.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase))
             {
-                // Allow health check endpoint through for restart polling
-                if (!reqPath.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
+                // Allow health check endpoint through for readiness polling
+                if (reqPath.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
                 {
-                    context.Response.StatusCode = 404;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                    await next();
                     return;
                 }
+                // The restart-screen poller hits /api/setup/status to learn when the
+                // new container is online with EasyAuth active. Return a 200 payload
+                // it can act on (isEasyAuthConfigured=true, isSetupCompleted=false)
+                // plus a Location header so any client treating this as a signed
+                // redirect can navigate to the app root.
+                if (reqPath.Equals("/api/setup/status", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = 200;
+                    context.Response.Headers["Location"] = "/";
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(
+                        "{\"isEasyAuthConfigured\":true,\"isSetupCompleted\":false,\"redirect\":\"/\",\"message\":\"Setup is complete.\"}");
+                    return;
+                }
+                context.Response.StatusCode = 404;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                return;
             }
             else if (reqPath.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
                      reqPath.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
