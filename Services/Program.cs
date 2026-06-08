@@ -795,10 +795,9 @@ app.MapGet("/.auth/me", (HttpContext context) =>
     return Results.Json(new { clientPrincipal = (object?)null });
 });
 
-// /api/me — returns clientPrincipal + permissions (routed through PowerShell Test-CIPPAccess)
-// This is handled as a regular PS endpoint via the /API/{endpoint} route below
-
-// /api/me endpoint — resolves permissions from user roles via PowerShell (if configured)
+// /api/me endpoint — resolves permissions from user roles via PowerShell (if configured).
+// Routes the request to Auth.MeEndpointFunction. When Auth.MeEndpointHandler is also set,
+// the handler is invoked as a wrapper and receives the endpoint name via Request.Params.CIPPEndpoint.
 app.MapGet("/api/me", async (HttpContext context) =>
 {
     var meFunction = CraftSettings.Auth.MeEndpointFunction;

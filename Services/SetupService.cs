@@ -673,7 +673,8 @@ public class SetupService
     }
 
     /// <summary>
-    /// Seeds the first superadmin user into the allowedUsers table.
+    /// Seeds the first user into the allowedUsers table with the roles from
+    /// Setup.FirstUserRoles (defaults to "superadmin" when unset).
     /// Only works when the table is empty — refuses if users already exist.
     /// Uses the same entity schema as CIPP-API's Invoke-ExecCIPPUsers.
     /// </summary>
@@ -695,7 +696,9 @@ public class SetupService
                 throw new InvalidOperationException("The allowed users table already contains users. First-user seeding is only available on an empty table.");
         }
 
-        var roles = new[] { "superadmin" };
+        string[] roles = _settings.Setup.FirstUserRoles.Count > 0
+            ? _settings.Setup.FirstUserRoles.ToArray()
+            : ["superadmin"];
         var rolesJson = JsonSerializer.Serialize(roles);
 
         var userEntity = new TableEntity("User", upn)
@@ -707,7 +710,7 @@ public class SetupService
         };
 
         await client.UpsertEntityAsync(userEntity, TableUpdateMode.Replace, ct);
-        _logger.LogInformation("[Setup] Seeded first superadmin user: {Upn}", upn);
+        _logger.LogInformation("[Setup] Seeded first user {Upn} with roles {Roles}", upn, string.Join(",", roles));
     }
 
     // ── Status ──

@@ -278,6 +278,16 @@ public class AuthSettings
     public string MeEndpointFunction { get; set; } = "";
 
     /// <summary>
+    /// Optional wrapper PowerShell function invoked for /api/me instead of MeEndpointFunction
+    /// directly. When set, this handler is called with the standard Request/TriggerMetadata
+    /// parameters and is expected to dispatch internally based on Request.Params.CIPPEndpoint
+    /// (which is set to MeEndpointFunction).
+    /// When empty (default), MeEndpointFunction is invoked directly.
+    /// Example (CIPP): "New-CippCoreRequest" with MeEndpointFunction = "me".
+    /// </summary>
+    public string MeEndpointHandler { get; set; } = "";
+
+    /// <summary>
     /// When true, any user who authenticates against the configured AAD tenant
     /// is allowed in — even if they are not in the allowedUsers table.
     /// Users not in the table get ["authenticated", "anonymous"] as default roles.
@@ -587,6 +597,14 @@ public class SetupSettings
     /// When empty (default), the secret is stored directly in the app setting.
     /// </summary>
     public string KeyVaultName { get; set; } = "";
+
+    /// <summary>
+    /// Role(s) assigned to the bootstrap user seeded by /api/setup/seed-user.
+    /// When empty (default), the role "superadmin" is used.
+    /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.
+    /// Override in appsettings to match the hosted app's role taxonomy, e.g. ["owner"] or ["admin", "authenticated"].
+    /// </summary>
+    public List<string> FirstUserRoles { get; set; } = [];
 }
 
 /// <summary>

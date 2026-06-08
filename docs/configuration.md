@@ -170,6 +170,13 @@ Controls authentication and the dev-mode auto-login principal.
   // Empty string = return raw client principal without PS processing.
   "MeEndpointFunction": "me",
 
+  // Optional wrapper PS function invoked for /api/me instead of MeEndpointFunction directly.
+  // When set, the handler receives the standard Request/TriggerMetadata parameters and is
+  // expected to dispatch internally based on Request.Params.CIPPEndpoint (which is set to
+  // MeEndpointFunction). When empty (default), MeEndpointFunction is invoked directly.
+  // Example (CIPP): "New-CippCoreRequest"
+  "MeEndpointHandler": "",
+
   // When true (default), any user who authenticates against the configured Azure AD tenant
   // is allowed in — even if they're not in the allowedUsers table.
   // Users not in the table get ["authenticated", "anonymous"] as default roles.
@@ -477,6 +484,7 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
       "CookieName": "cipp-session",
       "DevRoles": ["superadmin", "admin", "editor", "readonly", "authenticated", "anonymous"],
       "MeEndpointFunction": "me",
+      "MeEndpointHandler": "New-CippCoreRequest",
       "AllowAllTenantUsers": true
     },
 

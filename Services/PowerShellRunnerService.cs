@@ -13,6 +13,7 @@ public class PowerShellRunnerService : IDisposable
     private readonly PowerShellWorkerPool _pool;
     private readonly ScriptRepository _repo;
     private readonly WorkerSettings _workerSettings;
+    private readonly AuthSettings _authSettings;
 
     // Static JsonSerializerOptions — allocated once, reused everywhere
     private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = false };
@@ -31,6 +32,7 @@ public class PowerShellRunnerService : IDisposable
         _pool = pool;
         _repo = repo;
         _workerSettings = settings.Worker;
+        _authSettings = settings.Auth;
     }
 
     /// <summary>
@@ -61,7 +63,9 @@ public class PowerShellRunnerService : IDisposable
 
     /// <summary>
     /// Execute an HTTP request through the PS pipeline for endpoints not in the route table
-    /// (e.g., "me" which is handled by New-CippCoreRequest / Test-CIPPAccess directly).
+    /// (e.g., "me"). The actual PS function invoked is Auth.MeEndpointHandler when set
+    /// (with the endpoint name passed via Request.Params.CIPPEndpoint so the handler can
+    /// dispatch internally); otherwise the endpoint name is invoked as the function directly.
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpEndpoint(string endpoint, Hashtable request)
     {
@@ -79,6 +83,11 @@ public class PowerShellRunnerService : IDisposable
                 };
             }
 
+            // Resolve the PS function to invoke: configured wrapper (if set) or the endpoint itself
+            var handlerFunction = !string.IsNullOrEmpty(_authSettings.MeEndpointHandler)
+                ? _authSettings.MeEndpointHandler
+                : endpoint;
+
             var triggerMetadata = new Hashtable
             {
                 ["FunctionName"] = endpoint
@@ -90,13 +99,12 @@ public class PowerShellRunnerService : IDisposable
                 ["TriggerMetadata"] = triggerMetadata
             };
 
-            // Call New-CippCoreRequest which handles "me" internally via Test-CIPPAccess
             WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
 
             using var cts = _workerSettings.HttpTimeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.HttpTimeoutSeconds))
                 : null;
-            var results = await worker.InvokeAsync("New-CippCoreRequest", parameters, cts?.Token ?? default);
+            var results = await worker.InvokeAsync(handlerFunction, parameters, cts?.Token ?? default);
 
             foreach (var error in worker.Streams.Error)
                 _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, error.ToString());
