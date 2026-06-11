@@ -126,4 +126,29 @@ public static class AppLifecycleBridge
         }
         return svc.ReconcileAuthPolicy(reason);
     }
+
+    private static CraftSettings? s_settings;
+
+    /// <summary>
+    /// Diagnostic — log the currently-bound Setup config (UnauthenticatedClientAction, ExcludedPaths).
+    /// Use to verify CraftSettings is being populated correctly from appsettings.
+    /// PS usage: [Craft.Services.AppLifecycleBridge]::DumpSetupConfig("warmup")
+    /// </summary>
+    public static void DumpSetupConfig(string reason = "diagnostic dump")
+    {
+        if (s_settings == null)
+        {
+            s_logger?.LogWarning("[Lifecycle] DumpSetupConfig called before Initialize ({Reason})", reason);
+            return;
+        }
+        var s = s_settings.Setup;
+        s_logger?.LogInformation(
+            "[Lifecycle] DumpSetupConfig — UnauthenticatedClientAction={Action}, ExcludedPaths=[{Paths}] (count={Count}) ({Reason})",
+            s.UnauthenticatedClientAction,
+            string.Join(",", s.ExcludedPaths),
+            s.ExcludedPaths.Count,
+            reason);
+    }
+
+    internal static void SetSettings(CraftSettings settings) => s_settings = settings;
 }

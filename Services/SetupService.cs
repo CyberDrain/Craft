@@ -660,6 +660,10 @@ public class SetupService
         var desiredAction = _settings.Setup.UnauthenticatedClientAction;
         var desiredPaths = _settings.Setup.ExcludedPaths;
 
+        _logger.LogInformation(
+            "[Setup] Reconcile diff — current: action={CurAction}, paths=[{CurPaths}] | desired: action={DesAction}, paths=[{DesPaths}] ({Reason})",
+            currentAction, string.Join(",", currentPaths), desiredAction, string.Join(",", desiredPaths), reason);
+
         var actionMatches = string.Equals(currentAction, desiredAction, StringComparison.OrdinalIgnoreCase);
         var pathsMatch = currentPaths.Count == desiredPaths.Count
             && currentPaths.OrderBy(s => s, StringComparer.Ordinal)

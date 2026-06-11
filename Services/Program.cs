@@ -849,6 +849,7 @@ SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
 AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>(), setupService);
+AppLifecycleBridge.SetSettings(app.Services.GetRequiredService<CraftSettings>());
 
 // --- Setup API (C# direct — no PS) ---
 
