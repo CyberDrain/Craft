@@ -583,9 +583,14 @@ public class PowerShellRunnerService : IDisposable
         foreach (var q in httpRequest.Query)
             query[q.Key] = q.Value.ToString();
 
+        // Headers stored lowercase to match how CIPP's PS code accesses them via dot syntax
+        // ($Request.Headers.'x-ms-client-principal'). PowerShell dot-property access on
+        // a Hashtable does NOT respect StringComparer.OrdinalIgnoreCase consistently —
+        // it can return $null if stored case differs from the requested case. The Hashtable
+        // comparer is still case-insensitive for explicit indexer access ($h['Key']).
         var headers = new Hashtable(StringComparer.OrdinalIgnoreCase);
         foreach (var h in httpRequest.Headers)
-            headers[h.Key] = h.Value.ToString();
+            headers[h.Key.ToLowerInvariant()] = h.Value.ToString();
 
         object? body = null;
         if (httpRequest.ContentLength > 0 || httpRequest.ContentType != null)
