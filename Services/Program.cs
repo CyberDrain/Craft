@@ -854,6 +854,16 @@ app.MapGet("/api/me", async (HttpContext context) =>
     var parms = (System.Collections.Hashtable)request["Params"]!;
     parms["CIPPEndpoint"] = meFunction;
 
+    // Diagnostic — what does PS actually see for x-ms-client-principal?
+    var diagHeaders = (System.Collections.Hashtable)request["Headers"]!;
+    var diagPrincipal = diagHeaders["x-ms-client-principal"] as string;
+    var diagKeys = diagHeaders.Keys.Cast<string>()
+        .Where(k => k.StartsWith("x-ms-client-principal", StringComparison.OrdinalIgnoreCase))
+        .Select(k => $"{k}={(diagHeaders[k] as string)?.Length ?? 0}b");
+    logger.LogInformation(
+        "[Auth] /api/me PS-bound — principalLen={Len}, isPresent={Present}, principalKeys=[{Keys}]",
+        diagPrincipal?.Length ?? 0, diagPrincipal != null, string.Join(",", diagKeys));
+
     context.Response.StatusCode = 200;
     context.Response.ContentType = "application/json";
 
