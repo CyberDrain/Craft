@@ -602,6 +602,17 @@ app.Use(async (context, next) =>
         return;
     }
 
+    // Diagnostic for /api/me debugging — log whether the EasyAuth-injected header is visible.
+    // Information-level so it's visible in prod logs without enabling Debug. Remove once stable.
+    if (path.Equals("/api/me", StringComparison.OrdinalIgnoreCase))
+    {
+        var hasHeader = context.Request.Headers.ContainsKey("x-ms-client-principal");
+        var headerLen = hasHeader ? context.Request.Headers["x-ms-client-principal"].ToString().Length : 0;
+        logger.LogInformation(
+            "[Auth] /api/me middleware entry — hasPrincipalHeader={Has}, headerLen={Len}, allHeaders=[{Headers}]",
+            hasHeader, headerLen, string.Join(",", context.Request.Headers.Keys.Where(k => k.StartsWith("x-ms-", StringComparison.OrdinalIgnoreCase) || k.Equals("Cookie", StringComparison.OrdinalIgnoreCase)).Select(k => k.ToLowerInvariant())));
+    }
+
     if (context.Request.Headers.TryGetValue("x-ms-client-principal", out var existingHeader) &&
         !string.IsNullOrEmpty(existingHeader.ToString()))
     {
@@ -825,8 +836,14 @@ app.MapGet("/.auth/me", (HttpContext context) =>
 });
 
 // /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
-// MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint; the PS function
-// owns the response shape — status code and body pass through unchanged.
+// MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
+//
+// Always returns 200, even when PS errors. The SPA uses clientPrincipal:null as the
+// "not authenticated" signal, not HTTP status — returning a 4xx/5xx here makes the
+// frontend retry-storm (seen in the wild as 40+ requests in 6 seconds). When PS
+// throws or returns non-2xx, we wrap with { clientPrincipal: null, permissions: [] }
+// so the SPA boots cleanly into a login UI. Underlying PS errors are still logged
+// at Warning level for diagnosis.
 app.MapGet("/api/me", async (HttpContext context) =>
 {
     var meFunction = string.IsNullOrEmpty(CraftSettings.Auth.MeEndpointFunction)
@@ -837,10 +854,36 @@ app.MapGet("/api/me", async (HttpContext context) =>
     var parms = (System.Collections.Hashtable)request["Params"]!;
     parms["CIPPEndpoint"] = meFunction;
 
-    var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
-    context.Response.StatusCode = result.StatusCode;
+    context.Response.StatusCode = 200;
     context.Response.ContentType = "application/json";
-    await context.Response.WriteAsync(result.Body);
+
+    try
+    {
+        var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
+        if (result.StatusCode is >= 200 and < 300)
+        {
+            await context.Response.WriteAsync(result.Body);
+        }
+        else
+        {
+            logger.LogWarning("[Auth] /api/me PS returned {Status}: {Body}", result.StatusCode, result.Body);
+            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
+            {
+                clientPrincipal = (object?)null,
+                permissions = Array.Empty<string>(),
+                message = "Access denied. Contact your administrator."
+            }));
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "[Auth] /api/me failed");
+        await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
+        {
+            clientPrincipal = (object?)null,
+            permissions = Array.Empty<string>()
+        }));
+    }
 });
 
 // Concurrent request tracking for diagnostics

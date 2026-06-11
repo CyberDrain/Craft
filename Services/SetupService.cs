@@ -521,7 +521,7 @@ public class SetupService
         var globalValidation = new Dictionary<string, object>
         {
             ["unauthenticatedClientAction"] = _settings.Setup.UnauthenticatedClientAction,
-            ["redirectToProvider"] = "azureactivedirectory"
+            ["redirectToProvider"] = _settings.Setup.RedirectToProvider
         };
 
         if (_settings.Setup.ExcludedPaths.Count > 0)
@@ -656,22 +656,34 @@ public class SetupService
             }
         }
 
+        // Also read current redirectToProvider so we include it in the diff
+        var currentProvider = "";
+        if (liveProps.TryGetProperty("globalValidation", out var gvForProvider)
+            && gvForProvider.TryGetProperty("redirectToProvider", out var providerEl)
+            && providerEl.ValueKind == JsonValueKind.String)
+        {
+            currentProvider = providerEl.GetString() ?? "";
+        }
+
         var desiredAction = _settings.Setup.UnauthenticatedClientAction;
         var desiredPaths = _settings.Setup.ExcludedPaths;
+        var desiredProvider = _settings.Setup.RedirectToProvider;
 
         _logger.LogInformation(
-            "[Setup] Reconcile diff — current: action={CurAction}, paths=[{CurPaths}] | desired: action={DesAction}, paths=[{DesPaths}] ({Reason})",
-            currentAction, string.Join(",", currentPaths), desiredAction, string.Join(",", desiredPaths), reason);
+            "[Setup] Reconcile diff — current: action={CurAction}, provider={CurProvider}, paths=[{CurPaths}] | desired: action={DesAction}, provider={DesProvider}, paths=[{DesPaths}] ({Reason})",
+            currentAction, currentProvider, string.Join(",", currentPaths),
+            desiredAction, desiredProvider, string.Join(",", desiredPaths), reason);
 
         var actionMatches = string.Equals(currentAction, desiredAction, StringComparison.OrdinalIgnoreCase);
+        var providerMatches = string.Equals(currentProvider, desiredProvider, StringComparison.OrdinalIgnoreCase);
         var pathsMatch = currentPaths.Count == desiredPaths.Count
             && currentPaths.OrderBy(s => s, StringComparer.Ordinal)
                 .SequenceEqual(desiredPaths.OrderBy(s => s, StringComparer.Ordinal), StringComparer.Ordinal);
 
-        if (actionMatches && pathsMatch)
+        if (actionMatches && providerMatches && pathsMatch)
         {
-            _logger.LogInformation("[Setup] Reconcile: already in sync — action={Action}, paths={PathCount} ({Reason})",
-                desiredAction, desiredPaths.Count, reason);
+            _logger.LogInformation("[Setup] Reconcile: already in sync — action={Action}, provider={Provider}, paths={PathCount} ({Reason})",
+                desiredAction, desiredProvider, desiredPaths.Count, reason);
             return false;
         }
 
@@ -681,7 +693,8 @@ public class SetupService
         {
             var newGv = new System.Text.Json.Nodes.JsonObject
             {
-                ["unauthenticatedClientAction"] = desiredAction
+                ["unauthenticatedClientAction"] = desiredAction,
+                ["redirectToProvider"] = desiredProvider
             };
             if (desiredPaths.Count > 0)
             {
@@ -689,12 +702,14 @@ public class SetupService
                 foreach (var p in desiredPaths) arr.Add(p);
                 newGv["excludedPaths"] = arr;
             }
-            // Preserve other globalValidation keys (requireAuthentication, redirectToProvider, ...)
+            // Preserve other globalValidation keys (requireAuthentication, ...)
             if (props["globalValidation"] is System.Text.Json.Nodes.JsonObject existingGv)
             {
                 foreach (var kv in existingGv)
                 {
-                    if (kv.Key == "unauthenticatedClientAction" || kv.Key == "excludedPaths") continue;
+                    if (kv.Key == "unauthenticatedClientAction"
+                        || kv.Key == "excludedPaths"
+                        || kv.Key == "redirectToProvider") continue;
                     newGv[kv.Key] = kv.Value?.DeepClone();
                 }
             }

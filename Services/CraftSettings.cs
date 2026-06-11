@@ -575,6 +575,14 @@ public class SetupSettings
     public List<string> ExcludedPaths { get; set; } = [];
 
     /// <summary>
+    /// Identity provider key used for unauthenticated redirect (when UnauthenticatedClientAction
+    /// is RedirectToLoginPage). Applied to globalValidation.redirectToProvider in authsettingsV2.
+    /// Default "azureactivedirectory" (displayed as "Microsoft" in the Azure portal).
+    /// Override only when configuring a non-AAD provider (e.g. "google", "facebook").
+    /// </summary>
+    public string RedirectToProvider { get; set; } = "azureactivedirectory";
+
+    /// <summary>
     /// Client application IDs allowed to call the app with access tokens.
     /// Applied to identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications.
     /// When empty, no application-level restriction is applied (any valid token for the audience is accepted).
