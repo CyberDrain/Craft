@@ -598,6 +598,132 @@ public class SetupService
     }
 
     /// <summary>
+    /// Reconciles the live authsettingsV2.globalValidation block with current Setup settings.
+    /// Reads UnauthenticatedClientAction and ExcludedPaths from CraftSettings and writes only
+    /// those fields back via ARM. Identity providers, secrets, audiences, and the AAD validation
+    /// block are preserved verbatim.
+    ///
+    /// Idempotent — if the live config already matches the desired values, no ARM PUT is issued
+    /// and the method returns false. Safe to call on every container warmup.
+    ///
+    /// Returns true if the live config was changed; false if already in sync, EasyAuth is not
+    /// configured, or no managed identity token is available.
+    /// </summary>
+    public async Task<bool> ReconcileAuthPolicy(string reason, CancellationToken ct = default)
+    {
+        if (!IsEasyAuthConfigured())
+        {
+            _logger.LogInformation("[Setup] Reconcile skipped — EasyAuth not configured ({Reason})", reason);
+            return false;
+        }
+
+        var managementToken = await GetManagedIdentityToken("https://management.azure.com/", ct);
+        if (managementToken == null)
+        {
+            _logger.LogWarning("[Setup] Reconcile skipped — no managed identity token ({Reason})", reason);
+            return false;
+        }
+
+        var subscriptionId = GetSubscriptionId();
+        var resourceGroup = GetResourceGroup();
+        var siteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME")
+            ?? throw new InvalidOperationException("WEBSITE_SITE_NAME not set — not running in App Service?");
+
+        var armUri = $"https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}"
+            + $"/providers/Microsoft.Web/sites/{siteName}/config/authsettingsV2?api-version=2020-06-01";
+
+        // GET current config (Azure returns unauthenticatedClientAction as an int enum)
+        var current = await ArmRequest(HttpMethod.Get, armUri, managementToken, ct: ct);
+        if (!current.TryGetProperty("properties", out var currentProps))
+        {
+            _logger.LogWarning("[Setup] Reconcile aborted — authsettingsV2 response missing 'properties'");
+            return false;
+        }
+
+        // Extract current values for diff
+        string currentAction = "";
+        var currentPaths = new List<string>();
+        if (currentProps.TryGetProperty("globalValidation", out var currentGv))
+        {
+            if (currentGv.TryGetProperty("unauthenticatedClientAction", out var actionEl))
+                currentAction = NormalizeUnauthAction(actionEl);
+            if (currentGv.TryGetProperty("excludedPaths", out var pathsEl) && pathsEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var p in pathsEl.EnumerateArray())
+                {
+                    var s = p.GetString();
+                    if (!string.IsNullOrEmpty(s)) currentPaths.Add(s);
+                }
+            }
+        }
+
+        var desiredAction = _settings.Setup.UnauthenticatedClientAction;
+        var desiredPaths = _settings.Setup.ExcludedPaths;
+
+        var actionMatches = string.Equals(currentAction, desiredAction, StringComparison.OrdinalIgnoreCase);
+        var pathsMatch = currentPaths.Count == desiredPaths.Count
+            && currentPaths.OrderBy(s => s, StringComparer.Ordinal)
+                .SequenceEqual(desiredPaths.OrderBy(s => s, StringComparer.Ordinal), StringComparer.Ordinal);
+
+        if (actionMatches && pathsMatch)
+        {
+            _logger.LogDebug("[Setup] Reconcile: already in sync — action={Action}, paths={PathCount} ({Reason})",
+                desiredAction, desiredPaths.Count, reason);
+            return false;
+        }
+
+        // Re-serialize the full properties block, then surgically replace globalValidation.
+        // This keeps identityProviders, login, httpSettings, etc. untouched.
+        var props = System.Text.Json.Nodes.JsonNode.Parse(currentProps.GetRawText())!.AsObject();
+        var newGv = new System.Text.Json.Nodes.JsonObject
+        {
+            ["unauthenticatedClientAction"] = desiredAction
+        };
+        if (desiredPaths.Count > 0)
+        {
+            var arr = new System.Text.Json.Nodes.JsonArray();
+            foreach (var p in desiredPaths) arr.Add(p);
+            newGv["excludedPaths"] = arr;
+        }
+        // Preserve other globalValidation keys (requireAuthentication, redirectToProvider, ...)
+        if (props["globalValidation"] is System.Text.Json.Nodes.JsonObject existingGv)
+        {
+            foreach (var kv in existingGv)
+            {
+                if (kv.Key == "unauthenticatedClientAction" || kv.Key == "excludedPaths") continue;
+                newGv[kv.Key] = kv.Value?.DeepClone();
+            }
+        }
+        props["globalValidation"] = newGv;
+
+        var body = new System.Text.Json.Nodes.JsonObject { ["properties"] = props };
+        await ArmRequest(HttpMethod.Put, armUri, managementToken, body, ct);
+
+        _logger.LogInformation(
+            "[Setup] Reconcile applied — action: {OldAction}→{NewAction}, paths: {OldCount}→{NewCount} ({Reason})",
+            currentAction, desiredAction, currentPaths.Count, desiredPaths.Count, reason);
+        return true;
+    }
+
+    /// <summary>
+    /// Normalizes the unauthenticatedClientAction value as returned by ARM. Azure GETs return
+    /// the enum as an integer; PUTs accept both strings and integers. Map to canonical string.
+    /// </summary>
+    private static string NormalizeUnauthAction(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Number => el.GetInt32() switch
+        {
+            0 => "RedirectToLoginPage",
+            1 => "AllowAnonymous",
+            2 => "Return401",
+            3 => "Return403",
+            _ => el.GetInt32().ToString()
+        },
+        JsonValueKind.String => el.GetString() ?? "",
+        _ => ""
+    };
+
+    /// <summary>
     /// Saves app registration details manually (user-provided App ID, Secret, Tenant ID)
     /// and configures the App Service via ARM.
     /// </summary>

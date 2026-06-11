@@ -848,7 +848,7 @@ WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundT
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
-AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
+AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>(), setupService);
 
 // --- Setup API (C# direct — no PS) ---
 
