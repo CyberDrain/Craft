@@ -458,12 +458,9 @@ public class SetupService
         if (managementToken == null)
             throw new InvalidOperationException("Cannot get managed identity token — is the app running in Azure with a managed identity and Contributor role?");
 
-        var subscriptionId = GetSubscriptionId();
-        var resourceGroup = GetResourceGroup();
         var siteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME")
             ?? throw new InvalidOperationException("WEBSITE_SITE_NAME not set — not running in App Service?");
-
-        var baseUri = $"https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.Web/sites/{siteName}";
+        var baseUri = GetArmSiteBaseUri();
 
         // 1. Read current app settings
         var currentSettings = await ArmRequest(HttpMethod.Post,
@@ -603,6 +600,10 @@ public class SetupService
     /// those fields back via ARM. Identity providers, secrets, audiences, and the AAD validation
     /// block are preserved verbatim.
     ///
+    /// Current live config is read from the WEBSITE_AUTH_V2_CONFIG_JSON env var (Azure injects
+    /// this with the active authsettingsV2 JSON on container start — same source the platform
+    /// shows, no ARM round-trip required to diff). ARM is only touched if a PUT is needed.
+    ///
     /// Idempotent — if the live config already matches the desired values, no ARM PUT is issued
     /// and the method returns false. Safe to call on every container warmup.
     ///
@@ -617,33 +618,31 @@ public class SetupService
             return false;
         }
 
-        var managementToken = await GetManagedIdentityToken("https://management.azure.com/", ct);
-        if (managementToken == null)
+        // Read live config from the env var Azure injects on container start.
+        // Same JSON that ARM's GET would return; no HTTP call required for the diff.
+        var liveJson = Environment.GetEnvironmentVariable("WEBSITE_AUTH_V2_CONFIG_JSON");
+        if (string.IsNullOrWhiteSpace(liveJson))
         {
-            _logger.LogWarning("[Setup] Reconcile skipped — no managed identity token ({Reason})", reason);
+            _logger.LogWarning("[Setup] Reconcile aborted — WEBSITE_AUTH_V2_CONFIG_JSON not set ({Reason})", reason);
             return false;
         }
 
-        var subscriptionId = GetSubscriptionId();
-        var resourceGroup = GetResourceGroup();
-        var siteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME")
-            ?? throw new InvalidOperationException("WEBSITE_SITE_NAME not set — not running in App Service?");
-
-        var armUri = $"https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}"
-            + $"/providers/Microsoft.Web/sites/{siteName}/config/authsettingsV2?api-version=2020-06-01";
-
-        // GET current config (Azure returns unauthenticatedClientAction as an int enum)
-        var current = await ArmRequest(HttpMethod.Get, armUri, managementToken, ct: ct);
-        if (!current.TryGetProperty("properties", out var currentProps))
+        JsonElement liveProps;
+        try
         {
-            _logger.LogWarning("[Setup] Reconcile aborted — authsettingsV2 response missing 'properties'");
+            using var liveDoc = JsonDocument.Parse(liveJson);
+            liveProps = liveDoc.RootElement.Clone();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Setup] Reconcile aborted — WEBSITE_AUTH_V2_CONFIG_JSON unparseable ({Reason})", reason);
             return false;
         }
 
         // Extract current values for diff
         string currentAction = "";
         var currentPaths = new List<string>();
-        if (currentProps.TryGetProperty("globalValidation", out var currentGv))
+        if (liveProps.TryGetProperty("globalValidation", out var currentGv))
         {
             if (currentGv.TryGetProperty("unauthenticatedClientAction", out var actionEl))
                 currentAction = NormalizeUnauthAction(actionEl);
@@ -676,32 +675,37 @@ public class SetupService
             return false;
         }
 
-        // Re-serialize the full properties block, then surgically replace globalValidation.
-        // This keeps identityProviders, login, httpSettings, etc. untouched.
-        var props = System.Text.Json.Nodes.JsonNode.Parse(currentProps.GetRawText())!.AsObject();
-        var newGv = new System.Text.Json.Nodes.JsonObject
+        // Drift detected — GET the full authsettingsV2, replace globalValidation, PUT back.
+        // The helper preserves identityProviders / secrets / validation untouched.
+        var success = await UpdateAuthSettingsV2Async(props =>
         {
-            ["unauthenticatedClientAction"] = desiredAction
-        };
-        if (desiredPaths.Count > 0)
-        {
-            var arr = new System.Text.Json.Nodes.JsonArray();
-            foreach (var p in desiredPaths) arr.Add(p);
-            newGv["excludedPaths"] = arr;
-        }
-        // Preserve other globalValidation keys (requireAuthentication, redirectToProvider, ...)
-        if (props["globalValidation"] is System.Text.Json.Nodes.JsonObject existingGv)
-        {
-            foreach (var kv in existingGv)
+            var newGv = new System.Text.Json.Nodes.JsonObject
             {
-                if (kv.Key == "unauthenticatedClientAction" || kv.Key == "excludedPaths") continue;
-                newGv[kv.Key] = kv.Value?.DeepClone();
+                ["unauthenticatedClientAction"] = desiredAction
+            };
+            if (desiredPaths.Count > 0)
+            {
+                var arr = new System.Text.Json.Nodes.JsonArray();
+                foreach (var p in desiredPaths) arr.Add(p);
+                newGv["excludedPaths"] = arr;
             }
-        }
-        props["globalValidation"] = newGv;
+            // Preserve other globalValidation keys (requireAuthentication, redirectToProvider, ...)
+            if (props["globalValidation"] is System.Text.Json.Nodes.JsonObject existingGv)
+            {
+                foreach (var kv in existingGv)
+                {
+                    if (kv.Key == "unauthenticatedClientAction" || kv.Key == "excludedPaths") continue;
+                    newGv[kv.Key] = kv.Value?.DeepClone();
+                }
+            }
+            props["globalValidation"] = newGv;
+        }, ct);
 
-        var body = new System.Text.Json.Nodes.JsonObject { ["properties"] = props };
-        await ArmRequest(HttpMethod.Put, armUri, managementToken, body, ct);
+        if (!success)
+        {
+            _logger.LogWarning("[Setup] Reconcile drift detected but PUT failed ({Reason})", reason);
+            return false;
+        }
 
         _logger.LogInformation(
             "[Setup] Reconcile applied — action: {OldAction}→{NewAction}, paths: {OldCount}→{NewCount} ({Reason})",
@@ -870,6 +874,52 @@ public class SetupService
     }
 
     // ── Helper Methods ──
+
+    /// <summary>
+    /// Build the ARM base URI for the running app's Microsoft.Web/sites resource.
+    /// Throws if not running in App Service (WEBSITE_SITE_NAME unset).
+    /// </summary>
+    private string GetArmSiteBaseUri()
+    {
+        var siteName = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME")
+            ?? throw new InvalidOperationException("WEBSITE_SITE_NAME not set — not running in App Service?");
+        return $"https://management.azure.com/subscriptions/{GetSubscriptionId()}"
+            + $"/resourceGroups/{GetResourceGroup()}/providers/Microsoft.Web/sites/{siteName}";
+    }
+
+    /// <summary>
+    /// GET-mutate-PUT for authsettingsV2. Fetches the live config, hands the mutable
+    /// properties JsonObject to the caller for surgical edits, then PUTs the result.
+    /// All fields the mutator doesn't touch (identity providers, secrets, validation, etc.)
+    /// are preserved verbatim.
+    ///
+    /// Returns true if the PUT succeeded; false if no managed identity token is available
+    /// or the response shape is unexpected. Any ARM error inside the PUT throws.
+    /// </summary>
+    private async Task<bool> UpdateAuthSettingsV2Async(Action<System.Text.Json.Nodes.JsonObject> mutateProperties, CancellationToken ct = default)
+    {
+        var token = await GetManagedIdentityToken("https://management.azure.com/", ct);
+        if (token == null)
+        {
+            _logger.LogWarning("[Setup] ARM update: no managed identity token");
+            return false;
+        }
+
+        var uri = $"{GetArmSiteBaseUri()}/config/authsettingsV2?api-version=2020-06-01";
+        var current = await ArmRequest(HttpMethod.Get, uri, token, ct: ct);
+        if (!current.TryGetProperty("properties", out var props))
+        {
+            _logger.LogWarning("[Setup] ARM update: authsettingsV2 response missing 'properties'");
+            return false;
+        }
+
+        var propsNode = System.Text.Json.Nodes.JsonNode.Parse(props.GetRawText())!.AsObject();
+        mutateProperties(propsNode);
+
+        var body = new System.Text.Json.Nodes.JsonObject { ["properties"] = propsNode };
+        await ArmRequest(HttpMethod.Put, uri, token, body, ct);
+        return true;
+    }
 
     private async Task<JsonElement?> FindExistingApp(string accessToken, string displayName, CancellationToken ct)
     {
