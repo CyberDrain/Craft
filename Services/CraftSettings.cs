@@ -68,6 +68,23 @@ public class CraftSettings
 
     /// <summary>Container restart tracking — detects crash loops and forces worker reallocation.</summary>
     public ContainerHealthSettings ContainerHealth { get; set; } = new();
+
+    /// <summary>Frontend serving policy — CSP header injection (EasyAuth handles auth/redirects).</summary>
+    public FrontendSettings Frontend { get; set; } = new();
+}
+
+/// <summary>
+/// Frontend response policy. EasyAuth handles anon redirects and auth at the platform layer;
+/// this exists for response headers EasyAuth doesn't touch.
+/// </summary>
+public class FrontendSettings
+{
+    /// <summary>
+    /// Content-Security-Policy header value applied to all responses.
+    /// Mirrors what SWA's globalHeaders.content-security-policy did.
+    /// Null/empty = no CSP set.
+    /// </summary>
+    public string? ContentSecurityPolicy { get; set; }
 }
 
 /// <summary>
@@ -272,8 +289,9 @@ public class AuthSettings
     public string DevUserDetails { get; set; } = "developer@localhost";
 
     /// <summary>
-    /// PowerShell function name for the /api/me endpoint.
-    /// If empty, /api/me returns the raw client principal without PS processing.
+    /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
+    /// is used as the endpoint name. The PS function (or its MeEndpointHandler wrapper)
+    /// owns the response shape — /api/me passes status code and body through unchanged.
     /// </summary>
     public string MeEndpointFunction { get; set; } = "";
 

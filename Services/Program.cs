@@ -481,6 +481,25 @@ if (devFrontendUrl != null)
     });
 }
 
+// Content-Security-Policy — applied to all responses. EasyAuth doesn't set response
+// headers, so this is the only layer that can add CSP. Registered before UseStaticFiles
+// so asset responses get the header too.
+if (!string.IsNullOrEmpty(CraftSettings.Frontend.ContentSecurityPolicy))
+{
+    var csp = CraftSettings.Frontend.ContentSecurityPolicy;
+    app.Use(async (context, next) =>
+    {
+        context.Response.OnStarting(() =>
+        {
+            var headers = context.Response.Headers;
+            if (!headers.ContainsKey("Content-Security-Policy"))
+                headers["Content-Security-Policy"] = csp;
+            return Task.CompletedTask;
+        });
+        await next();
+    });
+}
+
 // Serve static files from Frontend/ (production mode, or fallback if dev proxy is down)
 var frontendPath = Path.Combine(AppContext.BaseDirectory, "Frontend");
 IFileProvider? frontendFileProvider = null;
@@ -795,88 +814,23 @@ app.MapGet("/.auth/me", (HttpContext context) =>
     return Results.Json(new { clientPrincipal = (object?)null });
 });
 
-// /api/me endpoint — resolves permissions from user roles via PowerShell (if configured).
-// Routes the request to Auth.MeEndpointFunction. When Auth.MeEndpointHandler is also set,
-// the handler is invoked as a wrapper and receives the endpoint name via Request.Params.CIPPEndpoint.
+// /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
+// MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint; the PS function
+// owns the response shape — status code and body pass through unchanged.
 app.MapGet("/api/me", async (HttpContext context) =>
 {
-    var meFunction = CraftSettings.Auth.MeEndpointFunction;
+    var meFunction = string.IsNullOrEmpty(CraftSettings.Auth.MeEndpointFunction)
+        ? "me"
+        : CraftSettings.Auth.MeEndpointFunction;
 
-    // If no PS function configured for /api/me, return the raw auth principal
-    if (string.IsNullOrEmpty(meFunction))
-    {
-        if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session)
-        {
-            var principal = authService.BuildClientPrincipal(session);
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = principal }));
-        }
-        else if (app.Environment.IsDevelopment())
-        {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
-            {
-                clientPrincipal = new
-                {
-                    identityProvider = "aad",
-                    userId = CraftSettings.Auth.DevUserId,
-                    userDetails = CraftSettings.Auth.DevUserDetails,
-                    userRoles = CraftSettings.Auth.DevRoles.ToArray()
-                }
-            }));
-        }
-        else
-        {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = (object?)null }));
-        }
-        return;
-    }
-
-    // Route through PowerShell for full permission resolution
     var request = await PowerShellRunnerService.SnapshotRequest(context);
     var parms = (System.Collections.Hashtable)request["Params"]!;
     parms["CIPPEndpoint"] = meFunction;
 
-    try
-    {
-        var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
-
-        // /api/me must ALWAYS return 200 — the frontend uses clientPrincipal: null
-        // as the "not authorized" signal, not HTTP status codes.
-        if (result.StatusCode is >= 200 and < 300)
-        {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(result.Body);
-        }
-        else
-        {
-            logger.LogWarning("[Auth] /api/me PS returned {Status}: {Body}", result.StatusCode, result.Body);
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
-            {
-                clientPrincipal = (object?)null,
-                permissions = Array.Empty<string>(),
-                message = "Access denied. Contact your administrator."
-            }));
-        }
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "[Auth] /api/me failed");
-        context.Response.StatusCode = 200;
-        context.Response.ContentType = "application/json";
-        await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
-        {
-            clientPrincipal = (object?)null,
-            permissions = Array.Empty<string>()
-        }));
-    }
+    var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
+    context.Response.StatusCode = result.StatusCode;
+    context.Response.ContentType = "application/json";
+    await context.Response.WriteAsync(result.Body);
 });
 
 // Concurrent request tracking for diagnostics

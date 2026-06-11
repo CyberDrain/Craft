@@ -166,8 +166,10 @@ Controls authentication and the dev-mode auto-login principal.
   // UPN/email for the dev principal
   "DevUserDetails": "developer@localhost",
 
-  // PowerShell function to call for /api/me.
-  // Empty string = return raw client principal without PS processing.
+  // PowerShell function dispatched for /api/me.
+  // Empty string = use the literal "me" as the endpoint name.
+  // The PS function (or its MeEndpointHandler wrapper) owns the response shape —
+  // /api/me passes status code and body through unchanged.
   "MeEndpointFunction": "me",
 
   // Optional wrapper PS function invoked for /api/me instead of MeEndpointFunction directly.
@@ -331,6 +333,17 @@ Controls where the host discovers PowerShell scripts.
     "Modules": ["CIPPHTTP"],
     "OutputFile": "Config/function-permissions.json"
   }
+}
+```
+
+### Frontend
+
+EasyAuth handles auth, redirects, and excluded paths at the App Service platform layer (see `Setup.UnauthenticatedClientAction` and `Setup.ExcludedPaths`). CRAFT only adds response headers EasyAuth doesn't touch — currently just CSP.
+
+```jsonc
+"Frontend": {
+  // Content-Security-Policy applied to all responses. Null/empty = no CSP set.
+  "ContentSecurityPolicy": "default-src https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *"
 }
 ```
 
