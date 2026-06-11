@@ -495,6 +495,22 @@ public class ScriptRepoSettings
     public List<string> HttpModules { get; set; } = [];
 
     /// <summary>
+    /// Optional global handler function name. When set, ALL /API/{endpoint} routes are
+    /// dispatched through this single function instead of invoking the route's function
+    /// directly. The endpoint name is passed via Request.Params.CIPPEndpoint so the handler
+    /// can dispatch internally. Route lookup still happens for 404 detection, but the
+    /// handler runs instead of the looked-up function.
+    ///
+    /// Use this when the hosted app's design assumes every HTTP endpoint goes through a
+    /// common router (e.g. CIPP's New-CippCoreRequest, which performs Test-CIPPAccess
+    /// authorization, telemetry, and feature-flag checks before dispatching to Invoke-*).
+    ///
+    /// Empty (default) = each /API/{endpoint} invokes Invoke-{endpoint} directly.
+    /// Example (CIPP): "New-CippCoreRequest"
+    /// </summary>
+    public string HttpHandler { get; set; } = "";
+
+    /// <summary>
     /// Directory names (relative to API/) to scan for background/timer scripts.
     /// </summary>
     public List<string> BackgroundScriptDirs { get; set; } = [];

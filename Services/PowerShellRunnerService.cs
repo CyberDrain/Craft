@@ -14,6 +14,7 @@ public class PowerShellRunnerService : IDisposable
     private readonly ScriptRepository _repo;
     private readonly WorkerSettings _workerSettings;
     private readonly AuthSettings _authSettings;
+    private readonly ScriptRepoSettings _scriptsSettings;
 
     // Static JsonSerializerOptions — allocated once, reused everywhere
     private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = false };
@@ -33,6 +34,7 @@ public class PowerShellRunnerService : IDisposable
         _repo = repo;
         _workerSettings = settings.Worker;
         _authSettings = settings.Auth;
+        _scriptsSettings = settings.Scripts;
     }
 
     /// <summary>
@@ -254,7 +256,16 @@ public class PowerShellRunnerService : IDisposable
             using var cts = timeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds))
                 : null;
-            var results = await worker.InvokeAsync(entry.FunctionName, parameters, cts?.Token ?? default);
+
+            // When Scripts.HttpHandler is set, ALL HTTP routes dispatch through that single
+            // function instead of invoking the route's function directly. The endpoint name
+            // is already in request.Params.CIPPEndpoint, set by BuildRequestFromParts —
+            // the handler reads it to route internally. BG scripts (isHttp=false) always
+            // invoke their own function — the handler pattern is HTTP-only.
+            var targetFunction = (isHttp && !string.IsNullOrEmpty(_scriptsSettings.HttpHandler))
+                ? _scriptsSettings.HttpHandler
+                : entry.FunctionName;
+            var results = await worker.InvokeAsync(targetFunction, parameters, cts?.Token ?? default);
 
             foreach (var error in worker.Streams.Error)
                 _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
