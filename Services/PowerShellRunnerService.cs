@@ -73,6 +73,11 @@ public class PowerShellRunnerService : IDisposable
     {
         var sw = Stopwatch.StartNew();
         PowerShellWorker? worker = null;
+        EventHandler<DataAddedEventArgs>? onError = null;
+        EventHandler<DataAddedEventArgs>? onWarning = null;
+        EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             worker = _pool.CheckoutHttp(TimeSpan.FromSeconds(30));
@@ -103,24 +108,44 @@ public class PowerShellRunnerService : IDisposable
 
             WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
 
+            // Subscribe to PS streams BEFORE invoke. worker.InvokeAsync's finally calls
+            // Cleanup() which clears the streams, so post-invoke iteration sees nothing.
+            // DataAdded events fire synchronously as PS emits records.
+            onError = (sender, args) =>
+            {
+                var records = (PSDataCollection<ErrorRecord>)sender!;
+                _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, records[args.Index].ToString());
+            };
+            onWarning = (sender, args) =>
+            {
+                var records = (PSDataCollection<WarningRecord>)sender!;
+                _logger.LogWarning("[API] PS warning in {Function}: {Warning}", endpoint, records[args.Index].ToString());
+            };
+            onInfo = (sender, args) =>
+            {
+                var records = (PSDataCollection<InformationRecord>)sender!;
+                _logger.LogInformation("[API] PS {Function}: {Info}", endpoint, records[args.Index].ToString());
+            };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[API] PS debug in {Function}: {Debug}", endpoint, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[API] PS verbose in {Function}: {Verbose}", endpoint, records[args.Index].ToString());
+            };
+            worker.Streams.Error.DataAdded += onError;
+            worker.Streams.Warning.DataAdded += onWarning;
+            worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
+
             using var cts = _workerSettings.HttpTimeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.HttpTimeoutSeconds))
                 : null;
             var results = await worker.InvokeAsync(handlerFunction, parameters, cts?.Token ?? default);
-
-            // Capture all PS streams (matches scheduler/orchestrator path). Previously only the
-            // Error stream was logged — Write-Information / Write-Warning / Write-Debug / Write-Verbose
-            // from HTTP-context PS functions were silently discarded, making diagnostics harder.
-            foreach (var error in worker.Streams.Error)
-                _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, error.ToString());
-            foreach (var warning in worker.Streams.Warning)
-                _logger.LogWarning("[API] PS warning in {Function}: {Warning}", endpoint, warning.ToString());
-            foreach (var info in worker.Streams.Information)
-                _logger.LogInformation("[API] PS {Function}: {Info}", endpoint, info.ToString());
-            foreach (var debug in worker.Streams.Debug)
-                _logger.LogDebug("[API] PS debug in {Function}: {Debug}", endpoint, debug.ToString());
-            foreach (var verbose in worker.Streams.Verbose)
-                _logger.LogTrace("[API] PS verbose in {Function}: {Verbose}", endpoint, verbose.ToString());
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -156,7 +181,14 @@ public class PowerShellRunnerService : IDisposable
         finally
         {
             if (worker != null)
+            {
+                if (onError != null) worker.Streams.Error.DataAdded -= onError;
+                if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
+                if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+                if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+                if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
                 _pool.Reclaim(worker, true);
+            }
         }
     }
 
@@ -210,6 +242,11 @@ public class PowerShellRunnerService : IDisposable
 
         PowerShellWorker? worker = null;
         var poolLabel = isHttp ? "HTTP" : "BG";
+        EventHandler<DataAddedEventArgs>? onError = null;
+        EventHandler<DataAddedEventArgs>? onWarning = null;
+        EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             if (isHttp)
@@ -252,6 +289,47 @@ public class PowerShellRunnerService : IDisposable
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} starting on {Worker}",
                 poolLabel, invocation.Id, entry.FunctionName, invocation.WorkerId);
 
+            // Subscribe to PS streams BEFORE invoke. worker.InvokeAsync's finally calls
+            // Cleanup() which clears the streams, so post-invoke iteration would see nothing.
+            // DataAdded events fire synchronously as PS emits records.
+            var entryFunc = entry.FunctionName;
+            var invId = invocation.Id;
+            onError = (sender, args) =>
+            {
+                var records = (PSDataCollection<ErrorRecord>)sender!;
+                _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onWarning = (sender, args) =>
+            {
+                var records = (PSDataCollection<WarningRecord>)sender!;
+                _logger.LogWarning("[API] {InvocationId} PS warning in {Function}: {Warning}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onInfo = (sender, args) =>
+            {
+                var records = (PSDataCollection<InformationRecord>)sender!;
+                _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            worker.Streams.Error.DataAdded += onError;
+            worker.Streams.Warning.DataAdded += onWarning;
+            worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
+
             var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
             using var cts = timeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds))
@@ -266,22 +344,6 @@ public class PowerShellRunnerService : IDisposable
                 ? _scriptsSettings.HttpHandler
                 : entry.FunctionName;
             var results = await worker.InvokeAsync(targetFunction, parameters, cts?.Token ?? default);
-
-            foreach (var error in worker.Streams.Error)
-                _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
-                    invocation.Id, entry.FunctionName, error.ToString());
-            foreach (var warning in worker.Streams.Warning)
-                _logger.LogWarning("[API] {InvocationId} PS warning in {Function}: {Warning}",
-                    invocation.Id, entry.FunctionName, warning.ToString());
-            foreach (var info in worker.Streams.Information)
-                _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
-                    invocation.Id, entry.FunctionName, info.ToString());
-            foreach (var debug in worker.Streams.Debug)
-                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
-                    invocation.Id, entry.FunctionName, debug.ToString());
-            foreach (var verbose in worker.Streams.Verbose)
-                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
-                    invocation.Id, entry.FunctionName, verbose.ToString());
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -319,7 +381,14 @@ public class PowerShellRunnerService : IDisposable
         finally
         {
             if (worker != null)
+            {
+                if (onError != null) worker.Streams.Error.DataAdded -= onError;
+                if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
+                if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+                if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+                if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
                 _pool.Reclaim(worker, isHttp);
+            }
         }
     }
 

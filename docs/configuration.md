@@ -323,6 +323,13 @@ Controls where the host discovers PowerShell scripts.
   // If a function starts with "Invoke-", that prefix is stripped for the route.
   "HttpModules": ["CIPPHTTP"],
 
+  // Optional global HTTP handler. When set, ALL /API/{endpoint} routes dispatch through
+  // this PS function instead of invoking Invoke-{endpoint} directly. The endpoint name
+  // is passed via Request.Params.CIPPEndpoint so the handler can dispatch internally.
+  // Use when the hosted app expects all routes to go through a common router
+  // (e.g. CIPP's New-CippCoreRequest which performs Test-CIPPAccess + telemetry).
+  "HttpHandler": "New-CippCoreRequest",
+
   // Directories (under API/) scanned for background scripts.
   // These are deployed as Function:\ items on each worker.
   "BackgroundScriptDirs": [],
