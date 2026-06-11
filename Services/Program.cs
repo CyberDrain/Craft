@@ -150,6 +150,16 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
+var setupService = app.Services.GetRequiredService<SetupService>();
+
+// AppLifecycleBridge MUST be initialized before pool.Initialize() — the PS warmup script
+// runs inside pool init and calls bridge methods (IsEasyAuthConfigured, ReconcileAuthPolicy,
+// RequestSetupMode). If the bridge's static state isn't populated, those calls silently
+// return false because the null-conditional logger swallows the "called before Initialize"
+// warning. Other bridges (Scheduler, Cache, StatsHistory) initialize later — they're only
+// called from request handlers or post-warmup PS, not from warmup itself.
+AppLifecycleBridge.Initialize(app.Lifetime, logger, setupService);
+AppLifecycleBridge.SetSettings(CraftSettings);
 
 // --- Container health monitoring ---
 // Track restart attempts on persistent storage (/home) to detect crash loops.
@@ -280,7 +290,7 @@ app.UseResponseCompression();
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
 // The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
 // setup wizard (e.g. after determining it cannot auto-configure from existing credentials).
-var setupService = app.Services.GetRequiredService<SetupService>();
+// (setupService is already resolved at the top of the file, alongside AppLifecycleBridge.Initialize)
 
 if (CraftSettings.Setup.Enabled)
 {
@@ -848,8 +858,8 @@ WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundT
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
-AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>(), setupService);
-AppLifecycleBridge.SetSettings(app.Services.GetRequiredService<CraftSettings>());
+// AppLifecycleBridge.Initialize is at the TOP of the file — it must run before pool.Initialize()
+// so the PS warmup script can use it (it would silently return false otherwise).
 
 // --- Setup API (C# direct — no PS) ---
 
