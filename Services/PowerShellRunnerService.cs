@@ -106,8 +106,19 @@ public class PowerShellRunnerService : IDisposable
                 : null;
             var results = await worker.InvokeAsync(handlerFunction, parameters, cts?.Token ?? default);
 
+            // Capture all PS streams (matches scheduler/orchestrator path). Previously only the
+            // Error stream was logged — Write-Information / Write-Warning / Write-Debug / Write-Verbose
+            // from HTTP-context PS functions were silently discarded, making diagnostics harder.
             foreach (var error in worker.Streams.Error)
                 _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, error.ToString());
+            foreach (var warning in worker.Streams.Warning)
+                _logger.LogWarning("[API] PS warning in {Function}: {Warning}", endpoint, warning.ToString());
+            foreach (var info in worker.Streams.Information)
+                _logger.LogInformation("[API] PS {Function}: {Info}", endpoint, info.ToString());
+            foreach (var debug in worker.Streams.Debug)
+                _logger.LogDebug("[API] PS debug in {Function}: {Debug}", endpoint, debug.ToString());
+            foreach (var verbose in worker.Streams.Verbose)
+                _logger.LogTrace("[API] PS verbose in {Function}: {Verbose}", endpoint, verbose.ToString());
 
             var response = ExtractResponse(results);
             sw.Stop();
