@@ -669,11 +669,6 @@ public class SetupService
         var desiredPaths = _settings.Setup.ExcludedPaths;
         var desiredProvider = _settings.Setup.RedirectToProvider;
 
-        _logger.LogInformation(
-            "[Setup] Reconcile diff — current: action={CurAction}, provider={CurProvider}, paths=[{CurPaths}] | desired: action={DesAction}, provider={DesProvider}, paths=[{DesPaths}] ({Reason})",
-            currentAction, currentProvider, string.Join(",", currentPaths),
-            desiredAction, desiredProvider, string.Join(",", desiredPaths), reason);
-
         var actionMatches = string.Equals(currentAction, desiredAction, StringComparison.OrdinalIgnoreCase);
         var providerMatches = string.Equals(currentProvider, desiredProvider, StringComparison.OrdinalIgnoreCase);
         var pathsMatch = currentPaths.Count == desiredPaths.Count
