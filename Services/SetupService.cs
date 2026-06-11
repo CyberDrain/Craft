@@ -667,7 +667,7 @@ public class SetupService
 
         if (actionMatches && pathsMatch)
         {
-            _logger.LogDebug("[Setup] Reconcile: already in sync — action={Action}, paths={PathCount} ({Reason})",
+            _logger.LogInformation("[Setup] Reconcile: already in sync — action={Action}, paths={PathCount} ({Reason})",
                 desiredAction, desiredPaths.Count, reason);
             return false;
         }
