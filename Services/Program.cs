@@ -150,6 +150,15 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
+var setupService = app.Services.GetRequiredService<SetupService>();
+
+// AppLifecycleBridge MUST be initialized before pool.Initialize() — the PS warmup script
+// runs inside pool init and calls bridge methods (IsEasyAuthConfigured, ReconcileAuthPolicy,
+// RequestSetupMode). If the bridge's static state isn't populated, those calls silently
+// return false because the null-conditional logger swallows the "called before Initialize"
+// warning. Other bridges (Scheduler, Cache, StatsHistory) initialize later — they're only
+// called from request handlers or post-warmup PS, not from warmup itself.
+AppLifecycleBridge.Initialize(app.Lifetime, logger, setupService);
 
 // --- Container health monitoring ---
 // Track restart attempts on persistent storage (/home) to detect crash loops.
@@ -280,7 +289,7 @@ app.UseResponseCompression();
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
 // The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
 // setup wizard (e.g. after determining it cannot auto-configure from existing credentials).
-var setupService = app.Services.GetRequiredService<SetupService>();
+// (setupService is already resolved at the top of the file, alongside AppLifecycleBridge.Initialize)
 
 if (CraftSettings.Setup.Enabled)
 {
@@ -292,14 +301,30 @@ if (CraftSettings.Setup.Enabled)
             var reqPath = context.Request.Path.Value ?? "";
             if (reqPath.StartsWith("/api/setup", StringComparison.OrdinalIgnoreCase))
             {
-                // Allow health check endpoint through for restart polling
-                if (!reqPath.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
+                // Allow health check endpoint through for readiness polling
+                if (reqPath.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
                 {
-                    context.Response.StatusCode = 404;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                    await next();
                     return;
                 }
+                // The restart-screen poller hits /api/setup/status to learn when the
+                // new container is online with EasyAuth active. Return a 200 payload
+                // it can act on (isEasyAuthConfigured=true, isSetupCompleted=false)
+                // plus a Location header so any client treating this as a signed
+                // redirect can navigate to the app root.
+                if (reqPath.Equals("/api/setup/status", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = 200;
+                    context.Response.Headers["Location"] = "/";
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(
+                        "{\"isEasyAuthConfigured\":true,\"isSetupCompleted\":false,\"redirect\":\"/\",\"message\":\"Setup is complete.\"}");
+                    return;
+                }
+                context.Response.StatusCode = 404;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync("{\"error\":\"Setup is complete. These endpoints are disabled.\"}");
+                return;
             }
             else if (reqPath.Equals("/setup", StringComparison.OrdinalIgnoreCase) ||
                      reqPath.StartsWith("/setup/", StringComparison.OrdinalIgnoreCase))
@@ -461,6 +486,25 @@ if (devFrontendUrl != null)
                 // Next.js dev server not running — fall through to static files
             }
         }
+        await next();
+    });
+}
+
+// Content-Security-Policy — applied to all responses. EasyAuth doesn't set response
+// headers, so this is the only layer that can add CSP. Registered before UseStaticFiles
+// so asset responses get the header too.
+if (!string.IsNullOrEmpty(CraftSettings.Frontend.ContentSecurityPolicy))
+{
+    var csp = CraftSettings.Frontend.ContentSecurityPolicy;
+    app.Use(async (context, next) =>
+    {
+        context.Response.OnStarting(() =>
+        {
+            var headers = context.Response.Headers;
+            if (!headers.ContainsKey("Content-Security-Policy"))
+                headers["Content-Security-Policy"] = csp;
+            return Task.CompletedTask;
+        });
         await next();
     });
 }
@@ -779,70 +823,38 @@ app.MapGet("/.auth/me", (HttpContext context) =>
     return Results.Json(new { clientPrincipal = (object?)null });
 });
 
-// /api/me — returns clientPrincipal + permissions (routed through PowerShell Test-CIPPAccess)
-// This is handled as a regular PS endpoint via the /API/{endpoint} route below
-
-// /api/me endpoint — resolves permissions from user roles via PowerShell (if configured)
+// /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
+// MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
+//
+// Always returns 200, even when PS errors. The SPA uses clientPrincipal:null as the
+// "not authenticated" signal, not HTTP status — returning a 4xx/5xx here makes the
+// frontend retry-storm (seen in the wild as 40+ requests in 6 seconds). When PS
+// throws or returns non-2xx, we wrap with { clientPrincipal: null, permissions: [] }
+// so the SPA boots cleanly into a login UI. Underlying PS errors are still logged
+// at Warning level for diagnosis.
 app.MapGet("/api/me", async (HttpContext context) =>
 {
-    var meFunction = CraftSettings.Auth.MeEndpointFunction;
+    var meFunction = string.IsNullOrEmpty(CraftSettings.Auth.MeEndpointFunction)
+        ? "me"
+        : CraftSettings.Auth.MeEndpointFunction;
 
-    // If no PS function configured for /api/me, return the raw auth principal
-    if (string.IsNullOrEmpty(meFunction))
-    {
-        if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session)
-        {
-            var principal = authService.BuildClientPrincipal(session);
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = principal }));
-        }
-        else if (app.Environment.IsDevelopment())
-        {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
-            {
-                clientPrincipal = new
-                {
-                    identityProvider = "aad",
-                    userId = CraftSettings.Auth.DevUserId,
-                    userDetails = CraftSettings.Auth.DevUserDetails,
-                    userRoles = CraftSettings.Auth.DevRoles.ToArray()
-                }
-            }));
-        }
-        else
-        {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = (object?)null }));
-        }
-        return;
-    }
-
-    // Route through PowerShell for full permission resolution
     var request = await PowerShellRunnerService.SnapshotRequest(context);
     var parms = (System.Collections.Hashtable)request["Params"]!;
     parms["CIPPEndpoint"] = meFunction;
 
+    context.Response.StatusCode = 200;
+    context.Response.ContentType = "application/json";
+
     try
     {
         var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
-
-        // /api/me must ALWAYS return 200 — the frontend uses clientPrincipal: null
-        // as the "not authorized" signal, not HTTP status codes.
         if (result.StatusCode is >= 200 and < 300)
         {
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
             await context.Response.WriteAsync(result.Body);
         }
         else
         {
             logger.LogWarning("[Auth] /api/me PS returned {Status}: {Body}", result.StatusCode, result.Body);
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
             await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
             {
                 clientPrincipal = (object?)null,
@@ -854,8 +866,6 @@ app.MapGet("/api/me", async (HttpContext context) =>
     catch (Exception ex)
     {
         logger.LogError(ex, "[Auth] /api/me failed");
-        context.Response.StatusCode = 200;
-        context.Response.ContentType = "application/json";
         await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
         {
             clientPrincipal = (object?)null,
@@ -879,7 +889,8 @@ WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundT
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
-AppLifecycleBridge.Initialize(app.Lifetime, app.Services.GetRequiredService<ILogger<Program>>());
+// AppLifecycleBridge.Initialize is at the TOP of the file — it must run before pool.Initialize()
+// so the PS warmup script can use it (it would silently return false otherwise).
 
 // --- Setup API (C# direct — no PS) ---
 

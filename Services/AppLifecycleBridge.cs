@@ -1,22 +1,24 @@
 namespace Craft.Services;
 
 /// <summary>
-/// Static bridge so downstream PowerShell apps can request a container restart.
-/// Uses IHostApplicationLifetime.StopApplication() to gracefully stop the host,
-/// which causes the App Service container to restart automatically.
+/// Static bridge so downstream PowerShell apps can request a container restart,
+/// trigger setup mode, or reconcile EasyAuth policy with the current appsettings.
 ///
 /// PS usage: [Craft.Services.AppLifecycleBridge]::RequestRestart("EasyAuth configuration applied")
 ///           [Craft.Services.AppLifecycleBridge]::IsEasyAuthConfigured()
+///           [Craft.Services.AppLifecycleBridge]::ReconcileAuthPolicy("CIPP warmup")
 /// </summary>
 public static class AppLifecycleBridge
 {
     private static IHostApplicationLifetime? s_lifetime;
     private static ILogger? s_logger;
+    private static SetupService? s_setupService;
 
-    public static void Initialize(IHostApplicationLifetime lifetime, ILogger logger)
+    public static void Initialize(IHostApplicationLifetime lifetime, ILogger logger, SetupService setupService)
     {
         s_lifetime = lifetime;
         s_logger = logger;
+        s_setupService = setupService;
     }
 
     /// <summary>
@@ -84,4 +86,44 @@ public static class AppLifecycleBridge
     /// Returns the reason setup was completed, or null if not yet completed.
     /// </summary>
     public static string? GetSetupCompletedReason() => s_setupCompletedReason;
+
+    /// <summary>
+    /// Pushes the current Setup.UnauthenticatedClientAction and Setup.ExcludedPaths into the
+    /// live authsettingsV2 via ARM. Idempotent — returns false if the live config already matches
+    /// or if EasyAuth isn't configured / no managed identity is available.
+    ///
+    /// Intended for the post-setup runtime path: PS warmup calls this after confirming EasyAuth
+    /// is already configured, so any subsequent appsettings changes (e.g. growing ExcludedPaths)
+    /// are reflected without going through the full setup wizard.
+    ///
+    /// Errors are swallowed and logged; this is best-effort and must not break warmup.
+    ///
+    /// PS usage: [Craft.Services.AppLifecycleBridge]::ReconcileAuthPolicy("CIPP startup")
+    /// </summary>
+    public static bool ReconcileAuthPolicy(string reason = "Reconcile requested by app")
+    {
+        try
+        {
+            return ReconcileAuthPolicyAsync(reason).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            s_logger?.LogError(ex, "[Lifecycle] ReconcileAuthPolicy failed ({Reason})", reason);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Async version of ReconcileAuthPolicy for callers that can await.
+    /// </summary>
+    public static Task<bool> ReconcileAuthPolicyAsync(string reason = "Reconcile requested by app")
+    {
+        var svc = s_setupService;
+        if (svc == null)
+        {
+            s_logger?.LogWarning("[Lifecycle] ReconcileAuthPolicy called before Initialize");
+            return Task.FromResult(false);
+        }
+        return svc.ReconcileAuthPolicy(reason);
+    }
 }

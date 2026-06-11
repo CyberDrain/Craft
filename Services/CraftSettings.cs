@@ -68,6 +68,23 @@ public class CraftSettings
 
     /// <summary>Container restart tracking — detects crash loops and forces worker reallocation.</summary>
     public ContainerHealthSettings ContainerHealth { get; set; } = new();
+
+    /// <summary>Frontend serving policy — CSP header injection (EasyAuth handles auth/redirects).</summary>
+    public FrontendSettings Frontend { get; set; } = new();
+}
+
+/// <summary>
+/// Frontend response policy. EasyAuth handles anon redirects and auth at the platform layer;
+/// this exists for response headers EasyAuth doesn't touch.
+/// </summary>
+public class FrontendSettings
+{
+    /// <summary>
+    /// Content-Security-Policy header value applied to all responses.
+    /// Mirrors what SWA's globalHeaders.content-security-policy did.
+    /// Null/empty = no CSP set.
+    /// </summary>
+    public string? ContentSecurityPolicy { get; set; }
 }
 
 /// <summary>
@@ -272,10 +289,21 @@ public class AuthSettings
     public string DevUserDetails { get; set; } = "developer@localhost";
 
     /// <summary>
-    /// PowerShell function name for the /api/me endpoint.
-    /// If empty, /api/me returns the raw client principal without PS processing.
+    /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
+    /// is used as the endpoint name. The PS function (or its MeEndpointHandler wrapper)
+    /// owns the response shape — /api/me passes status code and body through unchanged.
     /// </summary>
     public string MeEndpointFunction { get; set; } = "";
+
+    /// <summary>
+    /// Optional wrapper PowerShell function invoked for /api/me instead of MeEndpointFunction
+    /// directly. When set, this handler is called with the standard Request/TriggerMetadata
+    /// parameters and is expected to dispatch internally based on Request.Params.CIPPEndpoint
+    /// (which is set to MeEndpointFunction).
+    /// When empty (default), MeEndpointFunction is invoked directly.
+    /// Example (CIPP): "New-CippCoreRequest" with MeEndpointFunction = "me".
+    /// </summary>
+    public string MeEndpointHandler { get; set; } = "";
 
     /// <summary>
     /// When true, any user who authenticates against the configured AAD tenant
@@ -467,6 +495,22 @@ public class ScriptRepoSettings
     public List<string> HttpModules { get; set; } = [];
 
     /// <summary>
+    /// Optional global handler function name. When set, ALL /API/{endpoint} routes are
+    /// dispatched through this single function instead of invoking the route's function
+    /// directly. The endpoint name is passed via Request.Params.CIPPEndpoint so the handler
+    /// can dispatch internally. Route lookup still happens for 404 detection, but the
+    /// handler runs instead of the looked-up function.
+    ///
+    /// Use this when the hosted app's design assumes every HTTP endpoint goes through a
+    /// common router (e.g. CIPP's New-CippCoreRequest, which performs Test-CIPPAccess
+    /// authorization, telemetry, and feature-flag checks before dispatching to Invoke-*).
+    ///
+    /// Empty (default) = each /API/{endpoint} invokes Invoke-{endpoint} directly.
+    /// Example (CIPP): "New-CippCoreRequest"
+    /// </summary>
+    public string HttpHandler { get; set; } = "";
+
+    /// <summary>
     /// Directory names (relative to API/) to scan for background/timer scripts.
     /// </summary>
     public List<string> BackgroundScriptDirs { get; set; } = [];
@@ -547,6 +591,14 @@ public class SetupSettings
     public List<string> ExcludedPaths { get; set; } = [];
 
     /// <summary>
+    /// Identity provider key used for unauthenticated redirect (when UnauthenticatedClientAction
+    /// is RedirectToLoginPage). Applied to globalValidation.redirectToProvider in authsettingsV2.
+    /// Default "azureactivedirectory" (displayed as "Microsoft" in the Azure portal).
+    /// Override only when configuring a non-AAD provider (e.g. "google", "facebook").
+    /// </summary>
+    public string RedirectToProvider { get; set; } = "azureactivedirectory";
+
+    /// <summary>
     /// Client application IDs allowed to call the app with access tokens.
     /// Applied to identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications.
     /// When empty, no application-level restriction is applied (any valid token for the audience is accepted).
@@ -587,6 +639,14 @@ public class SetupSettings
     /// When empty (default), the secret is stored directly in the app setting.
     /// </summary>
     public string KeyVaultName { get; set; } = "";
+
+    /// <summary>
+    /// Role(s) assigned to the bootstrap user seeded by /api/setup/seed-user.
+    /// When empty (default), the role "superadmin" is used.
+    /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.
+    /// Override in appsettings to match the hosted app's role taxonomy, e.g. ["owner"] or ["admin", "authenticated"].
+    /// </summary>
+    public List<string> FirstUserRoles { get; set; } = [];
 }
 
 /// <summary>

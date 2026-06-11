@@ -166,9 +166,18 @@ Controls authentication and the dev-mode auto-login principal.
   // UPN/email for the dev principal
   "DevUserDetails": "developer@localhost",
 
-  // PowerShell function to call for /api/me.
-  // Empty string = return raw client principal without PS processing.
+  // PowerShell function dispatched for /api/me.
+  // Empty string = use the literal "me" as the endpoint name.
+  // The PS function (or its MeEndpointHandler wrapper) owns the response shape —
+  // /api/me passes status code and body through unchanged.
   "MeEndpointFunction": "me",
+
+  // Optional wrapper PS function invoked for /api/me instead of MeEndpointFunction directly.
+  // When set, the handler receives the standard Request/TriggerMetadata parameters and is
+  // expected to dispatch internally based on Request.Params.CIPPEndpoint (which is set to
+  // MeEndpointFunction). When empty (default), MeEndpointFunction is invoked directly.
+  // Example (CIPP): "New-CippCoreRequest"
+  "MeEndpointHandler": "",
 
   // When true (default), any user who authenticates against the configured Azure AD tenant
   // is allowed in — even if they're not in the allowedUsers table.
@@ -314,6 +323,13 @@ Controls where the host discovers PowerShell scripts.
   // If a function starts with "Invoke-", that prefix is stripped for the route.
   "HttpModules": ["CIPPHTTP"],
 
+  // Optional global HTTP handler. When set, ALL /API/{endpoint} routes dispatch through
+  // this PS function instead of invoking Invoke-{endpoint} directly. The endpoint name
+  // is passed via Request.Params.CIPPEndpoint so the handler can dispatch internally.
+  // Use when the hosted app expects all routes to go through a common router
+  // (e.g. CIPP's New-CippCoreRequest which performs Test-CIPPAccess + telemetry).
+  "HttpHandler": "New-CippCoreRequest",
+
   // Directories (under API/) scanned for background scripts.
   // These are deployed as Function:\ items on each worker.
   "BackgroundScriptDirs": [],
@@ -324,6 +340,17 @@ Controls where the host discovers PowerShell scripts.
     "Modules": ["CIPPHTTP"],
     "OutputFile": "Config/function-permissions.json"
   }
+}
+```
+
+### Frontend
+
+EasyAuth handles auth, redirects, and excluded paths at the App Service platform layer (see `Setup.UnauthenticatedClientAction` and `Setup.ExcludedPaths`). CRAFT only adds response headers EasyAuth doesn't touch — currently just CSP.
+
+```jsonc
+"Frontend": {
+  // Content-Security-Policy applied to all responses. Null/empty = no CSP set.
+  "ContentSecurityPolicy": "default-src https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *"
 }
 ```
 
@@ -477,6 +504,7 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
       "CookieName": "cipp-session",
       "DevRoles": ["superadmin", "admin", "editor", "readonly", "authenticated", "anonymous"],
       "MeEndpointFunction": "me",
+      "MeEndpointHandler": "New-CippCoreRequest",
       "AllowAllTenantUsers": true
     },
 

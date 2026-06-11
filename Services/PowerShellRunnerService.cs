@@ -13,6 +13,8 @@ public class PowerShellRunnerService : IDisposable
     private readonly PowerShellWorkerPool _pool;
     private readonly ScriptRepository _repo;
     private readonly WorkerSettings _workerSettings;
+    private readonly AuthSettings _authSettings;
+    private readonly ScriptRepoSettings _scriptsSettings;
 
     // Static JsonSerializerOptions — allocated once, reused everywhere
     private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = false };
@@ -31,6 +33,8 @@ public class PowerShellRunnerService : IDisposable
         _pool = pool;
         _repo = repo;
         _workerSettings = settings.Worker;
+        _authSettings = settings.Auth;
+        _scriptsSettings = settings.Scripts;
     }
 
     /// <summary>
@@ -61,12 +65,19 @@ public class PowerShellRunnerService : IDisposable
 
     /// <summary>
     /// Execute an HTTP request through the PS pipeline for endpoints not in the route table
-    /// (e.g., "me" which is handled by New-CippCoreRequest / Test-CIPPAccess directly).
+    /// (e.g., "me"). The actual PS function invoked is Auth.MeEndpointHandler when set
+    /// (with the endpoint name passed via Request.Params.CIPPEndpoint so the handler can
+    /// dispatch internally); otherwise the endpoint name is invoked as the function directly.
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpEndpoint(string endpoint, Hashtable request)
     {
         var sw = Stopwatch.StartNew();
         PowerShellWorker? worker = null;
+        EventHandler<DataAddedEventArgs>? onError = null;
+        EventHandler<DataAddedEventArgs>? onWarning = null;
+        EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             worker = _pool.CheckoutHttp(TimeSpan.FromSeconds(30));
@@ -79,6 +90,11 @@ public class PowerShellRunnerService : IDisposable
                 };
             }
 
+            // Resolve the PS function to invoke: configured wrapper (if set) or the endpoint itself
+            var handlerFunction = !string.IsNullOrEmpty(_authSettings.MeEndpointHandler)
+                ? _authSettings.MeEndpointHandler
+                : endpoint;
+
             var triggerMetadata = new Hashtable
             {
                 ["FunctionName"] = endpoint
@@ -90,16 +106,46 @@ public class PowerShellRunnerService : IDisposable
                 ["TriggerMetadata"] = triggerMetadata
             };
 
-            // Call New-CippCoreRequest which handles "me" internally via Test-CIPPAccess
             WorkerMetricsBridge.RecordFunction(worker.Id, endpoint);
+
+            // Subscribe to PS streams BEFORE invoke. worker.InvokeAsync's finally calls
+            // Cleanup() which clears the streams, so post-invoke iteration sees nothing.
+            // DataAdded events fire synchronously as PS emits records.
+            onError = (sender, args) =>
+            {
+                var records = (PSDataCollection<ErrorRecord>)sender!;
+                _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, records[args.Index].ToString());
+            };
+            onWarning = (sender, args) =>
+            {
+                var records = (PSDataCollection<WarningRecord>)sender!;
+                _logger.LogWarning("[API] PS warning in {Function}: {Warning}", endpoint, records[args.Index].ToString());
+            };
+            onInfo = (sender, args) =>
+            {
+                var records = (PSDataCollection<InformationRecord>)sender!;
+                _logger.LogInformation("[API] PS {Function}: {Info}", endpoint, records[args.Index].ToString());
+            };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[API] PS debug in {Function}: {Debug}", endpoint, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[API] PS verbose in {Function}: {Verbose}", endpoint, records[args.Index].ToString());
+            };
+            worker.Streams.Error.DataAdded += onError;
+            worker.Streams.Warning.DataAdded += onWarning;
+            worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
 
             using var cts = _workerSettings.HttpTimeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.HttpTimeoutSeconds))
                 : null;
-            var results = await worker.InvokeAsync("New-CippCoreRequest", parameters, cts?.Token ?? default);
-
-            foreach (var error in worker.Streams.Error)
-                _logger.LogError("[API] PS error in {Function}: {Error}", endpoint, error.ToString());
+            var results = await worker.InvokeAsync(handlerFunction, parameters, cts?.Token ?? default);
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -135,7 +181,14 @@ public class PowerShellRunnerService : IDisposable
         finally
         {
             if (worker != null)
+            {
+                if (onError != null) worker.Streams.Error.DataAdded -= onError;
+                if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
+                if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+                if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+                if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
                 _pool.Reclaim(worker, true);
+            }
         }
     }
 
@@ -189,6 +242,11 @@ public class PowerShellRunnerService : IDisposable
 
         PowerShellWorker? worker = null;
         var poolLabel = isHttp ? "HTTP" : "BG";
+        EventHandler<DataAddedEventArgs>? onError = null;
+        EventHandler<DataAddedEventArgs>? onWarning = null;
+        EventHandler<DataAddedEventArgs>? onInfo = null;
+        EventHandler<DataAddedEventArgs>? onDebug = null;
+        EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
             if (isHttp)
@@ -231,27 +289,61 @@ public class PowerShellRunnerService : IDisposable
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} starting on {Worker}",
                 poolLabel, invocation.Id, entry.FunctionName, invocation.WorkerId);
 
+            // Subscribe to PS streams BEFORE invoke. worker.InvokeAsync's finally calls
+            // Cleanup() which clears the streams, so post-invoke iteration would see nothing.
+            // DataAdded events fire synchronously as PS emits records.
+            var entryFunc = entry.FunctionName;
+            var invId = invocation.Id;
+            onError = (sender, args) =>
+            {
+                var records = (PSDataCollection<ErrorRecord>)sender!;
+                _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onWarning = (sender, args) =>
+            {
+                var records = (PSDataCollection<WarningRecord>)sender!;
+                _logger.LogWarning("[API] {InvocationId} PS warning in {Function}: {Warning}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onInfo = (sender, args) =>
+            {
+                var records = (PSDataCollection<InformationRecord>)sender!;
+                _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onDebug = (sender, args) =>
+            {
+                var records = (PSDataCollection<DebugRecord>)sender!;
+                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            onVerbose = (sender, args) =>
+            {
+                var records = (PSDataCollection<VerboseRecord>)sender!;
+                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
+                    invId, entryFunc, records[args.Index].ToString());
+            };
+            worker.Streams.Error.DataAdded += onError;
+            worker.Streams.Warning.DataAdded += onWarning;
+            worker.Streams.Information.DataAdded += onInfo;
+            worker.Streams.Debug.DataAdded += onDebug;
+            worker.Streams.Verbose.DataAdded += onVerbose;
+
             var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
             using var cts = timeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds))
                 : null;
-            var results = await worker.InvokeAsync(entry.FunctionName, parameters, cts?.Token ?? default);
 
-            foreach (var error in worker.Streams.Error)
-                _logger.LogError("[API] {InvocationId} PS error in {Function}: {Error}",
-                    invocation.Id, entry.FunctionName, error.ToString());
-            foreach (var warning in worker.Streams.Warning)
-                _logger.LogWarning("[API] {InvocationId} PS warning in {Function}: {Warning}",
-                    invocation.Id, entry.FunctionName, warning.ToString());
-            foreach (var info in worker.Streams.Information)
-                _logger.LogInformation("[API] {InvocationId} PS {Function}: {Info}",
-                    invocation.Id, entry.FunctionName, info.ToString());
-            foreach (var debug in worker.Streams.Debug)
-                _logger.LogDebug("[API] {InvocationId} PS debug in {Function}: {Debug}",
-                    invocation.Id, entry.FunctionName, debug.ToString());
-            foreach (var verbose in worker.Streams.Verbose)
-                _logger.LogTrace("[API] {InvocationId} PS verbose in {Function}: {Verbose}",
-                    invocation.Id, entry.FunctionName, verbose.ToString());
+            // When Scripts.HttpHandler is set, ALL HTTP routes dispatch through that single
+            // function instead of invoking the route's function directly. The endpoint name
+            // is already in request.Params.CIPPEndpoint, set by BuildRequestFromParts —
+            // the handler reads it to route internally. BG scripts (isHttp=false) always
+            // invoke their own function — the handler pattern is HTTP-only.
+            var targetFunction = (isHttp && !string.IsNullOrEmpty(_scriptsSettings.HttpHandler))
+                ? _scriptsSettings.HttpHandler
+                : entry.FunctionName;
+            var results = await worker.InvokeAsync(targetFunction, parameters, cts?.Token ?? default);
 
             var response = ExtractResponse(results);
             sw.Stop();
@@ -289,7 +381,14 @@ public class PowerShellRunnerService : IDisposable
         finally
         {
             if (worker != null)
+            {
+                if (onError != null) worker.Streams.Error.DataAdded -= onError;
+                if (onWarning != null) worker.Streams.Warning.DataAdded -= onWarning;
+                if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
+                if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
+                if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
                 _pool.Reclaim(worker, isHttp);
+            }
         }
     }
 
@@ -575,9 +674,14 @@ public class PowerShellRunnerService : IDisposable
         foreach (var q in httpRequest.Query)
             query[q.Key] = q.Value.ToString();
 
+        // Headers stored lowercase to match how CIPP's PS code accesses them via dot syntax
+        // ($Request.Headers.'x-ms-client-principal'). PowerShell dot-property access on
+        // a Hashtable does NOT respect StringComparer.OrdinalIgnoreCase consistently —
+        // it can return $null if stored case differs from the requested case. The Hashtable
+        // comparer is still case-insensitive for explicit indexer access ($h['Key']).
         var headers = new Hashtable(StringComparer.OrdinalIgnoreCase);
         foreach (var h in httpRequest.Headers)
-            headers[h.Key] = h.Value.ToString();
+            headers[h.Key.ToLowerInvariant()] = h.Value.ToString();
 
         object? body = null;
         if (httpRequest.ContentLength > 0 || httpRequest.ContentType != null)

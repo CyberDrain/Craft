@@ -486,11 +486,13 @@ public static class SetupPages
                 const res = await fetch('/api/setup/status', { cache: 'no-store' });
                 if (res.ok) {
                     const data = await res.json();
-                    if (data.isEasyAuthConfigured && !data.isSetupCompleted) {
+                    const headerRedirect = res.headers.get('Location');
+                    const target = data.redirect || headerRedirect;
+                    if (target || (data.isEasyAuthConfigured && !data.isSetupCompleted)) {
                         // New container is online with EasyAuth active — redirect to app
                         document.getElementById('restart-status').textContent = 'Application is ready!';
                         document.getElementById('restart-spinner').textContent = '\u2705';
-                        setTimeout(() => window.location.href = '/', 1000);
+                        setTimeout(() => window.location.href = target || '/', 1000);
                         return;
                     }
                     // Still on the old container (isSetupCompleted=true) — keep waiting
