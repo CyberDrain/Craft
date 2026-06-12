@@ -653,7 +653,7 @@ app.Use(async (context, next) =>
                     var swaJson = System.Text.Json.JsonSerializer.Serialize(swaFormat);
                     var swaBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(swaJson));
                     context.Request.Headers["x-ms-client-principal"] = swaBase64;
-                    context.Request.Headers["x-ms-client-principal-idp"] = "aad";
+                    context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
                     context.Request.Headers["x-ms-client-principal-name"] = upn;
                 }
             }
@@ -674,7 +674,7 @@ app.Use(async (context, next) =>
     {
         var headerValue = authService.BuildClientPrincipalHeader(session2);
         context.Request.Headers["x-ms-client-principal"] = headerValue;
-        context.Request.Headers["x-ms-client-principal-idp"] = "aad";
+        context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
         context.Request.Headers["x-ms-client-principal-name"] = session2.Upn;
     }
     else if (app.Environment.IsDevelopment())
@@ -691,7 +691,7 @@ app.Use(async (context, next) =>
         var devJson = System.Text.Json.JsonSerializer.Serialize(devPrincipal);
         var devBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(devJson));
         context.Request.Headers["x-ms-client-principal"] = devBase64;
-        context.Request.Headers["x-ms-client-principal-idp"] = "aad";
+        context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
         context.Request.Headers["x-ms-client-principal-name"] = CraftSettings.Auth.DevUserDetails;
     }
 
