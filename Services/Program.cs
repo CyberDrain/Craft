@@ -615,9 +615,11 @@ app.Use(async (context, next) =>
             // Detect App Service EasyAuth format: has "claims" array but no "userRoles"
             if (root.TryGetProperty("claims", out _) && !root.TryGetProperty("userRoles", out _))
             {
-                // Extract UPN from claims
+                // Extract identity claims
                 string? upn = null;
                 string? oid = null;
+                string? appId = null;
+                string? idtyp = null;
                 if (root.TryGetProperty("claims", out var claims))
                 {
                     foreach (var claim in claims.EnumerateArray())
@@ -626,12 +628,37 @@ app.Use(async (context, next) =>
                         var val = claim.GetProperty("val").GetString() ?? "";
                         if (typ == "preferred_username" || typ == "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
                             upn ??= val;
-                        if (typ == "http://schemas.microsoft.com/identity/claims/objectidentifier")
+                        else if (typ == "http://schemas.microsoft.com/identity/claims/objectidentifier")
                             oid ??= val;
+                        else if (typ == "appid" || typ == "azp")
+                            appId ??= val;
+                        else if (typ == "idtyp")
+                            idtyp ??= val;
                     }
                 }
 
-                if (!string.IsNullOrEmpty(upn))
+                // App-only (client-credentials) token: no UPN, has appid, or idtyp=="app"
+                bool isAppOnly = string.IsNullOrEmpty(upn) &&
+                                 (!string.IsNullOrEmpty(appId) || string.Equals(idtyp, "app", StringComparison.OrdinalIgnoreCase));
+
+                if (isAppOnly && !string.IsNullOrEmpty(appId))
+                {
+                    // Service principal — emit SWA-format principal with idp=aad so downstream
+                    // resolves AppName from the ApiClients table using x-ms-client-principal-name.
+                    var spFormat = new
+                    {
+                        identityProvider = "aad",
+                        userId = oid ?? appId,
+                        userDetails = appId,
+                        userRoles = Array.Empty<string>()
+                    };
+                    var spJson = System.Text.Json.JsonSerializer.Serialize(spFormat);
+                    var spBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(spJson));
+                    context.Request.Headers["x-ms-client-principal"] = spBase64;
+                    context.Request.Headers["x-ms-client-principal-idp"] = "aad";
+                    context.Request.Headers["x-ms-client-principal-name"] = appId;
+                }
+                else if (!string.IsNullOrEmpty(upn))
                 {
                     // Look up user in allowedUsers table for CIPP roles
                     var roles = await authService.GetUserRoles(upn);
