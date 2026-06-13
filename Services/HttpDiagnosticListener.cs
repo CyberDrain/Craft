@@ -206,6 +206,35 @@ public sealed class HttpDiagnosticListener : EventListener,
     private static readonly Regex s_partitionKeyRegex = new(@"PartitionKey='([^']*)'", RegexOptions.Compiled);
     private static readonly Regex s_rowKeyRegex = new(@"RowKey='([^']*)'", RegexOptions.Compiled);
 
+    // Form-encoded keys whose values are credentials and must never reach the log.
+    // OAuth covers most of these; `password` defends against ROPC-style flows.
+    private static readonly HashSet<string> s_sensitiveFormKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "refresh_token",
+        "client_secret",
+        "assertion",
+        "client_assertion",
+        "code",
+        "password",
+    };
+
+    private static readonly Regex s_formPairRegex = new(
+        @"(?<sep>^|&)(?<key>[^=&]+)=(?<value>[^&]*)",
+        RegexOptions.Compiled);
+
+    private static string ScrubSensitiveFormValues(string body)
+    {
+        return s_formPairRegex.Replace(body, m =>
+        {
+            string key;
+            try { key = Uri.UnescapeDataString(m.Groups["key"].Value); }
+            catch { key = m.Groups["key"].Value; }
+            return s_sensitiveFormKeys.Contains(key)
+                ? $"{m.Groups["sep"].Value}{m.Groups["key"].Value}=***"
+                : m.Value;
+        });
+    }
+
     private static string SummarizeBody(string? body, Uri? requestUri)
     {
         if (string.IsNullOrEmpty(body)) return "";
@@ -247,10 +276,12 @@ public sealed class HttpDiagnosticListener : EventListener,
             return "$batch (unparsed)";
         }
 
-        // For regular POST/PUT bodies, truncate
-        if (body.Length > 300)
-            return body[..300] + "...";
-        return body;
+        // For regular POST/PUT bodies, scrub credentials before truncating so a
+        // sensitive key past the 300-char cutoff still gets redacted.
+        var scrubbed = ScrubSensitiveFormValues(body);
+        if (scrubbed.Length > 300)
+            return scrubbed[..300] + "...";
+        return scrubbed;
     }
 
     private static string ExtractTableName(string url)
