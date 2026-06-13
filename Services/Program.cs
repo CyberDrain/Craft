@@ -27,7 +27,14 @@ builder.Configuration.GetSection("App").Bind(craftSettings);
 
 static void ApplySkuProfile(CraftSettings s)
 {
-    if (s.Worker.IgnoreSkuProfiles || s.Worker.SkuProfiles.Count == 0) return;
+    if (s.Worker.IgnoreSkuProfiles)
+    {
+        Console.WriteLine("[System] SkuProfile evaluation skipped: IgnoreSkuProfiles=true; " +
+            $"using baseline HttpPoolSize={s.Worker.HttpPoolSize} BgPoolSize={s.Worker.BgPoolSize}");
+        return;
+    }
+
+    if (s.Worker.SkuProfiles.Count == 0) return; // feature not configured — silent
 
     try
     {
@@ -59,11 +66,16 @@ static void ApplySkuProfile(CraftSettings s)
                 return;
             }
         }
+
+        // Walked the full list, nothing matched — keep baseline
+        Console.WriteLine($"[System] No SkuProfile matched runtime (ProcessorCount={cpu}, " +
+            $"checked {s.Worker.SkuProfiles.Count} profile(s)); " +
+            $"using baseline HttpPoolSize={s.Worker.HttpPoolSize} BgPoolSize={s.Worker.BgPoolSize}");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[System] SkuProfile evaluation failed ({ex.GetType().Name}: {ex.Message}); " +
-            "falling back to baseline HttpPoolSize/BgPoolSize");
+        Console.WriteLine($"[System] SkuProfile detection failed ({ex.GetType().Name}: {ex.Message}); " +
+            $"using baseline HttpPoolSize={s.Worker.HttpPoolSize} BgPoolSize={s.Worker.BgPoolSize}");
     }
 }
 
