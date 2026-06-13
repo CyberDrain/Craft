@@ -16,12 +16,56 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Bind App section to CraftSettings
 builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"));
+// Apply SkuProfiles override (host-tier pool sizing) before any consumer resolves the options
+builder.Services.PostConfigure<CraftSettings>(ApplySkuProfile);
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 
 // Bind configuration directly for early access (avoid BuildServiceProvider warning)
 var craftSettings = new CraftSettings();
 builder.Configuration.GetSection("App").Bind(craftSettings);
+
+static void ApplySkuProfile(CraftSettings s)
+{
+    if (s.Worker.IgnoreSkuProfiles || s.Worker.SkuProfiles.Count == 0) return;
+
+    try
+    {
+        var cpu = Environment.ProcessorCount;
+
+        foreach (var p in s.Worker.SkuProfiles)
+        {
+            bool skuMatch;
+            string? skuValue = null;
+            if (string.IsNullOrWhiteSpace(p.SkuEnv))
+            {
+                skuMatch = true;
+            }
+            else
+            {
+                skuValue = Environment.GetEnvironmentVariable(p.SkuEnv) ?? "";
+                skuMatch = string.Equals(skuValue, p.Sku ?? "", StringComparison.OrdinalIgnoreCase);
+            }
+
+            var cpuMatch = p.Cpu is null or 0 || p.Cpu == cpu;
+
+            if (skuMatch && cpuMatch)
+            {
+                Console.WriteLine($"[System] SkuProfile matched (SkuEnv='{p.SkuEnv}' Sku='{p.Sku}' Cpu={p.Cpu}) " +
+                    $"for runtime ({p.SkuEnv}='{skuValue}' ProcessorCount={cpu}); " +
+                    $"applying HttpPoolSize={p.HttpPoolSize} BgPoolSize={p.BgPoolSize}");
+                s.Worker.HttpPoolSize = p.HttpPoolSize;
+                s.Worker.BgPoolSize = p.BgPoolSize;
+                return;
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[System] SkuProfile evaluation failed ({ex.GetType().Name}: {ex.Message}); " +
+            "falling back to baseline HttpPoolSize/BgPoolSize");
+    }
+}
 
 // Configure Kestrel timeout
 // If KestrelTimeoutSeconds is explicitly set, use it.
