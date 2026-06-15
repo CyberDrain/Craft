@@ -63,7 +63,7 @@ if (-not ('Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext' -as [
     Add-Type -TypeDefinition @'
 using System.Collections;
 namespace Microsoft.Azure.Functions.PowerShellWorker
-
+{
     public class HttpResponseContext
     {
         public object StatusCode { get; set; } = 200;
