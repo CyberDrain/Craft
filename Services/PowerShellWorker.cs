@@ -57,29 +57,13 @@ public class PowerShellWorker : IDisposable
         // Common using namespaces needed by HTTP scripts
         RunScript("using namespace System.Net");
 
-        // HttpResponseContext
-        RunScript(@"
-if (-not ('Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System.Collections;
-namespace Microsoft.Azure.Functions.PowerShellWorker
-{
-    public class HttpResponseContext
-    {
-        public object StatusCode { get; set; } = 200;
-        public object Body { get; set; }
-        public Hashtable Headers { get; set; } = new Hashtable();
-        public string ContentType { get; set; } = ""application/json"";
-    }
-}
-'@
-}
-$__ta = [psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')
-if (-not $__ta::Get.ContainsKey('HttpResponseContext')) {
-    $__ta::Add('HttpResponseContext', [Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext])
-}
-Remove-Variable __ta -ErrorAction SilentlyContinue
-");
+        // HttpResponseContext — derive the runspace class from the Craft.dll-compiled base type
+        // (Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext). PowerShell classes are
+        // compiled by the PS engine (no Roslyn), so this resolves [HttpResponseContext] by short
+        // name in the runtime container image, where Add-Type -TypeDefinition does NOT (no C#
+        // compiler). The base type's namespace-qualified name lands in $_.PSObject.TypeNames, so
+        // CIPP's New-CippCoreRequest response filter matches it exactly as under Azure Functions.
+        RunScript("class HttpResponseContext : Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext {}");
         //
         // CRAFT_ROOT is always set — scripts use $env:CRAFT_ROOT to find the API root
         var resolvedApiBase = apiBasePath.Replace("\\", "/");
