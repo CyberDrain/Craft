@@ -57,14 +57,29 @@ public class PowerShellWorker : IDisposable
         // Common using namespaces needed by HTTP scripts
         RunScript("using namespace System.Net");
 
-        // HttpResponseContext stub
+        // HttpResponseContext
         RunScript(@"
-class HttpResponseContext {
-    [int]$StatusCode = 200
-    [object]$Body = $null
-    [hashtable]$Headers = @{}
-    [string]$ContentType = 'application/json'
-}");
+if (-not ('Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Collections;
+namespace Microsoft.Azure.Functions.PowerShellWorker
+
+    public class HttpResponseContext
+    {
+        public object StatusCode { get; set; } = 200;
+        public object Body { get; set; }
+        public Hashtable Headers { get; set; } = new Hashtable();
+        public string ContentType { get; set; } = ""application/json"";
+    }
+}
+'@
+}
+$__ta = [psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')
+if (-not $__ta::Get.ContainsKey('HttpResponseContext')) {
+    $__ta::Add('HttpResponseContext', [Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext])
+}
+Remove-Variable __ta -ErrorAction SilentlyContinue
+");
 
         // CRAFT_ROOT is always set — scripts use $env:CRAFT_ROOT to find the API root
         var resolvedApiBase = apiBasePath.Replace("\\", "/");
