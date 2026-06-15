@@ -245,10 +245,12 @@ public class WorkerSettings
     /// cannot resolve a wildcard-export module unless it was already imported, so background
     /// dispatchers that probe with Get-Command fail with "not found".
     ///
-    /// The rewrite is idempotent (manifests that already declare an explicit list are skipped),
-    /// so it converges after the first start. It mutates the on-disk manifests, so only enable
-    /// when running from bind-mounted source (local dev). Never enable in production.
-    /// Also settable via the environment variable CRAFT_DEV_EXPAND_EXPORTS=true.
+    /// The export list is regenerated from the current Public/*.ps1 set on every run — whether the
+    /// manifest currently holds a wildcard or a previously-written explicit list — so functions added
+    /// since the last run are picked up. The manifest is only written when the result differs, so an
+    /// already-current manifest leaves the file (and the dev file-watcher) stable. It mutates the
+    /// on-disk manifests, so only enable when running from bind-mounted source (local dev). Never
+    /// enable in production. Also settable via the environment variable CRAFT_DEV_EXPAND_EXPORTS=true.
     /// </summary>
     public bool DevExpandModuleExports { get; set; }
 

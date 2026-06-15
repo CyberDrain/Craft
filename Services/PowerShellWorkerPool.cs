@@ -711,9 +711,11 @@ public class PowerShellWorkerPool : IDisposable
             ?? manifests[0];
     }
 
-    // Matches FunctionsToExport assigned a single wildcard, e.g. FunctionsToExport = '*'  /  ="*".
-    private static readonly System.Text.RegularExpressions.Regex s_wildcardExportRegex = new(
-        @"FunctionsToExport\s*=\s*(['""])\*\1",
+    // Matches a FunctionsToExport assignment and its value in any form — a quoted scalar
+    // ('*' / "*") or an @(...) array (possibly multi-line; function names never contain ')').
+    // Used to rewrite the value to a freshly-computed explicit list on every run.
+    private static readonly System.Text.RegularExpressions.Regex s_functionsToExportRegex = new(
+        @"FunctionsToExport\s*=\s*(?:'[^']*'|""[^""]*""|@\([^)]*\))",
         System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     /// <summary>
@@ -732,14 +734,18 @@ public class PowerShellWorkerPool : IDisposable
     }
 
     /// <summary>
-    /// DEV ONLY. Rewrite wildcard <c>FunctionsToExport = '*'</c> in module manifests to the explicit
-    /// list of functions the module exports (its Public/*.ps1 basenames — the same set the source
-    /// .psm1 stub exports and that ModuleBuilder bakes in for production). This restores PowerShell
-    /// name-based command auto-loading for modules that aren't eagerly imported into a pool.
+    /// DEV ONLY. Rewrite each targeted module manifest's <c>FunctionsToExport</c> to the explicit list
+    /// of functions the module exports (its Public/*.ps1 basenames — the same set the source .psm1 stub
+    /// exports and that ModuleBuilder bakes in for production). This restores PowerShell name-based
+    /// command auto-loading for modules that aren't eagerly imported into a pool.
     ///
-    /// Gated by Worker.DevExpandModuleExports (or CRAFT_DEV_EXPAND_EXPORTS=true). Idempotent: manifests
-    /// with an explicit export list are left untouched, so it converges after the first start. Mutates
-    /// on-disk manifests, so this is intended for bind-mounted source in local dev only.
+    /// The list is regenerated from the current Public/*.ps1 set on every run — whether the manifest
+    /// currently holds a wildcard or a previously-written explicit list — so functions added since the
+    /// last run are picked up rather than skipped. The manifest is only written when the regenerated
+    /// content differs, so an already-current manifest leaves the file (and the dev file-watcher) stable.
+    ///
+    /// Gated by Worker.DevExpandModuleExports (or CRAFT_DEV_EXPAND_EXPORTS=true). Mutates on-disk
+    /// manifests, so this is intended for bind-mounted source in local dev only.
     /// </summary>
     private void ExpandModuleExportsForDev(string modulesPath)
     {
@@ -776,18 +782,10 @@ public class PowerShellWorkerPool : IDisposable
                 var manifest = FindModuleManifest(moduleDir, moduleName);
                 if (manifest == null) continue;
 
-                // Preserve the manifest's original encoding (some are UTF-16, most UTF-8-no-BOM).
-                var rawBytes = File.ReadAllBytes(manifest);
-                var encoding = DetectManifestEncoding(rawBytes);
-                string content;
-                using (var reader = new StreamReader(new MemoryStream(rawBytes), System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
-                    content = reader.ReadToEnd();
-                if (!s_wildcardExportRegex.IsMatch(content)) continue; // already explicit — idempotent skip
-
                 var publicDir = Path.Combine(moduleDir, "Public");
                 if (!Directory.Exists(publicDir))
                 {
-                    _logger.LogWarning("[DevExports] {Module}: wildcard export but no Public/ folder — left as-is", moduleName);
+                    _logger.LogWarning("[DevExports] {Module}: no Public/ folder — left as-is", moduleName);
                     continue;
                 }
 
@@ -805,14 +803,33 @@ public class PowerShellWorkerPool : IDisposable
                     continue;
                 }
 
-                // PowerShell single-quoted strings escape a quote by doubling it.
+                // Preserve the manifest's original encoding (some are UTF-16, most UTF-8-no-BOM).
+                var rawBytes = File.ReadAllBytes(manifest);
+                var encoding = DetectManifestEncoding(rawBytes);
+                string content;
+                using (var reader = new StreamReader(new MemoryStream(rawBytes), System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                    content = reader.ReadToEnd();
+
+                if (!s_functionsToExportRegex.IsMatch(content))
+                {
+                    _logger.LogWarning("[DevExports] {Module}: no FunctionsToExport entry to rewrite — left as-is", moduleName);
+                    continue;
+                }
+
+                // Always regenerate the export list from the current Public/*.ps1 set so functions
+                // added since the last run are picked up. PowerShell single-quoted strings escape a
+                // quote by doubling it.
                 var literal = string.Join(", ", functionNames.Select(n => $"'{n!.Replace("'", "''")}'"));
                 var replacement = $"FunctionsToExport = @({literal})";
-                var updated = s_wildcardExportRegex.Replace(content, replacement, count: 1);
+                var updated = s_functionsToExportRegex.Replace(content, replacement, count: 1);
+
+                // Only write when the result actually changed — keeps the file mtime (and the dev
+                // file-watcher) stable once the manifest already lists the current function set.
+                if (string.Equals(updated, content, StringComparison.Ordinal)) continue;
 
                 File.WriteAllText(manifest, updated, encoding);
                 expanded++;
-                _logger.LogInformation("[DevExports] {Module}: expanded FunctionsToExport to {Count} explicit functions", moduleName, functionNames.Count);
+                _logger.LogInformation("[DevExports] {Module}: wrote FunctionsToExport with {Count} explicit functions", moduleName, functionNames.Count);
             }
             catch (Exception ex)
             {
