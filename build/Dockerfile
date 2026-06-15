@@ -11,12 +11,13 @@ RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Debug -o /app/publish && \
     rm -rf /app/publish/ref \
-           /app/publish/cs /app/publish/de /app/publish/es /app/publish/fr \
-           /app/publish/it /app/publish/ja /app/publish/ko /app/publish/pl \
-           /app/publish/pt-BR /app/publish/ru /app/publish/tr \
-           /app/publish/zh-Hans /app/publish/zh-Hant
+    /app/publish/cs /app/publish/de /app/publish/es /app/publish/fr \
+    /app/publish/it /app/publish/ja /app/publish/ko /app/publish/pl \
+    /app/publish/pt-BR /app/publish/ru /app/publish/tr \
+    /app/publish/zh-Hans /app/publish/zh-Hant
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS runtime
+ARG TARGETARCH
 WORKDIR /app
 
 # Copy PowerShell from the SDK build stage (PS is bundled in dotnet/sdk images)
@@ -27,9 +28,20 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 # but NOT started — the entrypoint launches sshd only when CRAFT_SSH_ENABLED=true.
 # Also installs libmimalloc; see Dockerfile.release for the full rationale.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /run/sshd
+    && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+
+# Symlink libmimalloc to a fixed, arch-independent path so LD_PRELOAD works on
+# both amd64 (x86_64-linux-gnu) and arm64 (aarch64-linux-gnu).
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+    amd64) TRIPLET=x86_64-linux-gnu ;; \
+    arm64) TRIPLET=aarch64-linux-gnu ;; \
+    *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    ln -s /usr/lib/${TRIPLET}/libmimalloc.so.2 /usr/lib/libmimalloc.so.2
+
 COPY docker/sshd_config /etc/ssh/sshd_config
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -49,7 +61,7 @@ ENV CRAFT_VERBOSE="false"
 ENV CRAFT_SSH_ENABLED="false"
 
 # ── Memory & runtime tuning (kept in sync with Dockerfile.release) ──
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so.2
+ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
 ENV MALLOC_ARENA_MAX=2
 ENV POWERSHELL_TELEMETRY_OPTOUT=1
 ENV POWERSHELL_UPDATECHECK=Off
