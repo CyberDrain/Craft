@@ -114,7 +114,7 @@ if (kestrelTimeout > 0)
     {
         // Request timeout settings
         options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(kestrelTimeout);
-        options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(30, kestrelTimeout));
+        options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(60, kestrelTimeout));
 
         // HTTP/2 settings for better multiplexing
         options.Limits.Http2.MaxStreamsPerConnection = 100;
@@ -586,7 +586,7 @@ HttpClient? devProxyClient = null;
 if (devFrontendUrl != null)
 {
     devProxyClient = new HttpClient { BaseAddress = new Uri(devFrontendUrl) };
-    devProxyClient.Timeout = TimeSpan.FromSeconds(30);
+    devProxyClient.Timeout = TimeSpan.FromSeconds(120); // longer timeout for slow Next.js dev builds
     logger.LogInformation("[System] Dev mode: proxying frontend to {Url}", devFrontendUrl);
 
     // In dev mode, intercept frontend requests (/_next/*, static assets, etc.)
@@ -692,7 +692,7 @@ if (Directory.Exists(frontendPath))
         context.Response.ContentType = contentType;
         h.ETag = $"\"{variant.LastModified.ToFileTime():x}-{variant.Length:x}\"";
         h.CacheControl = reqPath.StartsWith("/_next/static/", StringComparison.OrdinalIgnoreCase)
-            ? "public, max-age=31536000, immutable"
+            ? "public, max-age=86400, immutable"
             : "no-cache, must-revalidate";
         // Set Content-Length explicitly so the precompressed body is sent fixed-length, not chunked
         // (ResponseCompression is upstream; with Content-Encoding already set it passes through).
@@ -723,17 +723,17 @@ if (Directory.Exists(frontendPath))
                 headers.CacheControl = "no-cache, must-revalidate";
                 headers.ETag = etag;
             }
-            // Content-hashed bundles — safe to pin for a year.
+            // Content-hashed bundles.
             else if (path.StartsWith("/_next/static/", StringComparison.OrdinalIgnoreCase))
             {
-                headers.CacheControl = "public, max-age=31536000, immutable";
+                headers.CacheControl = "public, max-age=86400, immutable";
             }
             // Stable-named binary assets (icons, report images, fonts) — long cache, revalidate on expiry.
             else if (path.EndsWith(".png") || path.EndsWith(".jpg") || path.EndsWith(".jpeg") ||
                      path.EndsWith(".gif") || path.EndsWith(".ico") || path.EndsWith(".svg") ||
                      path.EndsWith(".webp") || path.EndsWith(".woff") || path.EndsWith(".woff2"))
             {
-                headers.CacheControl = "public, max-age=15770000, must-revalidate";
+                headers.CacheControl = "public, max-age=86400, must-revalidate";
                 headers.ETag = etag;
             }
             // Non-hashed data JSON (permissionsList, secureScore, languageList) — store + revalidate cheaply.
@@ -743,7 +743,7 @@ if (Directory.Exists(frontendPath))
                 headers.CacheControl = "no-cache, must-revalidate";
                 headers.ETag = etag;
             }
-            // HTML and everything else — storable but always revalidated (Cloudflare-friendly; was no-store).
+            // HTML and everything else — storable but always revalidated.
             else
             {
                 headers.CacheControl = "no-cache, must-revalidate";
