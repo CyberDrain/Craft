@@ -85,6 +85,17 @@ public class FrontendSettings
     /// Null/empty = no CSP set.
     /// </summary>
     public string? ContentSecurityPolicy { get; set; }
+
+    /// <summary>
+    /// Whether the host compresses static responses. Default true.
+    /// - true: serves precompressed .br/.gz sibling files when present, and on-the-fly Brotli/Gzip as a
+    ///   fallback for anything without a sibling.
+    /// - false: serves everything raw/identity (no precompressed files served, ResponseCompression off).
+    /// Turn off when an upstream CDN (e.g. Cloudflare) already compresses, when the content does not
+    /// benefit, or to A/B measure compressed vs raw serving. Overridable via the CRAFT_COMPRESSION
+    /// environment variable (true/false), which takes precedence over this setting.
+    /// </summary>
+    public bool Compression { get; set; } = true;
 }
 
 /// <summary>
@@ -97,6 +108,21 @@ public class WorkerSettings
 
     /// <summary>Number of workers reserved for background jobs (scheduler, orchestrator, queue).</summary>
     public int BgPoolSize { get; set; } = 4;
+
+    /// <summary>
+    /// Optional list of host profiles that override HttpPoolSize/BgPoolSize based on the
+    /// detected runtime environment (WEBSITE_SKU + Environment.ProcessorCount).
+    /// First matching entry wins. No match (or any parse failure) leaves the baseline values
+    /// from HttpPoolSize/BgPoolSize untouched.
+    /// </summary>
+    public List<SkuProfile> SkuProfiles { get; set; } = [];
+
+    /// <summary>
+    /// When true, SkuProfiles are ignored entirely and the configured baseline
+    /// HttpPoolSize/BgPoolSize are always used. Kill-switch for downstream apps
+    /// that want to opt out of host-tier scaling.
+    /// </summary>
+    public bool IgnoreSkuProfiles { get; set; } = false;
 
     /// <summary>
     /// Maximum execution time in seconds for a single HTTP request handler.
@@ -188,6 +214,14 @@ public class WorkerSettings
     public List<string> SkipModules { get; set; } = [];
 
     /// <summary>
+    /// Static-only / web-content mode. When true, the PowerShell worker pool, scheduler, job manager
+    /// and all background hosted services are disabled, and /api, /API, /.auth, /login, /logout return
+    /// 503 — the host boots instantly and serves only static frontend content. Also settable via the
+    /// environment variable CRAFT_STATIC_ONLY=true.
+    /// </summary>
+    public bool Disabled { get; set; }
+
+    /// <summary>
     /// Module names to load for HTTP workers. If empty, loads all modules (minus SkipModules).
     /// When specified, only these modules are imported into HTTP worker runspaces.
     /// Example: ["CIPPCore", "CIPPHTTP", "AzBobbyTables"]
@@ -208,6 +242,40 @@ public class WorkerSettings
     /// permission/role loading — any JSON file can be injected generically.
     /// </summary>
     public List<GlobalJsonPreload> JsonPreloads { get; set; } = [];
+}
+
+/// <summary>
+/// Maps a host environment (an env var value and/or CPU count) to a worker pool sizing.
+/// Used by the SkuProfiles list on WorkerSettings.
+///
+/// Matching:
+///   - SkuEnv: name of the env var to read (e.g. "WEBSITE_SKU" on Azure App Service).
+///             Null or empty = SKU criterion is wildcard (match any host).
+///   - Sku:    expected value of that env var, compared case-insensitively
+///             (e.g. "Basic", "PremiumV3"). Ignored when SkuEnv is empty.
+///   - Cpu:    compared to Environment.ProcessorCount. Null or 0 = match any count.
+///
+/// All specified criteria must match. First matching entry in the list wins.
+/// Letting the profile name the env var means downstream apps can target any host
+/// (Azure, AWS, GCP, k8s, plain Docker) without backend changes — just point at
+/// whatever env var the operator uses to identify the host tier.
+/// </summary>
+public class SkuProfile
+{
+    /// <summary>Name of the env var to read for the SKU identifier (e.g. "WEBSITE_SKU"). Null/empty = wildcard.</summary>
+    public string? SkuEnv { get; set; }
+
+    /// <summary>Expected value of the env var named by SkuEnv (e.g. "Basic"). Compared case-insensitively.</summary>
+    public string? Sku { get; set; }
+
+    /// <summary>CPU count to match (Environment.ProcessorCount). Null or 0 = match any count.</summary>
+    public int? Cpu { get; set; }
+
+    /// <summary>HTTP worker pool size to apply when this profile matches.</summary>
+    public int HttpPoolSize { get; set; }
+
+    /// <summary>Background worker pool size to apply when this profile matches.</summary>
+    public int BgPoolSize { get; set; }
 }
 
 /// <summary>
@@ -287,6 +355,13 @@ public class AuthSettings
 
     /// <summary>User details (UPN/email) for the dev-mode auto-login principal.</summary>
     public string DevUserDetails { get; set; } = "developer@localhost";
+
+    /// <summary>
+    /// Permissions returned in the canned /api/me response when static-only dev-auth is enabled
+    /// (CRAFT_STATIC_ONLY_DEVAUTH=true). Empty = ["*"]. No default here — config binding appends to
+    /// list initializers, causing duplicates.
+    /// </summary>
+    public List<string> DevPermissions { get; set; } = [];
 
     /// <summary>
     /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
