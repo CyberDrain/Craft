@@ -2,6 +2,7 @@ using System.Collections;
 using System.Net.Http;
 using Craft.Services;
 using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Options;
 
@@ -24,6 +25,25 @@ builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings
 // Bind configuration directly for early access (avoid BuildServiceProvider warning)
 var craftSettings = new CraftSettings();
 builder.Configuration.GetSection("App").Bind(craftSettings);
+
+// Static-only / web-content mode: disable the PowerShell worker pool, scheduler, job manager and all
+// background services so the host boots instantly and only serves static frontend content.
+var staticOnly = craftSettings.Worker.Disabled
+    || string.Equals(Environment.GetEnvironmentVariable("CRAFT_STATIC_ONLY"), "true", StringComparison.OrdinalIgnoreCase);
+// Dev-auth toggle: in static-only mode, serve a canned dev principal for /.auth/me + /api/me so the SPA
+// boots and renders pages without the PowerShell backend. For local testing only — never in production.
+var staticOnlyDevAuth = staticOnly
+    && string.Equals(Environment.GetEnvironmentVariable("CRAFT_STATIC_ONLY_DEVAUTH"), "true", StringComparison.OrdinalIgnoreCase);
+
+// Compression toggle: when false, the host serves all static content raw/identity — precompressed
+// .br/.gz siblings are not served and on-the-fly ResponseCompression is not applied. Lets a downstream
+// app turn compression off (e.g. an upstream CDN already compresses, or the content doesn't benefit) and
+// lets the perf harness A/B compressed vs raw on the same image. Default true (from App:Frontend:Compression);
+// the CRAFT_COMPRESSION environment variable (true/false) takes precedence when set.
+var compressionEnabled = craftSettings.Frontend.Compression;
+var compressionEnv = Environment.GetEnvironmentVariable("CRAFT_COMPRESSION");
+if (!string.IsNullOrEmpty(compressionEnv))
+    compressionEnabled = compressionEnv.Equals("true", StringComparison.OrdinalIgnoreCase) || compressionEnv == "1";
 
 static void ApplySkuProfile(CraftSettings s)
 {
@@ -179,11 +199,15 @@ builder.Services.AddSingleton<OrchestratorTableStore>();
 builder.Services.AddSingleton<OrchestratorService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<SetupService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
 builder.Services.AddSingleton<SchedulerService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
 builder.Services.AddSingleton<StatsHistoryService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
+// Background hosted services (job manager, scheduler, stats history) only run when NOT static-only.
+if (!staticOnly)
+{
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
+}
 builder.Services.AddSingleton(sp =>
 {
     var settings = sp.GetRequiredService<IOptions<CraftSettings>>().Value.ContainerHealth;
@@ -284,7 +308,13 @@ void RunInitialization()
     healthMonitor.ClearRestartCounter();
 }
 
-if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
+if (staticOnly)
+{
+    logger.LogWarning("[System] STATIC-ONLY mode — PowerShell worker pool, scheduler, job manager and " +
+        "background services are disabled. Serving static frontend content only; /api, /API, /.auth, " +
+        "/login and /logout return 503.");
+}
+else if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
 {
     // Defer init until after Kestrel is listening — Azure probe gets a fast 200,
     // users see a loading page while workers initialize in the background.
@@ -339,8 +369,63 @@ if (app.Environment.IsDevelopment())
         string.Join(", ", CraftSettings.Auth.DevRoles));
 }
 
-// Response compression must be before static files
-app.UseResponseCompression();
+// Response compression must be before static files. Skipped entirely when compression is disabled
+// (App:Frontend:Compression=false / CRAFT_COMPRESSION=false) so everything is served raw/identity.
+if (compressionEnabled)
+    app.UseResponseCompression();
+logger.LogInformation("[System] Static compression: {State}", compressionEnabled ? "enabled (precompressed .br/.gz + on-the-fly fallback)" : "DISABLED (raw/identity)");
+
+// Static-only mode: short-circuit all dynamic/API/auth endpoints with 503 so nothing touches the
+// (disabled) PowerShell pipeline; everything else falls through to static file serving.
+if (staticOnly)
+{
+    // Optional dev-auth (CRAFT_STATIC_ONLY_DEVAUTH=true): canned /.auth/me + /api/me so the SPA boots and
+    // renders pages without the PS backend. Roles/permissions come from Auth.DevRoles / Auth.DevPermissions.
+    var devRoles = CraftSettings.Auth.DevRoles.Count > 0
+        ? CraftSettings.Auth.DevRoles.ToArray() : new[] { "superadmin", "authenticated" };
+    var devPerms = CraftSettings.Auth.DevPermissions.Count > 0
+        ? CraftSettings.Auth.DevPermissions.ToArray() : new[] { "*" };
+    var devPrincipal = new
+    {
+        identityProvider = "aad",
+        userId = CraftSettings.Auth.DevUserId,
+        userDetails = CraftSettings.Auth.DevUserDetails,
+        userRoles = devRoles
+    };
+    var authMeJson = System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = devPrincipal });
+    var apiMeJson = System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = devPrincipal, permissions = devPerms });
+    if (staticOnlyDevAuth)
+        logger.LogWarning("[System] STATIC-ONLY dev-auth ENABLED — serving a canned superadmin principal for " +
+            "/.auth/me and /api/me. For local testing only; never enable in production.");
+
+    app.Use(async (context, next) =>
+    {
+        var p = context.Request.Path.Value ?? "";
+        if (staticOnlyDevAuth && p.Equals("/.auth/me", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(authMeJson);
+            return;
+        }
+        if (staticOnlyDevAuth && p.Equals("/api/me", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(apiMeJson);
+            return;
+        }
+        if (p.StartsWith("/api", StringComparison.OrdinalIgnoreCase) ||
+            p.StartsWith("/.auth", StringComparison.OrdinalIgnoreCase) ||
+            p.Equals("/login", StringComparison.OrdinalIgnoreCase) ||
+            p.Equals("/logout", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = 503;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync("{\"error\":\"CRAFT static-only mode: API and auth are disabled.\"}");
+            return;
+        }
+        await next();
+    });
+}
 
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
 // The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
@@ -453,7 +538,7 @@ if (CraftSettings.Setup.Enabled)
 // for browser requests and 503 for API calls. Health endpoint stays available for polling.
 app.Use(async (context, next) =>
 {
-    if (!pool.IsReady)
+    if (!pool.IsReady && !staticOnly)
     {
         var path = context.Request.Path.Value ?? "";
 
@@ -572,6 +657,49 @@ if (Directory.Exists(frontendPath))
 {
     frontendFileProvider = new PhysicalFileProvider(frontendPath);
 
+    // Pre-compressed static serving: when a request for a compressible asset has a sibling
+    // .br/.gz on disk and the client accepts that encoding, serve the precompressed file with
+    // the original Content-Type and ZERO per-request compression CPU. Registered before the
+    // static-file middleware so it short-circuits; ResponseCompression sees Content-Encoding
+    // already set and skips, so nothing is compressed twice.
+    var precompressContentTypes = new FileExtensionContentTypeProvider();
+    var precompressExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ".js", ".css", ".html", ".json", ".svg", ".xml", ".txt", ".map", ".wasm"
+    };
+    app.Use(async (context, next) =>
+    {
+        // Compression disabled: skip precompressed serving — fall through to raw UseStaticFiles (identity).
+        if (!compressionEnabled) { await next(); return; }
+        var reqPath = context.Request.Path.Value ?? "";
+        var ext = Path.GetExtension(reqPath);
+        if (ext.Length == 0 || !precompressExtensions.Contains(ext)) { await next(); return; }
+
+        var accept = context.Request.Headers.AcceptEncoding.ToString();
+        string? enc = null, suffix = null;
+        if (accept.Contains("br", StringComparison.OrdinalIgnoreCase)) { enc = "br"; suffix = ".br"; }
+        else if (accept.Contains("gzip", StringComparison.OrdinalIgnoreCase)) { enc = "gzip"; suffix = ".gz"; }
+        if (enc == null) { await next(); return; }
+
+        var variant = frontendFileProvider!.GetFileInfo(reqPath.TrimStart('/') + suffix);
+        if (!variant.Exists || variant.IsDirectory || variant.PhysicalPath == null) { await next(); return; }
+
+        if (!precompressContentTypes.TryGetContentType(reqPath, out var contentType))
+            contentType = "application/octet-stream";
+        var h = context.Response.Headers;
+        h.ContentEncoding = enc;
+        h.Vary = "Accept-Encoding";
+        context.Response.ContentType = contentType;
+        h.ETag = $"\"{variant.LastModified.ToFileTime():x}-{variant.Length:x}\"";
+        h.CacheControl = reqPath.StartsWith("/_next/static/", StringComparison.OrdinalIgnoreCase)
+            ? "public, max-age=31536000, immutable"
+            : "no-cache, must-revalidate";
+        // Set Content-Length explicitly so the precompressed body is sent fixed-length, not chunked
+        // (ResponseCompression is upstream; with Content-Encoding already set it passes through).
+        context.Response.ContentLength = variant.Length;
+        await context.Response.SendFileAsync(variant.PhysicalPath);
+    });
+
     app.UseDefaultFiles(new DefaultFilesOptions
     {
         FileProvider = frontendFileProvider
@@ -585,34 +713,41 @@ if (Directory.Exists(frontendPath))
         {
             var path = ctx.Context.Request.Path.Value ?? "";
             var headers = ctx.Context.Response.Headers;
+            var etag = $"\"{ctx.File.LastModified.ToFileTime():x}-{ctx.File.Length:x}\"";
 
-            if (path.StartsWith("/_next/static/") || path.EndsWith(".js") || path.EndsWith(".css"))
+            // Never-cache control files: service worker, version probe, PWA manifest.
+            if (path.EndsWith("/sw.js", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith("/version.json", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith("/manifest.json", StringComparison.OrdinalIgnoreCase))
             {
-                // Immutable hashed assets — cache for 6 months (matches SWA config)
-                headers.CacheControl = "public, max-age=15770000, immutable";
-                // ETag not needed for immutable assets but doesn't hurt
-                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
+                headers.CacheControl = "no-cache, must-revalidate";
+                headers.ETag = etag;
             }
-            else if (path.EndsWith(".png") || path.EndsWith(".jpg") || path.EndsWith(".gif") ||
-                     path.EndsWith(".ico") || path.EndsWith(".svg") || path.EndsWith(".xml") ||
+            // Content-hashed bundles — safe to pin for a year.
+            else if (path.StartsWith("/_next/static/", StringComparison.OrdinalIgnoreCase))
+            {
+                headers.CacheControl = "public, max-age=31536000, immutable";
+            }
+            // Stable-named binary assets (icons, report images, fonts) — long cache, revalidate on expiry.
+            else if (path.EndsWith(".png") || path.EndsWith(".jpg") || path.EndsWith(".jpeg") ||
+                     path.EndsWith(".gif") || path.EndsWith(".ico") || path.EndsWith(".svg") ||
                      path.EndsWith(".webp") || path.EndsWith(".woff") || path.EndsWith(".woff2"))
             {
-                // Static assets with validation — cache for 6 months
                 headers.CacheControl = "public, max-age=15770000, must-revalidate";
-                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
+                headers.ETag = etag;
             }
-            else if (path.EndsWith(".json") && !path.Contains("/api/", StringComparison.OrdinalIgnoreCase))
+            // Non-hashed data JSON (permissionsList, secureScore, languageList) — store + revalidate cheaply.
+            else if (path.EndsWith(".json", StringComparison.OrdinalIgnoreCase) &&
+                     !path.Contains("/api/", StringComparison.OrdinalIgnoreCase))
             {
-                // JSON files (manifests, configs) — short cache with validation
-                headers.CacheControl = "public, max-age=3600, must-revalidate";
-                headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}\"";
+                headers.CacheControl = "no-cache, must-revalidate";
+                headers.ETag = etag;
             }
+            // HTML and everything else — storable but always revalidated (Cloudflare-friendly; was no-store).
             else
             {
-                // HTML and other files — no cache by default
-                headers.CacheControl = "no-cache, no-store, must-revalidate";
-                headers.Pragma = "no-cache";
-                headers.Expires = "0";
+                headers.CacheControl = "no-cache, must-revalidate";
+                headers.ETag = etag;
             }
         }
     });
@@ -1451,6 +1586,58 @@ app.MapFallback(async (HttpContext context) =>
 {
     var path = context.Request.Path.Value?.TrimEnd('/') ?? "";
 
+    // Serve an HTML document, preferring a precomputed .br/.gz sibling when the client accepts it, so the
+    // SPA fallback (index.html) and prerendered route pages go out precompressed with a fixed Content-Length
+    // and ZERO per-request compression CPU — instead of being Brotli-compressed on the fly by
+    // ResponseCompression (which strips Content-Length and chunks the response). Mirrors the precompressed
+    // static middleware above; ResponseCompression sees Content-Encoding already set and passes through.
+    async Task ServeHtmlAsync(string physicalHtmlPath)
+    {
+        var h = context.Response.Headers;
+        context.Response.ContentType = "text/html";
+        h.CacheControl = "no-cache, must-revalidate";
+
+        string? enc = null, suffix = null;
+        var accept = context.Request.Headers.AcceptEncoding.ToString();
+        if (accept.Contains("br", StringComparison.OrdinalIgnoreCase)) { enc = "br"; suffix = ".br"; }
+        else if (accept.Contains("gzip", StringComparison.OrdinalIgnoreCase)) { enc = "gzip"; suffix = ".gz"; }
+
+        if (compressionEnabled && suffix != null)
+        {
+            var variant = new FileInfo(physicalHtmlPath + suffix);
+            if (variant.Exists)
+            {
+                h.ContentEncoding = enc;
+                h.Vary = "Accept-Encoding";
+                h.ETag = $"\"{variant.LastWriteTimeUtc.ToFileTime():x}-{variant.Length:x}\"";
+                context.Response.ContentLength = variant.Length;
+                await context.Response.SendFileAsync(variant.FullName);
+                return;
+            }
+        }
+
+        // No precompressed sibling (a sub-1KB page, or compression disabled) — send raw with an explicit
+        // Content-Length so the identity response is fixed-length, not chunked. If compression is enabled,
+        // ResponseCompression may still compress this on the fly (replacing the length with chunked); when
+        // compression is disabled it stays fixed-length identity.
+        var raw = new FileInfo(physicalHtmlPath);
+        if (raw.Exists)
+        {
+            h.ETag = $"\"{raw.LastWriteTimeUtc.ToFileTime():x}-{raw.Length:x}\"";
+            context.Response.ContentLength = raw.Length;
+        }
+        await context.Response.SendFileAsync(physicalHtmlPath);
+    }
+
+    // Never SPA-fallback API or auth paths — return 404 so an unmatched /api, /API or /.auth path
+    // isn't served index.html (a soft-200 that Cloudflare could cache against an API URL).
+    if (path.StartsWith("/api", StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith("/.auth", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.StatusCode = 404;
+        return;
+    }
+
     // Dev mode: proxy everything to Next.js dev server (Turbopack hot-reload)
     if (devProxyClient != null)
     {
@@ -1494,18 +1681,14 @@ app.MapFallback(async (HttpContext context) =>
         var fileInfo = frontendFileProvider.GetFileInfo(htmlRelPath);
         if (fileInfo.Exists && !fileInfo.IsDirectory && fileInfo.PhysicalPath != null)
         {
-            context.Response.ContentType = "text/html";
-            context.Response.Headers.CacheControl = "no-cache, no-store";
-            await context.Response.SendFileAsync(fileInfo.PhysicalPath);
+            await ServeHtmlAsync(fileInfo.PhysicalPath);
             return;
         }
     }
 
     // Fall back to index.html for SPA client-side routing
     var indexPath = Path.Combine(frontendPath, "index.html");
-    context.Response.ContentType = "text/html";
-    context.Response.Headers.CacheControl = "no-cache, no-store";
-    await context.Response.SendFileAsync(indexPath);
+    await ServeHtmlAsync(indexPath);
 });
 
 app.Run();

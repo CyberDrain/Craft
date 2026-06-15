@@ -85,6 +85,17 @@ public class FrontendSettings
     /// Null/empty = no CSP set.
     /// </summary>
     public string? ContentSecurityPolicy { get; set; }
+
+    /// <summary>
+    /// Whether the host compresses static responses. Default true.
+    /// - true: serves precompressed .br/.gz sibling files when present, and on-the-fly Brotli/Gzip as a
+    ///   fallback for anything without a sibling.
+    /// - false: serves everything raw/identity (no precompressed files served, ResponseCompression off).
+    /// Turn off when an upstream CDN (e.g. Cloudflare) already compresses, when the content does not
+    /// benefit, or to A/B measure compressed vs raw serving. Overridable via the CRAFT_COMPRESSION
+    /// environment variable (true/false), which takes precedence over this setting.
+    /// </summary>
+    public bool Compression { get; set; } = true;
 }
 
 /// <summary>
@@ -201,6 +212,14 @@ public class WorkerSettings
     /// Module names to skip during ISS import (e.g. test modules, legacy entrypoints).
     /// </summary>
     public List<string> SkipModules { get; set; } = [];
+
+    /// <summary>
+    /// Static-only / web-content mode. When true, the PowerShell worker pool, scheduler, job manager
+    /// and all background hosted services are disabled, and /api, /API, /.auth, /login, /logout return
+    /// 503 — the host boots instantly and serves only static frontend content. Also settable via the
+    /// environment variable CRAFT_STATIC_ONLY=true.
+    /// </summary>
+    public bool Disabled { get; set; }
 
     /// <summary>
     /// Module names to load for HTTP workers. If empty, loads all modules (minus SkipModules).
@@ -336,6 +355,13 @@ public class AuthSettings
 
     /// <summary>User details (UPN/email) for the dev-mode auto-login principal.</summary>
     public string DevUserDetails { get; set; } = "developer@localhost";
+
+    /// <summary>
+    /// Permissions returned in the canned /api/me response when static-only dev-auth is enabled
+    /// (CRAFT_STATIC_ONLY_DEVAUTH=true). Empty = ["*"]. No default here — config binding appends to
+    /// list initializers, causing duplicates.
+    /// </summary>
+    public List<string> DevPermissions { get; set; } = [];
 
     /// <summary>
     /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
