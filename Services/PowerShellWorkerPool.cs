@@ -61,6 +61,11 @@ public class PowerShellWorkerPool : IDisposable
             }
         }
 
+        // DEV ONLY: expand wildcard FunctionsToExport in module manifests so PowerShell
+        // name-based command auto-loading works for modules not eagerly imported into a pool.
+        // Must run before any ISS is built (auto-load reads the manifest off disk).
+        ExpandModuleExportsForDev(modulesPath);
+
         var sw = System.Diagnostics.Stopwatch.StartNew();
         StartupInfoBridge.SetCpuCount(Environment.ProcessorCount);
         StartupInfoBridge.SetPoolConfig(_httpPoolSize, _bgPoolSize);
@@ -704,6 +709,119 @@ public class PowerShellWorkerPool : IDisposable
         return Array.Find(manifests, m =>
             Path.GetFileNameWithoutExtension(m).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
             ?? manifests[0];
+    }
+
+    // Matches FunctionsToExport assigned a single wildcard, e.g. FunctionsToExport = '*'  /  ="*".
+    private static readonly System.Text.RegularExpressions.Regex s_wildcardExportRegex = new(
+        @"FunctionsToExport\s*=\s*(['""])\*\1",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Pick the encoding to write a manifest back with, preserving its original BOM/encoding
+    /// (CIPP ships a mix of UTF-16LE and UTF-8-without-BOM .psd1 files). Defaults to UTF-8 no BOM.
+    /// </summary>
+    private static System.Text.Encoding DetectManifestEncoding(byte[] bytes)
+    {
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            return new System.Text.UnicodeEncoding(bigEndian: false, byteOrderMark: true);
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            return new System.Text.UnicodeEncoding(bigEndian: true, byteOrderMark: true);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+        return new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    }
+
+    /// <summary>
+    /// DEV ONLY. Rewrite wildcard <c>FunctionsToExport = '*'</c> in module manifests to the explicit
+    /// list of functions the module exports (its Public/*.ps1 basenames — the same set the source
+    /// .psm1 stub exports and that ModuleBuilder bakes in for production). This restores PowerShell
+    /// name-based command auto-loading for modules that aren't eagerly imported into a pool.
+    ///
+    /// Gated by Worker.DevExpandModuleExports (or CRAFT_DEV_EXPAND_EXPORTS=true). Idempotent: manifests
+    /// with an explicit export list are left untouched, so it converges after the first start. Mutates
+    /// on-disk manifests, so this is intended for bind-mounted source in local dev only.
+    /// </summary>
+    private void ExpandModuleExportsForDev(string modulesPath)
+    {
+        var enabled = _settings.Worker.DevExpandModuleExports
+            || string.Equals(Environment.GetEnvironmentVariable("CRAFT_DEV_EXPAND_EXPORTS"), "true", StringComparison.OrdinalIgnoreCase);
+        if (!enabled) return;
+        if (!Directory.Exists(modulesPath))
+        {
+            _logger.LogWarning("[DevExports] Modules path not found, skipping export expansion: {Path}", modulesPath);
+            return;
+        }
+
+        // Target the configured module list, or every module dir (minus SkipModules) when empty.
+        IEnumerable<string> moduleDirs;
+        var configured = _settings.Worker.DevExpandModules;
+        if (configured.Count > 0)
+        {
+            moduleDirs = configured
+                .Select(name => Path.Combine(modulesPath, name))
+                .Where(Directory.Exists);
+        }
+        else
+        {
+            moduleDirs = Directory.GetDirectories(modulesPath)
+                .Where(dir => !_settings.Worker.SkipModules.Contains(Path.GetFileName(dir), StringComparer.OrdinalIgnoreCase));
+        }
+
+        var expanded = 0;
+        foreach (var moduleDir in moduleDirs)
+        {
+            var moduleName = Path.GetFileName(moduleDir);
+            try
+            {
+                var manifest = FindModuleManifest(moduleDir, moduleName);
+                if (manifest == null) continue;
+
+                // Preserve the manifest's original encoding (some are UTF-16, most UTF-8-no-BOM).
+                var rawBytes = File.ReadAllBytes(manifest);
+                var encoding = DetectManifestEncoding(rawBytes);
+                string content;
+                using (var reader = new StreamReader(new MemoryStream(rawBytes), System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+                    content = reader.ReadToEnd();
+                if (!s_wildcardExportRegex.IsMatch(content)) continue; // already explicit — idempotent skip
+
+                var publicDir = Path.Combine(moduleDir, "Public");
+                if (!Directory.Exists(publicDir))
+                {
+                    _logger.LogWarning("[DevExports] {Module}: wildcard export but no Public/ folder — left as-is", moduleName);
+                    continue;
+                }
+
+                var functionNames = Directory
+                    .EnumerateFiles(publicDir, "*.ps1", SearchOption.AllDirectories)
+                    .Select(Path.GetFileNameWithoutExtension)
+                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (functionNames.Count == 0)
+                {
+                    _logger.LogWarning("[DevExports] {Module}: no Public/*.ps1 functions found — left as-is", moduleName);
+                    continue;
+                }
+
+                // PowerShell single-quoted strings escape a quote by doubling it.
+                var literal = string.Join(", ", functionNames.Select(n => $"'{n!.Replace("'", "''")}'"));
+                var replacement = $"FunctionsToExport = @({literal})";
+                var updated = s_wildcardExportRegex.Replace(content, replacement, count: 1);
+
+                File.WriteAllText(manifest, updated, encoding);
+                expanded++;
+                _logger.LogInformation("[DevExports] {Module}: expanded FunctionsToExport to {Count} explicit functions", moduleName, functionNames.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DevExports] {Module}: failed to expand FunctionsToExport", moduleName);
+            }
+        }
+
+        if (expanded > 0)
+            _logger.LogInformation("[DevExports] Expanded wildcard exports in {Count} module manifest(s)", expanded);
     }
 
     public void Dispose()
