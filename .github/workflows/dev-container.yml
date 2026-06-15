@@ -48,7 +48,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build and push (attempt 1)
+        id: build_push_attempt_1
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/Dockerfile
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+            COMMIT_SHA=${{ github.sha }}
+            IMAGE_TAG=dev
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Craft - Dev Build
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push (retry)
+        if: steps.build_push_attempt_1.outcome == 'failure'
         uses: docker/build-push-action@v6
         with:
           context: .
