@@ -80,7 +80,7 @@ if (-not $__ta::Get.ContainsKey('HttpResponseContext')) {
 }
 Remove-Variable __ta -ErrorAction SilentlyContinue
 ");
-
+        //
         // CRAFT_ROOT is always set — scripts use $env:CRAFT_ROOT to find the API root
         var resolvedApiBase = apiBasePath.Replace("\\", "/");
         RunScript($"$env:CRAFT_ROOT = '{resolvedApiBase}'");
