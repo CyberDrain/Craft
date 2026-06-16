@@ -2,7 +2,12 @@
 # CyberDrain Runtime for Apps, Functions, Tasks
 # Dev build — includes Debug symbols for diagnostics.
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS build
+# Default the .NET base images to the GHCR mirror (CyberDrain/Containers) so
+# builds survive an mcr.microsoft.com / Azure Container Registry outage.
+# Override with --build-arg DOTNET_REGISTRY=mcr.microsoft.com to pull upstream.
+ARG DOTNET_REGISTRY=ghcr.io/cyberdrain
+
+FROM ${DOTNET_REGISTRY}/dotnet/sdk:8.0-bookworm-slim AS build
 WORKDIR /src
 
 COPY Craft.csproj .
@@ -16,7 +21,7 @@ RUN dotnet publish -c Debug -o /app/publish && \
     /app/publish/pt-BR /app/publish/ru /app/publish/tr \
     /app/publish/zh-Hans /app/publish/zh-Hant
 
-FROM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim AS runtime
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-bookworm-slim AS runtime
 ARG TARGETARCH
 WORKDIR /app
 

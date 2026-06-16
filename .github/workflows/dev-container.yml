@@ -64,6 +64,7 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=dev
+            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
