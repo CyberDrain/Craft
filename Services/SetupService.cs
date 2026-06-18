@@ -501,12 +501,9 @@ public class SetupService
             mergedSettings["AUTH_SECRET"] = clientSecret;
         }
 
-        // Determine effective allowed tenants (always include the setup tenant)
-        bool useCommonIssuer = multiTenant;
-
         // Always remove WEBSITE_AUTH_AAD_ALLOWED_TENANTS — we rely on the issuer URL
         // for tenant restriction ("Use default restrictions based on issuer" in the portal).
-        // Multi-tenant uses common/v2.0 issuer, single-tenant uses {tenantId}/v2.0.
+        // The issuer is always pinned to {tenantId}/v2.0.
         mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
 
         // 3. PUT merged settings back
@@ -569,9 +566,7 @@ public class SetupService
                         {
                             clientId = appId,
                             clientSecretSettingName = "AUTH_SECRET",
-                            openIdIssuer = useCommonIssuer
-                                ? "https://login.microsoftonline.com/common/v2.0"
-                                : $"https://login.microsoftonline.com/{tenantId}/v2.0"
+                            openIdIssuer = $"https://login.microsoftonline.com/{tenantId}/v2.0"
                         },
                         validation = aadValidation
                     }
