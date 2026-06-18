@@ -51,6 +51,7 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=latest
+            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.app_version }}

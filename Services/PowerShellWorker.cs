@@ -57,15 +57,14 @@ public class PowerShellWorker : IDisposable
         // Common using namespaces needed by HTTP scripts
         RunScript("using namespace System.Net");
 
-        // HttpResponseContext stub
-        RunScript(@"
-class HttpResponseContext {
-    [int]$StatusCode = 200
-    [object]$Body = $null
-    [hashtable]$Headers = @{}
-    [string]$ContentType = 'application/json'
-}");
-
+        // HttpResponseContext — derive the runspace class from the Craft.dll-compiled base type
+        // (Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext). PowerShell classes are
+        // compiled by the PS engine (no Roslyn), so this resolves [HttpResponseContext] by short
+        // name in the runtime container image, where Add-Type -TypeDefinition does NOT (no C#
+        // compiler). The base type's namespace-qualified name lands in $_.PSObject.TypeNames, so
+        // CIPP's New-CippCoreRequest response filter matches it exactly as under Azure Functions.
+        RunScript("class HttpResponseContext : Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext {}");
+        //
         // CRAFT_ROOT is always set — scripts use $env:CRAFT_ROOT to find the API root
         var resolvedApiBase = apiBasePath.Replace("\\", "/");
         RunScript($"$env:CRAFT_ROOT = '{resolvedApiBase}'");

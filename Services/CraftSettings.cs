@@ -236,6 +236,31 @@ public class WorkerSettings
     public List<string> BgModules { get; set; } = [];
 
     /// <summary>
+    /// DEV ONLY. When true, before any worker imports modules the host rewrites each targeted
+    /// module manifest's wildcard <c>FunctionsToExport = '*'</c> into the explicit list of
+    /// functions the module exports (derived from its Public/*.ps1 files). This restores
+    /// PowerShell name-based command auto-loading for modules that are NOT eagerly imported
+    /// into a given pool (see HttpModules/BgModules) — matching what the production ModuleBuilder
+    /// build bakes into the manifest. Without it, <c>Get-Command -Name Foo</c> / <c>&amp; Foo</c>
+    /// cannot resolve a wildcard-export module unless it was already imported, so background
+    /// dispatchers that probe with Get-Command fail with "not found".
+    ///
+    /// The export list is regenerated from the current Public/*.ps1 set on every run — whether the
+    /// manifest currently holds a wildcard or a previously-written explicit list — so functions added
+    /// since the last run are picked up. The manifest is only written when the result differs, so an
+    /// already-current manifest leaves the file (and the dev file-watcher) stable. It mutates the
+    /// on-disk manifests, so only enable when running from bind-mounted source (local dev). Never
+    /// enable in production. Also settable via the environment variable CRAFT_DEV_EXPAND_EXPORTS=true.
+    /// </summary>
+    public bool DevExpandModuleExports { get; set; }
+
+    /// <summary>
+    /// DEV ONLY. Module names to expand when DevExpandModuleExports is true.
+    /// Empty (default) = every module under Modules/ (minus SkipModules) that uses a wildcard export.
+    /// </summary>
+    public List<string> DevExpandModules { get; set; } = [];
+
+    /// <summary>
     /// JSON files to preload into PowerShell variables at worker init.
     /// Each entry specifies a file path (relative to API/Config/), a variable name,
     /// and a scope ("global" or "env"). This replaces the need for hardcoded

@@ -45,6 +45,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -53,6 +56,7 @@ jobs:
         with:
           context: .
           file: build/Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -60,6 +64,7 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=dev
+            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

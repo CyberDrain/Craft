@@ -420,7 +420,9 @@ public class AuthService
         // Skip internal rows
         if (entity.RowKey.StartsWith("_")) continue;
 
-        var upn = entity.RowKey;
+        // Normalize the UPN to lowercase so case-variant duplicate rows
+        // resolve to a single entry.
+        var upn = entity.RowKey.ToLowerInvariant();
         var rolesJson = entity.GetString("Roles") ?? "[]";
         string[] roles;
         try
@@ -432,11 +434,28 @@ public class AuthService
           roles = new[] { rolesJson }; // Fallback: single role as plain string
         }
 
-        newCache[upn] = new AllowedUser
+        if (newCache.TryGetValue(upn, out var existing))
         {
-          Upn = upn,
-          Roles = roles
-        };
+          // Duplicate case-variant row — union the roles (case-sensitive dedupe)
+          // so no role assignment is silently dropped by last-writer-wins.
+          var merged = new List<string>(existing.Roles);
+          foreach (var role in roles)
+          {
+            if (!merged.Contains(role, StringComparer.Ordinal))
+            {
+              merged.Add(role);
+            }
+          }
+          existing.Roles = merged.ToArray();
+        }
+        else
+        {
+          newCache[upn] = new AllowedUser
+          {
+            Upn = upn,
+            Roles = roles
+          };
+        }
       }
 
       _allowedUsersCache.Clear();
