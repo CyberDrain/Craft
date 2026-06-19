@@ -1072,23 +1072,6 @@ string DiscoverV1Authority()
     issuer = issuer.TrimEnd('/');
     if (disc.UseV1Authority && issuer.EndsWith("/v2.0", StringComparison.OrdinalIgnoreCase))
         issuer = issuer[..^"/v2.0".Length];
-
-    // Single-tenant app registrations can't authorize via the /common (or /organizations) endpoint
-    // (AADSTS50194). The EasyAuth issuer tracks the multi-tenant SSO app (often /common), but the
-    // OAuth client here is the API client app, which may be single-tenant. Substitute the concrete
-    // tenant it's registered in (CIPP's TenantID) so the authorize endpoint is tenant-specific.
-    var tenantId = Environment.GetEnvironmentVariable("TenantID");
-    if (!string.IsNullOrEmpty(tenantId))
-    {
-        foreach (var virt in new[] { "/common", "/organizations", "/consumers" })
-        {
-            if (issuer.EndsWith(virt, StringComparison.OrdinalIgnoreCase))
-            {
-                issuer = issuer[..^virt.Length] + "/" + tenantId;
-                break;
-            }
-        }
-    }
     return issuer;
 }
 
