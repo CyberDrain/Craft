@@ -71,38 +71,6 @@ public class CraftSettings
 
     /// <summary>Frontend serving policy — CSP header injection (EasyAuth handles auth/redirects).</summary>
     public FrontendSettings Frontend { get; set; } = new();
-
-    /// <summary>OAuth 2.0 discovery documents served by the host (RFC 9728 Protected Resource Metadata).</summary>
-    public OAuthDiscoverySettings OAuthDiscovery { get; set; } = new();
-}
-
-/// <summary>
-/// OAuth 2.0 discovery documents served by the host. Currently the RFC 9728 Protected Resource
-/// Metadata (/.well-known/oauth-protected-resource), which advertises the authorization server(s)
-/// to OAuth clients (e.g. MCP connectors). Served by Craft so we can point clients at the v1
-/// authority: Entra's v2 authorize endpoint rejects the RFC 8707 `resource` parameter such clients
-/// must send (AADSTS901002), while the v1 endpoint accepts it. The issued token is still a v2 token
-/// (the resource app forces requestedAccessTokenVersion=2), so platform token validation is unchanged.
-/// </summary>
-public class OAuthDiscoverySettings
-{
-    /// <summary>Serve the Protected Resource Metadata from the host. False = fall through to platform/SPA.</summary>
-    public bool Enabled { get; set; } = true;
-
-    /// <summary>
-    /// Hard override for authorization_servers. When empty, derived from the live EasyAuth
-    /// openIdIssuer (WEBSITE_AUTH_V2_CONFIG_JSON) with the /v2.0 suffix stripped.
-    /// </summary>
-    public List<string> AuthorizationServers { get; set; } = [];
-
-    /// <summary>Strip the /v2.0 suffix from the discovered issuer so clients hit the v1 authorize endpoint.</summary>
-    public bool UseV1Authority { get; set; } = true;
-
-    /// <summary>Delegated scope advertised in scopes_supported, relative to the resource identifier URI.</summary>
-    public string ScopeName { get; set; } = "user_impersonation";
-
-    /// <summary>Override the resource identifier URI base. Empty = https://{WEBSITE_HOSTNAME}.</summary>
-    public string ResourceOverride { get; set; } = "";
 }
 
 /// <summary>
