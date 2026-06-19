@@ -1041,6 +1041,66 @@ app.MapGet("/.auth/me", (HttpContext context) =>
     return Results.Json(new { clientPrincipal = (object?)null });
 });
 
+// --- OAuth 2.0 discovery (RFC 9728 Protected Resource Metadata) ---
+// Platform EasyAuth auto-emits this PRM with authorization_servers = openIdIssuer (…/v2.0); Entra's v2
+// authorize endpoint rejects the RFC 8707 `resource` param MCP clients must send (AADSTS901002). When the
+// path is excluded from EasyAuth (Setup.ExcludedPaths) we serve our own pointing at the v1 authority, whose
+// authorize endpoint accepts `resource`. Issued token is still v2 (resource app forces
+// requestedAccessTokenVersion=2), so platform token validation is unchanged. Tunable via App:OAuthDiscovery.
+string DiscoverV1Authority()
+{
+    var disc = CraftSettings.OAuthDiscovery;
+    string? issuer = null;
+    var cfg = Environment.GetEnvironmentVariable("WEBSITE_AUTH_V2_CONFIG_JSON");
+    if (!string.IsNullOrEmpty(cfg))
+    {
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(cfg);
+            if (doc.RootElement.TryGetProperty("identityProviders", out var idp)
+                && idp.TryGetProperty("azureActiveDirectory", out var aad)
+                && aad.TryGetProperty("registration", out var reg)
+                && reg.TryGetProperty("openIdIssuer", out var iss))
+                issuer = iss.GetString();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "[OAuthDiscovery] Failed to parse WEBSITE_AUTH_V2_CONFIG_JSON; falling back to env tenant");
+        }
+    }
+    issuer ??= $"https://login.microsoftonline.com/{Environment.GetEnvironmentVariable("WEBSITE_AUTH_AAD_ALLOWED_TENANTS") ?? "common"}/v2.0";
+    issuer = issuer.TrimEnd('/');
+    if (disc.UseV1Authority && issuer.EndsWith("/v2.0", StringComparison.OrdinalIgnoreCase))
+        issuer = issuer[..^"/v2.0".Length];
+    return issuer;
+}
+
+object? BuildProtectedResourceMetadata(HttpContext ctx, string? rest)
+{
+    var disc = CraftSettings.OAuthDiscovery;
+    if (!disc.Enabled) return null;
+
+    var host = Environment.GetEnvironmentVariable("WEBSITE_HOSTNAME") ?? ctx.Request.Host.Value;
+    var baseResource = string.IsNullOrEmpty(disc.ResourceOverride) ? $"https://{host}" : disc.ResourceOverride.TrimEnd('/');
+    var resource = string.IsNullOrEmpty(rest) ? baseResource : $"{baseResource}/{rest}";
+
+    var authServers = disc.AuthorizationServers.Count > 0
+        ? disc.AuthorizationServers.ToArray()
+        : new[] { DiscoverV1Authority() };
+
+    return new
+    {
+        resource,
+        authorization_servers = authServers,
+        scopes_supported = new[] { $"{baseResource}/{disc.ScopeName}" }
+    };
+}
+
+app.MapGet("/.well-known/oauth-protected-resource", (HttpContext ctx) =>
+    BuildProtectedResourceMetadata(ctx, null) is { } prm ? Results.Json(prm) : Results.NotFound());
+app.MapGet("/.well-known/oauth-protected-resource/{*rest}", (HttpContext ctx, string rest) =>
+    BuildProtectedResourceMetadata(ctx, rest) is { } prm ? Results.Json(prm) : Results.NotFound());
+
 // /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
 // MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
 //
