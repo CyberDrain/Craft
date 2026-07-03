@@ -755,14 +755,12 @@ public class SetupService
 
     /// <summary>
     /// Resolves the storage connection string for the allowedUsers table.
-    /// Same logic as AuthService — uses Auth.UserStorageConnection if set,
-    /// falls back to AzureWebJobsStorage, then dev storage.
+    /// Same logic as AuthService — uses Auth.UserStorageConnection if set, then
+    /// AzureWebJobsStorage. Fails closed in production if neither is configured
+    /// (see <see cref="StorageSettings.ResolveConnection"/>).
     /// </summary>
     private string StorageConnectionString =>
-        (!string.IsNullOrEmpty(_settings.Auth.UserStorageConnection)
-            ? _settings.Auth.UserStorageConnection
-            : Environment.GetEnvironmentVariable("AzureWebJobsStorage"))
-        ?? "UseDevelopmentStorage=true";
+        _settings.Storage.ResolveConnection(_settings.Auth.UserStorageConnection, "first-user seeding");
 
     /// <summary>
     /// Resolves the user table name with the same sanitization as AuthService.

@@ -141,44 +141,46 @@ static void ApplySkuProfile(CraftSettings s)
     }
 }
 
-// Configure Kestrel timeout
-// If KestrelTimeoutSeconds is explicitly set, use it.
-// Otherwise, derive from HttpTimeoutSeconds if > 0, else default to 0 (no timeout).
+// Configure Kestrel limits. Request timeout: explicit KestrelTimeoutSeconds wins; else derive from
+// Worker.HttpTimeoutSeconds; else default to 600s (10 min). The DoS-relevant limits below (body size,
+// connection cap, slow-loris data rates) are always applied, independent of the timeout.
 var kestrelTimeout = craftSettings.KestrelTimeoutSeconds;
-if (kestrelTimeout == 0 && craftSettings.Worker.HttpTimeoutSeconds > 0)
+if (kestrelTimeout <= 0)
+    kestrelTimeout = craftSettings.Worker.HttpTimeoutSeconds > 0
+        ? craftSettings.Worker.HttpTimeoutSeconds
+        : 600;
+
+builder.WebHost.ConfigureKestrel(options =>
 {
-    kestrelTimeout = craftSettings.Worker.HttpTimeoutSeconds;
-}
+    // Request timeout settings
+    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(kestrelTimeout);
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(60, kestrelTimeout));
 
-if (kestrelTimeout > 0)
-{
-    builder.WebHost.ConfigureKestrel(options =>
-    {
-        // Request timeout settings
-        options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(kestrelTimeout);
-        options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(60, kestrelTimeout));
+    // HTTP/2 settings for better multiplexing
+    options.Limits.Http2.MaxStreamsPerConnection = 100;
+    options.Limits.Http2.HeaderTableSize = 4096;
+    options.Limits.Http2.MaxFrameSize = 16384;
+    options.Limits.Http2.MaxRequestHeaderFieldSize = 8192;
+    options.Limits.Http2.InitialConnectionWindowSize = 131072;
+    options.Limits.Http2.InitialStreamWindowSize = 98304;
 
-        // HTTP/2 settings for better multiplexing
-        options.Limits.Http2.MaxStreamsPerConnection = 100;
-        options.Limits.Http2.HeaderTableSize = 4096;
-        options.Limits.Http2.MaxFrameSize = 16384;
-        options.Limits.Http2.MaxRequestHeaderFieldSize = 8192;
-        options.Limits.Http2.InitialConnectionWindowSize = 131072;
-        options.Limits.Http2.InitialStreamWindowSize = 98304;
+    // Request body size cap. Default 100 MB; 0 = unlimited.
+    var maxBodyMb = craftSettings.Limits.MaxRequestBodyMB;
+    options.Limits.MaxRequestBodySize = maxBodyMb > 0 ? maxBodyMb * 1024L * 1024L : null;
 
-        // Connection limits (adjust based on expected load)
-        options.Limits.MaxConcurrentConnections = null;  // null = unlimited (let OS handle)
-        options.Limits.MaxConcurrentUpgradedConnections = null;
+    // Concurrent connection cap. Default 200; <= 0 = unlimited (let the OS handle).
+    var maxConn = craftSettings.Limits.MaxConcurrentConnections;
+    options.Limits.MaxConcurrentConnections = maxConn > 0 ? maxConn : null;
+    options.Limits.MaxConcurrentUpgradedConnections = maxConn > 0 ? maxConn : null;
 
-        // Prevent slow-loris attacks — minimum data rates
-        options.Limits.MinRequestBodyDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
-            bytesPerSecond: 240,   // 240 bytes/sec minimum
-            gracePeriod: TimeSpan.FromSeconds(5));
-        options.Limits.MinResponseDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
-            bytesPerSecond: 240,
-            gracePeriod: TimeSpan.FromSeconds(5));
-    });
-}
+    // Prevent slow-loris attacks — minimum data rates
+    options.Limits.MinRequestBodyDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
+        bytesPerSecond: 240,   // 240 bytes/sec minimum
+        gracePeriod: TimeSpan.FromSeconds(5));
+    options.Limits.MinResponseDataRate = new Microsoft.AspNetCore.Server.Kestrel.Core.MinDataRate(
+        bytesPerSecond: 240,
+        gracePeriod: TimeSpan.FromSeconds(5));
+});
 
 // Resolve the configured log level (supports CRAFT_LOG_LEVEL env var override)
 var fileLoggingSettings = new FileLoggingSettings();
@@ -261,7 +263,44 @@ builder.Services.AddSingleton(sp =>
     return new ContainerHealthMonitor(monitorLogger, settings);
 });
 
+// Per-client fixed-window rate limiter, partitioned by authenticated principal name (fallback:
+// X-Forwarded-For / remote IP) so a single caller cannot exhaust the small HTTP worker pool.
+// Enabled by default; turn off via App:RateLimit:Enabled=false.
+if (craftSettings.RateLimit.IsEnabled)
+{
+    builder.Services.AddRateLimiter(options =>
+    {
+        options.RejectionStatusCode = 429;
+        options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter.Create<HttpContext, string>(context =>
+        {
+            var key = context.Request.Headers["x-ms-client-principal-name"].ToString();
+            if (string.IsNullOrEmpty(key))
+            {
+                // Behind Azure App Service the socket peer is the platform load balancer, so the real
+                // client is in X-Forwarded-For — use its first hop so anonymous callers aren't all
+                // collapsed into a single shared partition.
+                var xff = context.Request.Headers["X-Forwarded-For"].ToString();
+                key = !string.IsNullOrEmpty(xff)
+                    ? xff.Split(',')[0].Trim()
+                    : context.Connection.RemoteIpAddress?.ToString() ?? "anonymous";
+            }
+            return System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(key, _ =>
+                new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+                {
+                    PermitLimit = Math.Max(1, craftSettings.RateLimit.PermitPerWindow),
+                    Window = TimeSpan.FromSeconds(Math.Max(1, craftSettings.RateLimit.WindowSeconds)),
+                    QueueLimit = Math.Max(0, craftSettings.RateLimit.QueueLimit),
+                    QueueProcessingOrder = System.Threading.RateLimiting.QueueProcessingOrder.OldestFirst
+                });
+        });
+    });
+}
+
 var app = builder.Build();
+
+// Rate limiter middleware — only added when the limiter is registered above.
+if (craftSettings.RateLimit.IsEnabled)
+    app.UseRateLimiter();
 
 // HTTP diagnostic listener — tracks DNS, TLS, socket connect, and HTTP request timing
 // from ALL HttpClient instances (including those inside PowerShell's Invoke-RestMethod)
@@ -364,8 +403,8 @@ void RunInitialization()
 if (!runPowerShell)
 {
     logger.LogWarning("[System] STATIC-ONLY (Frontend role) — PowerShell worker pool, scheduler, job manager " +
-        "and background services are disabled. Serving static frontend content only; /api, /API, /.auth, " +
-        "/login and /logout return 404.");
+        "and background services are disabled. Serving static frontend content only; /api, /API and /.auth " +
+        "return 404.");
 }
 else if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
 {
@@ -799,32 +838,19 @@ else
 if (capHttp)
 {
 
-// Auth middleware: handles three auth scenarios:
-// 1. Azure App Service EasyAuth (x-ms-client-principal in App Service format — has "claims", no "userRoles")
-//    → Transform to SWA format with roles from allowedUsers table
-// 2. Azure SWA EasyAuth (x-ms-client-principal in SWA format — has "userRoles")
-//    → Pass through as-is
-// 3. Craft session cookie (no x-ms-client-principal)
-//    → Build header from validated session
+// Auth middleware: normalizes the EasyAuth-injected principal for downstream PowerShell.
+// 1. App Service EasyAuth (x-ms-client-principal has "claims", no "userRoles")
+//    → transform to SWA format with roles looked up from the allowedUsers table
+// 2. SWA-format principal (already has "userRoles") → pass through as-is
+// 3. No principal header, Development only → inject a dev principal
 app.Use(async (context, next) =>
 {
     var authStart = CacheProfiler.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
     var path = context.Request.Path.Value ?? "";
 
-    // Always try to resolve Craft session and store it for /.auth/me to use
-    if (authService.IsConfigured)
-    {
-        var session = authService.GetSession(context);
-        if (session != null)
-        {
-            context.Items["CraftSession"] = session;
-        }
-    }
-
-    // Skip header injection for static files, login/logout endpoints, and /.auth/*
+    // Skip header injection for static files and /.auth/*
     if (path.StartsWith("/_next/") || path.StartsWith("/assets/") ||
-        path.StartsWith("/.auth/") || path == "/login" || path == "/logout" ||
-        Path.HasExtension(path))
+        path.StartsWith("/.auth/") || Path.HasExtension(path))
     {
         await next();
         return;
@@ -913,7 +939,9 @@ app.Use(async (context, next) =>
                     context.Request.Headers["x-ms-client-principal-name"] = upn;
                 }
             }
-            // else: already in SWA format (has userRoles) — pass through as-is
+            // else: already in SWA format (has userRoles) — pass through as-is. EasyAuth strips
+            // inbound principal headers upstream, so a header reaching us here came from the
+            // trusted front end.
         }
         catch (Exception ex)
         {
@@ -926,15 +954,9 @@ app.Use(async (context, next) =>
         return;
     }
 
-    // No x-ms-client-principal header — try Craft session cookie
-    if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session2)
-    {
-        var headerValue = authService.BuildClientPrincipalHeader(session2);
-        context.Request.Headers["x-ms-client-principal"] = headerValue;
-        context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
-        context.Request.Headers["x-ms-client-principal-name"] = session2.Upn;
-    }
-    else if (app.Environment.IsDevelopment())
+    // No x-ms-client-principal header — local dev injects a dev principal (EasyAuth owns auth in
+    // real deployments, so a missing header there simply means anonymous).
+    if (app.Environment.IsDevelopment())
     {
         // Local dev: inject a dev principal so no login is required
         logger.LogDebug("[Auth] Dev auth bypass: injecting dev principal for {Path}", path);
@@ -956,114 +978,16 @@ app.Use(async (context, next) =>
     await next();
 });
 
-// --- Login / Logout / Auth Endpoints ---
+// --- Auth endpoints ---
+// Login/logout/callback are handled by the upstream App Service EasyAuth layer at the platform
+// edge; Craft maps none of them. It only transforms the injected x-ms-client-principal header and
+// authorizes via the allowedUsers table.
 
-// Login: redirects to Azure AD
-app.MapGet("/login", (HttpContext context) =>
-{
-    if (!authService.IsConfigured)
-    {
-        return Results.Problem("Authentication not configured. Set WEBSITE_AUTH_CLIENT_ID, AUTH_SECRET, WEBSITE_AUTH_AAD_ALLOWED_TENANTS.");
-    }
-
-    var postLoginRedirect = context.Request.Query["post_login_redirect_uri"].ToString();
-    if (string.IsNullOrEmpty(postLoginRedirect)) postLoginRedirect = "/";
-
-    var host = context.Request.Host.ToString();
-    var scheme = context.Request.Scheme;
-    var redirectUri = $"{scheme}://{host}/.auth/callback";
-
-    var loginUrl = authService.GetLoginUrl(redirectUri, postLoginRedirect);
-    return Results.Redirect(loginUrl);
-});
-
-// Also support the SWA-style login path for frontend compatibility
-app.MapGet("/.auth/login/aad", (HttpContext context) =>
-{
-    if (!authService.IsConfigured)
-    {
-        return Results.Redirect("/");
-    }
-
-    var postLoginRedirect = context.Request.Query["post_login_redirect_uri"].ToString();
-    if (string.IsNullOrEmpty(postLoginRedirect)) postLoginRedirect = "/";
-
-    var host = context.Request.Host.ToString();
-    var scheme = context.Request.Scheme;
-    var redirectUri = $"{scheme}://{host}/.auth/callback";
-
-    var loginUrl = authService.GetLoginUrl(redirectUri, postLoginRedirect);
-    return Results.Redirect(loginUrl);
-});
-
-// OAuth callback: exchanges code for tokens, validates, creates session
-app.MapGet("/.auth/callback", async (HttpContext context) =>
-{
-    var code = context.Request.Query["code"].ToString();
-    var state = context.Request.Query["state"].ToString();
-    var error = context.Request.Query["error"].ToString();
-
-    if (!string.IsNullOrEmpty(error))
-    {
-        var errorDesc = context.Request.Query["error_description"].ToString();
-        logger.LogWarning("[Auth] OAuth error: {Error} - {Desc}", error, errorDesc);
-        context.Response.Redirect($"/unauthenticated?error={Uri.EscapeDataString(errorDesc)}");
-        return;
-    }
-
-    if (string.IsNullOrEmpty(code))
-    {
-        context.Response.Redirect("/unauthenticated?error=No+authorization+code+received");
-        return;
-    }
-
-    try
-    {
-        var host = context.Request.Host.ToString();
-        var scheme = context.Request.Scheme;
-        var redirectUri = $"{scheme}://{host}/.auth/callback";
-
-        var (sessionId, redirectUrl) = await authService.HandleCallback(code, state, redirectUri);
-        authService.SetSessionCookie(context, sessionId);
-        context.Response.Redirect(redirectUrl);
-    }
-    catch (UnauthorizedAccessException ex)
-    {
-        logger.LogWarning("[Auth] Unauthorized: {Message}", ex.Message);
-        context.Response.Redirect($"/unauthenticated?error={Uri.EscapeDataString(ex.Message)}");
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "[Auth] Callback failed");
-        context.Response.Redirect($"/unauthenticated?error={Uri.EscapeDataString("Authentication failed. Please try again.")}");
-    }
-});
-
-// Logout: clears session, invalidates user cache, and redirects
-app.MapGet("/logout", (HttpContext context) =>
-{
-    authService.ClearSession(context);
-    authService.InvalidateUserCache();
-    return Results.Redirect("/");
-});
-
-app.MapGet("/.auth/logout", (HttpContext context) =>
-{
-    authService.ClearSession(context);
-    authService.InvalidateUserCache();
-    return Results.Redirect("/");
-});
-
-// /.auth/me — returns clientPrincipal in Azure SWA format for frontend compatibility
+// /.auth/me — returns clientPrincipal in Azure SWA format for frontend compatibility. In real
+// deployments EasyAuth serves this at the platform edge; here it's a local-dev fallback (dev
+// principal in Development, else null/anonymous).
 app.MapGet("/.auth/me", (HttpContext context) =>
 {
-    // If we have a Craft session, return clientPrincipal from validated token
-    if (context.Items.TryGetValue("CraftSession", out var sessionObj) && sessionObj is AuthService.SessionData session)
-    {
-        var clientPrincipal = authService.BuildClientPrincipal(session);
-        return Results.Json(new { clientPrincipal });
-    }
-
     // Dev mode: return dev principal without requiring login
     if (app.Environment.IsDevelopment())
     {
@@ -1132,7 +1056,7 @@ app.MapGet("/api/me", async (HttpContext context) =>
     }
 });
 
-} // end HTTP-role block (auth middleware + login/logout/me). Bridges below run for any PS role; the
+} // end HTTP-role block (auth middleware + /.auth/me). Bridges below run for any PS role; the
   // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
 
 // Concurrent request tracking for diagnostics
