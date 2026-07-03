@@ -31,8 +31,7 @@ public class OrchestratorTableStore
     public OrchestratorTableStore(ILogger<OrchestratorTableStore> logger, CraftSettings settings)
     {
         _logger = logger;
-        var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
-                               ?? "UseDevelopmentStorage=true";
+        var connectionString = settings.Storage.ResolveConnection(null, "orchestrator state tables");
 
         var prefix = settings.Orchestrator.TablePrefix;
         _runsTable = new TableClient(connectionString, $"{prefix}Runs");

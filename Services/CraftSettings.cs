@@ -81,6 +81,103 @@ public class CraftSettings
 
     /// <summary>Health probe endpoint configuration. See <see cref="HealthSettings"/>.</summary>
     public HealthSettings Health { get; set; } = new();
+
+    /// <summary>Azure Storage connection policy — see <see cref="StorageSettings"/>. Governs the dev-emulator fallback.</summary>
+    public StorageSettings Storage { get; set; } = new();
+
+    /// <summary>Kestrel request limits (body size, connection cap). See <see cref="KestrelLimitsSettings"/>.</summary>
+    public KestrelLimitsSettings Limits { get; set; } = new();
+
+    /// <summary>Request rate limiting. See <see cref="RateLimitSettings"/>. On by default.</summary>
+    public RateLimitSettings RateLimit { get; set; } = new();
+}
+
+/// <summary>
+/// Azure Storage connection policy. The Tables used for the allowedUsers authorization table and
+/// orchestrator state resolve their connection string in this order: an explicit per-feature setting
+/// (e.g. <c>Auth:UserStorageConnection</c>) → the <c>AzureWebJobsStorage</c> environment variable.
+///
+/// If neither is configured the host does NOT silently fall back to the local storage emulator
+/// (<c>UseDevelopmentStorage=true</c>) in production — that would point authorization and orchestrator
+/// state at a non-existent emulator. The fallback is only used when explicitly opted in; otherwise
+/// <see cref="ResolveConnection"/> throws and the host fails to start.
+/// </summary>
+public class StorageSettings
+{
+    /// <summary>
+    /// Allow the local storage emulator fallback (<c>UseDevelopmentStorage=true</c>) when no real
+    /// connection string is configured. Default false (fail closed). Also enabled by the
+    /// <c>CRAFT_ALLOW_DEV_STORAGE=true</c> environment variable or when
+    /// <c>ASPNETCORE_ENVIRONMENT=Development</c>.
+    /// </summary>
+    public bool AllowDevelopmentStorage { get; set; }
+
+    private bool DevStorageAllowed =>
+        AllowDevelopmentStorage
+        || string.Equals(Environment.GetEnvironmentVariable("CRAFT_ALLOW_DEV_STORAGE"), "true", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolves a Table Storage connection string, failing closed in production when nothing is
+    /// configured. <paramref name="explicitConnection"/> is the per-feature override (may be null);
+    /// <paramref name="purpose"/> is used only in the exception message for diagnosability.
+    /// </summary>
+    public string ResolveConnection(string? explicitConnection, string purpose)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitConnection)) return explicitConnection;
+        var env = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+        if (!string.IsNullOrWhiteSpace(env)) return env;
+        if (DevStorageAllowed) return "UseDevelopmentStorage=true";
+        throw new InvalidOperationException(
+            $"No Azure Storage connection is configured for {purpose}. Set the AzureWebJobsStorage " +
+            "environment variable (or Auth:UserStorageConnection in appsettings). To use the local " +
+            "storage emulator during development, set App:Storage:AllowDevelopmentStorage=true or the " +
+            "CRAFT_ALLOW_DEV_STORAGE=true environment variable.");
+    }
+}
+
+/// <summary>
+/// Kestrel request limits applied unconditionally at startup. These protect the small HTTP worker
+/// pool from oversized bodies and connection floods independently of the request timeout.
+/// </summary>
+public class KestrelLimitsSettings
+{
+    /// <summary>Maximum request body size in megabytes. Default 100. Set to 0 for unlimited (not recommended).</summary>
+    public int MaxRequestBodyMB { get; set; } = 100;
+
+    /// <summary>
+    /// Maximum concurrent TCP connections. Default 200 (a reasonable cap for a B2-class host). Set to
+    /// 0 or a negative value for unlimited (let the OS decide).
+    /// </summary>
+    public int MaxConcurrentConnections { get; set; } = 200;
+}
+
+/// <summary>
+/// Request rate limiting. On by default: a per-client fixed-window limiter partitioned by
+/// authenticated principal name (falling back to X-Forwarded-For / remote IP) so a single caller
+/// cannot exhaust the HTTP worker pool.
+/// </summary>
+public class RateLimitSettings
+{
+    /// <summary>
+    /// Enable the global rate limiter. Default true (300 requests / 10 s per client). Disable via
+    /// App:RateLimit:Enabled=false; the CRAFT_RATELIMIT_ENABLED=true env var can also force it on.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Permitted requests per window, per client. Default 300.</summary>
+    public int PermitPerWindow { get; set; } = 300;
+
+    /// <summary>Window length in seconds. Default 10.</summary>
+    public int WindowSeconds { get; set; } = 10;
+
+    /// <summary>Requests queued when the limit is hit before rejecting with 429. Default 0 (reject immediately).</summary>
+    public int QueueLimit { get; set; }
+
+    /// <summary>Resolved enabled state, honouring the CRAFT_RATELIMIT_ENABLED environment override.</summary>
+    public bool IsEnabled =>
+        Enabled
+        || string.Equals(Environment.GetEnvironmentVariable("CRAFT_RATELIMIT_ENABLED"), "true", StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>
@@ -129,11 +226,14 @@ public class RolesSettings
 public class FrontendSettings
 {
     /// <summary>
-    /// Content-Security-Policy header value applied to all responses.
-    /// Mirrors what SWA's globalHeaders.content-security-policy did.
-    /// Null/empty = no CSP set.
+    /// Content-Security-Policy header value applied to all responses. Mirrors what SWA's
+    /// globalHeaders.content-security-policy did. Defaults to the CIPP-compatible policy so a CSP is
+    /// emitted secure-by-default even if a deployment doesn't configure one; override via
+    /// App:Frontend:ContentSecurityPolicy (the hosted app can supply a tighter policy). Set to ""
+    /// to disable.
     /// </summary>
-    public string? ContentSecurityPolicy { get; set; }
+    public string? ContentSecurityPolicy { get; set; } =
+        "default-src https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *";
 
     /// <summary>
     /// Whether the host compresses static responses. Default true.

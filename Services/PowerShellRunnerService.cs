@@ -165,7 +165,7 @@ public class PowerShellRunnerService : IDisposable
             return new ScriptResult
             {
                 StatusCode = 504,
-                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {_workerSettings.HttpTimeoutSeconds}s" }, s_jsonOptions)
+                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {_workerSettings.HttpTimeoutSeconds}s", code = "timeout" }, s_jsonOptions)
             };
         }
         catch (Exception ex)
@@ -387,7 +387,7 @@ public class PowerShellRunnerService : IDisposable
             return new ScriptResult
             {
                 StatusCode = 504,
-                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {timeoutSeconds}s" }, s_jsonOptions)
+                Body = JsonSerializer.Serialize(new { error = $"Request timed out after {timeoutSeconds}s", code = "timeout" }, s_jsonOptions)
             };
         }
         catch (Exception ex)

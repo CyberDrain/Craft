@@ -209,7 +209,9 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     /// Async invoke — does not block a ThreadPool thread during PS execution.
     /// Includes post-invocation cleanup matching Azure Functions' ResetRunspace.
     /// When a cancellation token is provided and fires, the PowerShell pipeline is
-    /// stopped via <see cref="PowerShell.Stop"/> and an <see cref="OperationCanceledException"/> is thrown.
+    /// stopped via <see cref="PowerShell.Stop"/>. The resulting <c>PipelineStoppedException</c>
+    /// is normalized to an <see cref="OperationCanceledException"/> so timeout callers can
+    /// distinguish a cancelled request from a genuine script failure.
     /// </summary>
     public async Task<Collection<PSObject>> InvokeAsync(string functionName, Dictionary<string, object?> parameters,
         CancellationToken ct = default)
@@ -239,6 +241,13 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             var coll = new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
             if (prof) copyTicks = System.Diagnostics.Stopwatch.GetTimestamp() - cpStart;
             return coll;
+        }
+        catch (PipelineStoppedException) when (ct.IsCancellationRequested)
+        {
+            // ct.Register(_pwsh.Stop) stopped the pipeline mid-invoke, so EndInvoke threw
+            // PipelineStoppedException rather than reaching ThrowIfCancellationRequested below.
+            // Normalize to OperationCanceledException so timeout callers return 504, not 500.
+            throw new OperationCanceledException(ct);
         }
         finally
         {
@@ -272,6 +281,12 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
 
             ct.ThrowIfCancellationRequested();
             return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+        }
+        catch (PipelineStoppedException) when (ct.IsCancellationRequested)
+        {
+            // See InvokeAsync: a cancellation-triggered _pwsh.Stop() surfaces as
+            // PipelineStoppedException; normalize it to OperationCanceledException.
+            throw new OperationCanceledException(ct);
         }
         finally
         {
