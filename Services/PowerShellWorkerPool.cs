@@ -26,6 +26,8 @@ public class PowerShellWorkerPool : IDisposable
     private ExportedModuleState? _bgClonedState;    // Cached state from first BG worker
 
     public bool IsReady => _httpReady.IsSet;
+    /// <summary>True once the background worker pool has finished initializing.</summary>
+    public bool BackgroundReady => _bgReady.IsSet;
     public int HttpAvailable => _httpPool.Count;
     public int BgAvailable => _bgPool.Count;
     public int HttpPoolSize => _httpPoolSize;
@@ -45,8 +47,21 @@ public class PowerShellWorkerPool : IDisposable
         _bgPool = new BlockingCollection<PowerShellWorker>(_bgPoolSize);
     }
 
-    public void Initialize()
+    /// <summary>
+    /// Initialize the worker pool(s). <paramref name="enableHttp"/> / <paramref name="enableBg"/> are driven
+    /// by the node's deployment roles: an Http-only node builds no BG pool, a Background-only node builds no
+    /// HTTP pool. The disabled pool's ready event is signaled immediately so nothing waits on a pool this
+    /// node never populates.
+    /// </summary>
+    public void Initialize(bool enableHttp = true, bool enableBg = true)
     {
+        if (!enableHttp && !enableBg)
+        {
+            _httpReady.Set(); _ready.Set(); _bgReady.Set();
+            _logger.LogWarning("[System] Pool.Initialize called with no pools enabled — nothing to do");
+            return;
+        }
+
         // Set PSModulePath at process level BEFORE creating ISS —
         // PowerShell's command discovery reads the process environment, not ISS env vars
         var modulesPath = Path.Combine(_apiBasePath, "Modules");
@@ -68,7 +83,7 @@ public class PowerShellWorkerPool : IDisposable
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         StartupInfoBridge.SetCpuCount(Environment.ProcessorCount);
-        StartupInfoBridge.SetPoolConfig(_httpPoolSize, _bgPoolSize);
+        StartupInfoBridge.SetPoolConfig(enableHttp ? _httpPoolSize : 0, enableBg ? _bgPoolSize : 0);
 
         // Test whether thread priority control works on this OS
         try
@@ -116,10 +131,12 @@ public class PowerShellWorkerPool : IDisposable
 
         bool useSharedBase = sharedModules.Count > 0 && (httpOnlyModules.Count > 0 || bgOnlyModules.Count > 0);
 
-        if (useSharedBase)
+        // The shared-base optimization only applies when BOTH pools are built. Single-pool nodes
+        // (Http-only / Background-only) always take the simple path.
+        if (enableHttp && enableBg && useSharedBase)
             InitializeWithSharedBase(sw, sharedModules, httpOnlyModules, bgOnlyModules, warmupMode);
         else
-            InitializeSimple(sw, separateModuleLists, warmupMode);
+            InitializeSimple(sw, separateModuleLists, warmupMode, enableHttp, enableBg);
     }
 
     /// <summary>
@@ -234,79 +251,131 @@ public class PowerShellWorkerPool : IDisposable
     /// Simple initialization (no shared base): same-module or single-list config.
     /// Falls back to sequential first-worker + clone pattern.
     /// </summary>
-    private void InitializeSimple(System.Diagnostics.Stopwatch sw, bool separateModuleLists, string warmupMode)
+    private void InitializeSimple(System.Diagnostics.Stopwatch sw, bool separateModuleLists, string warmupMode,
+        bool enableHttp, bool enableBg)
     {
-        // First HTTP worker: full module import
-        var fullHttpISS = BuildISS(isHttp: true);
-        var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullHttpISS, _logger);
-        firstWorker.Initialize(_repo, _apiBasePath, _settings);
+        // Decide where warmup runs. Normally on the HTTP first worker (unless WarmupMode=Background), but a
+        // node without that pool runs it on the pool it does have, so warmup never silently gets skipped.
+        var isBgWarmup = warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase);
+        var warmupOnHttp = enableHttp && (!isBgWarmup || !enableBg);
+        var warmupOnBg = enableBg && !warmupOnHttp;
 
-        _httpClonedState = firstWorker.ExportModuleState();
-
-        // Run warmup before signaling ready (BeforeReady and AfterReady both run here;
-        // Background mode runs warmup on the first BG worker instead)
-        if (!warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
-            RunWarmup(firstWorker, sw);
-
-        AddToHttpPool(firstWorker);
-
-        // Signal HTTP ready — one worker can serve requests (warmup already complete)
-        _httpReady.Set();
-        _ready.Set();
-        var firstWorkerMs = sw.ElapsedMilliseconds;
-        StartupInfoBridge.SetHttpReady(firstWorkerMs, _httpClonedState.Functions.Count);
-        _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests", firstWorkerMs);
-
-        // Clone remaining HTTP workers (API already serving with first worker)
-        if (_httpPoolSize > 1)
+        if (enableHttp)
         {
-            var clonedHttpISS = BuildClonedISS(_httpClonedState);
-            var httpRemaining = new List<PowerShellWorker>();
-            for (int i = 1; i < _httpPoolSize; i++)
-                httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+            // First HTTP worker: full module import
+            var fullHttpISS = BuildISS(isHttp: true);
+            var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullHttpISS, _logger);
+            firstWorker.Initialize(_repo, _apiBasePath, _settings);
 
-            Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
-            foreach (var w in httpRemaining)
-                AddToHttpPool(w);
+            _httpClonedState = firstWorker.ExportModuleState();
 
-            _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
-                _httpPoolSize, sw.ElapsedMilliseconds);
+            if (warmupOnHttp)
+                RunWarmup(firstWorker, sw);
+
+            AddToHttpPool(firstWorker);
+
+            // Signal HTTP ready — one worker can serve requests (warmup already complete)
+            _httpReady.Set();
+            _ready.Set();
+            var firstWorkerMs = sw.ElapsedMilliseconds;
+            StartupInfoBridge.SetHttpReady(firstWorkerMs, _httpClonedState.Functions.Count);
+            _logger.LogInformation("[System] HTTP ready: 1 worker in {Ms}ms — API accepting requests", firstWorkerMs);
+
+            // Clone remaining HTTP workers (API already serving with first worker)
+            if (_httpPoolSize > 1)
+            {
+                var clonedHttpISS = BuildClonedISS(_httpClonedState);
+                var httpRemaining = new List<PowerShellWorker>();
+                for (int i = 1; i < _httpPoolSize; i++)
+                    httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+
+                Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                foreach (var w in httpRemaining)
+                    AddToHttpPool(w);
+
+                _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms",
+                    _httpPoolSize, sw.ElapsedMilliseconds);
+            }
+        }
+        else
+        {
+            // No Http role — no HTTP workers. Signal http-ready so any waiter (readiness mode / WaitForReady)
+            // doesn't block on a pool this node never populates.
+            _httpReady.Set();
+            _ready.Set();
+            _logger.LogInformation("[System] HTTP pool disabled (no Http role) — no HTTP workers created");
         }
 
-        // BG workers
-        if (separateModuleLists)
+        if (enableBg && enableHttp)
         {
+            // Combined path: BG reuses HTTP state unless module lists differ.
+            if (separateModuleLists)
+            {
+                var bgSw = System.Diagnostics.Stopwatch.StartNew();
+                var fullBgISS = BuildISS(isHttp: false);
+                var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullBgISS, _logger);
+                firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
+                _bgClonedState = firstBgWorker.ExportModuleState();
+
+                if (warmupOnBg)
+                    RunWarmup(firstBgWorker, sw);
+
+                AddToBgPool(firstBgWorker);
+                StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
+                _logger.LogInformation("[System] First BG worker ready in {Ms}ms — BG state: {FnCount} functions, {VarCount} variables",
+                    bgSw.ElapsedMilliseconds, _bgClonedState.Functions.Count, _bgClonedState.Variables.Count);
+            }
+            else
+            {
+                // Combined path always builds the HTTP first worker before this point, so _httpClonedState is set.
+                _bgClonedState = _httpClonedState;
+            }
+
+            var clonedBgISS = BuildClonedISS(_bgClonedState!);
+            var bgStart = separateModuleLists ? 1 : 0;
+            var bgRemaining = new List<PowerShellWorker>();
+            for (int i = bgStart; i < _bgPoolSize; i++)
+                bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+
+            if (bgRemaining.Count > 0)
+            {
+                Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                foreach (var w in bgRemaining)
+                    AddToBgPool(w);
+            }
+        }
+        else if (enableBg)
+        {
+            // Background-only node — no HTTP worker exists to clone from; build the BG base directly.
             var bgSw = System.Diagnostics.Stopwatch.StartNew();
             var fullBgISS = BuildISS(isHttp: false);
             var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullBgISS, _logger);
             firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
             _bgClonedState = firstBgWorker.ExportModuleState();
 
-            // Background: warmup runs on the first BG worker — HTTP pool unaffected
-            if (warmupMode.Equals("Background", StringComparison.OrdinalIgnoreCase))
+            if (warmupOnBg)
                 RunWarmup(firstBgWorker, sw);
 
             AddToBgPool(firstBgWorker);
             StartupInfoBridge.SetBgReady(sw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
-            _logger.LogInformation("[System] First BG worker ready in {Ms}ms — BG state: {FnCount} functions, {VarCount} variables",
-                bgSw.ElapsedMilliseconds, _bgClonedState.Functions.Count, _bgClonedState.Variables.Count);
+            _logger.LogInformation("[System] BG-only: first BG worker ready in {Ms}ms — {FnCount} functions",
+                bgSw.ElapsedMilliseconds, _bgClonedState.Functions.Count);
+
+            if (_bgPoolSize > 1)
+            {
+                var clonedBgISS = BuildClonedISS(_bgClonedState);
+                var bgRemaining = new List<PowerShellWorker>();
+                for (int i = 1; i < _bgPoolSize; i++)
+                    bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+
+                Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                foreach (var w in bgRemaining)
+                    AddToBgPool(w);
+            }
         }
         else
         {
-            _bgClonedState = _httpClonedState;
-        }
-
-        var clonedBgISS = BuildClonedISS(_bgClonedState);
-        var bgStart = separateModuleLists ? 1 : 0;
-        var bgRemaining = new List<PowerShellWorker>();
-        for (int i = bgStart; i < _bgPoolSize; i++)
-            bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
-
-        if (bgRemaining.Count > 0)
-        {
-            Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
-            foreach (var w in bgRemaining)
-                AddToBgPool(w);
+            _logger.LogInformation("[System] BG pool disabled (no Background role) — no BG workers created");
         }
 
         _bgReady.Set();
@@ -316,7 +385,7 @@ public class PowerShellWorkerPool : IDisposable
 
         StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
         _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
-            _httpPoolSize, _bgPoolSize, sw.ElapsedMilliseconds);
+            _httpWorkerIds.Count, _bgWorkerIds.Count, sw.ElapsedMilliseconds);
     }
 
     /// <summary>

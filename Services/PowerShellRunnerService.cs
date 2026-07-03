@@ -213,8 +213,23 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpScript(string route, HttpContext httpContext)
     {
+        if (!DispatchProfiler.Enabled)
+        {
+            var req = await BuildRequestObject(httpContext);
+            return await ExecuteHttpScriptInternal(route, req, isHttp: true);
+        }
+
+        // Profiling path: time request marshaling + the runner-side segments (checkout/invoke/extract).
+        DispatchProfiler.SetLogger(_logger);
+        var totalStart = Stopwatch.GetTimestamp();
+        var mStart = Stopwatch.GetTimestamp();
         var request = await BuildRequestObject(httpContext);
-        return await ExecuteHttpScriptInternal(route, request, isHttp: true);
+        var marshalTicks = Stopwatch.GetTimestamp() - mStart;
+        var timing = new DispatchTiming();
+        var result = await ExecuteHttpScriptInternal(route, request, isHttp: true, timing);
+        DispatchProfiler.Record(marshalTicks, timing.CheckoutTicks, timing.InvokeTicks, timing.ExtractTicks,
+            Stopwatch.GetTimestamp() - totalStart);
+        return result;
     }
 
     /// <summary>
@@ -227,7 +242,8 @@ public class PowerShellRunnerService : IDisposable
         return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: true);
     }
 
-    private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp)
+    private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp,
+        DispatchTiming? timing = null)
     {
         var sw = Stopwatch.StartNew();
         var entry = _repo.GetByRoute(route);
@@ -249,9 +265,11 @@ public class PowerShellRunnerService : IDisposable
         EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
+            var checkoutStart = timing != null ? Stopwatch.GetTimestamp() : 0;
             if (isHttp)
             {
                 worker = _pool.CheckoutHttp(TimeSpan.FromSeconds(30));
+                if (timing != null) timing.CheckoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
                 if (worker == null)
                 {
                     _logger.LogWarning("HTTP pool exhausted — no worker available within 30s for {Route}", route);
@@ -343,9 +361,13 @@ public class PowerShellRunnerService : IDisposable
             var targetFunction = (isHttp && !string.IsNullOrEmpty(_scriptsSettings.HttpHandler))
                 ? _scriptsSettings.HttpHandler
                 : entry.FunctionName;
+            var invokeStart = timing != null ? Stopwatch.GetTimestamp() : 0;
             var results = await worker.InvokeAsync(targetFunction, parameters, cts?.Token ?? default);
+            if (timing != null) timing.InvokeTicks = Stopwatch.GetTimestamp() - invokeStart;
 
+            var extractStart = timing != null ? Stopwatch.GetTimestamp() : 0;
             var response = ExtractResponse(results);
+            if (timing != null) timing.ExtractTicks = Stopwatch.GetTimestamp() - extractStart;
             sw.Stop();
             _logger.LogInformation("[{Pool}] {InvocationId} {Function} {StatusCode} {Ms}ms",
                 poolLabel, invocation.Id, entry.FunctionName, response.StatusCode, sw.ElapsedMilliseconds);
@@ -418,8 +440,13 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public async Task ExecuteScript(string functionName, Dictionary<string, object>? parameters = null)
     {
+        var prof = DispatchProfiler.Enabled;
+        var totalStart = prof ? Stopwatch.GetTimestamp() : 0;
+        long checkoutTicks = 0, invokeTicks = 0;
+        var checkoutStart = prof ? Stopwatch.GetTimestamp() : 0;
         var sw = Stopwatch.StartNew();
         var worker = _pool.CheckoutBackground(CancellationToken.None);
+        if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
@@ -494,7 +521,9 @@ public class PowerShellRunnerService : IDisposable
             using var cts = _workerSettings.BgTimeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.BgTimeoutSeconds))
                 : null;
+            var invokeStart = prof ? Stopwatch.GetTimestamp() : 0;
             await worker.InvokeAsync(resolvedName, psParams, cts?.Token ?? default);
+            if (prof) invokeTicks = Stopwatch.GetTimestamp() - invokeStart;
 
             sw.Stop();
             _logger.LogInformation("[Scheduler] {InvocationId} {Function} completed {Ms}ms",
@@ -526,6 +555,9 @@ public class PowerShellRunnerService : IDisposable
             _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
         }
 
+        // BG dispatch profiling (checkout + invoke + total; marshal/extract N/A for a script call).
+        if (prof) { DispatchProfiler.SetLogger(_logger); DispatchProfiler.Record(0, checkoutTicks, invokeTicks, 0, Stopwatch.GetTimestamp() - totalStart); }
+
         // Worker has been returned to the pool — drain any orchestrator/queue triggers
         // the script enqueued in the background so the next job can grab the worker now
         // instead of waiting for child-run table writes.
@@ -538,8 +570,13 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public async Task<string> ExecuteScriptWithOutput(string functionName, Dictionary<string, object>? parameters = null)
     {
+        var prof = DispatchProfiler.Enabled;
+        var totalStart = prof ? Stopwatch.GetTimestamp() : 0;
+        long checkoutTicks = 0, invokeTicks = 0;
+        var checkoutStart = prof ? Stopwatch.GetTimestamp() : 0;
         var sw = Stopwatch.StartNew();
         var worker = _pool.CheckoutBackground(CancellationToken.None);
+        if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
         // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
         var parentRun = OperationContext.Current?.RunName;
@@ -601,11 +638,14 @@ public class PowerShellRunnerService : IDisposable
             using var cts = _workerSettings.BgTimeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(_workerSettings.BgTimeoutSeconds))
                 : null;
+            var invokeStart = prof ? Stopwatch.GetTimestamp() : 0;
             var results = await worker.InvokeAsync(resolvedName, psParams, cts?.Token ?? default);
+            if (prof) invokeTicks = Stopwatch.GetTimestamp() - invokeStart;
 
             sw.Stop();
             _logger.LogInformation("[Planner] {InvocationId} {Function} completed {Ms}ms",
                 invocation.Id, functionName, sw.ElapsedMilliseconds);
+            if (prof) { DispatchProfiler.SetLogger(_logger); DispatchProfiler.Record(0, checkoutTicks, invokeTicks, 0, Stopwatch.GetTimestamp() - totalStart); }
             var output = string.Join("\n", (results ?? new Collection<PSObject>()).Select(r => r?.ToString() ?? ""));
             // Drain triggered child orchestrators/queue commands after returning — they should
             // not block the planner's caller. (Note: Reclaim still happens in finally below.)

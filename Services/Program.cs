@@ -26,24 +26,66 @@ builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings
 var craftSettings = new CraftSettings();
 builder.Configuration.GetSection("App").Bind(craftSettings);
 
-// Static-only / web-content mode: disable the PowerShell worker pool, scheduler, job manager and all
-// background services so the host boots instantly and only serves static frontend content.
-var staticOnly = craftSettings.Worker.Disabled
-    || string.Equals(Environment.GetEnvironmentVariable("CRAFT_STATIC_ONLY"), "true", StringComparison.OrdinalIgnoreCase);
-// Dev-auth toggle: in static-only mode, serve a canned dev principal for /.auth/me + /api/me so the SPA
-// boots and renders pages without the PowerShell backend. For local testing only — never in production.
-var staticOnlyDevAuth = staticOnly
-    && string.Equals(Environment.GetEnvironmentVariable("CRAFT_STATIC_ONLY_DEVAUTH"), "true", StringComparison.OrdinalIgnoreCase);
+// Parse an env var as a tri-state bool: null when unset/blank, else true for "true"/"1" (case-insensitive).
+static bool? EnvFlag(string name)
+{
+    var v = Environment.GetEnvironmentVariable(name);
+    if (string.IsNullOrWhiteSpace(v)) return null;
+    return v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1";
+}
+
+// ── Deployment roles (capabilities) ────────────────────────────────────────────────────────────────
+// One image, three independent switches selected by env flag or App:Roles config:
+//   Frontend   — serve static web content (Frontend/)
+//   Http       — serve /api + auth via the HTTP PowerShell pool
+//   Background — scheduler / orchestrator / job-manager / stats via the BG PowerShell pool
+// Resolution: if ANY role is explicitly set (CRAFT_SERVE_*/CRAFT_RUN_* env wins over App:Roles) → use exactly
+// those (unset → off); else (nothing set) → all three on (the combined monolith).
+var roleFrontend = EnvFlag("CRAFT_SERVE_FRONTEND") ?? craftSettings.Roles.Frontend;
+var roleHttp = EnvFlag("CRAFT_SERVE_API") ?? craftSettings.Roles.Http;
+var roleBackground = EnvFlag("CRAFT_RUN_BACKGROUND") ?? craftSettings.Roles.Background;
+var anyRoleExplicit = roleFrontend.HasValue || roleHttp.HasValue || roleBackground.HasValue;
+
+bool capFrontend, capHttp, capBackground;
+if (anyRoleExplicit)
+{
+    capFrontend = roleFrontend ?? false;
+    capHttp = roleHttp ?? false;
+    capBackground = roleBackground ?? false;
+}
+else
+{
+    capFrontend = true; capHttp = true; capBackground = true;
+}
+
+if (!capFrontend && !capHttp && !capBackground)
+{
+    Console.Error.WriteLine("[System] FATAL: no deployment roles enabled — set at least one of " +
+        "CRAFT_SERVE_FRONTEND / CRAFT_SERVE_API / CRAFT_RUN_BACKGROUND (or App:Roles:*). " +
+        "Roles are declared by enabling what you want; unset roles default off once any is set.");
+    Environment.Exit(78); // EX_CONFIG
+}
+
+// Whether the host runs any PowerShell at all (HTTP handlers and/or background workers).
+var runPowerShell = capHttp || capBackground;
+
+// Response cache: default on only when a node serves BOTH a browser UI and its API (combined / frontend+http);
+// off for api-only, worker-only and static-only. App:Cache:Enabled / CRAFT_RESPONSE_CACHE override the default.
+var cacheEnabled = (EnvFlag("CRAFT_RESPONSE_CACHE") ?? craftSettings.Cache.Enabled) ?? (capFrontend && capHttp);
+
+// Health probe: role-agnostic liveness/readiness endpoint. Disable-able and relocatable so a downstream
+// deployment can put it behind a specific probe URL or turn it off. Env overrides win over App:Health.
+var healthEnabled = EnvFlag("CRAFT_HEALTH_ENABLED") ?? craftSettings.Health.Enabled;
+var healthPathEnv = Environment.GetEnvironmentVariable("CRAFT_HEALTH_PATH");
+var healthPath = !string.IsNullOrWhiteSpace(healthPathEnv) ? healthPathEnv.Trim() : craftSettings.Health.Path;
+if (!healthPath.StartsWith('/')) healthPath = "/" + healthPath;
 
 // Compression toggle: when false, the host serves all static content raw/identity — precompressed
 // .br/.gz siblings are not served and on-the-fly ResponseCompression is not applied. Lets a downstream
 // app turn compression off (e.g. an upstream CDN already compresses, or the content doesn't benefit) and
 // lets the perf harness A/B compressed vs raw on the same image. Default true (from App:Frontend:Compression);
 // the CRAFT_COMPRESSION environment variable (true/false) takes precedence when set.
-var compressionEnabled = craftSettings.Frontend.Compression;
-var compressionEnv = Environment.GetEnvironmentVariable("CRAFT_COMPRESSION");
-if (!string.IsNullOrEmpty(compressionEnv))
-    compressionEnabled = compressionEnv.Equals("true", StringComparison.OrdinalIgnoreCase) || compressionEnv == "1";
+var compressionEnabled = EnvFlag("CRAFT_COMPRESSION") ?? craftSettings.Frontend.Compression;
 
 static void ApplySkuProfile(CraftSettings s)
 {
@@ -192,17 +234,21 @@ builder.Services.Configure<GzipCompressionProviderOptions>(options =>
 builder.Services.AddSingleton<ScriptRepository>();
 builder.Services.AddSingleton<PowerShellWorkerPool>();
 builder.Services.AddSingleton<PowerShellRunnerService>();
-builder.Services.AddSingleton<CacheService>();
+builder.Services.AddSingleton<CacheService>(sp => new CacheService(
+    sp.GetRequiredService<ILogger<CacheService>>(),
+    sp.GetRequiredService<CraftSettings>(),
+    cacheEnabled));
 builder.Services.AddSingleton<BackgroundTaskLimiter>();
 builder.Services.AddSingleton<JobManager>();
 builder.Services.AddSingleton<OrchestratorTableStore>();
+builder.Services.AddSingleton<OrchestratorStatusWriter>();
 builder.Services.AddSingleton<OrchestratorService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<SetupService>();
 builder.Services.AddSingleton<SchedulerService>();
 builder.Services.AddSingleton<StatsHistoryService>();
-// Background hosted services (job manager, scheduler, stats history) only run when NOT static-only.
-if (!staticOnly)
+// Background hosted services (job manager, scheduler, stats history) only run on nodes with the Background role.
+if (capBackground)
 {
     builder.Services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
@@ -285,6 +331,12 @@ if (!readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase) && is
 logger.LogInformation("[System] Readiness mode: {Mode}", readinessMode);
 StartupInfoBridge.SetReadinessMode(readinessMode);
 
+// Announce the resolved deployment roles + derived toggles for this process.
+logger.LogInformation("[System] Roles: Frontend={Frontend} Http={Http} Background={Background} | " +
+    "ResponseCache={Cache} Compression={Compression}",
+    capFrontend ? "on" : "off", capHttp ? "on" : "off", capBackground ? "on" : "off",
+    cacheEnabled ? "on" : "off", compressionEnabled ? "on" : "off");
+
 void RunInitialization()
 {
     // 1. Load scripts — parse .ps1 files, build route table
@@ -301,18 +353,19 @@ void RunInitialization()
         CraftSettings.Worker.BgPoolSize,
         configuredLogLevel);
 
-    // 3. Initialize PowerShell worker pool (loads modules, creates runspaces)
-    pool.Initialize();
+    // 3. Initialize PowerShell worker pool (loads modules, creates runspaces).
+    //    Build only the pools this node's roles require: Http → HTTP pool, Background → BG pool.
+    pool.Initialize(enableHttp: capHttp, enableBg: capBackground);
 
     // Pool is ready — clear the restart counter so we don't carry stale crash state
     healthMonitor.ClearRestartCounter();
 }
 
-if (staticOnly)
+if (!runPowerShell)
 {
-    logger.LogWarning("[System] STATIC-ONLY mode — PowerShell worker pool, scheduler, job manager and " +
-        "background services are disabled. Serving static frontend content only; /api, /API, /.auth, " +
-        "/login and /logout return 503.");
+    logger.LogWarning("[System] STATIC-ONLY (Frontend role) — PowerShell worker pool, scheduler, job manager " +
+        "and background services are disabled. Serving static frontend content only; /api, /API, /.auth, " +
+        "/login and /logout return 404.");
 }
 else if (readinessMode.Equals("Immediate", StringComparison.OrdinalIgnoreCase))
 {
@@ -375,57 +428,10 @@ if (compressionEnabled)
     app.UseResponseCompression();
 logger.LogInformation("[System] Static compression: {State}", compressionEnabled ? "enabled (precompressed .br/.gz + on-the-fly fallback)" : "DISABLED (raw/identity)");
 
-// Static-only mode: short-circuit all dynamic/API/auth endpoints with 503 so nothing touches the
-// (disabled) PowerShell pipeline; everything else falls through to static file serving.
-if (staticOnly)
-{
-    // Optional dev-auth (CRAFT_STATIC_ONLY_DEVAUTH=true): canned /.auth/me + /api/me so the SPA boots and
-    // renders pages without the PS backend. Roles/permissions come from Auth.DevRoles / Auth.DevPermissions.
-    var devRoles = CraftSettings.Auth.DevRoles.Count > 0
-        ? CraftSettings.Auth.DevRoles.ToArray() : new[] { "superadmin", "authenticated" };
-    var devPerms = CraftSettings.Auth.DevPermissions.Count > 0
-        ? CraftSettings.Auth.DevPermissions.ToArray() : new[] { "*" };
-    var devPrincipal = new
-    {
-        identityProvider = "aad",
-        userId = CraftSettings.Auth.DevUserId,
-        userDetails = CraftSettings.Auth.DevUserDetails,
-        userRoles = devRoles
-    };
-    var authMeJson = System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = devPrincipal });
-    var apiMeJson = System.Text.Json.JsonSerializer.Serialize(new { clientPrincipal = devPrincipal, permissions = devPerms });
-    if (staticOnlyDevAuth)
-        logger.LogWarning("[System] STATIC-ONLY dev-auth ENABLED — serving a canned superadmin principal for " +
-            "/.auth/me and /api/me. For local testing only; never enable in production.");
-
-    app.Use(async (context, next) =>
-    {
-        var p = context.Request.Path.Value ?? "";
-        if (staticOnlyDevAuth && p.Equals("/.auth/me", StringComparison.OrdinalIgnoreCase))
-        {
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(authMeJson);
-            return;
-        }
-        if (staticOnlyDevAuth && p.Equals("/api/me", StringComparison.OrdinalIgnoreCase))
-        {
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(apiMeJson);
-            return;
-        }
-        if (p.StartsWith("/api", StringComparison.OrdinalIgnoreCase) ||
-            p.StartsWith("/.auth", StringComparison.OrdinalIgnoreCase) ||
-            p.Equals("/login", StringComparison.OrdinalIgnoreCase) ||
-            p.Equals("/logout", StringComparison.OrdinalIgnoreCase))
-        {
-            context.Response.StatusCode = 503;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync("{\"error\":\"CRAFT static-only mode: API and auth are disabled.\"}");
-            return;
-        }
-        await next();
-    });
-}
+// Nodes without the Http role do not short-circuit /api or auth paths: the HTTP endpoints simply aren't
+// mapped (see the `if (capHttp)` blocks below), so those requests fall through to static file serving
+// (a Frontend node can expose /api/me etc. from its own static dir) and finally to MapFallback (which
+// 404s unmatched /api|/.auth). Nothing here intercepts them.
 
 // Setup mode middleware: when Setup.Enabled, register setup route guards.
 // The child app must call AppLifecycleBridge.RequestSetupMode() to activate the
@@ -534,16 +540,18 @@ if (CraftSettings.Setup.Enabled)
             : "waiting for child app to call RequestSetupMode()");
 }
 
-// Startup loading screen: while the worker pool is initializing, serve a loading page
-// for browser requests and 503 for API calls. Health endpoint stays available for polling.
+// Startup loading screen: while the HTTP worker pool is initializing, serve a loading page
+// for browser requests and 503 for API calls. Only applies to nodes with the Http role — a Frontend-only
+// or Background-only node has no HTTP pool to wait on. Health endpoint stays available for polling.
 app.Use(async (context, next) =>
 {
-    if (!pool.IsReady && !staticOnly)
+    if (capHttp && !pool.IsReady)
     {
         var path = context.Request.Path.Value ?? "";
 
-        // Always let the health endpoint through for polling
-        if (path.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase))
+        // Always let the health endpoints through for polling
+        if (path.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase) ||
+            (healthEnabled && path.Equals(healthPath, StringComparison.OrdinalIgnoreCase)))
         {
             await next();
             return;
@@ -578,8 +586,8 @@ app.Use(async (context, next) =>
 });
 
 // Dev proxy: in Development mode, proxy frontend requests to `next dev` (hot-reload)
-// instead of serving precompiled static files from Frontend/
-var devFrontendUrl = app.Environment.IsDevelopment()
+// instead of serving precompiled static files from Frontend/. Only when this node has the Frontend role.
+var devFrontendUrl = (capFrontend && app.Environment.IsDevelopment())
     ? Environment.GetEnvironmentVariable("CRAFT_DEV_FRONTEND_URL") ?? "http://localhost:3000"
     : null;
 HttpClient? devProxyClient = null;
@@ -650,10 +658,11 @@ if (!string.IsNullOrEmpty(CraftSettings.Frontend.ContentSecurityPolicy))
     });
 }
 
-// Serve static files from Frontend/ (production mode, or fallback if dev proxy is down)
+// Serve static files from Frontend/ (production mode, or fallback if dev proxy is down).
+// Only when this node has the Frontend role — a Http/Background-only node serves no static content.
 var frontendPath = Path.Combine(AppContext.BaseDirectory, "Frontend");
 IFileProvider? frontendFileProvider = null;
-if (Directory.Exists(frontendPath))
+if (capFrontend && Directory.Exists(frontendPath))
 {
     frontendFileProvider = new PhysicalFileProvider(frontendPath);
 
@@ -762,6 +771,34 @@ else
 // Auth service
 var authService = app.Services.GetRequiredService<AuthService>();
 
+// --- Health (role-agnostic; mapped before the HTTP-role block so it survives every role) ---
+if (healthEnabled)
+{
+    // 200 whenever the process is up (liveness); the body's `ready` flags report per-role readiness.
+    app.MapGet(healthPath, () =>
+    {
+        var httpReady = !capHttp || pool.IsReady;
+        var bgReady = !capBackground || pool.BackgroundReady;
+        return Results.Json(new
+        {
+            status = (httpReady && bgReady) ? "ready" : "starting",
+            roles = new { frontend = capFrontend, http = capHttp, background = capBackground },
+            ready = new { http = httpReady, background = bgReady }
+        });
+    });
+    logger.LogInformation("[System] Health endpoint: {Path}", healthPath);
+}
+else
+{
+    logger.LogInformation("[System] Health endpoint: disabled");
+}
+
+// ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
+// A node without the Http role maps NONE of these, so /api and auth paths fall through to static serving
+// (a Frontend node can expose them from its own static dir) and finally to MapFallback (404 for /api|/.auth).
+if (capHttp)
+{
+
 // Auth middleware: handles three auth scenarios:
 // 1. Azure App Service EasyAuth (x-ms-client-principal in App Service format — has "claims", no "userRoles")
 //    → Transform to SWA format with roles from allowedUsers table
@@ -771,6 +808,7 @@ var authService = app.Services.GetRequiredService<AuthService>();
 //    → Build header from validated session
 app.Use(async (context, next) =>
 {
+    var authStart = CacheProfiler.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
     var path = context.Request.Path.Value ?? "";
 
     // Always try to resolve Craft session and store it for /.auth/me to use
@@ -883,6 +921,7 @@ app.Use(async (context, next) =>
             // Pass through untouched if we can't parse it
         }
 
+        if (CacheProfiler.Enabled) CacheProfiler.RecordAuth(System.Diagnostics.Stopwatch.GetTimestamp() - authStart);
         await next();
         return;
     }
@@ -913,6 +952,7 @@ app.Use(async (context, next) =>
         context.Request.Headers["x-ms-client-principal-name"] = CraftSettings.Auth.DevUserDetails;
     }
 
+    if (CacheProfiler.Enabled) CacheProfiler.RecordAuth(System.Diagnostics.Stopwatch.GetTimestamp() - authStart);
     await next();
 });
 
@@ -1092,6 +1132,9 @@ app.MapGet("/api/me", async (HttpContext context) =>
     }
 });
 
+} // end HTTP-role block (auth middleware + login/logout/me). Bridges below run for any PS role; the
+  // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
+
 // Concurrent request tracking for diagnostics
 var activeRequests = 0;
 
@@ -1109,6 +1152,10 @@ CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());
 // AppLifecycleBridge.Initialize is at the TOP of the file — it must run before pool.Initialize()
 // so the PS warmup script can use it (it would silently return false otherwise).
+
+// ── HTTP-role endpoints (continued): Setup API + Job Status + PowerShell dispatch ──
+if (capHttp)
+{
 
 // --- Setup API (C# direct — no PS) ---
 
@@ -1265,6 +1312,16 @@ app.MapGet("/API/jobs/summary", (HttpContext context) =>
     return Results.Ok(summary);
 });
 
+// Worker-allocation snapshot: JobManager queue/active, the concurrency limiter's live gate, and the BG pool's
+// busy/idle workers. Poll it during a fan-out to see the ramp, worker utilization, and I/O idle over time.
+var bgLimiter = app.Services.GetRequiredService<BackgroundTaskLimiter>();
+app.MapGet("/API/jobs/allocation", () => Results.Json(new
+{
+    jm = new { active = jobManager.ActiveCount, queued = jobManager.QueuedCount, maxConcurrency = jobManager.MaxConcurrency },
+    limiter = new { currentMax = bgLimiter.CurrentMax, effectiveMax = bgLimiter.EffectiveMax, overSubscribe = bgLimiter.OverSubscribe, burst = bgLimiter.BurstToCeiling, active = bgLimiter.Active, waiting = bgLimiter.Waiting, httpThrottled = bgLimiter.IsHttpThrottled },
+    pool = new { bgBusy = pool.BgPoolSize - pool.BgAvailable, bgTotal = pool.BgPoolSize, bgAvail = pool.BgAvailable, httpAvail = pool.HttpAvailable }
+}));
+
 app.MapGet("/API/jobs/runs", (HttpContext context) =>
 {
     var runs = jobManager.GetRunSummaries();
@@ -1346,11 +1403,23 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
         var isReadEndpoint = context.Request.Method == "GET"
             && endpoint.StartsWith("List", StringComparison.OrdinalIgnoreCase);
 
+        // Computed once here and reused for the write-back below (was recomputed on the miss path).
+        string? cacheKey = null;
+
         if (isReadEndpoint)
         {
+            var cprof = CacheProfiler.Enabled;
+            var t0 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var userRoleHash = CacheService.GetUserRoleHash(context);
-            var cacheKey = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
+            var t1 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            cacheKey = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
+            var t2 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var cached = await cache.Get(cacheKey, endpoint);
+            if (cprof)
+            {
+                CacheProfiler.SetLogger(logger);
+                CacheProfiler.RecordRequest(t1 - t0, t2 - t1, System.Diagnostics.Stopwatch.GetTimestamp() - t2, cached != null);
+            }
 
             if (cached != null)
             {
@@ -1455,11 +1524,9 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
             }
         }
 
-        // Cache successful GET List* responses
-        if (isReadEndpoint && result.StatusCode is >= 200 and < 400)
+        // Cache successful GET List* responses (reuse the key computed on the read path — no recompute).
+        if (isReadEndpoint && cacheKey != null && result.StatusCode is >= 200 and < 400)
         {
-            var userRoleHash = CacheService.GetUserRoleHash(context);
-            var cacheKey = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
             await cache.Set(cacheKey, result);
         }
 
@@ -1578,6 +1645,8 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
     }
 });
 
+} // end HTTP-role block (setup / jobs / PowerShell dispatch)
+
 // Fallback: in dev mode, proxy to Next.js dev server for hot-reload.
 // In production, try {path}.html first (Next.js static export), then index.html for SPA routing.
 // Reuse the existing frontendFileProvider — do NOT create a new PhysicalFileProvider per request
@@ -1585,6 +1654,14 @@ app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH
 app.MapFallback(async (HttpContext context) =>
 {
     var path = context.Request.Path.Value?.TrimEnd('/') ?? "";
+
+    // No frontend on this node (Http/Background-only role, or Frontend/ absent) — nothing to fall back to.
+    // Return 404 rather than faulting on a missing index.html.
+    if (frontendFileProvider == null && devProxyClient == null)
+    {
+        context.Response.StatusCode = 404;
+        return;
+    }
 
     // Serve an HTML document, preferring a precomputed .br/.gz sibling when the client accepts it, so the
     // SPA fallback (index.html) and prerendered route pages go out precompressed with a fixed Content-Length

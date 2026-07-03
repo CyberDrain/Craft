@@ -5,6 +5,10 @@ using Azure.Data.Tables;
 
 namespace Craft.Services;
 
+/// <summary>An immutable snapshot of a task's status for the coalescing batched writer.</summary>
+public record TaskStatusWrite(string RunName, string TaskId, string Status, string? ParametersJson,
+    int AttemptCount, string? LastError, DateTime? CompletedUtc);
+
 /// <summary>
 /// Typed CRUD wrapper around Azure Table Storage for orchestrator persistence.
 /// Manages three tables: CippOrchestratorRuns, CippOrchestratorTasks, CippOrchestratorResults.
@@ -201,6 +205,74 @@ public class OrchestratorTableStore
             await _tasksTable.SubmitTransactionAsync(batch);
         }
     }
+
+    /// <summary>
+    /// Write a set of coalesced task-status transitions in as few Azure Table transactions as possible.
+    /// Batches are bounded by BOTH the 100-entity transaction limit AND a byte budget (entities carry
+    /// ParametersJson, up to ~64 KB each, so 100 could exceed the 4 MB transaction cap). All entities in a
+    /// transaction must share a PartitionKey, so writes are grouped by run first. On a transaction failure the
+    /// batch falls back to per-entity upserts so one bad entity can't drop the rest. Used by the batched
+    /// status writer — the large-result path (<see cref="StoreResultAsync"/>) is untouched.
+    /// </summary>
+    public async Task WriteTaskStatusBatchAsync(IReadOnlyList<TaskStatusWrite> writes)
+    {
+        const int maxCount = 100;
+        const int maxChars = 1_600_000; // ≈3.2 MB UTF-16, safely under the 4 MB transaction limit
+
+        foreach (var group in writes.GroupBy(w => w.RunName))
+        {
+            var runName = group.Key;
+            var batch = new List<TableTransactionAction>(maxCount);
+            var chars = 0;
+
+            foreach (var w in group)
+            {
+                var entity = BuildTaskEntity(w);
+                var entityChars = (w.ParametersJson?.Length ?? 0) + (w.LastError?.Length ?? 0) + 128;
+
+                if (batch.Count > 0 && (batch.Count >= maxCount || chars + entityChars > maxChars))
+                {
+                    await SubmitTaskBatchAsync(batch);
+                    batch.Clear();
+                    chars = 0;
+                }
+
+                batch.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, entity));
+                chars += entityChars;
+            }
+
+            if (batch.Count > 0)
+                await SubmitTaskBatchAsync(batch);
+        }
+    }
+
+    private async Task SubmitTaskBatchAsync(List<TableTransactionAction> batch)
+    {
+        try
+        {
+            await _tasksTable.SubmitTransactionAsync(batch);
+        }
+        catch (Exception ex)
+        {
+            // A transaction is all-or-nothing; on failure fall back to individual upserts so a single bad
+            // entity (or a transient 4xx) doesn't lose every task status in the batch.
+            _logger.LogWarning(ex, "[Orchestrator] Task status batch of {Count} failed — falling back to per-entity", batch.Count);
+            foreach (var action in batch)
+            {
+                try { await _tasksTable.UpsertEntityAsync((TableEntity)action.Entity, TableUpdateMode.Replace); }
+                catch (Exception ix) { _logger.LogWarning(ix, "[Orchestrator] Per-entity fallback upsert failed for {Row}", action.Entity.RowKey); }
+            }
+        }
+    }
+
+    private static TableEntity BuildTaskEntity(TaskStatusWrite w) => new(w.RunName, w.TaskId)
+    {
+        ["Status"] = w.Status,
+        ["ParametersJson"] = w.ParametersJson,
+        ["AttemptCount"] = w.AttemptCount,
+        ["LastError"] = w.LastError,
+        ["CompletedUtc"] = w.CompletedUtc.HasValue ? new DateTimeOffset(w.CompletedUtc.Value, TimeSpan.Zero) : (DateTimeOffset?)null
+    };
 
     // ─── Constants for Azure Table Storage limits ───
     // Azure Table string properties are UTF-16 encoded, max 64 KiB (≈32K chars).
