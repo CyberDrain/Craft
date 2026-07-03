@@ -40,10 +40,25 @@ public class BackgroundTaskLimiter : IDisposable
     private DateTime? _queuePressureSince;
     private DateTime? _httpPressureSince;
     private bool _httpThrottled;
+    private readonly bool _burstToCeiling;
+    private readonly int _overSubscribe;
 
     public int BaseConcurrency { get; }
     public int CeilingConcurrency { get; }
     public TimeSpan ScaleUpAfter { get; }
+
+    /// <summary>When true, the limiter jumps straight to the ceiling the moment tasks start queuing,
+    /// instead of waiting <see cref="ScaleUpAfter"/> to ramp — for bursty fan-out. Default false.</summary>
+    public bool BurstToCeiling => _burstToCeiling;
+
+    /// <summary>Extra concurrency admitted ON TOP of the worker-target (ceiling), so this many tasks can do
+    /// their pre-invoke table writes (the "Running" marker) and queue at the worker checkout while the pool
+    /// stays full — closing the slot-held-during-I/O gap. Real worker concurrency is still capped by the pool.
+    /// Default 0.</summary>
+    public int OverSubscribe => _overSubscribe;
+
+    /// <summary>Admission limit = the ramp-controlled worker target plus the over-subscribe headroom.</summary>
+    public int EffectiveMax => _currentMax + _overSubscribe;
 
     /// <summary>
     /// Number of busy HTTP workers that triggers BG throttling.
@@ -92,14 +107,21 @@ public class BackgroundTaskLimiter : IDisposable
         HttpPressureAfter = TimeSpan.FromSeconds(
             configuration.GetValue("BackgroundHttpPressureAfterSeconds", 10));
 
+        // Burst: jump straight to ceiling on the first sign of queueing (skip the ScaleUpAfter dwell).
+        _burstToCeiling = configuration.GetValue("BackgroundBurstToCeiling", false);
+
+        // Over-subscription: admit this many tasks ABOVE the worker target so they can do their pre-invoke
+        // table writes and queue at the worker checkout while the pool stays full. 0 = off (strict pool cap).
+        _overSubscribe = Math.Max(0, configuration.GetValue("BackgroundOverSubscribe", 0));
+
         _currentMax = BaseConcurrency;
 
         // Monitor timer: checks queue and HTTP pressure every 10s
         _monitorTimer = new Timer(MonitorCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
 
         _logger.LogInformation("[System] Limiter init: baseline={Base} ceiling={Ceiling} scaleAfter={ScaleAfter}s " +
-            "httpPressureThreshold={HttpThreshold} httpPressureAfter={HttpAfter}s cpus={Cpus}",
-            BaseConcurrency, CeilingConcurrency, ScaleUpAfter.TotalSeconds,
+            "burstToCeiling={Burst} overSubscribe={Over} httpPressureThreshold={HttpThreshold} httpPressureAfter={HttpAfter}s cpus={Cpus}",
+            BaseConcurrency, CeilingConcurrency, ScaleUpAfter.TotalSeconds, _burstToCeiling, _overSubscribe,
             HttpPressureThreshold, HttpPressureAfter.TotalSeconds, Environment.ProcessorCount);
     }
 
@@ -154,7 +176,17 @@ public class BackgroundTaskLimiter : IDisposable
 
         lock (_gateLock)
         {
-            if (_active < _currentMax)
+            // Burst-to-ceiling: the moment demand reaches the worker target, jump straight to the ceiling
+            // instead of waiting ScaleUpAfter to ramp. (HTTP pressure still wins — don't fight the throttle.)
+            if (_burstToCeiling && _active >= _currentMax && _currentMax < CeilingConcurrency && !_httpThrottled)
+            {
+                var old = _currentMax;
+                _currentMax = CeilingConcurrency;
+                _queuePressureSince = null;
+                _logger.LogInformation("[System] Limiter burst-to-ceiling: {Old} -> {New}", old, _currentMax);
+            }
+
+            if (_active < _currentMax + _overSubscribe)
             {
                 // Slot available — grant immediately
                 _active++;
@@ -216,7 +248,7 @@ public class BackgroundTaskLimiter : IDisposable
     /// </summary>
     private void GrantWaiters()
     {
-        while (_active < _currentMax && _waiters.Count > 0)
+        while (_active < _currentMax + _overSubscribe && _waiters.Count > 0)
         {
             var node = _waiters.First!;
             _waiters.RemoveFirst();

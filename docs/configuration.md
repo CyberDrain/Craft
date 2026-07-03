@@ -57,6 +57,86 @@ environment:
 
 ---
 
+### Roles (split deployments)
+
+Craft ships as **one image** that can run in split roles selected at runtime, so the cheap-to-scale static
+frontend and the compute-heavy PowerShell backend can be deployed and scaled independently.
+
+Three independent capabilities:
+
+| Capability | Serves | Env flag | Config |
+|---|---|---|---|
+| **Frontend** | static web content from `Frontend/` | `CRAFT_SERVE_FRONTEND` | `App:Roles:Frontend` |
+| **Http** | `/api` + auth (`/login`, `/.auth/*`, `/api/me`) via the HTTP pool | `CRAFT_SERVE_API` | `App:Roles:Http` |
+| **Background** | scheduler / orchestrator / job-manager / stats via the BG pool | `CRAFT_RUN_BACKGROUND` | `App:Roles:Background` |
+
+**Resolution (highest wins):**
+1. If **any** role is explicitly set (env `CRAFT_SERVE_*`/`CRAFT_RUN_*` wins over `App:Roles:*`) → the host
+   uses exactly those; unset roles default **off**. (So you declare roles by enabling what you want.)
+2. Else (nothing set) → **all three on** — the default monolith.
+
+If all three resolve off, the host fails fast (`EX_CONFIG`). The resolved set is logged at startup:
+`[System] Roles: Frontend=on Http=off Background=off | ResponseCache=off Compression=on`.
+
+**Presets** (combinations that fall out of the flags):
+
+| Preset | Frontend | Http | Background | Use |
+|---|:-:|:-:|:-:|---|
+| `frontend` | ✓ | – | – | Pure static host (CDN origin), no PowerShell |
+| `http` | – | ✓ | – | API-only node (does **not** process orchestrations — see caveat) |
+| `background` | – | – | ✓ | Worker node — scheduler + orchestrator processing |
+| `backend` | – | ✓ | ✓ | Self-contained API + workers, no frontend |
+| `frontend+http` | ✓ | ✓ | – | App node without background workers |
+| `combined` *(default)* | ✓ | ✓ | ✓ | The monolith |
+
+A node without the **Http** role maps none of the API/auth handlers, so `/api`, `/.auth`, `/login` fall
+through to static serving first (a **Frontend** node can expose e.g. `/api/me` from its own static dir) and
+finally to `MapFallback` (which `404`s unmatched `/api`/`/.auth`). A node without the **Frontend** role serves
+no static content and `404`s SPA routes.
+
+A role-agnostic **health endpoint** is available in every mode (200 while the process is up; body reports
+per-role readiness) — point Azure/K8s liveness at it. It defaults to `/healthz` and can be relocated or
+disabled: `App:Health:Path` / `CRAFT_HEALTH_PATH` (e.g. `/status`) and `App:Health:Enabled` /
+`CRAFT_HEALTH_ENABLED=false`.
+
+> **⚠️ Orchestration caveat.** Triggering an orchestration and processing it must happen in the **same
+> process** — the trigger is an in-process queue, not a durable cross-process one. A pure `http` node that
+> triggers orchestrations will not run them. Any node that triggers orchestrations from HTTP must also carry
+> the **Background** role: use **`backend`** or **`combined`**. A pure `background` node self-triggers via its
+> own scheduler and processes in-process, which is fine.
+
+```jsonc
+"Roles": {
+  "Frontend": true,   // null/unset = not explicitly set
+  "Http": true,
+  "Background": false
+}
+```
+
+Docker Compose (env flags, same image):
+
+```yaml
+# frontend node (static origin behind a CDN)
+environment: [ CRAFT_SERVE_FRONTEND=true ]
+
+# api node (API only — no orchestration processing)
+environment: [ CRAFT_SERVE_API=true, WEBSITE_AUTH_CLIENT_ID=..., AUTH_SECRET=... ]
+
+# worker node (scheduler + orchestrator processing)
+environment: [ CRAFT_RUN_BACKGROUND=true, AzureWebJobsStorage=... ]
+
+# backend node (API + workers, no frontend) — self-contained backend
+environment: [ CRAFT_SERVE_API=true, CRAFT_RUN_BACKGROUND=true, WEBSITE_AUTH_CLIENT_ID=..., AUTH_SECRET=..., AzureWebJobsStorage=... ]
+
+# monolith (unchanged default) — no role flags
+```
+
+**Response cache & roles:** the API response cache (see [Cache](#cache)) defaults **on only when a node
+serves both a browser UI and its API** (`combined` / `frontend+http`) and **off** otherwise. Override per node
+with `App:Cache:Enabled` (bool) or `CRAFT_RESPONSE_CACHE=true/false`.
+
+---
+
 ### Worker
 
 Controls the PowerShell runspace pools that execute all scripts.
@@ -70,6 +150,13 @@ Controls the PowerShell runspace pools that execute all scripts.
   // Number of background workers for scheduler, orchestrator, and queue tasks.
   // Higher = more parallel orchestrator tasks, but more memory.
   "BgPoolSize": 4,
+
+  // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
+  // Default true — the biggest single per-request dispatch win (~50% of the PS-invoke cost, +68% throughput
+  // on dispatch-bound load; see docs/dispatch-analysis.md), and matches the Azure Functions PS worker's
+  // persistent runspace. Safe: each worker owns one runspace and serves one request at a time. Set false
+  // only to A/B or if a module misbehaves on a long-lived pipeline thread.
+  "ReuseRunspaceThread": true,
 
   // Maximum execution time (seconds) for HTTP request handlers.
   // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
@@ -228,6 +315,30 @@ Drives the cron-based background task system.
 
 ---
 
+### Background concurrency limiter
+
+Gates how many background/orchestrator tasks run at once, on top of the `Worker.BgPoolSize` runspaces. These
+are **root-level** config keys (set at the top of `appsettings.json` or as env vars, not under `App:`).
+By default it starts narrow and ramps slowly, to keep idle memory low; tune it for bursty fan-out.
+
+| Key | Default | Effect |
+|---|---|---|
+| `BackgroundBaseConcurrency` | `clamp(cores, 2, 4)` | starting width when idle |
+| `BackgroundScaleUpAfterSeconds` | `15` | how long the queue must be backed up before ramping (doubles per 10s tick) |
+| `BackgroundMaxConcurrency` | `BgPoolSize` | ceiling |
+| `BackgroundBurstToCeiling` | `false` | jump straight to the ceiling the moment tasks queue, skipping the ramp — **~2.7× faster fan-out** for bursts shorter than the ramp dwell (see docs/orch-analysis.md) |
+| `BackgroundOverSubscribe` | `0` | admit this many tasks *above* the ceiling so they can do their pre-invoke table write and queue at the worker checkout while the pool stays full (helps only up to Azure Table write throughput) |
+| `BackgroundHttpPressureThreshold` | `HttpPoolSize/2` | busy-HTTP-worker count that throttles BG to 2; `0` disables |
+| `BackgroundHttpPressureAfterSeconds` | `10` | how long HTTP pressure must persist before throttling |
+
+```jsonc
+// top level of appsettings.json (NOT under "App"):
+"BackgroundBurstToCeiling": true,     // fill the pool immediately on a fan-out burst
+"BackgroundScaleUpAfterSeconds": 5    // or: ramp sooner without going straight to ceiling
+```
+
+---
+
 ### Orchestrator
 
 Fan-out/fan-in task execution with crash recovery.
@@ -236,6 +347,20 @@ Fan-out/fan-in task execution with crash recovery.
 "Orchestrator": {
   // Prefix for Azure Tables: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results
   "TablePrefix": "Orchestrator",
+
+  // Batch + coalesce per-task/run STATUS writes off the fan-out critical path, in ≤100-entity byte-budgeted
+  // Azure Table transactions. Default true. This is the throughput fix for large fan-outs — the per-task
+  // table write was the ceiling (see docs/orch-analysis.md). Results are NEVER batched (their chunking /
+  // multi-row large-payload path is untouched). Set false to fall back to per-task writes.
+  "BatchStatusWrites": true,
+  // Write the pre-invoke "Running" marker under a durable barrier (persisted BEFORE the task runs, batched
+  // with concurrently-starting tasks) so AttemptCount/MaxRetries still bounds poison tasks. Default true.
+  // False = eventual: the marker rides the periodic flush and the task doesn't wait — max throughput (100%
+  // pool utilization) at the cost of the strict poison-before-invoke guarantee. Terminal + run states stay
+  // durable in both modes (flushed before a run finalizes and on shutdown).
+  "DurableRunningBarrier": true,
+  // Status-writer flush interval / barrier latency ceiling (ms). Default 25.
+  "StatusFlushIntervalMs": 25,
 
   // PS function that executes individual tasks. Receives TaskJson parameter.
   // Default: "Invoke-CraftTask" (provided in CraftRuntime/)
@@ -285,10 +410,21 @@ This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applica
 
 ### Cache
 
-In-memory response cache for HTTP endpoints.
+In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET endpoints.
 
 ```jsonc
 "Cache": {
+  // Whether the cache is active. Omit (default) for auto: ON only when this node serves BOTH a browser UI
+  // and its API (combined / frontend+http roles), OFF for api-only, worker-only and static-only nodes.
+  // Set true/false to force it. Env override (wins): CRAFT_RESPONSE_CACHE=true/false.
+  // When disabled, no _cache/ directory is created or scanned and all get/set operations are no-ops.
+  // "Enabled": true,
+
+  // Bytes budget for the in-memory body tier (LRU over the disk cache) — a HIT returns the body from RAM
+  // instead of re-reading + re-decoding the file. Default 64 MiB; 0 = disk-only. Gain scales with response
+  // size (+44% throughput for small List* responses, +157% at ~150KB; see docs/cache-analysis.md).
+  "MaxMemoryBytes": 67108864,
+
   // Maximum cached responses held in memory
   "MaxEntries": 1000,
 
