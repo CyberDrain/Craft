@@ -233,6 +233,10 @@ builder.Services.Configure<GzipCompressionProviderOptions>(options =>
 });
 
 // Register services
+builder.Services.AddSingleton<ICraftTableStore, AzureTableStore>();
+builder.Services.AddSingleton<StorageHealthMonitor>();
+builder.Services.AddSingleton<RealtimeService>();
+
 builder.Services.AddSingleton<ScriptRepository>();
 builder.Services.AddSingleton<PowerShellWorkerPool>();
 builder.Services.AddSingleton<PowerShellRunnerService>();
@@ -315,6 +319,8 @@ var logger = app.Services.GetRequiredService<ILogger<Program>>();
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();
+var realtime = app.Services.GetRequiredService<RealtimeService>();
+RealtimeBridge.Initialize(realtime);
 var setupService = app.Services.GetRequiredService<SetupService>();
 
 // AppLifecycleBridge MUST be initialized before pool.Initialize() — the PS warmup script
@@ -590,6 +596,7 @@ app.Use(async (context, next) =>
 
         // Always let the health endpoints through for polling
         if (path.Equals("/api/setup/health", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/.craft/", StringComparison.OrdinalIgnoreCase) ||
             (healthEnabled && path.Equals(healthPath, StringComparison.OrdinalIgnoreCase)))
         {
             await next();
@@ -636,11 +643,57 @@ if (devFrontendUrl != null)
     devProxyClient.Timeout = TimeSpan.FromSeconds(120); // longer timeout for slow Next.js dev builds
     logger.LogInformation("[System] Dev mode: proxying frontend to {Url}", devFrontendUrl);
 
+    // Fast Refresh (HMR) in `next dev` runs over a WebSocket under /_next/* (Turbopack in Next 16, or
+    // webpack). Enable WebSockets so the dev proxy can bridge that upgrade to the Next.js dev server —
+    // without this, HTML/asset GETs proxy fine but the HMR socket never establishes, so edits don't
+    // hot-reload until a manual/forced browser refresh. Dev-only; no effect on production static serving.
+    app.UseWebSockets();
+    var devBaseUri = new Uri(devFrontendUrl);
+
+    // Pump WebSocket frames one direction between the browser and the Next.js dev server.
+    static async Task PumpDevWsAsync(System.Net.WebSockets.WebSocket from, System.Net.WebSockets.WebSocket to, CancellationToken ct)
+    {
+        var buffer = new byte[16 * 1024];
+        try
+        {
+            while (from.State == System.Net.WebSockets.WebSocketState.Open && to.State == System.Net.WebSockets.WebSocketState.Open)
+            {
+                var result = await from.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+                if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
+                {
+                    await to.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, null, ct);
+                    break;
+                }
+                await to.SendAsync(new ArraySegment<byte>(buffer, 0, result.Count), result.MessageType, result.EndOfMessage, ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (System.Net.WebSockets.WebSocketException) { }
+    }
+
     // In dev mode, intercept frontend requests (/_next/*, static assets, etc.)
     // and proxy them to the Next.js dev server before static file middleware runs
     app.Use(async (context, next) =>
     {
         var reqPath = context.Request.Path.Value ?? "";
+
+        // HMR WebSocket upgrade (Fast Refresh, under /_next/*) — bridge it to the dev server both ways.
+        if (context.WebSockets.IsWebSocketRequest)
+        {
+            var wsScheme = devBaseUri.Scheme == "https" ? "wss" : "ws";
+            var target = new Uri($"{wsScheme}://{devBaseUri.Authority}{reqPath}{context.Request.QueryString}");
+            using var upstream = new System.Net.WebSockets.ClientWebSocket();
+            foreach (var proto in context.WebSockets.WebSocketRequestedProtocols)
+                upstream.Options.AddSubProtocol(proto);
+            try { await upstream.ConnectAsync(target, context.RequestAborted); }
+            catch { context.Response.StatusCode = 502; return; }
+            using var client = await context.WebSockets.AcceptWebSocketAsync(upstream.SubProtocol);
+            await Task.WhenAll(
+                PumpDevWsAsync(client, upstream, context.RequestAborted),
+                PumpDevWsAsync(upstream, client, context.RequestAborted));
+            return;
+        }
+
         // Proxy to Next.js: /_next/*, /__nextjs, and any non-API path with a file extension
         // (e.g. /version.json, /manifest.json, /favicon.ico) that doesn't exist in Frontend/
         var shouldProxy = reqPath.StartsWith("/_next/") || reqPath.StartsWith("/__nextjs")
@@ -810,6 +863,14 @@ else
 // Auth service
 var authService = app.Services.GetRequiredService<AuthService>();
 
+// Storage readiness — only relevant to roles that use the store (http: allowedUsers; background:
+// orchestrator). A frontend-only node never touches storage, so it is not resolved there (which also
+// avoids requiring a connection string on a pure static origin).
+var storageHealth = (capHttp || capBackground)
+    ? app.Services.GetRequiredService<StorageHealthMonitor>()
+    : null;
+if (storageHealth != null) _ = storageHealth.RefreshAsync(); // prime the cache off the request path
+
 // --- Health (role-agnostic; mapped before the HTTP-role block so it survives every role) ---
 if (healthEnabled)
 {
@@ -818,11 +879,12 @@ if (healthEnabled)
     {
         var httpReady = !capHttp || pool.IsReady;
         var bgReady = !capBackground || pool.BackgroundReady;
+        var storageReady = storageHealth == null || storageHealth.Snapshot();
         return Results.Json(new
         {
-            status = (httpReady && bgReady) ? "ready" : "starting",
+            status = (httpReady && bgReady && storageReady) ? "ready" : "starting",
             roles = new { frontend = capFrontend, http = capHttp, background = capBackground },
-            ready = new { http = httpReady, background = bgReady }
+            ready = new { http = httpReady, background = bgReady, storage = storageReady }
         });
     });
     logger.LogInformation("[System] Health endpoint: {Path}", healthPath);
@@ -830,6 +892,61 @@ if (healthEnabled)
 else
 {
     logger.LogInformation("[System] Health endpoint: disabled");
+}
+
+// ── Realtime SSE channel (/.craft/events) — served by http/frontend nodes ───────────────────────────
+// Identity-gated delivery of job events published in-process via RealtimeBridge. See RealtimeService
+// and docs/realtime-bridge-plan.md. Pure C# — never touches a PowerShell runspace.
+if ((capHttp || capFrontend) && CraftSettings.Realtime.Enabled)
+{
+    app.MapGet("/.craft/events", async (HttpContext ctx) =>
+    {
+        var userId = ctx.Request.Headers["x-ms-client-principal-name"].ToString();
+        if (string.IsNullOrEmpty(userId)) { ctx.Response.StatusCode = 401; return; }
+
+        var (connId, conn) = realtime.Connect(userId);
+        if (conn == null) { ctx.Response.StatusCode = 503; return; } // over MaxConnections
+
+        ctx.Response.Headers["Content-Type"] = "text/event-stream";
+        ctx.Response.Headers["Cache-Control"] = "no-cache";
+        ctx.Response.Headers["X-Accel-Buffering"] = "no"; // don't let nginx buffer the stream
+        ctx.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>()?.DisableBuffering();
+
+        var heartbeat = TimeSpan.FromSeconds(Math.Max(5, CraftSettings.Realtime.HeartbeatSeconds));
+        var ct = ctx.RequestAborted;
+        try
+        {
+            await ctx.Response.WriteAsync(": connected\n\n", ct);
+            // Replay the current message for each of this user's live jobs so a (re)connect resyncs.
+            foreach (var frame in realtime.CurrentFrames(userId))
+                await ctx.Response.WriteAsync(frame, ct);
+            await ctx.Response.Body.FlushAsync(ct);
+
+            var reader = conn.Reader;
+            while (!ct.IsCancellationRequested)
+            {
+                using var hb = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                hb.CancelAfter(heartbeat);
+                try
+                {
+                    if (await reader.WaitToReadAsync(hb.Token))
+                    {
+                        while (reader.TryRead(out var frame))
+                            await ctx.Response.WriteAsync(frame, ct);
+                        await ctx.Response.Body.FlushAsync(ct);
+                    }
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    await ctx.Response.WriteAsync(": ping\n\n", ct); // heartbeat
+                    await ctx.Response.Body.FlushAsync(ct);
+                }
+            }
+        }
+        catch (OperationCanceledException) { /* client disconnected — normal */ }
+        finally { realtime.Disconnect(userId, connId); }
+    });
+    logger.LogInformation("[System] Realtime SSE endpoint: /.craft/events");
 }
 
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
@@ -954,8 +1071,8 @@ app.Use(async (context, next) =>
         return;
     }
 
-    // No x-ms-client-principal header — local dev injects a dev principal (EasyAuth owns auth in
-    // real deployments, so a missing header there simply means anonymous).
+    // No x-ms-client-principal header — local dev injects a dev principal (EasyAuth owns auth in real
+    // deployments, so a missing header there simply means anonymous).
     if (app.Environment.IsDevelopment())
     {
         // Local dev: inject a dev principal so no login is required
@@ -979,31 +1096,9 @@ app.Use(async (context, next) =>
 });
 
 // --- Auth endpoints ---
-// Login/logout/callback are handled by the upstream App Service EasyAuth layer at the platform
-// edge; Craft maps none of them. It only transforms the injected x-ms-client-principal header and
-// authorizes via the allowedUsers table.
-
-// /.auth/me — returns clientPrincipal in Azure SWA format for frontend compatibility. In real
-// deployments EasyAuth serves this at the platform edge; here it's a local-dev fallback (dev
-// principal in Development, else null/anonymous).
-app.MapGet("/.auth/me", (HttpContext context) =>
-{
-    // Dev mode: return dev principal without requiring login
-    if (app.Environment.IsDevelopment())
-    {
-        var devPrincipal = new
-        {
-            identityProvider = "aad",
-            userId = CraftSettings.Auth.DevUserId,
-            userDetails = CraftSettings.Auth.DevUserDetails,
-            userRoles = CraftSettings.Auth.DevRoles.ToArray()
-        };
-        return Results.Json(new { clientPrincipal = devPrincipal });
-    }
-
-    // No session — return null clientPrincipal (frontend shows login)
-    return Results.Json(new { clientPrincipal = (object?)null });
-});
+// Login/logout/callback and /.auth/me are handled by the upstream App Service EasyAuth layer at the
+// platform edge; Craft maps none of them. It only transforms the injected x-ms-client-principal header
+// and authorizes via the allowedUsers table.
 
 // /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
 // MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
@@ -1056,7 +1151,7 @@ app.MapGet("/api/me", async (HttpContext context) =>
     }
 });
 
-} // end HTTP-role block (auth middleware + /.auth/me). Bridges below run for any PS role; the
+} // end HTTP-role block (auth middleware). Bridges below run for any PS role; the
   // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
 
 // Concurrent request tracking for diagnostics

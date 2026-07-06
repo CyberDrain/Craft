@@ -39,10 +39,16 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 # working set. Preloading mimalloc typically reclaims 20–40% RSS on long-lived
 # .NET-on-Linux hosts that spawn child processes. LD_PRELOAD propagates to
 # child pwsh runspaces automatically, which is exactly what we want here.
+# SSH (App Service SCM access) is gated behind INSTALL_SSH — default true for the dev/prod images;
+# portable/off-Azure images build with --build-arg INSTALL_SSH=false to drop the daemon entirely.
+# libmimalloc is always installed. SSH is still never started unless CRAFT_SSH_ENABLED=true at runtime.
+ARG INSTALL_SSH=true
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /run/sshd
+ && apt-get install -y --no-install-recommends libmimalloc2.0 \
+ && if [ "$INSTALL_SSH" = "true" ]; then \
+      apt-get install -y --no-install-recommends openssh-server && mkdir -p /run/sshd; \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
 COPY docker/sshd_config /etc/ssh/sshd_config
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

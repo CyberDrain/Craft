@@ -1,0 +1,12 @@
+{
+	# Local TLS-terminating proxy in front of the SUT — stands in for Cloudflare so the browser test
+	# runs over HTTPS (browsers only request brotli over https, and the prod CSP is `default-src https:`).
+	auto_https disable_redirects
+	admin off
+}
+
+https://caddy, https://localhost {
+	tls internal
+	# Pass through to the http origin, including its Content-Encoding (br) — do NOT re-compress here.
+	reverse_proxy sut:8080
+}

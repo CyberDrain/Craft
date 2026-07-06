@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
-using Azure.Data.Tables;
 
 namespace Craft.Services;
 
@@ -36,6 +35,7 @@ public class AuthService
   private readonly ILogger<AuthService> _logger;
   private readonly IConfiguration _config;
   private readonly CraftSettings _settings;
+  private readonly ICraftTableStore _store;
 
   // allowedUsers cache
   private readonly ConcurrentDictionary<string, AllowedUser> _allowedUsersCache = new(StringComparer.OrdinalIgnoreCase);
@@ -43,11 +43,12 @@ public class AuthService
   private readonly TimeSpan _allowedUsersCacheTtl = TimeSpan.FromMinutes(5);
   private readonly SemaphoreSlim _allowedUsersLock = new(1, 1);
 
-  public AuthService(ILogger<AuthService> logger, IConfiguration config, CraftSettings settings)
+  public AuthService(ILogger<AuthService> logger, IConfiguration config, CraftSettings settings, ICraftTableStore store)
   {
     _logger = logger;
     _config = config;
     _settings = settings;
+    _store = store;
   }
 
   // --- Configuration ---
@@ -80,9 +81,6 @@ public class AuthService
       return _resolvedTableName;
     }
   }
-
-  private string StorageConnectionString =>
-      _settings.Storage.ResolveConnection(_settings.Auth.UserStorageConnection, "the allowedUsers authorization table");
 
   /// <summary>
   /// Clears the allowedUsers cache. Call after auth credentials/config are updated at runtime
@@ -163,20 +161,19 @@ public class AuthService
   {
     try
     {
-      var client = new TableClient(StorageConnectionString, UserTableFullName);
-      await client.CreateIfNotExistsAsync(cancellationToken: ct);
+      await _store.EnsureTableAsync(UserTableFullName, ct);
 
       var newCache = new Dictionary<string, AllowedUser>(StringComparer.OrdinalIgnoreCase);
 
-      await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+      await foreach (var row in _store.QueryTableAsync(UserTableFullName, ct))
       {
         // Skip internal rows
-        if (entity.RowKey.StartsWith("_")) continue;
+        if (row.RowKey.StartsWith("_")) continue;
 
         // Normalize the UPN to lowercase so case-variant duplicate rows
         // resolve to a single entry.
-        var upn = entity.RowKey.ToLowerInvariant();
-        var rolesJson = entity.GetString("Roles") ?? "[]";
+        var upn = row.RowKey.ToLowerInvariant();
+        var rolesJson = row.GetString("Roles") ?? "[]";
         string[] roles;
         try
         {

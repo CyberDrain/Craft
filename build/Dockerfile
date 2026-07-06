@@ -32,10 +32,16 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 # Optional SSH server for Azure App Service SCM access. Installed unconditionally
 # but NOT started — the entrypoint launches sshd only when CRAFT_SSH_ENABLED=true.
 # Also installs libmimalloc; see Dockerfile.release for the full rationale.
+# SSH (App Service SCM access) is gated behind INSTALL_SSH — default true for the dev/prod images;
+# portable/off-Azure images build with --build-arg INSTALL_SSH=false to drop the daemon entirely.
+# libmimalloc is always installed. SSH is still never started unless CRAFT_SSH_ENABLED=true at runtime.
+ARG INSTALL_SSH=true
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /run/sshd
+    && apt-get install -y --no-install-recommends libmimalloc2.0 \
+    && if [ "$INSTALL_SSH" = "true" ]; then \
+         apt-get install -y --no-install-recommends openssh-server && mkdir -p /run/sshd; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
 
 # Symlink libmimalloc to a fixed, arch-independent path so LD_PRELOAD works on
 # both amd64 (x86_64-linux-gnu) and arm64 (aarch64-linux-gnu).

@@ -1,0 +1,37 @@
+name: regression
+
+# Core build regression for the Azure-native branch. Builds the AzureTables configuration on PRs to
+# main or dev and on pushes to dev (main is PR-only; direct pushes are blocked by branch protection).
+# Doc- and perf-harness-only changes do not trigger it — they touch no compiled file.
+on:
+  push:
+    branches: [dev]
+    paths-ignore:
+      - 'docs/**'
+      - 'perf-harness/**'
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+      - 'perf-harness/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (AzureTables)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build — AzureTables
+        run: dotnet build Craft.csproj -c Release --nologo

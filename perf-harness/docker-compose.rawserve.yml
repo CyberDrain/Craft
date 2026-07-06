@@ -1,0 +1,8 @@
+# Override: serve static content RAW — no compression. Sets CRAFT_COMPRESSION=false so the host serves
+# everything identity/uncompressed: no precompressed .br/.gz are served and on-the-fly ResponseCompression
+# is off. Lets the harness A/B compressed vs raw serving on the SAME image (the toggle is a host config,
+# not a rebuild). Layered by run.ps1 -NoCompression. Requires a CRAFT base that supports CRAFT_COMPRESSION.
+services:
+  sut:
+    environment:
+      - CRAFT_COMPRESSION=false

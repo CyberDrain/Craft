@@ -90,6 +90,9 @@ public class CraftSettings
 
     /// <summary>Request rate limiting. See <see cref="RateLimitSettings"/>. On by default.</summary>
     public RateLimitSettings RateLimit { get; set; } = new();
+
+    /// <summary>Realtime SSE channel (<c>/.craft/events</c>). See <see cref="RealtimeSettings"/>.</summary>
+    public RealtimeSettings Realtime { get; set; } = new();
 }
 
 /// <summary>
@@ -178,6 +181,36 @@ public class RateLimitSettings
     public bool IsEnabled =>
         Enabled
         || string.Equals(Environment.GetEnvironmentVariable("CRAFT_RATELIMIT_ENABLED"), "true", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Realtime SSE channel served at <c>/.craft/events</c>. Downstream code publishes job lifecycle events
+/// through <see cref="RealtimeBridge"/>; browsers consume them. In-memory, single instance — see
+/// docs/realtime-bridge-plan.md. The limits below bound memory and the connection budget.
+/// </summary>
+public class RealtimeSettings
+{
+    /// <summary>Enable the realtime endpoint and bridge delivery. Default true (still role-gated to http/frontend).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Max serialized size of a single event's <c>data</c> payload. Over this it is dropped and a
+    /// 413 "too large" frame is delivered instead. Default 16 KB.</summary>
+    public int MaxMessageBytes { get; set; } = 16 * 1024;
+
+    /// <summary>Max number of concurrently stored (userId, jobId) entries. Default 10000.</summary>
+    public int MaxActiveJobs { get; set; } = 10_000;
+
+    /// <summary>Max number of concurrent SSE connections across all users. Default 1000.</summary>
+    public int MaxConnections { get; set; } = 1_000;
+
+    /// <summary>Buffered frames per connection before the oldest is dropped (coalescing). Default 256.</summary>
+    public int PerConnectionQueue { get; set; } = 256;
+
+    /// <summary>Heartbeat comment interval, seconds, to keep the stream alive through proxies. Default 20.</summary>
+    public int HeartbeatSeconds { get; set; } = 20;
+
+    /// <summary>TTL for a stored entry that never receives an <c>end</c> (crash backstop), minutes. Default 60.</summary>
+    public int EntryTtlMinutes { get; set; } = 60;
 }
 
 /// <summary>
