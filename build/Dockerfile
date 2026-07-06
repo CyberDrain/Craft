@@ -73,9 +73,10 @@ ENV POWERSHELL_UPDATECHECK=Off
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 # ── .NET GC tuning (kept in sync with Dockerfile.release) ──
-ENV DOTNET_gcServer=1
+# Workstation GC default; override to DOTNET_gcServer=1 on multi-core SKUs.
+ENV DOTNET_gcServer=0
 ENV DOTNET_GCDynamicAdaptationMode=1
-ENV DOTNET_GCHeapHardLimitPercent=46
+ENV DOTNET_GCHeapHardLimit=0x80000000
 ENV DOTNET_GCConserveMemory=7
 
 EXPOSE 8080 2222
