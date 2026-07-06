@@ -151,6 +151,20 @@ try {
   $pass = @($results | Where-Object { $_.pass })
   Write-Host ""
   Write-Host ("===== E2E: {0} passed, {1} failed =====" -f $pass.Count, $fail.Count) -ForegroundColor $(if ($fail.Count) { 'Red' } else { 'Green' })
+
+  # GitHub Actions job summary — renders the PASS/FAIL table on the run page (no-op locally). Written
+  # before the non-zero exit so a failing run still shows exactly which checks failed.
+  if ($env:GITHUB_STEP_SUMMARY) {
+    $md = [System.Text.StringBuilder]::new()
+    [void]$md.AppendLine("## CRAFT E2E — combined role (Azurite)").AppendLine()
+    [void]$md.AppendLine($(if ($fail.Count) { "❌ **$($fail.Count) failed**, $($pass.Count) passed" } else { "✅ **All $($pass.Count) checks passed**" })).AppendLine()
+    [void]$md.AppendLine("| Result | Area | Check | Perf | Detail |")
+    [void]$md.AppendLine("|:------:|------|-------|------|--------|")
+    foreach ($r in $results) {
+      [void]$md.AppendLine("| $(if ($r.pass) { '✅' } else { '❌' }) | $($r.area) | $($r.name) | $($r.perf) | $($r.detail) |")
+    }
+    Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $md.ToString()
+  }
 }
 finally {
   if ($KeepUp) { Info "leaving stack up (-KeepUp). down: docker compose -f `"$compose`" down -v" }
