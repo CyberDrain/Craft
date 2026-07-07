@@ -483,17 +483,26 @@ public class SetupService
             if (kvName.Equals("auto", StringComparison.OrdinalIgnoreCase))
                 kvName = siteName;
 
-            // Store secret in Key Vault via REST API
+            // Store secrets in Key Vault via REST API
             var vaultToken = await GetManagedIdentityToken("https://vault.azure.net", ct)
                 ?? throw new InvalidOperationException("Cannot get Key Vault token — ensure the managed identity has Secret Set permission on the vault");
 
-            var kvSecretUrl = $"https://{kvName}.vault.azure.net/secrets/AUTH-SECRET?api-version=7.4";
-            var kvBody = new { value = clientSecret };
-            await KeyVaultRequest(HttpMethod.Put, kvSecretUrl, vaultToken, kvBody, ct);
+            // Secret names are configurable (App:Setup:SsoSecretNames), defaulting to the
+            // names CIPP expects: SSOAppSecret / SSOAppId / SSOMultiTenant.
+            var secretNames = _settings.Setup.SsoSecretNames;
 
-            // Set app setting as a KV reference
-            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName=AUTH-SECRET)";
-            _logger.LogInformation("[Setup] Client secret stored in Key Vault '{VaultName}', app setting set as KV reference", kvName);
+            // Client secret — this is what the AUTH_SECRET app setting references.
+            await PutKeyVaultSecret(kvName, secretNames.AppSecret, clientSecret, vaultToken, ct);
+            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName={secretNames.AppSecret})";
+
+            // App (client) ID and multi-tenant flag — persisted so the downstream app can read
+            // its own SSO credentials from the same vault.
+            await PutKeyVaultSecret(kvName, secretNames.AppId, appId, vaultToken, ct);
+            await PutKeyVaultSecret(kvName, secretNames.MultiTenant, multiTenant ? "true" : "false", vaultToken, ct);
+
+            _logger.LogInformation(
+                "[Setup] SSO app details stored in Key Vault '{VaultName}' (secrets '{AppSecret}', '{AppId}', '{MultiTenant}'); AUTH_SECRET set as KV reference",
+                kvName, secretNames.AppSecret, secretNames.AppId, secretNames.MultiTenant);
         }
         else
         {
@@ -1130,6 +1139,16 @@ public class SetupService
 
         using var doc = JsonDocument.Parse(responseBody);
         return doc.RootElement.Clone();
+    }
+
+    /// <summary>
+    /// Sets (creates or updates) a single Key Vault secret via the vault's REST API.
+    /// </summary>
+    private Task PutKeyVaultSecret(
+        string vaultName, string secretName, string value, string vaultToken, CancellationToken ct)
+    {
+        var url = $"https://{vaultName}.vault.azure.net/secrets/{secretName}?api-version=7.4";
+        return KeyVaultRequest(HttpMethod.Put, url, vaultToken, new { value }, ct);
     }
 
     private async Task KeyVaultRequest(

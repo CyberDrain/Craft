@@ -922,12 +922,43 @@ public class SetupSettings
     public string KeyVaultName { get; set; } = "";
 
     /// <summary>
+    /// Key Vault secret names under which the bootstrap persists the created SSO app
+    /// registration's details (client secret, client/app ID, and multi-tenant flag) so a
+    /// downstream app can read its own credentials from the vault. Only written when
+    /// <see cref="KeyVaultName"/> is set (same condition that gates the client secret).
+    /// The defaults match the names CIPP expects; override any of them in appsettings/env
+    /// (e.g. App:Setup:SsoSecretNames:AppSecret) to store under different names.
+    /// </summary>
+    public SsoSecretNames SsoSecretNames { get; set; } = new();
+
+    /// <summary>
     /// Role(s) assigned to the bootstrap user seeded by /api/setup/seed-user.
     /// When empty (default), the role "superadmin" is used.
     /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.
     /// Override in appsettings to match the hosted app's role taxonomy, e.g. ["owner"] or ["admin", "authenticated"].
     /// </summary>
     public List<string> FirstUserRoles { get; set; } = [];
+}
+
+/// <summary>
+/// Key Vault secret names used by the bootstrap when persisting the created SSO app
+/// registration's details. Each is the SecretName portion of the Key Vault secret the
+/// setup flow writes (and, for the client secret, the SecretName the AUTH_SECRET app
+/// setting references). Defaults mirror CIPP's expected names.
+/// </summary>
+public class SsoSecretNames
+{
+    /// <summary>
+    /// KV secret name holding the EasyAuth client secret. This is what the AUTH_SECRET app
+    /// setting's Key Vault reference points at. Default "SSOAppSecret".
+    /// </summary>
+    public string AppSecret { get; set; } = "SSOAppSecret";
+
+    /// <summary>KV secret name holding the app (client) ID. Default "SSOAppId".</summary>
+    public string AppId { get; set; } = "SSOAppId";
+
+    /// <summary>KV secret name holding the multi-tenant flag ("true"/"false"). Default "SSOMultiTenant".</summary>
+    public string MultiTenant { get; set; } = "SSOMultiTenant";
 }
 
 /// <summary>
