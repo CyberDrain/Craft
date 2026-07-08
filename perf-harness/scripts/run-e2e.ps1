@@ -132,6 +132,29 @@ try {
     Add-Result 'security' 'csp-header' ([bool]$csp) '-' "CSP present"
   } catch { Add-Result 'security' 'csp-header' $false '-' $_.Exception.Message }
 
+  # ── Dev-mode principal injection ──────────────────────────────────────────────
+  # In local dev, Craft returns an injected dev principal from /.auth/me so the SPA boots without a
+  # login (in production EasyAuth serves it at the edge and this handler is shadowed). The main stack
+  # runs Production, so verify on a throwaway Development-mode container. /.auth/me is a C# endpoint, so
+  # it needs no PS pool or storage.
+  Info "dev-auth: launching a Development-mode container ..."
+  docker rm -f craft-e2e-devauth 2>&1 | Out-Null
+  docker run -d --name craft-e2e-devauth -p '5401:8080' `
+    -e ASPNETCORE_ENVIRONMENT=Development -e CRAFT_SERVE_API=true -e App__Setup__Enabled=false `
+    $SutImage 2>&1 | Out-Null
+  try {
+    $devBase = 'http://127.0.0.1:5401'
+    $me = $null; $dl = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $dl) {
+      $me = try { Invoke-RestMethod "$devBase/.auth/me" -TimeoutSec 5 } catch { $null }
+      if ($me -and $me.clientPrincipal) { break }
+      Start-Sleep -Seconds 2
+    }
+    $meOk = [bool]($me.clientPrincipal -and $me.clientPrincipal.userDetails)
+    Add-Result 'dev-auth' 'auth-me-dev-principal' $meOk '-' "Development /.auth/me -> userDetails=$($me.clientPrincipal.userDetails)"
+  }
+  finally { docker rm -f craft-e2e-devauth 2>&1 | Out-Null }
+
   # ── Frontend static serving ─────────────────────────────────────────────────
   # Two static HTML pages served correctly + fast, and a compressible asset served precompressed
   # (Content-Encoding: br) when the client accepts brotli, plus its identity content verified.
