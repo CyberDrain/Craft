@@ -1096,9 +1096,28 @@ app.Use(async (context, next) =>
 });
 
 // --- Auth endpoints ---
-// Login/logout/callback and /.auth/me are handled by the upstream App Service EasyAuth layer at the
-// platform edge; Craft maps none of them. It only transforms the injected x-ms-client-principal header
-// and authorizes via the allowedUsers table.
+// Login/logout/callback are handled by the upstream App Service EasyAuth layer at the platform edge;
+// Craft maps none of them. In production EasyAuth also serves /.auth/me at the edge, so the handler
+// below is shadowed — it only does anything in local development.
+
+// /.auth/me — dev convenience: in Development, return the injected dev principal so the SPA boots
+// without a login. In production EasyAuth serves this at the edge before it reaches here.
+app.MapGet("/.auth/me", (HttpContext context) =>
+{
+    // Dev mode: return dev principal without requiring login
+    if (app.Environment.IsDevelopment())
+    {
+        var devPrincipal = new
+        {
+            identityProvider = "aad",
+            userId = CraftSettings.Auth.DevUserId,
+            userDetails = CraftSettings.Auth.DevUserDetails,
+            userRoles = CraftSettings.Auth.DevRoles.ToArray()
+        };
+        return Results.Json(new { clientPrincipal = devPrincipal });
+    }
+    return Results.Json(new { clientPrincipal = (object?)null });
+});
 
 // /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
 // MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
