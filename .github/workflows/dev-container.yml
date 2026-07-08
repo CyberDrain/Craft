@@ -6,7 +6,6 @@ on:
     paths:
       - 'build/**'
       - 'docker/**'
-      - 'Properties/**'
       - 'Runtime/**'
       - 'Services/**'
       - 'appsettings.json'
