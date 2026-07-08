@@ -1,0 +1,13 @@
+# Adds a Caddy TLS-terminating reverse proxy in front of the SUT — like Cloudflare in production. Lets
+# the browser per-page test run over HTTPS so it gets the REAL behavior: brotli (browsers only request
+# br over https) and the production CSP (`default-src https:`) active. Caddy auto-generates an internal cert.
+services:
+  caddy:
+    image: caddy:2
+    container_name: craft-perf-caddy
+    depends_on: [sut]
+    networks: [perfnet]
+    ports:
+      - "5443:443"
+    volumes:
+      - ./pageload/Caddyfile:/etc/caddy/Caddyfile:ro

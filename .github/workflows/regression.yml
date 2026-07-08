@@ -1,0 +1,53 @@
+name: regression
+
+# Regression gate for the Azure-native branch. On PRs to main/dev and pushes to dev it (1) compiles the
+# AzureTables configuration and (2) runs the combined-role E2E suite (Azurite + orchestrator + scheduler
+# + realtime + API dispatch), failing if any subsystem check fails. Doc-only changes don't trigger it.
+on:
+  push:
+    branches: [dev]
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    branches: [main, dev]
+    paths-ignore:
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (AzureTables)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build — AzureTables
+        run: dotnet build Craft.csproj -c Release --nologo
+
+  e2e:
+    name: e2e (combined role, Azurite)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the AzureTables image the E2E stack runs (compose references it as craft:ci).
+      - name: Build image
+        run: docker build -f build/Dockerfile -t craft:ci .
+
+      # Brings up Azurite + the SUT (combined role), asserts every subsystem PASS/FAIL, and exits
+      # non-zero on any failure. pwsh, docker, and docker compose are preinstalled on ubuntu-latest.
+      - name: Run combined-role E2E suite
+        shell: pwsh
+        run: perf-harness/scripts/run-e2e.ps1 -SutImage craft:ci

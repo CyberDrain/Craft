@@ -2,7 +2,6 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using Azure.Data.Tables;
 
 namespace Craft.Services;
 
@@ -19,6 +18,7 @@ public class SetupService
 {
     private readonly ILogger<SetupService> _logger;
     private readonly CraftSettings _settings;
+    private readonly ICraftTableStore _store;
     private static readonly HttpClient s_httpClient;
 
     // Retry settings for policy propagation
@@ -43,10 +43,11 @@ public class SetupService
         s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Craft-Setup/1.0");
     }
 
-    public SetupService(ILogger<SetupService> logger, CraftSettings settings)
+    public SetupService(ILogger<SetupService> logger, CraftSettings settings, ICraftTableStore store)
     {
         _logger = logger;
         _settings = settings;
+        _store = store;
     }
 
     /// <summary>
@@ -763,15 +764,6 @@ public class SetupService
     // ── First User Seeding ──
 
     /// <summary>
-    /// Resolves the storage connection string for the allowedUsers table.
-    /// Same logic as AuthService — uses Auth.UserStorageConnection if set, then
-    /// AzureWebJobsStorage. Fails closed in production if neither is configured
-    /// (see <see cref="StorageSettings.ResolveConnection"/>).
-    /// </summary>
-    private string StorageConnectionString =>
-        _settings.Storage.ResolveConnection(_settings.Auth.UserStorageConnection, "first-user seeding");
-
-    /// <summary>
     /// Resolves the user table name with the same sanitization as AuthService.
     /// </summary>
     private string ResolveUserTableName()
@@ -792,13 +784,12 @@ public class SetupService
         try
         {
             var tableName = ResolveUserTableName();
-            var client = new TableClient(StorageConnectionString, tableName);
-            await client.CreateIfNotExistsAsync(cancellationToken: ct);
+            await _store.EnsureTableAsync(tableName, ct);
 
             var count = 0;
-            await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+            await foreach (var row in _store.QueryTableAsync(tableName, ct))
             {
-                if (!entity.RowKey.StartsWith("_"))
+                if (!row.RowKey.StartsWith("_"))
                 {
                     count++;
                     if (count > 0) break; // We only need to know if any exist
@@ -837,13 +828,12 @@ public class SetupService
         upn = upn.Trim().ToLower();
 
         var tableName = ResolveUserTableName();
-        var client = new TableClient(StorageConnectionString, tableName);
-        await client.CreateIfNotExistsAsync(cancellationToken: ct);
+        await _store.EnsureTableAsync(tableName, ct);
 
         // Guard: refuse if the table already has users
-        await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+        await foreach (var row in _store.QueryTableAsync(tableName, ct))
         {
-            if (!entity.RowKey.StartsWith("_"))
+            if (!row.RowKey.StartsWith("_"))
                 throw new InvalidOperationException("The allowed users table already contains users. First-user seeding is only available on an empty table.");
         }
 
@@ -852,15 +842,18 @@ public class SetupService
             : ["superadmin"];
         var rolesJson = JsonSerializer.Serialize(roles);
 
-        var userEntity = new TableEntity("User", upn)
+        var userRow = new StoreRow("User", upn)
         {
-            ["Roles"] = rolesJson,
-            ["ManualRoles"] = rolesJson,
-            ["AutoRoles"] = "[]",
-            ["Source"] = "Manual"
+            Properties =
+            {
+                ["Roles"] = rolesJson,
+                ["ManualRoles"] = rolesJson,
+                ["AutoRoles"] = "[]",
+                ["Source"] = "Manual"
+            }
         };
 
-        await client.UpsertEntityAsync(userEntity, TableUpdateMode.Replace, ct);
+        await _store.UpsertAsync(tableName, userRow, ct);
         _logger.LogInformation("[Setup] Seeded first user {Upn} with roles {Roles}", upn, string.Join(",", roles));
     }
 

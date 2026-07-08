@@ -1,0 +1,3 @@
+# Precompressed assets are binary — never apply text/EOL conversion.
+*.br binary
+*.gz binary
