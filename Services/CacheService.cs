@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -46,6 +47,7 @@ public class CacheService : IDisposable
 {
     private readonly ILogger<CacheService> _logger;
     private readonly CraftSettings _settings;
+    private readonly bool _enabled;
     private readonly string _cachePath;
     private readonly ConcurrentDictionary<string, CacheEntry> _index = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> _refreshingKeys = new(StringComparer.OrdinalIgnoreCase);
@@ -60,6 +62,12 @@ public class CacheService : IDisposable
     private readonly int _maxEntries;
     private readonly TimeSpan _defaultTtl;
 
+    // In-memory body tier: keep hot body strings in RAM so a hit skips the disk read. Budget in bytes;
+    // 0 = disabled (disk-only). _memBytes is the running total; _memLock serializes eviction.
+    private readonly long _maxMemoryBytes;
+    private long _memBytes;
+    private readonly object _memLock = new();
+
     // Per-endpoint TTL overrides (e.g. "ListTenants" -> 5 minutes)
     private readonly Dictionary<string, TimeSpan> _endpointTtls = new(StringComparer.OrdinalIgnoreCase);
 
@@ -72,15 +80,19 @@ public class CacheService : IDisposable
     /// <summary>Name of the query parameter that triggers full cache invalidation.</summary>
     public string InvalidateParam => _settings.Cache.InvalidateParam;
 
-    public CacheService(ILogger<CacheService> logger, CraftSettings settings)
+    /// <summary>Whether the cache is active. When false, all get/set/invalidate operations are no-ops.</summary>
+    public bool Enabled => _enabled;
+
+    public CacheService(ILogger<CacheService> logger, CraftSettings settings, bool enabled = true)
     {
         _logger = logger;
         _settings = settings;
+        _enabled = enabled;
         _cachePath = Path.Combine(AppContext.BaseDirectory, "_cache");
-        Directory.CreateDirectory(_cachePath);
 
         _maxEntries = settings.Cache.MaxEntries;
         _defaultTtl = TimeSpan.FromSeconds(settings.Cache.DefaultTtlSeconds);
+        _maxMemoryBytes = settings.Cache.MaxMemoryBytes;
 
         // Build excluded params set from config
         _excludedParams = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -93,6 +105,17 @@ public class CacheService : IDisposable
         {
             _endpointTtls[endpoint] = TimeSpan.FromSeconds(seconds);
         }
+
+        if (!_enabled)
+        {
+            // Disabled: no disk footprint, no orphan scan, no eviction timer. All operations short-circuit.
+            _logger.LogInformation("[Cache] Response cache disabled — serving all responses fresh (no _cache/).");
+            _evictionTimer = new Timer(_ => { }, null, Timeout.Infinite, Timeout.Infinite);
+            return;
+        }
+        _logger.LogWarning("[Cache] enabled; in-memory body tier budget = {Bytes} bytes", _maxMemoryBytes);
+
+        Directory.CreateDirectory(_cachePath);
 
         // Clean up orphan files from previous runs
         CleanupOrphanFiles();
@@ -171,6 +194,8 @@ public class CacheService : IDisposable
     /// </summary>
     public async Task<CachedResponse?> Get(string cacheKey, string endpoint)
     {
+        if (!_enabled)
+            return null;
         if (!_index.TryGetValue(cacheKey, out var entry))
             return null;
 
@@ -184,15 +209,32 @@ public class CacheService : IDisposable
             return null;
         }
 
+        // In-memory tier: if the body is resident, return it without touching disk (the hot path).
+        var memBody = entry.Body;
+        if (memBody != null)
+        {
+            if (CacheProfiler.Enabled) CacheProfiler.RecordMemHit();
+            return new CachedResponse
+            {
+                Result = new ScriptResult { StatusCode = entry.StatusCode, Body = memBody },
+                CachedAt = entry.CachedAt,
+                IsStale = age > ttl,
+                Age = age,
+                Ttl = ttl
+            };
+        }
+
         try
         {
-            if (!File.Exists(entry.FilePath))
-            {
-                _index.TryRemove(cacheKey, out _);
-                return null;
-            }
-
+            // Not resident — read from disk. No File.Exists pre-check: the read itself surfaces a missing
+            // file via the catch below, so we save a redundant stat syscall on every disk-tier hit.
+            var diskStart = CacheProfiler.Enabled ? Stopwatch.GetTimestamp() : 0;
             var body = await File.ReadAllTextAsync(entry.FilePath);
+            if (CacheProfiler.Enabled) CacheProfiler.RecordGetDisk(Stopwatch.GetTimestamp() - diskStart);
+
+            // Promote into the memory tier so subsequent hits skip the disk.
+            StoreBody(entry, body);
+
             return new CachedResponse
             {
                 Result = new ScriptResult { StatusCode = entry.StatusCode, Body = body },
@@ -204,8 +246,48 @@ public class CacheService : IDisposable
         }
         catch
         {
-            _index.TryRemove(cacheKey, out _);
+            Remove(cacheKey);
             return null;
+        }
+    }
+
+    /// <summary>Charge a body to the in-memory tier (idempotent per entry), evicting LRU bodies if over budget.</summary>
+    private void StoreBody(CacheEntry entry, string body)
+    {
+        if (_maxMemoryBytes <= 0) return;
+        var bytes = body.Length * 2;              // ~UTF-16 in-memory size
+        var old = entry.BodyBytes;
+        entry.Body = body;
+        entry.BodyBytes = bytes;
+        Interlocked.Add(ref _memBytes, bytes - old);
+        if (Interlocked.Read(ref _memBytes) > _maxMemoryBytes) EvictMemLru();
+    }
+
+    /// <summary>Drop an entry's in-memory body and reclaim its budget (index entry + disk file are untouched).</summary>
+    private void ForgetBody(CacheEntry? entry)
+    {
+        if (entry == null) return;
+        var b = entry.BodyBytes;
+        if (entry.Body != null)
+        {
+            entry.Body = null;
+            entry.BodyBytes = 0;
+            Interlocked.Add(ref _memBytes, -b);
+        }
+    }
+
+    /// <summary>Evict least-recently-used resident bodies until the memory budget is satisfied.</summary>
+    private void EvictMemLru()
+    {
+        lock (_memLock)
+        {
+            if (Interlocked.Read(ref _memBytes) <= _maxMemoryBytes) return;
+            var victims = _index.Values.Where(e => e.Body != null).OrderBy(e => e.LastAccessedAt).ToList();
+            foreach (var v in victims)
+            {
+                if (Interlocked.Read(ref _memBytes) <= _maxMemoryBytes) break;
+                ForgetBody(v);
+            }
         }
     }
 
@@ -215,6 +297,9 @@ public class CacheService : IDisposable
     /// </summary>
     public async Task Set(string cacheKey, ScriptResult result)
     {
+        if (!_enabled)
+            return;
+        var setStart = CacheProfiler.Enabled ? Stopwatch.GetTimestamp() : 0;
         try
         {
             // Evict if at capacity before adding
@@ -229,13 +314,19 @@ public class CacheService : IDisposable
 
             await File.WriteAllTextAsync(filePath, result.Body);
 
-            _index[cacheKey] = new CacheEntry
+            var entry = new CacheEntry
             {
                 StatusCode = result.StatusCode,
                 CachedAt = DateTime.UtcNow,
                 LastAccessedAt = DateTime.UtcNow,
                 FilePath = filePath
             };
+            // Populate the in-memory body BEFORE publishing the entry, so any concurrent Get that sees the
+            // new entry always sees its body (the stale-while-revalidate refresh republishes constantly —
+            // publishing a body-less entry first would make those Gets fall through to a disk read).
+            StoreBody(entry, result.Body);
+            _index[cacheKey] = entry;
+            if (CacheProfiler.Enabled) CacheProfiler.RecordSet(Stopwatch.GetTimestamp() - setStart);
         }
         catch (Exception ex)
         {
@@ -250,6 +341,7 @@ public class CacheService : IDisposable
     {
         if (_index.TryRemove(cacheKey, out var entry))
         {
+            ForgetBody(entry);
             TryDeleteFile(entry.FilePath);
         }
     }
@@ -268,6 +360,7 @@ public class CacheService : IDisposable
             {
                 if (_index.TryRemove(key, out var entry))
                 {
+                    ForgetBody(entry);
                     TryDeleteFile(entry.FilePath);
                     count++;
                 }
@@ -295,6 +388,7 @@ public class CacheService : IDisposable
             {
                 if (_index.TryRemove(key, out var entry))
                 {
+                    ForgetBody(entry);
                     TryDeleteFile(entry.FilePath);
                     count++;
                 }
@@ -318,6 +412,7 @@ public class CacheService : IDisposable
         }
         _index.Clear();
         _refreshingKeys.Clear();
+        Interlocked.Exchange(ref _memBytes, 0);   // all bodies dropped with the index
         _logger.LogInformation("All response caches invalidated ({Count} entries)", count);
     }
 
@@ -414,6 +509,7 @@ public class CacheService : IDisposable
             {
                 if (_index.TryRemove(kvp.Key, out var entry))
                 {
+                    ForgetBody(entry);
                     TryDeleteFile(entry.FilePath);
                     evicted++;
                 }
@@ -436,6 +532,7 @@ public class CacheService : IDisposable
         {
             if (_index.TryRemove(key, out var entry))
             {
+                ForgetBody(entry);
                 TryDeleteFile(entry.FilePath);
             }
         }
@@ -492,7 +589,8 @@ public class CacheStats
 }
 
 /// <summary>
-/// Lightweight in-memory index entry — no JSON body, just metadata + file path.
+/// In-memory index entry: metadata + file path, plus an optional in-memory copy of the body (the LRU
+/// memory tier). When <see cref="Body"/> is non-null a cache Get returns it without touching disk.
 /// </summary>
 public class CacheEntry
 {
@@ -500,6 +598,11 @@ public class CacheEntry
     public DateTime CachedAt { get; set; }
     public DateTime LastAccessedAt { get; set; }
     public required string FilePath { get; set; }
+
+    /// <summary>In-memory copy of the body (null = not resident; read from FilePath). Guarded by the mem tier.</summary>
+    public volatile string? Body;
+    /// <summary>Approx bytes charged to the memory budget for <see cref="Body"/> (chars × 2).</summary>
+    public int BodyBytes;
 }
 
 /// <summary>

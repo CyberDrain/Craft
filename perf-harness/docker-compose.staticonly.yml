@@ -1,0 +1,15 @@
+# Override: "frontend-only" mode via the Frontend deployment role. With only CRAFT_SERVE_FRONTEND set, the
+# PowerShell worker pool, scheduler, job manager and all background hosted services are disabled, so the host
+# boots instantly and serves only static web content. Unmatched /api, /.auth, /login paths fall through to
+# static serving and then MapFallback (404 for /api|/.auth) — CRAFT no longer intercepts them.
+#
+# Usage:  pwsh scripts\run.ps1 -StaticOnly -Label frontend-only
+#
+# NOTE: the canned dev-principal shim (formerly CRAFT_STATIC_ONLY_DEVAUTH) has been removed from CRAFT. A
+# frontend-only host does not synthesize /.auth/me or /api/me. If a browser page-load test needs a principal,
+# ship those as static JSON files in the frontend image (e.g. Frontend/api/me) — the static host serves them
+# directly, exactly as it would any other asset.
+services:
+  sut:
+    environment:
+      - CRAFT_SERVE_FRONTEND=true

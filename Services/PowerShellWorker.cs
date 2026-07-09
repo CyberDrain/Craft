@@ -41,6 +41,12 @@ public class PowerShellWorker : IDisposable
     {
         if (_initialized) return;
 
+        // Reuse one pipeline thread across invocations instead of spinning a new thread per BeginInvoke
+        // (measured ~50% of the PS-invoke cost). Must be set before the runspace opens — GetGlobalVariables()
+        // below is the first SessionStateProxy access, which opens it. On by default; see docs/dispatch-analysis.md.
+        if (settings.Worker.ReuseRunspaceThread)
+            _pwsh.Runspace.ThreadOptions = PSThreadOptions.ReuseThread;
+
         // Capture built-in globals for cleanup (once, thread-safe)
         if (s_builtinGlobalVars == null)
         {
@@ -203,14 +209,19 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     /// Async invoke — does not block a ThreadPool thread during PS execution.
     /// Includes post-invocation cleanup matching Azure Functions' ResetRunspace.
     /// When a cancellation token is provided and fires, the PowerShell pipeline is
-    /// stopped via <see cref="PowerShell.Stop"/> and an <see cref="OperationCanceledException"/> is thrown.
+    /// stopped via <see cref="PowerShell.Stop"/>. The resulting <c>PipelineStoppedException</c>
+    /// is normalized to an <see cref="OperationCanceledException"/> so timeout callers can
+    /// distinguish a cancelled request from a genuine script failure.
     /// </summary>
     public async Task<Collection<PSObject>> InvokeAsync(string functionName, Dictionary<string, object?> parameters,
         CancellationToken ct = default)
     {
         CancellationTokenRegistration? registration = null;
+        var prof = DispatchProfiler.Enabled;
+        long buildTicks = 0, runTicks = 0, copyTicks = 0;
         try
         {
+            var bStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             _pwsh.AddCommand(functionName);
             foreach (var p in parameters)
                 _pwsh.AddParameter(p.Key, p.Value);
@@ -218,17 +229,33 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             // Register cancellation callback to stop the PS pipeline
             if (ct.CanBeCanceled)
                 registration = ct.Register(() => _pwsh.Stop());
+            if (prof) buildTicks = System.Diagnostics.Stopwatch.GetTimestamp() - bStart;
 
+            var rStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var asyncResult = _pwsh.BeginInvoke();
             var results = await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
-
             ct.ThrowIfCancellationRequested();
-            return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+            if (prof) runTicks = System.Diagnostics.Stopwatch.GetTimestamp() - rStart;
+
+            var cpStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var coll = new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+            if (prof) copyTicks = System.Diagnostics.Stopwatch.GetTimestamp() - cpStart;
+            return coll;
+        }
+        catch (PipelineStoppedException) when (ct.IsCancellationRequested)
+        {
+            // ct.Register(_pwsh.Stop) stopped the pipeline mid-invoke, so EndInvoke threw
+            // PipelineStoppedException rather than reaching ThrowIfCancellationRequested below.
+            // Normalize to OperationCanceledException so timeout callers return 504, not 500.
+            throw new OperationCanceledException(ct);
         }
         finally
         {
             registration?.Dispose();
+            var cStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             Cleanup();
+            if (prof) DispatchProfiler.RecordInvokeDetail(buildTicks, runTicks, copyTicks,
+                System.Diagnostics.Stopwatch.GetTimestamp() - cStart);
         }
     }
 
@@ -254,6 +281,12 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
 
             ct.ThrowIfCancellationRequested();
             return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+        }
+        catch (PipelineStoppedException) when (ct.IsCancellationRequested)
+        {
+            // See InvokeAsync: a cancellation-triggered _pwsh.Stop() surfaces as
+            // PipelineStoppedException; normalize it to OperationCanceledException.
+            throw new OperationCanceledException(ct);
         }
         finally
         {

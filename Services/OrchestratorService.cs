@@ -205,6 +205,7 @@ public class OrchestratorService
     private readonly BackgroundTaskLimiter _limiter;
     private readonly JobManager _jobManager;
     private readonly OrchestratorTableStore _store;
+    private readonly OrchestratorStatusWriter _writer;
     private readonly CraftSettings _settings;
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<string, bool> _activePlanners = new();
@@ -244,6 +245,7 @@ public class OrchestratorService
         BackgroundTaskLimiter limiter,
         JobManager jobManager,
         OrchestratorTableStore store,
+        OrchestratorStatusWriter writer,
         CraftSettings settings)
     {
         _logger = logger;
@@ -251,6 +253,7 @@ public class OrchestratorService
         _limiter = limiter;
         _jobManager = jobManager;
         _store = store;
+        _writer = writer;
         _settings = settings;
     }
 
@@ -615,8 +618,9 @@ public class OrchestratorService
                 {
                     task.Status = "Running";
                 }
-                // Pre-script "Running" write is awaited — it's the durability marker for crash recovery.
-                await _store.UpsertTaskAsync(run.Name, task);
+                // Pre-script "Running" write is awaited — the durability marker for crash recovery. Batched
+                // across concurrently-starting tasks by the status writer, but still durable before the invoke.
+                await _writer.MarkRunningAsync(run.Name, task);
 
                 try
                 {
@@ -687,14 +691,10 @@ public class OrchestratorService
     /// </summary>
     private void PersistTaskAndRunAsync(OrchestratorRun run, OrchestratorTaskItem task)
     {
-        _ = Task.Run(async () =>
-        {
-            try { await _store.UpsertTaskAsync(run.Name, task); }
-            catch (Exception ex) { _logger.LogWarning(ex, "[Scheduler] Background UpsertTask failed for {Run}/{Task}", run.Name, task.Id); }
-
-            try { await _store.UpsertRunAsync(run); }
-            catch (Exception ex) { _logger.LogWarning(ex, "[Scheduler] Background UpsertRun failed for {Run}", run.Name); }
-        });
+        // Non-blocking: the status writer coalesces these terminal task/run writes and flushes them in batches
+        // (guaranteed flushed before the run finalizes). Previously two individual fire-and-forget writes.
+        _writer.QueueTask(run.Name, task);
+        _writer.QueueRun(run);
     }
 
     private void LogRunStatus(OrchestratorRun run)
@@ -775,7 +775,10 @@ public class OrchestratorService
         if (!string.IsNullOrEmpty(run.PostExecFunctionName))
             run.PostExecStatus = "Pending";
 
-        await _store.UpsertRunAsync(run);
+        // Flush-before-finalize: queue the run's final status, then await a full drain so every task's terminal
+        // state + this run status are durable BEFORE we declare the run done and dispatch PostExecution.
+        _writer.QueueRun(run);
+        await _writer.FlushAsync();
 
         _activeRuns.TryRemove(run.Name, out _);
         _cancelledRuns.TryRemove(run.Name, out _);

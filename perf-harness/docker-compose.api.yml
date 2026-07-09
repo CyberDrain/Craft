@@ -1,0 +1,55 @@
+# HTTP-only API perf harness — CRAFT in the Http deployment role, serving synthetic PowerShell endpoints.
+#
+# Same CRAFT image as every other deployment (default craft:local — build once with
+#   docker build -f build/Dockerfile -t craft:local .
+# or point SUT_IMAGE at any CRAFT image). http-only mode is selected purely by the env vars below;
+# the test endpoints are provided by mounting the PerfApi module into the image's (empty) /app/API.
+# Nothing here is baked into a special image.
+name: craft-perf-api
+
+services:
+  sut:
+    image: ${SUT_IMAGE:-craft:local}
+    platform: linux/amd64
+    container_name: craft-perf-api-sut
+    # Pin CPU for consistent, SKU-representative results (default 2 vCPU). .NET honors the cgroup quota.
+    cpus: ${SUT_CPUS:-2}
+    ports:
+      - "${SUT_PORT:-5297}:8080"
+    volumes:
+      # Overlay the synthetic API module onto the base image's empty /app/API. Read-only; live-editable.
+      - ./api-harness/API:/app/API:ro
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      # Deployment role: Http (+ optionally Frontend for frontend+http cache/auth profiling — run-cache.ps1).
+      - CRAFT_SERVE_API=true
+      - CRAFT_SERVE_FRONTEND=${SERVE_FRONTEND:-}
+      # Opt-in cache/auth-middleware profiling (run-cache.ps1). Off => zero overhead.
+      - CRAFT_CACHE_TIMING=${CACHE_TIMING:-}
+      # In-memory cache body tier budget (bytes). run-cache.ps1 -DiskOnly sets 0 to A/B the disk-only "before".
+      # Must be a valid long (the config binder rejects empty) — defaults to 64 MiB.
+      - App__Cache__MaxMemoryBytes=${CACHE_MEM_BYTES:-67108864}
+      # Route discovery: expose the PerfApi module's functions as /API/{name}. No HttpHandler => direct
+      # dispatch to Invoke-{name} with no auth gate — the clean path we want to measure.
+      - App__Scripts__HttpModules__0=PerfApi
+      # Concurrency lever: number of HTTP PowerShell runspaces. Vary with run-api.ps1 -Pool.
+      - App__Worker__HttpPoolSize=${POOL:-2}
+      - App__Worker__IgnoreSkuProfiles=true
+      # Determinism: Kestrel up immediately; we poll /healthz. No setup wizard, quiet logs.
+      - App__ReadinessMode=Immediate
+      - App__Setup__Enabled=false
+      - CRAFT_LOG_LEVEL=Warning
+      - Logging__LogLevel__Default=Warning
+      # Opt-in per-segment dispatch timing (run-api.ps1 -DispatchTiming). The profiler's windowed report
+      # logs at Warning level so it surfaces without turning on Info spam. Off => zero overhead.
+      - CRAFT_DISPATCH_TIMING=${DISPATCH_TIMING:-}
+      # Reused pipeline thread is the production default (on). run-api.ps1 -NoReuseThread sets this false to
+      # A/B the before/after. Must always be a valid bool — the config binder rejects an empty string — so
+      # this defaults to true when unset/blank.
+      - App__Worker__ReuseRunspaceThread=${REUSE_THREAD:-true}
+    networks: [perfapinet]
+
+networks:
+  perfapinet:
+    name: craft-perf-apinet

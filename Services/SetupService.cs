@@ -2,7 +2,6 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using Azure.Data.Tables;
 
 namespace Craft.Services;
 
@@ -19,6 +18,7 @@ public class SetupService
 {
     private readonly ILogger<SetupService> _logger;
     private readonly CraftSettings _settings;
+    private readonly ICraftTableStore _store;
     private static readonly HttpClient s_httpClient;
 
     // Retry settings for policy propagation
@@ -43,10 +43,11 @@ public class SetupService
         s_httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Craft-Setup/1.0");
     }
 
-    public SetupService(ILogger<SetupService> logger, CraftSettings settings)
+    public SetupService(ILogger<SetupService> logger, CraftSettings settings, ICraftTableStore store)
     {
         _logger = logger;
         _settings = settings;
+        _store = store;
     }
 
     /// <summary>
@@ -483,17 +484,26 @@ public class SetupService
             if (kvName.Equals("auto", StringComparison.OrdinalIgnoreCase))
                 kvName = siteName;
 
-            // Store secret in Key Vault via REST API
+            // Store secrets in Key Vault via REST API
             var vaultToken = await GetManagedIdentityToken("https://vault.azure.net", ct)
                 ?? throw new InvalidOperationException("Cannot get Key Vault token — ensure the managed identity has Secret Set permission on the vault");
 
-            var kvSecretUrl = $"https://{kvName}.vault.azure.net/secrets/AUTH-SECRET?api-version=7.4";
-            var kvBody = new { value = clientSecret };
-            await KeyVaultRequest(HttpMethod.Put, kvSecretUrl, vaultToken, kvBody, ct);
+            // Secret names are configurable (App:Setup:SsoSecretNames), defaulting to the
+            // names CIPP expects: SSOAppSecret / SSOAppId / SSOMultiTenant.
+            var secretNames = _settings.Setup.SsoSecretNames;
 
-            // Set app setting as a KV reference
-            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName=AUTH-SECRET)";
-            _logger.LogInformation("[Setup] Client secret stored in Key Vault '{VaultName}', app setting set as KV reference", kvName);
+            // Client secret — this is what the AUTH_SECRET app setting references.
+            await PutKeyVaultSecret(kvName, secretNames.AppSecret, clientSecret, vaultToken, ct);
+            mergedSettings["AUTH_SECRET"] = $"@Microsoft.KeyVault(VaultName={kvName};SecretName={secretNames.AppSecret})";
+
+            // App (client) ID and multi-tenant flag — persisted so the downstream app can read
+            // its own SSO credentials from the same vault.
+            await PutKeyVaultSecret(kvName, secretNames.AppId, appId, vaultToken, ct);
+            await PutKeyVaultSecret(kvName, secretNames.MultiTenant, multiTenant ? "true" : "false", vaultToken, ct);
+
+            _logger.LogInformation(
+                "[Setup] SSO app details stored in Key Vault '{VaultName}' (secrets '{AppSecret}', '{AppId}', '{MultiTenant}'); AUTH_SECRET set as KV reference",
+                kvName, secretNames.AppSecret, secretNames.AppId, secretNames.MultiTenant);
         }
         else
         {
@@ -754,17 +764,6 @@ public class SetupService
     // ── First User Seeding ──
 
     /// <summary>
-    /// Resolves the storage connection string for the allowedUsers table.
-    /// Same logic as AuthService — uses Auth.UserStorageConnection if set,
-    /// falls back to AzureWebJobsStorage, then dev storage.
-    /// </summary>
-    private string StorageConnectionString =>
-        (!string.IsNullOrEmpty(_settings.Auth.UserStorageConnection)
-            ? _settings.Auth.UserStorageConnection
-            : Environment.GetEnvironmentVariable("AzureWebJobsStorage"))
-        ?? "UseDevelopmentStorage=true";
-
-    /// <summary>
     /// Resolves the user table name with the same sanitization as AuthService.
     /// </summary>
     private string ResolveUserTableName()
@@ -785,13 +784,12 @@ public class SetupService
         try
         {
             var tableName = ResolveUserTableName();
-            var client = new TableClient(StorageConnectionString, tableName);
-            await client.CreateIfNotExistsAsync(cancellationToken: ct);
+            await _store.EnsureTableAsync(tableName, ct);
 
             var count = 0;
-            await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+            await foreach (var row in _store.QueryTableAsync(tableName, ct))
             {
-                if (!entity.RowKey.StartsWith("_"))
+                if (!row.RowKey.StartsWith("_"))
                 {
                     count++;
                     if (count > 0) break; // We only need to know if any exist
@@ -830,13 +828,12 @@ public class SetupService
         upn = upn.Trim().ToLower();
 
         var tableName = ResolveUserTableName();
-        var client = new TableClient(StorageConnectionString, tableName);
-        await client.CreateIfNotExistsAsync(cancellationToken: ct);
+        await _store.EnsureTableAsync(tableName, ct);
 
         // Guard: refuse if the table already has users
-        await foreach (var entity in client.QueryAsync<TableEntity>(cancellationToken: ct))
+        await foreach (var row in _store.QueryTableAsync(tableName, ct))
         {
-            if (!entity.RowKey.StartsWith("_"))
+            if (!row.RowKey.StartsWith("_"))
                 throw new InvalidOperationException("The allowed users table already contains users. First-user seeding is only available on an empty table.");
         }
 
@@ -845,15 +842,18 @@ public class SetupService
             : ["superadmin"];
         var rolesJson = JsonSerializer.Serialize(roles);
 
-        var userEntity = new TableEntity("User", upn)
+        var userRow = new StoreRow("User", upn)
         {
-            ["Roles"] = rolesJson,
-            ["ManualRoles"] = rolesJson,
-            ["AutoRoles"] = "[]",
-            ["Source"] = "Manual"
+            Properties =
+            {
+                ["Roles"] = rolesJson,
+                ["ManualRoles"] = rolesJson,
+                ["AutoRoles"] = "[]",
+                ["Source"] = "Manual"
+            }
         };
 
-        await client.UpsertEntityAsync(userEntity, TableUpdateMode.Replace, ct);
+        await _store.UpsertAsync(tableName, userRow, ct);
         _logger.LogInformation("[Setup] Seeded first user {Upn} with roles {Roles}", upn, string.Join(",", roles));
     }
 
@@ -1132,6 +1132,16 @@ public class SetupService
 
         using var doc = JsonDocument.Parse(responseBody);
         return doc.RootElement.Clone();
+    }
+
+    /// <summary>
+    /// Sets (creates or updates) a single Key Vault secret via the vault's REST API.
+    /// </summary>
+    private Task PutKeyVaultSecret(
+        string vaultName, string secretName, string value, string vaultToken, CancellationToken ct)
+    {
+        var url = $"https://{vaultName}.vault.azure.net/secrets/{secretName}?api-version=7.4";
+        return KeyVaultRequest(HttpMethod.Put, url, vaultToken, new { value }, ct);
     }
 
     private async Task KeyVaultRequest(

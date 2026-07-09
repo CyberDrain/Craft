@@ -1,21 +1,24 @@
 using System.Text;
 using System.Text.Json;
-using Azure;
-using Azure.Data.Tables;
 
 namespace Craft.Services;
 
+/// <summary>An immutable snapshot of a task's status for the coalescing batched writer.</summary>
+public record TaskStatusWrite(string RunName, string TaskId, string Status, string? ParametersJson,
+    int AttemptCount, string? LastError, DateTime? CompletedUtc);
+
 /// <summary>
-/// Typed CRUD wrapper around Azure Table Storage for orchestrator persistence.
-/// Manages three tables: CippOrchestratorRuns, CippOrchestratorTasks, CippOrchestratorResults.
-/// Replaces the local-file SaveRun/LoadRun and in-memory OrchestrationResults.
+/// Typed CRUD wrapper over <see cref="ICraftTableStore"/> for orchestrator persistence. Manages three
+/// logical tables: {prefix}Runs, {prefix}Tasks, {prefix}Results. Persists through the
+/// <see cref="ICraftTableStore"/> abstraction.
 /// </summary>
 public class OrchestratorTableStore
 {
     private readonly ILogger<OrchestratorTableStore> _logger;
-    private readonly TableClient _runsTable;
-    private readonly TableClient _tasksTable;
-    private readonly TableClient _resultsTable;
+    private readonly ICraftTableStore _store;
+    private readonly string _runsTable;
+    private readonly string _tasksTable;
+    private readonly string _resultsTable;
     private bool _initialized;
 
     private static readonly JsonSerializerOptions s_jsonOptions = new()
@@ -24,137 +27,133 @@ public class OrchestratorTableStore
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    public OrchestratorTableStore(ILogger<OrchestratorTableStore> logger, CraftSettings settings)
+    public OrchestratorTableStore(ILogger<OrchestratorTableStore> logger, CraftSettings settings, ICraftTableStore store)
     {
         _logger = logger;
-        var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage")
-                               ?? "UseDevelopmentStorage=true";
-
+        _store = store;
         var prefix = settings.Orchestrator.TablePrefix;
-        _runsTable = new TableClient(connectionString, $"{prefix}Runs");
-        _tasksTable = new TableClient(connectionString, $"{prefix}Tasks");
-        _resultsTable = new TableClient(connectionString, $"{prefix}Results");
+        _runsTable = $"{prefix}Runs";
+        _tasksTable = $"{prefix}Tasks";
+        _resultsTable = $"{prefix}Results";
     }
 
-    /// <summary>
-    /// Create the three tables if they do not exist. Called once on startup.
-    /// </summary>
+    /// <summary>Create the three tables if they do not exist. Called once on startup.</summary>
     public async Task InitializeAsync()
     {
         if (_initialized) return;
 
-        await _runsTable.CreateIfNotExistsAsync();
-        await _tasksTable.CreateIfNotExistsAsync();
-        await _resultsTable.CreateIfNotExistsAsync();
+        await _store.EnsureTableAsync(_runsTable);
+        await _store.EnsureTableAsync(_tasksTable);
+        await _store.EnsureTableAsync(_resultsTable);
         _initialized = true;
 
         _logger.LogInformation("[OrchestratorStore] Tables initialized");
     }
 
-    /// <summary>
-    /// Upsert run metadata (without tasks — tasks are separate rows).
-    /// </summary>
+    /// <summary>Upsert run metadata (without tasks — tasks are separate rows).</summary>
     public async Task UpsertRunAsync(OrchestratorRun run)
     {
-        var entity = new TableEntity("Run", run.Name)
+        var row = new StoreRow("Run", run.Name)
         {
-            ["Status"] = run.Status,
-            ["Priority"] = run.Priority,
-            ["StartedUtc"] = run.StartedUtc,
-            ["CompletedUtc"] = run.CompletedUtc,
-            ["TaskScriptName"] = run.TaskScriptName,
-            ["PostExecFunctionName"] = run.PostExecFunctionName,
-            ["PostExecParametersJson"] = run.PostExecParametersJson,
-            ["PostExecStatus"] = run.PostExecStatus,
-            ["TaskCount"] = run.Tasks.Count
+            Properties =
+            {
+                ["Status"] = run.Status,
+                ["Priority"] = run.Priority,
+                ["StartedUtc"] = run.StartedUtc,
+                ["CompletedUtc"] = run.CompletedUtc,
+                ["TaskScriptName"] = run.TaskScriptName,
+                ["PostExecFunctionName"] = run.PostExecFunctionName,
+                ["PostExecParametersJson"] = run.PostExecParametersJson,
+                ["PostExecStatus"] = run.PostExecStatus,
+                ["TaskCount"] = run.Tasks.Count
+            }
         };
 
-        await _runsTable.UpsertEntityAsync(entity, TableUpdateMode.Replace);
+        await _store.UpsertAsync(_runsTable, row);
     }
 
-    /// <summary>
-    /// Load a run and all its tasks from both tables.
-    /// Returns null if the run does not exist.
-    /// </summary>
+    /// <summary>Load a run and all its tasks. Returns null if the run does not exist.</summary>
     public async Task<OrchestratorRun?> GetRunAsync(string name)
     {
-        try
+        var runRow = await _store.GetAsync(_runsTable, "Run", name);
+        if (runRow == null) return null;
+
+        var run = new OrchestratorRun
         {
-            var response = await _runsTable.GetEntityAsync<TableEntity>("Run", name);
-            var entity = response.Value;
+            Name = name,
+            Status = runRow.GetString("Status") ?? "Pending",
+            Priority = runRow.GetInt32("Priority") ?? 2,
+            StartedUtc = runRow.GetDateTimeOffset("StartedUtc")?.UtcDateTime ?? DateTime.UtcNow,
+            CompletedUtc = runRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime,
+            TaskScriptName = runRow.GetString("TaskScriptName"),
+            PostExecFunctionName = runRow.GetString("PostExecFunctionName"),
+            PostExecParametersJson = runRow.GetString("PostExecParametersJson"),
+            PostExecStatus = runRow.GetString("PostExecStatus")
+        };
 
-            var run = new OrchestratorRun
+        var tasks = new List<OrchestratorTaskItem>();
+        await foreach (var taskRow in _store.QueryPartitionAsync(_tasksTable, name))
+        {
+            var parametersJson = taskRow.GetString("ParametersJson");
+            Dictionary<string, object> parameters;
+            try
             {
-                Name = name,
-                Status = entity.GetString("Status") ?? "Pending",
-                Priority = entity.GetInt32("Priority") ?? 2,
-                StartedUtc = entity.GetDateTimeOffset("StartedUtc")?.UtcDateTime ?? DateTime.UtcNow,
-                CompletedUtc = entity.GetDateTimeOffset("CompletedUtc")?.UtcDateTime,
-                TaskScriptName = entity.GetString("TaskScriptName"),
-                PostExecFunctionName = entity.GetString("PostExecFunctionName"),
-                PostExecParametersJson = entity.GetString("PostExecParametersJson"),
-                PostExecStatus = entity.GetString("PostExecStatus")
-            };
-
-            // Load tasks
-            var tasks = new List<OrchestratorTaskItem>();
-            await foreach (var taskEntity in _tasksTable.QueryAsync<TableEntity>(
-                filter: $"PartitionKey eq '{EscapeFilter(name)}'"))
+                parameters = !string.IsNullOrEmpty(parametersJson)
+                    ? JsonSerializer.Deserialize<Dictionary<string, object>>(parametersJson, s_jsonOptions) ?? []
+                    : [];
+            }
+            catch
             {
-                var parametersJson = taskEntity.GetString("ParametersJson");
-                Dictionary<string, object> parameters;
-                try
-                {
-                    parameters = !string.IsNullOrEmpty(parametersJson)
-                        ? JsonSerializer.Deserialize<Dictionary<string, object>>(parametersJson, s_jsonOptions) ?? []
-                        : [];
-                }
-                catch
-                {
-                    parameters = [];
-                }
-
-                tasks.Add(new OrchestratorTaskItem
-                {
-                    Id = taskEntity.RowKey,
-                    Status = taskEntity.GetString("Status") ?? "Pending",
-                    Parameters = parameters,
-                    AttemptCount = taskEntity.GetInt32("AttemptCount") ?? 0,
-                    LastError = taskEntity.GetString("LastError"),
-                    CompletedUtc = taskEntity.GetDateTimeOffset("CompletedUtc")?.UtcDateTime
-                });
+                parameters = [];
             }
 
-            run.Tasks = tasks;
-            return run;
+            tasks.Add(new OrchestratorTaskItem
+            {
+                Id = taskRow.RowKey,
+                Status = taskRow.GetString("Status") ?? "Pending",
+                Parameters = parameters,
+                AttemptCount = taskRow.GetInt32("AttemptCount") ?? 0,
+                LastError = taskRow.GetString("LastError"),
+                CompletedUtc = taskRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime
+            });
         }
-        catch (RequestFailedException ex) when (ex.Status == 404)
-        {
-            return null;
-        }
+
+        run.Tasks = tasks;
+        return run;
     }
 
-    /// <summary>
-    /// List all known run names.
-    /// </summary>
+    /// <summary>List all known run names.</summary>
     public async Task<List<string>> ListRunsAsync()
     {
         var names = new List<string>();
-        await foreach (var entity in _runsTable.QueryAsync<TableEntity>(
-            filter: "PartitionKey eq 'Run'",
-            select: new[] { "RowKey" }))
-        {
-            names.Add(entity.RowKey);
-        }
+        await foreach (var row in _store.QueryPartitionAsync(_runsTable, "Run"))
+            names.Add(row.RowKey);
         return names;
     }
 
+    /// <summary>Upsert a single task row.</summary>
+    public Task UpsertTaskAsync(string runName, OrchestratorTaskItem task) =>
+        _store.UpsertAsync(_tasksTable, BuildTaskRow(runName, task));
+
+    /// <summary>Batch upsert all tasks for a run (used at run creation).</summary>
+    public Task UpsertTaskBatchAsync(string runName, List<OrchestratorTaskItem> tasks) =>
+        _store.UpsertBatchAsync(_tasksTable, runName, tasks.Select(t => BuildTaskRow(runName, t)).ToList());
+
     /// <summary>
-    /// Upsert a single task row.
+    /// Write a set of coalesced task-status transitions. Rows are grouped by run (partition) and handed
+    /// to the store, which applies each group as atomically as the backend allows and chunks to any
+    /// per-request limits. Used by the batched status writer; the large-result path
+    /// (<see cref="StoreResultAsync"/>) is untouched.
     /// </summary>
-    public async Task UpsertTaskAsync(string runName, OrchestratorTaskItem task)
+    public async Task WriteTaskStatusBatchAsync(IReadOnlyList<TaskStatusWrite> writes)
     {
-        var entity = new TableEntity(runName, task.Id)
+        foreach (var group in writes.GroupBy(w => w.RunName))
+            await _store.UpsertBatchAsync(_tasksTable, group.Key, group.Select(BuildTaskRow).ToList());
+    }
+
+    private static StoreRow BuildTaskRow(string runName, OrchestratorTaskItem task) => new(runName, task.Id)
+    {
+        Properties =
         {
             ["Status"] = task.Status,
             ["ParametersJson"] = JsonSerializer.Serialize(task.Parameters, s_jsonOptions),
@@ -163,199 +162,111 @@ public class OrchestratorTableStore
             ["CompletedUtc"] = task.CompletedUtc.HasValue
                 ? new DateTimeOffset(task.CompletedUtc.Value, TimeSpan.Zero)
                 : (DateTimeOffset?)null
-        };
-
-        await _tasksTable.UpsertEntityAsync(entity, TableUpdateMode.Replace);
-    }
-
-    /// <summary>
-    /// Batch upsert all tasks for a run (used at run creation).
-    /// Azure Table batch operations are limited to 100 entities per batch
-    /// and all entities in a batch must share the same PartitionKey.
-    /// </summary>
-    public async Task UpsertTaskBatchAsync(string runName, List<OrchestratorTaskItem> tasks)
-    {
-        const int batchSize = 100;
-
-        for (int i = 0; i < tasks.Count; i += batchSize)
-        {
-            var batch = new List<TableTransactionAction>();
-            var chunk = tasks.Skip(i).Take(batchSize);
-
-            foreach (var task in chunk)
-            {
-                var entity = new TableEntity(runName, task.Id)
-                {
-                    ["Status"] = task.Status,
-                    ["ParametersJson"] = JsonSerializer.Serialize(task.Parameters, s_jsonOptions),
-                    ["AttemptCount"] = task.AttemptCount,
-                    ["LastError"] = task.LastError,
-                    ["CompletedUtc"] = task.CompletedUtc.HasValue
-                        ? new DateTimeOffset(task.CompletedUtc.Value, TimeSpan.Zero)
-                        : (DateTimeOffset?)null
-                };
-
-                batch.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, entity));
-            }
-
-            await _tasksTable.SubmitTransactionAsync(batch);
         }
-    }
+    };
 
-    // ─── Constants for Azure Table Storage limits ───
-    // Azure Table string properties are UTF-16 encoded, max 64 KiB (≈32K chars).
-    // We use 30,000 chars to stay safely under the limit with multi-byte chars.
+    private static StoreRow BuildTaskRow(TaskStatusWrite w) => new(w.RunName, w.TaskId)
+    {
+        Properties =
+        {
+            ["Status"] = w.Status,
+            ["ParametersJson"] = w.ParametersJson,
+            ["AttemptCount"] = w.AttemptCount,
+            ["LastError"] = w.LastError,
+            ["CompletedUtc"] = w.CompletedUtc.HasValue
+                ? new DateTimeOffset(w.CompletedUtc.Value, TimeSpan.Zero)
+                : (DateTimeOffset?)null
+        }
+    };
+
+    // ─── Result storage ───
+    // Results can be large (50–150 MB for big runs). We chunk a result across multiple properties and,
+    // if needed, multiple rows in the same partition. These bounds are sized for Azure Table Storage
+    // (64 KiB/property, 1 MiB/entity); on a backend without those limits the chunking is simply
+    // unnecessary but still correct, and it keeps per-row payloads small (good for e.g. SQL packet size).
     private const int MaxPropertyChars = 30_000;
-    // Max entity size is 1 MiB. We use ~900KB (UTF-16 basis) as our ceiling.
-    // In practice, at 30K chars/property, ~15 properties would hit 1 MiB,
-    // well under the 252 custom property limit.
-    private const int MaxEntityChars = 450_000; // ~900KB UTF-16
+    private const int MaxEntityChars = 450_000;
 
-    /// <summary>
-    /// Store a single task result, automatically chunking large JSON across
-    /// properties and rows to stay within Azure Table Storage limits.
-    ///
-    /// Azure Table Storage limits:
-    ///   - String property: 64 KiB UTF-16 (~32K chars)
-    ///   - Entity total: 1 MiB
-    ///   - Max 252 custom properties per entity
-    ///
-    /// Chunking strategy (mirrors CIPP's Add-CIPPAzDataTableEntity):
-    ///   1. If ResultJson fits in one property (&lt;30K chars) → single entity, single property
-    ///   2. If ResultJson is large → split into ResultJson_0, _1, etc. (each &lt;30K chars)
-    ///   3. If the entity total exceeds ~450K chars → spill across rows with OriginalEntityId + PartIndex
-    /// </summary>
+    /// <summary>Store a single task result, chunking large JSON across properties/rows as needed.</summary>
     public async Task StoreResultAsync(string runName, string taskId, string resultJson)
     {
         // Fast path: fits in a single property
         if (resultJson.Length <= MaxPropertyChars)
         {
-            var entity = new TableEntity(runName, taskId)
-            {
-                ["ResultJson"] = resultJson
-            };
-            await _resultsTable.UpsertEntityAsync(entity, TableUpdateMode.Replace);
+            var row = new StoreRow(runName, taskId) { Properties = { ["ResultJson"] = resultJson } };
+            await _store.UpsertAsync(_resultsTable, row);
             return;
         }
 
-        // Split the JSON string into chunks that fit within property size limits
         var chunks = ChunkString(resultJson, MaxPropertyChars);
 
-        // Try to fit all chunks into a single entity
+        // Try to fit all chunks into a single row
         if (EstimateTotalChars(chunks) <= MaxEntityChars)
         {
-            var entity = new TableEntity(runName, taskId);
+            var row = new StoreRow(runName, taskId);
             for (int i = 0; i < chunks.Count; i++)
-                entity[$"ResultJson_{i}"] = chunks[i];
-            entity["ResultChunkCount"] = chunks.Count;
+                row[$"ResultJson_{i}"] = chunks[i];
+            row["ResultChunkCount"] = chunks.Count;
 
-            await _resultsTable.UpsertEntityAsync(entity, TableUpdateMode.Replace);
+            await _store.UpsertAsync(_resultsTable, row);
             return;
         }
 
-        // Entity too large — split across multiple rows
+        // Row too large — split across multiple rows
         var rowIndex = 0;
         var chunkIndex = 0;
 
         while (chunkIndex < chunks.Count)
         {
             var rowKey = rowIndex == 0 ? taskId : $"{taskId}-part{rowIndex}";
-            var entity = new TableEntity(runName, rowKey);
+            var row = new StoreRow(runName, rowKey);
 
             if (rowIndex > 0)
             {
-                entity["OriginalEntityId"] = taskId;
-                entity["PartIndex"] = rowIndex;
+                row["OriginalEntityId"] = taskId;
+                row["PartIndex"] = rowIndex;
             }
 
-            // Pack as many chunks as fit into this row
             var currentChars = runName.Length + rowKey.Length + 100; // overhead estimate
 
             while (chunkIndex < chunks.Count)
             {
                 var chunkChars = chunks[chunkIndex].Length;
-                // Property name length (e.g. "ResultJson_99" = ~15 chars)
                 if (currentChars + chunkChars + 20 > MaxEntityChars)
                     break;
 
-                entity[$"ResultJson_{chunkIndex}"] = chunks[chunkIndex];
+                row[$"ResultJson_{chunkIndex}"] = chunks[chunkIndex];
                 currentChars += chunkChars + 20;
                 chunkIndex++;
             }
 
-            entity["ResultChunkCount"] = chunks.Count;
-            await _resultsTable.UpsertEntityAsync(entity, TableUpdateMode.Replace);
+            row["ResultChunkCount"] = chunks.Count;
+            await _store.UpsertAsync(_resultsTable, row);
             rowIndex++;
         }
     }
 
-    /// <summary>
-    /// Get all result JSON strings for a run, reassembling any chunked/multi-row results.
-    /// </summary>
+    /// <summary>Get all result JSON strings for a run, reassembling any chunked/multi-row results.</summary>
     public async Task<string[]> GetResultsAsync(string runName)
     {
-        // Load all result entities for this run
-        var allEntities = new List<TableEntity>();
-        await foreach (var entity in _resultsTable.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{EscapeFilter(runName)}'"))
-        {
-            allEntities.Add(entity);
-        }
-
-        // Group: standalone rows vs parts of a multi-row result
-        var standalone = new Dictionary<string, List<TableEntity>>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var entity in allEntities)
-        {
-            var originalId = entity.GetString("OriginalEntityId");
-            var key = !string.IsNullOrEmpty(originalId) ? originalId : entity.RowKey;
-
-            if (!standalone.TryGetValue(key, out var group))
-            {
-                group = new List<TableEntity>();
-                standalone[key] = group;
-            }
-            group.Add(entity);
-        }
+        var grouped = await LoadResultGroupsAsync(runName);
 
         var results = new List<string>();
-        foreach (var (_, entities) in standalone)
+        foreach (var (_, rows) in grouped)
         {
-            // Sort by PartIndex (root row has no PartIndex → treat as 0)
-            var sorted = entities
-                .OrderBy(e => e.GetInt32("PartIndex") ?? 0)
-                .ToList();
-
-            // Determine total chunk count from any row (all rows carry it)
-            var totalChunks = sorted
-                .Select(e => e.GetInt32("ResultChunkCount"))
-                .FirstOrDefault(c => c.HasValue) ?? 0;
+            var sorted = rows.OrderBy(e => e.GetInt32("PartIndex") ?? 0).ToList();
+            var totalChunks = sorted.Select(e => e.GetInt32("ResultChunkCount")).FirstOrDefault(c => c.HasValue) ?? 0;
 
             if (totalChunks == 0)
             {
-                // Simple unchunked result
                 var json = sorted[0].GetString("ResultJson");
                 if (!string.IsNullOrEmpty(json))
                     results.Add(json);
                 continue;
             }
 
-            // Reassemble chunks across all rows
             var sb = new StringBuilder();
-            for (int i = 0; i < totalChunks; i++)
-            {
-                var propName = $"ResultJson_{i}";
-                foreach (var entity in sorted)
-                {
-                    var chunk = entity.GetString(propName);
-                    if (chunk != null)
-                    {
-                        sb.Append(chunk);
-                        break;
-                    }
-                }
-            }
-
+            AppendChunks(sb, sorted, totalChunks);
             if (sb.Length > 0)
                 results.Add(sb.ToString());
         }
@@ -364,50 +275,21 @@ public class OrchestratorTableStore
     }
 
     /// <summary>
-    /// Stream all result JSON strings for a run directly to a file, reassembling
-    /// any chunked/multi-row results on the fly. Avoids loading all results into
-    /// a single in-memory string (which can be 50-150 MB for large runs).
-    /// Writes a JSON array: [{result1},{result2},...]
+    /// Stream all result JSON strings for a run directly to a file, reassembling any chunked/multi-row
+    /// results on the fly. Avoids loading all results into one in-memory string. Writes a JSON array.
     /// </summary>
     public async Task StreamResultsToFileAsync(string runName, string filePath)
     {
-        // Load all result entities for this run
-        var allEntities = new List<TableEntity>();
-        await foreach (var entity in _resultsTable.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{EscapeFilter(runName)}'"))
-        {
-            allEntities.Add(entity);
-        }
-
-        // Group: standalone rows vs parts of a multi-row result
-        var standalone = new Dictionary<string, List<TableEntity>>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var entity in allEntities)
-        {
-            var originalId = entity.GetString("OriginalEntityId");
-            var key = !string.IsNullOrEmpty(originalId) ? originalId : entity.RowKey;
-
-            if (!standalone.TryGetValue(key, out var group))
-            {
-                group = new List<TableEntity>();
-                standalone[key] = group;
-            }
-            group.Add(entity);
-        }
+        var grouped = await LoadResultGroupsAsync(runName);
 
         await using var writer = new StreamWriter(filePath, append: false, Encoding.UTF8, bufferSize: 65536);
         await writer.WriteAsync('[');
         var first = true;
 
-        foreach (var (_, entities) in standalone)
+        foreach (var (_, rows) in grouped)
         {
-            var sorted = entities
-                .OrderBy(e => e.GetInt32("PartIndex") ?? 0)
-                .ToList();
-
-            var totalChunks = sorted
-                .Select(e => e.GetInt32("ResultChunkCount"))
-                .FirstOrDefault(c => c.HasValue) ?? 0;
+            var sorted = rows.OrderBy(e => e.GetInt32("PartIndex") ?? 0).ToList();
+            var totalChunks = sorted.Select(e => e.GetInt32("ResultChunkCount")).FirstOrDefault(c => c.HasValue) ?? 0;
 
             if (totalChunks == 0)
             {
@@ -421,19 +303,14 @@ public class OrchestratorTableStore
                 continue;
             }
 
-            // Reassemble chunks and write directly to file
             if (!first) await writer.WriteAsync(',');
             for (int i = 0; i < totalChunks; i++)
             {
                 var propName = $"ResultJson_{i}";
-                foreach (var entity in sorted)
+                foreach (var row in sorted)
                 {
-                    var chunk = entity.GetString(propName);
-                    if (chunk != null)
-                    {
-                        await writer.WriteAsync(chunk);
-                        break;
-                    }
+                    var chunk = row.GetString(propName);
+                    if (chunk != null) { await writer.WriteAsync(chunk); break; }
                 }
             }
             first = false;
@@ -442,29 +319,48 @@ public class OrchestratorTableStore
         await writer.WriteAsync(']');
 
         _logger.LogInformation("[OrchestratorStore] Streamed {Count} results to {Path} for run {Name}",
-            standalone.Count, filePath, runName);
+            grouped.Count, filePath, runName);
     }
 
-    /// <summary>
-    /// Delete all entities across the 3 tables for a completed run.
-    /// Called after PostExec completes or after retention period expires.
-    /// </summary>
+    /// <summary>Load all result rows for a run, grouped by logical result (root row + any spill rows).</summary>
+    private async Task<Dictionary<string, List<StoreRow>>> LoadResultGroupsAsync(string runName)
+    {
+        var grouped = new Dictionary<string, List<StoreRow>>(StringComparer.OrdinalIgnoreCase);
+        await foreach (var row in _store.QueryPartitionAsync(_resultsTable, runName))
+        {
+            var originalId = row.GetString("OriginalEntityId");
+            var key = !string.IsNullOrEmpty(originalId) ? originalId : row.RowKey;
+            if (!grouped.TryGetValue(key, out var group))
+            {
+                group = new List<StoreRow>();
+                grouped[key] = group;
+            }
+            group.Add(row);
+        }
+        return grouped;
+    }
+
+    private static void AppendChunks(StringBuilder sb, List<StoreRow> sorted, int totalChunks)
+    {
+        for (int i = 0; i < totalChunks; i++)
+        {
+            var propName = $"ResultJson_{i}";
+            foreach (var row in sorted)
+            {
+                var chunk = row.GetString(propName);
+                if (chunk != null) { sb.Append(chunk); break; }
+            }
+        }
+    }
+
+    /// <summary>Delete all entities across the 3 tables for a completed run.</summary>
     public async Task CleanupRunAsync(string runName)
     {
         try
         {
-            // Delete run metadata
-            try
-            {
-                await _runsTable.DeleteEntityAsync("Run", runName);
-            }
-            catch (RequestFailedException ex) when (ex.Status == 404) { }
-
-            // Delete all tasks
-            await DeletePartitionAsync(_tasksTable, runName);
-
-            // Delete all results
-            await DeletePartitionAsync(_resultsTable, runName);
+            await _store.DeleteAsync(_runsTable, "Run", runName);
+            await _store.DeletePartitionAsync(_tasksTable, runName);
+            await _store.DeletePartitionAsync(_resultsTable, runName);
 
             _logger.LogInformation("[OrchestratorStore] Cleaned up run: {Name}", runName);
         }
@@ -474,67 +370,34 @@ public class OrchestratorTableStore
         }
     }
 
-    /// <summary>
-    /// Delete all runs (and their tasks/results) older than the specified retention period.
-    /// </summary>
+    /// <summary>Delete all runs (and their tasks/results) older than the retention period.</summary>
     public async Task CleanupOldRunsAsync(TimeSpan retention)
     {
         var cutoff = DateTimeOffset.UtcNow - retention;
-        var deletedCount = 0;
 
-        await foreach (var entity in _runsTable.QueryAsync<TableEntity>(
-            filter: "PartitionKey eq 'Run'",
-            select: new[] { "RowKey", "CompletedUtc", "Status" }))
+        // Collect first, then delete — avoids mutating the "Run" partition while enumerating it.
+        var toClean = new List<string>();
+        await foreach (var row in _store.QueryPartitionAsync(_runsTable, "Run"))
         {
-            var completedUtc = entity.GetDateTimeOffset("CompletedUtc");
-            var status = entity.GetString("Status");
+            var completedUtc = row.GetDateTimeOffset("CompletedUtc");
+            var status = row.GetString("Status");
 
-            // Only cleanup completed/failed runs that are past retention
             if (status is "Completed" or "CompletedWithErrors" or "Failed"
                 && completedUtc.HasValue && completedUtc.Value < cutoff)
             {
-                await CleanupRunAsync(entity.RowKey);
-                deletedCount++;
+                toClean.Add(row.RowKey);
             }
         }
 
-        if (deletedCount > 0)
+        foreach (var name in toClean)
+            await CleanupRunAsync(name);
+
+        if (toClean.Count > 0)
             _logger.LogInformation("[OrchestratorStore] Cleaned up {Count} old runs (retention: {Days}d)",
-                deletedCount, retention.TotalDays);
+                toClean.Count, retention.TotalDays);
     }
 
-    private async Task DeletePartitionAsync(TableClient table, string partitionKey)
-    {
-        var toDelete = new List<TableEntity>();
-        await foreach (var entity in table.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{EscapeFilter(partitionKey)}'",
-            select: new[] { "PartitionKey", "RowKey" }))
-        {
-            toDelete.Add(entity);
-        }
-
-        // Batch delete in groups of 100
-        const int batchSize = 100;
-        for (int i = 0; i < toDelete.Count; i += batchSize)
-        {
-            var batch = toDelete.Skip(i).Take(batchSize)
-                .Select(e => new TableTransactionAction(TableTransactionActionType.Delete, e))
-                .ToList();
-            try
-            {
-                await table.SubmitTransactionAsync(batch);
-            }
-            catch (RequestFailedException ex) when (ex.Status == 404)
-            {
-                // Already deleted — safe to ignore
-            }
-        }
-    }
-
-    /// <summary>
-    /// Split a string into chunks of at most maxChars characters.
-    /// Avoids splitting surrogate pairs.
-    /// </summary>
+    /// <summary>Split a string into chunks of at most maxChars characters, avoiding surrogate splits.</summary>
     internal static List<string> ChunkString(string value, int maxChars)
     {
         var chunks = new List<string>();
@@ -545,7 +408,6 @@ public class OrchestratorTableStore
             var remaining = value.Length - start;
             var take = Math.Min(remaining, maxChars);
 
-            // Don't split in the middle of a surrogate pair
             if (take < remaining && char.IsHighSurrogate(value[start + take - 1]))
                 take--;
 
@@ -556,19 +418,11 @@ public class OrchestratorTableStore
         return chunks;
     }
 
-    /// <summary>
-    /// Estimate total character count across all chunks plus overhead.
-    /// </summary>
     private static int EstimateTotalChars(List<string> chunks)
     {
-        var total = 200; // overhead for PartitionKey, RowKey, metadata properties
+        var total = 200; // overhead for keys + metadata properties
         for (int i = 0; i < chunks.Count; i++)
             total += chunks[i].Length + 20; // chunk + property name
         return total;
     }
-
-    /// <summary>
-    /// Escape single quotes in OData filter values to prevent injection.
-    /// </summary>
-    private static string EscapeFilter(string value) => value.Replace("'", "''");
 }

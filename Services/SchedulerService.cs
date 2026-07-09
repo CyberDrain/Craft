@@ -70,6 +70,7 @@ public class SchedulerService : BackgroundService
     private readonly JobManager _jobManager;
     private readonly CraftSettings _settings;
     private readonly PowerShellWorkerPool _pool;
+    private readonly StorageHealthMonitor _storageHealth;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
     private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
@@ -84,7 +85,8 @@ public class SchedulerService : BackgroundService
         OrchestratorService orchestrator,
         JobManager jobManager,
         CraftSettings settings,
-        PowerShellWorkerPool pool)
+        PowerShellWorkerPool pool,
+        StorageHealthMonitor storageHealth)
     {
         _logger = logger;
         _psRunner = psRunner;
@@ -93,6 +95,7 @@ public class SchedulerService : BackgroundService
         _jobManager = jobManager;
         _settings = settings;
         _pool = pool;
+        _storageHealth = storageHealth;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -118,6 +121,10 @@ public class SchedulerService : BackgroundService
         {
             _lastRun[task.Id] = startup;
         }
+
+        // Wait for the storage backend to accept connections before the first orchestrator store access.
+        // Avoids a startup error when storage becomes reachable a moment after the app.
+        await _storageHealth.WaitUntilReadyAsync(TimeSpan.FromSeconds(60), stoppingToken);
 
         // Resume any orchestrator runs that were interrupted by a previous crash
         try

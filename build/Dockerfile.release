@@ -39,10 +39,16 @@ RUN ln -s /usr/share/powershell/pwsh /usr/bin/pwsh
 # working set. Preloading mimalloc typically reclaims 20–40% RSS on long-lived
 # .NET-on-Linux hosts that spawn child processes. LD_PRELOAD propagates to
 # child pwsh runspaces automatically, which is exactly what we want here.
+# SSH (App Service SCM access) is gated behind INSTALL_SSH — default true for the dev/prod images;
+# portable/off-Azure images build with --build-arg INSTALL_SSH=false to drop the daemon entirely.
+# libmimalloc is always installed. SSH is still never started unless CRAFT_SSH_ENABLED=true at runtime.
+ARG INSTALL_SSH=true
 RUN apt-get update \
- && apt-get install -y --no-install-recommends openssh-server libmimalloc2.0 \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /run/sshd
+ && apt-get install -y --no-install-recommends libmimalloc2.0 \
+ && if [ "$INSTALL_SSH" = "true" ]; then \
+      apt-get install -y --no-install-recommends openssh-server && mkdir -p /run/sshd; \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
 COPY docker/sshd_config /etc/ssh/sshd_config
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -74,20 +80,16 @@ ENV POWERSHELL_UPDATECHECK=Off
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 # ── .NET GC tuning ──
-# Server GC + DATAS. Plain server GC eagerly reserves a heap segment per logical
-# CPU at startup, which on small (2-vCPU / 4 GB) hosts spikes committed memory
-# by ~400 MB before any work happens. DATAS (Dynamic Adaptation To Application
-# Sizes) tells server GC to start with a single heap and grow only when the
-# throughput cost crosses the target — giving server-GC's parallel collection
-# benefits without the eager reservation. DATAS is opt-in on .NET 8 and
-# default-on in .NET 9+; setting it explicitly is safe on both.
-ENV DOTNET_gcServer=1
+# Workstation GC by default: on memory-constrained tiers (Basic B2, 2 vCPU/3.5 GB)
+# it ~halves peak RSS vs server GC at no throughput cost. Override to
+# DOTNET_gcServer=1 (App Setting, no rebuild) on multi-core SKUs, where DATAS
+# below keeps server GC's per-core heaps from over-reserving.
+ENV DOTNET_gcServer=0
 ENV DOTNET_GCDynamicAdaptationMode=1
-# Cap the .NET heap to a percentage of physical memory (or container limit).
-# Parsed as HEXADECIMAL — 0x46 = 70 decimal = 70%. On a 4 GB host this caps
-# the GC heap at ~2.8 GB, leaving ~1.2 GB for the OS, pwsh native memory and
-# sockets. Switch to DOTNET_System_GC_HeapHardLimitPercent for decimal input.
-ENV DOTNET_GCHeapHardLimitPercent=46
+# Absolute managed-heap cap in bytes (HEX): 0x80000000 = 2 GiB. Absolute, not
+# percent, so packing multiple instances into one App Service Plan is safe — a
+# percent limit sizes off the whole shared VM. Tune per deployment via App Setting.
+ENV DOTNET_GCHeapHardLimit=0x80000000
 # 0–9 scale; higher = more aggressive about returning freed segments to the OS
 # rather than caching them for reuse. Pairs with the mimalloc preload above —
 # the runtime hands pages back to mimalloc, which hands them back to the kernel.

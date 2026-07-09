@@ -3,11 +3,23 @@ name: "Build: Dev Container"
 on:
   push:
     branches: [dev]
+    paths:
+      - 'build/**'
+      - 'docker/**'
+      - 'Runtime/**'
+      - 'Services/**'
+      - 'appsettings.json'
+      - 'Craft.csproj'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+
+# Cancel an in-flight dev build when a newer commit is pushed to dev.
+concurrency:
+  group: dev-container
+  cancel-in-progress: true
 
 jobs:
   build:

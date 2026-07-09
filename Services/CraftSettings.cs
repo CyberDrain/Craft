@@ -71,6 +71,185 @@ public class CraftSettings
 
     /// <summary>Frontend serving policy — CSP header injection (EasyAuth handles auth/redirects).</summary>
     public FrontendSettings Frontend { get; set; } = new();
+
+    /// <summary>
+    /// Deployment roles (capabilities) — which parts of the host this process serves. One image, three
+    /// independent switches. See <see cref="RolesSettings"/>. Also settable via the CRAFT_SERVE_FRONTEND /
+    /// CRAFT_SERVE_API / CRAFT_RUN_BACKGROUND environment variables (which take precedence).
+    /// </summary>
+    public RolesSettings Roles { get; set; } = new();
+
+    /// <summary>Health probe endpoint configuration. See <see cref="HealthSettings"/>.</summary>
+    public HealthSettings Health { get; set; } = new();
+
+    /// <summary>Azure Storage connection policy — see <see cref="StorageSettings"/>. Governs the dev-emulator fallback.</summary>
+    public StorageSettings Storage { get; set; } = new();
+
+    /// <summary>Kestrel request limits (body size, connection cap). See <see cref="KestrelLimitsSettings"/>.</summary>
+    public KestrelLimitsSettings Limits { get; set; } = new();
+
+    /// <summary>Request rate limiting. See <see cref="RateLimitSettings"/>. On by default.</summary>
+    public RateLimitSettings RateLimit { get; set; } = new();
+
+    /// <summary>Realtime SSE channel (<c>/.craft/events</c>). See <see cref="RealtimeSettings"/>.</summary>
+    public RealtimeSettings Realtime { get; set; } = new();
+}
+
+/// <summary>
+/// Azure Storage connection policy. The Tables used for the allowedUsers authorization table and
+/// orchestrator state resolve their connection string in this order: an explicit per-feature setting
+/// (e.g. <c>Auth:UserStorageConnection</c>) → the <c>AzureWebJobsStorage</c> environment variable.
+///
+/// If neither is configured the host does NOT silently fall back to the local storage emulator
+/// (<c>UseDevelopmentStorage=true</c>) in production — that would point authorization and orchestrator
+/// state at a non-existent emulator. The fallback is only used when explicitly opted in; otherwise
+/// <see cref="ResolveConnection"/> throws and the host fails to start.
+/// </summary>
+public class StorageSettings
+{
+    /// <summary>
+    /// Allow the local storage emulator fallback (<c>UseDevelopmentStorage=true</c>) when no real
+    /// connection string is configured. Default false (fail closed). Also enabled by the
+    /// <c>CRAFT_ALLOW_DEV_STORAGE=true</c> environment variable or when
+    /// <c>ASPNETCORE_ENVIRONMENT=Development</c>.
+    /// </summary>
+    public bool AllowDevelopmentStorage { get; set; }
+
+    private bool DevStorageAllowed =>
+        AllowDevelopmentStorage
+        || string.Equals(Environment.GetEnvironmentVariable("CRAFT_ALLOW_DEV_STORAGE"), "true", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolves a Table Storage connection string, failing closed in production when nothing is
+    /// configured. <paramref name="explicitConnection"/> is the per-feature override (may be null);
+    /// <paramref name="purpose"/> is used only in the exception message for diagnosability.
+    /// </summary>
+    public string ResolveConnection(string? explicitConnection, string purpose)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitConnection)) return explicitConnection;
+        var env = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+        if (!string.IsNullOrWhiteSpace(env)) return env;
+        if (DevStorageAllowed) return "UseDevelopmentStorage=true";
+        throw new InvalidOperationException(
+            $"No Azure Storage connection is configured for {purpose}. Set the AzureWebJobsStorage " +
+            "environment variable (or Auth:UserStorageConnection in appsettings). To use the local " +
+            "storage emulator during development, set App:Storage:AllowDevelopmentStorage=true or the " +
+            "CRAFT_ALLOW_DEV_STORAGE=true environment variable.");
+    }
+}
+
+/// <summary>
+/// Kestrel request limits applied unconditionally at startup. These protect the small HTTP worker
+/// pool from oversized bodies and connection floods independently of the request timeout.
+/// </summary>
+public class KestrelLimitsSettings
+{
+    /// <summary>Maximum request body size in megabytes. Default 100. Set to 0 for unlimited (not recommended).</summary>
+    public int MaxRequestBodyMB { get; set; } = 100;
+
+    /// <summary>
+    /// Maximum concurrent TCP connections. Default 200 (a reasonable cap for a B2-class host). Set to
+    /// 0 or a negative value for unlimited (let the OS decide).
+    /// </summary>
+    public int MaxConcurrentConnections { get; set; } = 200;
+}
+
+/// <summary>
+/// Request rate limiting. On by default: a per-client fixed-window limiter partitioned by
+/// authenticated principal name (falling back to X-Forwarded-For / remote IP) so a single caller
+/// cannot exhaust the HTTP worker pool.
+/// </summary>
+public class RateLimitSettings
+{
+    /// <summary>
+    /// Enable the global rate limiter. Default true (300 requests / 10 s per client). Disable via
+    /// App:RateLimit:Enabled=false; the CRAFT_RATELIMIT_ENABLED=true env var can also force it on.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Permitted requests per window, per client. Default 300.</summary>
+    public int PermitPerWindow { get; set; } = 300;
+
+    /// <summary>Window length in seconds. Default 10.</summary>
+    public int WindowSeconds { get; set; } = 10;
+
+    /// <summary>Requests queued when the limit is hit before rejecting with 429. Default 0 (reject immediately).</summary>
+    public int QueueLimit { get; set; }
+
+    /// <summary>Resolved enabled state, honouring the CRAFT_RATELIMIT_ENABLED environment override.</summary>
+    public bool IsEnabled =>
+        Enabled
+        || string.Equals(Environment.GetEnvironmentVariable("CRAFT_RATELIMIT_ENABLED"), "true", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Realtime SSE channel served at <c>/.craft/events</c>. Downstream code publishes job lifecycle events
+/// through <see cref="RealtimeBridge"/>; browsers consume them. In-memory, single instance — see
+/// docs/realtime-bridge-plan.md. The limits below bound memory and the connection budget.
+/// </summary>
+public class RealtimeSettings
+{
+    /// <summary>Enable the realtime endpoint and bridge delivery. Default true (still role-gated to http/frontend).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Max serialized size of a single event's <c>data</c> payload. Over this it is dropped and a
+    /// 413 "too large" frame is delivered instead. Default 16 KB.</summary>
+    public int MaxMessageBytes { get; set; } = 16 * 1024;
+
+    /// <summary>Max number of concurrently stored (userId, jobId) entries. Default 10000.</summary>
+    public int MaxActiveJobs { get; set; } = 10_000;
+
+    /// <summary>Max number of concurrent SSE connections across all users. Default 1000.</summary>
+    public int MaxConnections { get; set; } = 1_000;
+
+    /// <summary>Buffered frames per connection before the oldest is dropped (coalescing). Default 256.</summary>
+    public int PerConnectionQueue { get; set; } = 256;
+
+    /// <summary>Heartbeat comment interval, seconds, to keep the stream alive through proxies. Default 20.</summary>
+    public int HeartbeatSeconds { get; set; } = 20;
+
+    /// <summary>TTL for a stored entry that never receives an <c>end</c> (crash backstop), minutes. Default 60.</summary>
+    public int EntryTtlMinutes { get; set; } = 60;
+}
+
+/// <summary>
+/// Role-agnostic health probe. Enabled by default at <c>/healthz</c>; a deployment can relocate it behind a
+/// specific probe URL or turn it off entirely. Overridable via CRAFT_HEALTH_ENABLED / CRAFT_HEALTH_PATH.
+/// </summary>
+public class HealthSettings
+{
+    /// <summary>Whether the health endpoint is mapped. Default true.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Path the health endpoint is served at. Default "/healthz". A leading slash is added if missing.</summary>
+    public string Path { get; set; } = "/healthz";
+}
+
+/// <summary>
+/// Deployment roles (capabilities). Each is a nullable bool: <c>null</c> = "not explicitly set".
+///
+/// Resolution (in Program.cs): if ANY of the three is explicitly set (here or via CRAFT_SERVE_*/CRAFT_RUN_*
+/// env), the host uses exactly those (unset → off). Otherwise all three default on (the combined monolith).
+///
+/// Presets that fall out of the flags:
+///   frontend        Frontend                       — pure static host (CDN origin), no PowerShell
+///   http            Http                           — API node; can queue orchestrations, processed elsewhere
+///   background      Background                     — worker node; scheduler + orchestrator processing
+///   backend         Http + Background              — self-contained API + workers, no frontend
+///   frontend+http   Frontend + Http                — app node without background workers
+///   combined        Frontend + Http + Background   — the default monolith
+/// </summary>
+public class RolesSettings
+{
+    /// <summary>Serve static web content from Frontend/. Null = not explicitly set.</summary>
+    public bool? Frontend { get; set; }
+
+    /// <summary>Serve /api + auth via the HTTP PowerShell pool. Null = not explicitly set.</summary>
+    public bool? Http { get; set; }
+
+    /// <summary>Run scheduler / orchestrator / job-manager / stats via the BG pool. Null = not explicitly set.</summary>
+    public bool? Background { get; set; }
 }
 
 /// <summary>
@@ -80,11 +259,14 @@ public class CraftSettings
 public class FrontendSettings
 {
     /// <summary>
-    /// Content-Security-Policy header value applied to all responses.
-    /// Mirrors what SWA's globalHeaders.content-security-policy did.
-    /// Null/empty = no CSP set.
+    /// Content-Security-Policy header value applied to all responses. Mirrors what SWA's
+    /// globalHeaders.content-security-policy did. Defaults to the CIPP-compatible policy so a CSP is
+    /// emitted secure-by-default even if a deployment doesn't configure one; override via
+    /// App:Frontend:ContentSecurityPolicy (the hosted app can supply a tighter policy). Set to ""
+    /// to disable.
     /// </summary>
-    public string? ContentSecurityPolicy { get; set; }
+    public string? ContentSecurityPolicy { get; set; } =
+        "default-src https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *";
 
     /// <summary>
     /// Whether the host compresses static responses. Default true.
@@ -190,6 +372,16 @@ public class WorkerSettings
     public int RecycleAfterInvocations { get; set; } = 0;
 
     /// <summary>
+    /// Run each worker's PowerShell pipeline on one reused thread (PSThreadOptions.ReuseThread) instead of
+    /// spinning a new thread per invocation. Default true. This is the single biggest per-request dispatch
+    /// win (thread creation was ~50% of the PS-invoke cost — see docs/dispatch-analysis.md) and matches how
+    /// the Azure Functions PowerShell worker keeps a persistent runspace. Safe because each worker owns one
+    /// runspace and serves one request at a time. Set false only to A/B or if a module misbehaves on a
+    /// long-lived pipeline thread.
+    /// </summary>
+    public bool ReuseRunspaceThread { get; set; } = true;
+
+    /// <summary>
     /// Assemblies (.dll) to load into each runspace, relative to the API base path.
     /// Example: ["Shared/MyLib/bin/MyLib.dll"]
     /// </summary>
@@ -212,14 +404,6 @@ public class WorkerSettings
     /// Module names to skip during ISS import (e.g. test modules, legacy entrypoints).
     /// </summary>
     public List<string> SkipModules { get; set; } = [];
-
-    /// <summary>
-    /// Static-only / web-content mode. When true, the PowerShell worker pool, scheduler, job manager
-    /// and all background hosted services are disabled, and /api, /API, /.auth, /login, /logout return
-    /// 503 — the host boots instantly and serves only static frontend content. Also settable via the
-    /// environment variable CRAFT_STATIC_ONLY=true.
-    /// </summary>
-    public bool Disabled { get; set; }
 
     /// <summary>
     /// Module names to load for HTTP workers. If empty, loads all modules (minus SkipModules).
@@ -382,13 +566,6 @@ public class AuthSettings
     public string DevUserDetails { get; set; } = "developer@localhost";
 
     /// <summary>
-    /// Permissions returned in the canned /api/me response when static-only dev-auth is enabled
-    /// (CRAFT_STATIC_ONLY_DEVAUTH=true). Empty = ["*"]. No default here — config binding appends to
-    /// list initializers, causing duplicates.
-    /// </summary>
-    public List<string> DevPermissions { get; set; } = [];
-
-    /// <summary>
     /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
     /// is used as the endpoint name. The PS function (or its MeEndpointHandler wrapper)
     /// owns the response shape — /api/me passes status code and body through unchanged.
@@ -457,6 +634,26 @@ public class OrchestratorSettings
     /// Tables created: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results.
     /// </summary>
     public string TablePrefix { get; set; } = "Orchestrator";
+
+    /// <summary>
+    /// Batch and coalesce per-task/run status writes through OrchestratorStatusWriter instead of writing each
+    /// individually. Removes the per-task Azure Table write from the fan-out critical path (the throughput
+    /// ceiling — see docs/orch-analysis.md). Default true. Results are never batched (their chunking path is
+    /// untouched). Set false to fall back to the original per-task writes (for A/B).
+    /// </summary>
+    public bool BatchStatusWrites { get; set; } = true;
+
+    /// <summary>
+    /// When batching status writes, write the pre-invoke "Running" marker under a synchronous barrier so it
+    /// is durable BEFORE the task invokes (batched with other concurrently-starting tasks). Preserves the
+    /// AttemptCount/MaxRetries poison-task guarantee. Default true. False = eventual (faster, weaker: the
+    /// marker rides the periodic flush, so a host crash within the flush window may not advance AttemptCount).
+    /// </summary>
+    public bool DurableRunningBarrier { get; set; } = true;
+
+    /// <summary>How often (ms) the status writer flushes coalesced writes. Also the barrier latency ceiling.
+    /// Default 25.</summary>
+    public int StatusFlushIntervalMs { get; set; } = 25;
 
     /// <summary>
     /// PowerShell function used to execute individual orchestrator tasks.
@@ -556,8 +753,25 @@ public class FileLoggingSettings
 /// </summary>
 public class CacheSettings
 {
+    /// <summary>
+    /// Whether the in-memory/disk-backed API response cache is active. Null (default) = auto: on only when
+    /// the node serves BOTH a browser UI and its API (combined / frontend+http roles), off for api-only,
+    /// worker-only and static-only nodes. Set true/false to force it on or off in any role.
+    /// Overridable via the CRAFT_RESPONSE_CACHE environment variable (true/false), which takes precedence.
+    /// When disabled, no _cache/ directory is created or scanned and all get/set operations are no-ops.
+    /// </summary>
+    public bool? Enabled { get; set; }
+
     /// <summary>Maximum number of cached responses in memory.</summary>
     public int MaxEntries { get; set; } = 1000;
+
+    /// <summary>
+    /// Budget (bytes) for keeping cached response bodies in memory (an LRU tier over the disk cache) so a
+    /// cache HIT returns from RAM instead of re-reading + re-decoding the file every time. Default 64 MiB.
+    /// 0 disables the in-memory tier (disk-only — every hit reads the file). The index is always in memory;
+    /// this only governs the hot bodies. See docs/cache-analysis.md.
+    /// </summary>
+    public long MaxMemoryBytes { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>Default TTL in seconds for cached responses.</summary>
     public int DefaultTtlSeconds { get; set; } = 600;
@@ -741,12 +955,43 @@ public class SetupSettings
     public string KeyVaultName { get; set; } = "";
 
     /// <summary>
+    /// Key Vault secret names under which the bootstrap persists the created SSO app
+    /// registration's details (client secret, client/app ID, and multi-tenant flag) so a
+    /// downstream app can read its own credentials from the vault. Only written when
+    /// <see cref="KeyVaultName"/> is set (same condition that gates the client secret).
+    /// The defaults match the names CIPP expects; override any of them in appsettings/env
+    /// (e.g. App:Setup:SsoSecretNames:AppSecret) to store under different names.
+    /// </summary>
+    public SsoSecretNames SsoSecretNames { get; set; } = new();
+
+    /// <summary>
     /// Role(s) assigned to the bootstrap user seeded by /api/setup/seed-user.
     /// When empty (default), the role "superadmin" is used.
     /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.
     /// Override in appsettings to match the hosted app's role taxonomy, e.g. ["owner"] or ["admin", "authenticated"].
     /// </summary>
     public List<string> FirstUserRoles { get; set; } = [];
+}
+
+/// <summary>
+/// Key Vault secret names used by the bootstrap when persisting the created SSO app
+/// registration's details. Each is the SecretName portion of the Key Vault secret the
+/// setup flow writes (and, for the client secret, the SecretName the AUTH_SECRET app
+/// setting references). Defaults mirror CIPP's expected names.
+/// </summary>
+public class SsoSecretNames
+{
+    /// <summary>
+    /// KV secret name holding the EasyAuth client secret. This is what the AUTH_SECRET app
+    /// setting's Key Vault reference points at. Default "SSOAppSecret".
+    /// </summary>
+    public string AppSecret { get; set; } = "SSOAppSecret";
+
+    /// <summary>KV secret name holding the app (client) ID. Default "SSOAppId".</summary>
+    public string AppId { get; set; } = "SSOAppId";
+
+    /// <summary>KV secret name holding the multi-tenant flag ("true"/"false"). Default "SSOMultiTenant".</summary>
+    public string MultiTenant { get; set; } = "SSOMultiTenant";
 }
 
 /// <summary>
