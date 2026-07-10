@@ -115,6 +115,30 @@ public class StorageSettings
     /// </summary>
     public bool AllowDevelopmentStorage { get; set; }
 
+    /// <summary>
+    /// Maximum concurrent TCP connections CRAFT opens to a single storage endpoint
+    /// (e.g. <c>&lt;account&gt;.table.core.windows.net</c>). Azure Table Storage is HTTP/1.1 with no
+    /// multiplexing, so this caps the number of simultaneous in-flight table requests — it bounds
+    /// outbound sockets so a job fan-out can't exhaust the host's connection/SNAT budget (Azure App
+    /// Service starts throttling around ~128 concurrent outbound connections). This is the same
+    /// connection-reuse/limit lever the downstream AzBobbyTables module uses.
+    /// Default <b>30</b> (matches the proven Function Apps setting; a storage account is fronted by several
+    /// servers, so a modest per-endpoint cap still leaves plenty of aggregate throughput while keeping the
+    /// host well under its outbound ceiling). Set to 0 or a negative value for unlimited (the Azure SDK
+    /// default). Applies only to the Azure Tables provider. Env override:
+    /// <c>CRAFT_STORAGE_MAX_CONNECTIONS_PER_SERVER</c>.
+    /// </summary>
+    public int MaxConnectionsPerServer { get; set; } = 30;
+
+    /// <summary>
+    /// How long (minutes) a pooled storage connection may be reused before it is recycled. Periodic
+    /// recycling lets DNS changes propagate and prevents long-idle SNAT ports from wedging. Default
+    /// <b>30</b>. Set to 0 or a negative value to disable recycling (connections live as long as usable,
+    /// the raw runtime default). Applies only to the Azure Tables provider. Env override:
+    /// <c>CRAFT_STORAGE_POOLED_CONNECTION_LIFETIME_MINUTES</c>.
+    /// </summary>
+    public int PooledConnectionLifetimeMinutes { get; set; } = 30;
+
     private bool DevStorageAllowed =>
         AllowDevelopmentStorage
         || string.Equals(Environment.GetEnvironmentVariable("CRAFT_ALLOW_DEV_STORAGE"), "true", StringComparison.OrdinalIgnoreCase)
