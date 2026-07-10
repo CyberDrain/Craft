@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Azure;
+using Azure.Core.Pipeline;
 using Azure.Data.Tables;
 
 namespace Craft.Services;
@@ -14,6 +15,13 @@ public sealed class AzureTableStore : ICraftTableStore
     private readonly Lazy<string> _connectionString;
     private readonly ConcurrentDictionary<string, TableClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private TableServiceClient? _service;
+
+    // Shared client options carrying ONE HttpClientTransport (a single SocketsHttpHandler) that every
+    // TableClient/TableServiceClient reuses, so all storage traffic rides one bounded connection pool.
+    // Same connection-reuse/limit pattern the downstream AzBobbyTables module uses; here the cap defaults
+    // on (see StorageSettings.MaxConnectionsPerServer) because CRAFT knows it runs on connection-capped
+    // Azure App Service. Built once — this store is a singleton.
+    private readonly TableClientOptions _clientOptions;
 
     // Azure Table transaction limits: at most 100 entities, all sharing a partition key, ~4 MB total.
     private const int MaxBatch = 100;
@@ -31,12 +39,41 @@ public sealed class AzureTableStore : ICraftTableStore
         // RBAC-table override for backward compatibility; else the shared AzureWebJobsStorage connection.
         _connectionString = new Lazy<string>(() =>
             settings.Storage.ResolveConnection(settings.Auth.UserStorageConnection, "table storage"));
+        _clientOptions = BuildClientOptions(settings.Storage);
     }
 
-    private TableClient Client(string table) =>
-        _clients.GetOrAdd(table, t => new TableClient(_connectionString.Value, t));
+    /// <summary>
+    /// Builds the shared <see cref="TableClientOptions"/> that every client reuses. All TableClients and
+    /// the TableServiceClient share the single <see cref="HttpClientTransport"/> it carries, so they pool
+    /// connections across one <see cref="SocketsHttpHandler"/>. That handler is optionally capped at
+    /// <c>MaxConnectionsPerServer</c> (Azure Table is HTTP/1.1 with no multiplexing → one TCP connection
+    /// per concurrent request, so this ceilings the outbound socket count during a job fan-out) and its
+    /// pooled connections are recycled on <c>PooledConnectionLifetime</c> for DNS/SNAT hygiene. Both are
+    /// configurable via <see cref="StorageSettings"/> or env, so a downstream app can tune or disable them.
+    /// </summary>
+    private static TableClientOptions BuildClientOptions(StorageSettings storage)
+    {
+        var maxConns = ParseIntEnv("CRAFT_STORAGE_MAX_CONNECTIONS_PER_SERVER") ?? storage.MaxConnectionsPerServer;
+        var lifetimeMin = ParseIntEnv("CRAFT_STORAGE_POOLED_CONNECTION_LIFETIME_MINUTES") ?? storage.PooledConnectionLifetimeMinutes;
 
-    private TableServiceClient Service => _service ??= new TableServiceClient(_connectionString.Value);
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = lifetimeMin > 0 ? TimeSpan.FromMinutes(lifetimeMin) : Timeout.InfiniteTimeSpan,
+        };
+        // <= 0 → leave the SDK/runtime default (int.MaxValue, i.e. unbounded).
+        if (maxConns > 0)
+            handler.MaxConnectionsPerServer = maxConns;
+
+        return new TableClientOptions { Transport = new HttpClientTransport(handler) };
+    }
+
+    private static int? ParseIntEnv(string name) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var v) ? v : null;
+
+    private TableClient Client(string table) =>
+        _clients.GetOrAdd(table, t => new TableClient(_connectionString.Value, t, _clientOptions));
+
+    private TableServiceClient Service => _service ??= new TableServiceClient(_connectionString.Value, _clientOptions);
 
     public async Task PingAsync(CancellationToken ct = default)
     {

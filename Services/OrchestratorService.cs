@@ -938,6 +938,8 @@ public class OrchestratorService
                 string? functionName = null;
                 string? suiteName = null;
                 string? batchNumber = null;
+                string? queueName = null;
+                string? customerId = null;
 
                 foreach (var prop in element.EnumerateObject())
                 {
@@ -963,6 +965,12 @@ public class OrchestratorService
                         suiteName = prop.Value.GetString();
                     if (prop.Name.Equals("BatchNumber", StringComparison.OrdinalIgnoreCase))
                         batchNumber = prop.Value.ToString();
+                    if (prop.Name.Equals("QueueName", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                        queueName = prop.Value.GetString();
+                    if (prop.Name.Equals("customerId", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                        customerId = prop.Value.GetString();
 
                     // Extract tenant from nested Tenant object (e.g. audit log batch items)
                     if (tenantFilter == null && prop.Name.Equals("Tenant", StringComparison.OrdinalIgnoreCase)
@@ -976,7 +984,7 @@ public class OrchestratorService
 
                 // Build a unique task ID from available distinguishing properties
                 var label = collectionType ?? suiteName ?? name ?? functionName ?? "unknown";
-                var tenant = tenantFilter ?? "unknown";
+                var tenant = tenantFilter ?? queueName ?? customerId ?? "unknown";
                 var taskId = batchNumber != null ? $"{label}_{tenant}_b{batchNumber}" : $"{label}_{tenant}";
 
                 // Ensure uniqueness — append index if collision
