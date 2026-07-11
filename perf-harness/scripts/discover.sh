@@ -1,7 +1,7 @@
 #!/bin/sh
 # Emit KEY=VALUE lines describing the deployed frontend bundle, so the harness
 # targets the REAL (content-hashed) filenames of whatever image is under test.
-cd /app/Frontend 2>/dev/null || { echo "ERR=no_frontend"; exit 0; }
+cd /home/app/Frontend 2>/dev/null || { echo "ERR=no_frontend"; exit 0; }
 
 APP=$(find _next/static/chunks/pages -name '_app-*.js' 2>/dev/null | head -1)
 [ -z "$APP" ] && APP=$(find _next/static/chunks -type f -name '*.js' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | sed 's/^[0-9]* //')

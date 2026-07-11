@@ -25,7 +25,7 @@ services:
     ports:
       - "${SUT_PORT:-5298}:8080"
     volumes:
-      - ./api-harness/API:/app/API:ro
+      - ./api-harness/API:/home/app/API:ro
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:8080

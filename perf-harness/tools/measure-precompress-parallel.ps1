@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force $pc | Out-Null
 $tmp = "cipp-pcpar-tmp"
 docker rm -f $tmp *> $null
 docker create --name $tmp $Image | Out-Null
-docker cp "${tmp}:/app/Frontend" "$pc\Frontend"
+docker cp "${tmp}:/home/app/Frontend" "$pc\Frontend"
 docker rm -f $tmp *> $null
 Copy-Item (Join-Path $PSScriptRoot "precompress.mjs") "$pc\precompress.mjs"
 $pcD = $pc.Replace([char]92, [char]47)

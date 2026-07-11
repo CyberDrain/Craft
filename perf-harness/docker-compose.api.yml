@@ -3,7 +3,7 @@
 # Same CRAFT image as every other deployment (default craft:local — build once with
 #   docker build -f build/Dockerfile -t craft:local .
 # or point SUT_IMAGE at any CRAFT image). http-only mode is selected purely by the env vars below;
-# the test endpoints are provided by mounting the PerfApi module into the image's (empty) /app/API.
+# the test endpoints are provided by mounting the PerfApi module into the image's (empty) /home/app/API.
 # Nothing here is baked into a special image.
 name: craft-perf-api
 
@@ -17,8 +17,8 @@ services:
     ports:
       - "${SUT_PORT:-5297}:8080"
     volumes:
-      # Overlay the synthetic API module onto the base image's empty /app/API. Read-only; live-editable.
-      - ./api-harness/API:/app/API:ro
+      # Overlay the synthetic API module onto the base image's empty /home/app/API. Read-only; live-editable.
+      - ./api-harness/API:/home/app/API:ro
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:8080

@@ -69,7 +69,7 @@ try {
 
   # Keep only routes whose prerendered .html exists in the image
   $check = ($Routes | ForEach-Object { if($_ -eq '/'){ 'index' } else { $_.TrimStart('/') } }) -join "`n"
-  $existing = $check | docker exec -i $container sh -c 'cd /app/Frontend && while read r; do [ -f "$r.html" ] && echo "$r"; done'
+  $existing = $check | docker exec -i $container sh -c 'cd /home/app/Frontend && while read r; do [ -f "$r.html" ] && echo "$r"; done'
   $active = @('/') + (($existing -split "`n") | Where-Object { $_ -and $_ -ne 'index' } | ForEach-Object { '/' + $_ })
   $active = $active | Select-Object -Unique
   Info "routes to load ($($active.Count)): $($active -join ', ')"
