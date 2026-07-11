@@ -55,7 +55,11 @@ WORKDIR /app
 
 COPY --from=mimalloc-src /mimalloc/libmimalloc.so.2 /usr/lib/libmimalloc.so.2
 
-COPY --from=build /app/publish .
+# Own the running dir as the non-root runtime user (APP_UID) — the distroless base runs
+# as 1654, but COPY defaults to root ownership, leaving /app read-only to the app. Chowning
+# it here makes /app writable in place (matching the writable $HOME at /home/app) so app-owned
+# content such as API/Config/function-permissions.json needs no separate chown.
+COPY --chown=$APP_UID:$APP_UID --from=build /app/publish .
 
 # ─── Runtime Configuration ────────────────────────────────
 ARG APP_VERSION=0.0.0-local
@@ -69,9 +73,10 @@ ENV CRAFT_VERBOSE="false"
 
 # Writable state for the non-root user (logs, restart-tracker) defaults to the app
 # user's home ($HOME → /home/app) in code (see RuntimePaths in CraftSettings.cs), so
-# no path envs are needed here. function-permissions.json is the exception — it lives
-# at /app/API/Config and is made writable via COPY --chown in downstream images,
-# since PowerShell modules read it from that fixed path.
+# no path envs are needed here. The /app dir itself is now owned by APP_UID (see the
+# --chown on the publish COPY above), so app-owned content such as
+# API/Config/function-permissions.json is writable in place — downstream images that
+# COPY additional files as root should still --chown them to APP_UID.
 
 # ── Memory & runtime tuning ──
 ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
