@@ -44,7 +44,10 @@ RUN set -eux; \
 # distroless-extra = distroless + icu/tzdata. PowerShell needs globalization, so
 # the plain -distroless tag (no ICU) would break it — the -extra tag is required.
 FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runtime
-WORKDIR /app
+# Run from the non-root user's home (/home/app). It is created and owned by APP_UID (1654) in
+# the distroless base, so runtime-created dirs (_cache, _data, logs) land in an app-owned parent
+# and are writable — unlike a fresh /app, whose root-owned top-level dir blocked those writes.
+WORKDIR /home/app
 
 # NOTE: the standalone /usr/share/powershell (~50 MB) is intentionally NOT copied.
 # CRAFT hosts PowerShell in-process via Microsoft.PowerShell.SDK (engine + built-in
@@ -55,10 +58,8 @@ WORKDIR /app
 
 COPY --from=mimalloc-src /mimalloc/libmimalloc.so.2 /usr/lib/libmimalloc.so.2
 
-# Own the running dir as the non-root runtime user (APP_UID) — the distroless base runs
-# as 1654, but COPY defaults to root ownership, leaving /app read-only to the app. Chowning
-# it here makes /app writable in place (matching the writable $HOME at /home/app) so app-owned
-# content such as API/Config/function-permissions.json needs no separate chown.
+# Publish output lands in /home/app (the WORKDIR). --chown makes the whole app tree owned by
+# APP_UID so app-owned content such as API/Config/function-permissions.json is writable in place.
 COPY --chown=$APP_UID:$APP_UID --from=build /app/publish .
 
 # ─── Runtime Configuration ────────────────────────────────
@@ -71,12 +72,11 @@ ENV IMAGE_TAG=$IMAGE_TAG
 
 ENV CRAFT_VERBOSE="false"
 
-# Writable state for the non-root user (logs, restart-tracker) defaults to the app
-# user's home ($HOME → /home/app) in code (see RuntimePaths in CraftSettings.cs), so
-# no path envs are needed here. The /app dir itself is now owned by APP_UID (see the
-# --chown on the publish COPY above), so app-owned content such as
-# API/Config/function-permissions.json is writable in place — downstream images that
-# COPY additional files as root should still --chown them to APP_UID.
+# The app runs from /home/app, the non-root user's home, so writable state lands in an
+# app-owned dir with no path envs needed: logs + restart-tracker (via RuntimePaths in
+# CraftSettings.cs) and runtime _cache/_data. App-owned content such as
+# API/Config/function-permissions.json is writable in place — downstream images that COPY
+# additional files as root should still --chown them to APP_UID.
 
 # ── Memory & runtime tuning ──
 ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
