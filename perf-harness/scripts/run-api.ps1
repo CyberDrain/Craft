@@ -4,7 +4,7 @@
 
 .DESCRIPTION
   Brings up CRAFT in http-only mode (CRAFT_SERVE_API=true) serving the synthetic PerfApi endpoints
-  (mounted into the image's /home/app/API), waits for /healthz, then measures under k6 load:
+  (mounted into the image's /app/API), waits for /healthz, then measures under k6 load:
     1. Throughput / latency  - req/s, overall + per-endpoint p50/p95/p99, error rate (k6)
     2. Server resources      - CPU% / RAM sampled from `docker stats` during load
   Writes results\<label>-<timestamp>.json (machine) and .md (human). Tears down on exit.

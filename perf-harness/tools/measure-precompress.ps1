@@ -10,10 +10,10 @@ New-Item -ItemType Directory -Force $pc | Out-Null
 $tmp = 'cipp-pc-tmp'
 docker rm -f $tmp *> $null
 docker create --name $tmp $Image | Out-Null
-docker cp "${tmp}:/home/app/Frontend/_next/static/chunks/pages" "$pc\pages"
-docker cp "${tmp}:/home/app/Frontend/_next/static/css"          "$pc\css"
-docker cp "${tmp}:/home/app/Frontend/permissionsList.json"      "$pc\permissionsList.json"
-docker cp "${tmp}:/home/app/Frontend/index.html"                "$pc\index.html"
+docker cp "${tmp}:/app/Frontend/_next/static/chunks/pages" "$pc\pages"
+docker cp "${tmp}:/app/Frontend/_next/static/css"          "$pc\css"
+docker cp "${tmp}:/app/Frontend/permissionsList.json"      "$pc\permissionsList.json"
+docker cp "${tmp}:/app/Frontend/index.html"                "$pc\index.html"
 docker rm -f $tmp *> $null
 Copy-Item (Join-Path $PSScriptRoot 'precompress.mjs') "$pc\precompress.mjs"
 $fwd = [char]47

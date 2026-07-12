@@ -20,8 +20,8 @@ services:
     ports:
       - "${SUT_PORT:-5399}:8080"
     volumes:
-      - ./api-harness/API:/home/app/API:ro       # PerfApi module + e2e-timers.json scheduler config
-      - ./e2e-frontend:/home/app/Frontend:ro     # static frontend fixture (html pages + a precompressed .br)
+      - ./api-harness/API:/app/API:ro       # PerfApi module + e2e-timers.json scheduler config
+      - ./e2e-frontend:/app/Frontend:ro     # static frontend fixture (html pages + a precompressed .br)
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:8080
