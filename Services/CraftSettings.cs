@@ -589,6 +589,9 @@ public class AuthSettings
     /// <summary>User details (UPN/email) for the dev-mode auto-login principal.</summary>
     public string DevUserDetails { get; set; } = "developer@localhost";
 
+    /// <summary>Identity provider reported for the dev-mode auto-login principal (aad, github, …).</summary>
+    public string DevIdentityProvider { get; set; } = "aad";
+
     /// <summary>
     /// PowerShell function name dispatched for /api/me. If empty, the literal "me"
     /// is used as the endpoint name. The PS function (or its MeEndpointHandler wrapper)
