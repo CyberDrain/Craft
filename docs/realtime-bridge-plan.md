@@ -127,6 +127,12 @@ a global notification center; scope to the originating tab via a `localStorage` 
 `Enabled`, `MaxMessageBytes`, `MaxActiveJobs`, `MaxConnections`, `PerConnectionQueue`,
 `HeartbeatSeconds`, `EntryTtlMinutes`.
 
+**The channel is opt-in — `Enabled` defaults to `false`.** Turn it on with `App:Realtime:Enabled=true` in
+`appsettings.json`, or the `CRAFT_REALTIME_ENABLED=true/false` env var (which wins over config). While off:
+`/.craft/events` is not mapped (it falls through to normal static/fallback handling), `RealtimeBridge.Publish`
+is a no-op, and no matrix state or TTL timer is held — so a deployment that doesn't use realtime pays nothing
+for it. The role gate still applies on top: only **http**/**frontend** nodes map the endpoint.
+
 ## M1 deliverables
 - `Services/RealtimeService.cs` — matrix + connections, moded publish, GUID + size enforcement,
   reconnect replay, TTL sweep.

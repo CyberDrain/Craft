@@ -479,6 +479,29 @@ Controls where the host discovers PowerShell scripts.
 }
 ```
 
+### Realtime (SSE)
+
+Identity-gated Server-Sent Events channel at `/.craft/events`, fed in-process by
+`[Craft.Services.RealtimeBridge]::Publish(...)` from PowerShell. See [realtime-bridge-plan.md](realtime-bridge-plan.md).
+
+**Off by default — opt in.** Set `Enabled: true` (or `CRAFT_REALTIME_ENABLED=true`, which wins over config).
+While off the endpoint is not mapped, `Publish` calls are no-ops, and no state or timer is held. When on, the
+endpoint is still only mapped by nodes carrying the **Http** or **Frontend** role.
+
+```jsonc
+"Realtime": {
+  "Enabled": false,           // opt-in switch — set true to serve /.craft/events
+
+  // Tuning (defaults shown)
+  "MaxMessageBytes": 16384,   // per-event data cap; over this the payload is dropped and a 413 frame is sent
+  "MaxActiveJobs": 10000,     // max stored (userId, jobId) entries
+  "MaxConnections": 1000,     // max concurrent SSE streams
+  "PerConnectionQueue": 256,  // buffered frames per connection before the oldest is dropped
+  "HeartbeatSeconds": 20,     // keep-alive comment interval
+  "EntryTtlMinutes": 60       // backstop eviction for jobs that never send "end"
+}
+```
+
 ### Frontend
 
 EasyAuth handles auth, redirects, and excluded paths at the App Service platform layer (see `Setup.UnauthenticatedClientAction` and `Setup.ExcludedPaths`). CRAFT only adds response headers EasyAuth doesn't touch — currently just CSP.
@@ -501,6 +524,7 @@ These are process-level variables read directly (not part of `App:*`):
 | `CRAFT_LOG_LEVEL` | `Information` | Minimum log level for file/console output and PowerShell stream capture. Values: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`. At `Debug`, Write-Debug is captured; at `Trace`, Write-Verbose is also captured. Overrides `App:FileLogging:LogLevel` in appsettings. |
 | `CRAFT_ROOT` | *(auto-set)* | API base path — set automatically, available as `$env:CRAFT_ROOT` in PS |
 | `CRAFT_DEV_FRONTEND_URL` | `http://localhost:3000` | Dev mode: proxy frontend requests to this URL (hot-reload) |
+| `CRAFT_REALTIME_ENABLED` | *(unset)* | `true`/`false` — realtime SSE channel at `/.craft/events`. Overrides `App:Realtime:Enabled` (which defaults to **off**) |
 | `AzureWebJobsStorage` | *(required)* | Azure Storage connection string for Table Storage |
 | `ASPNETCORE_ENVIRONMENT` | `Production` | `Development` enables dev auth, dev errors, frontend proxy |
 

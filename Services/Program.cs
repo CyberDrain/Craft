@@ -897,7 +897,10 @@ else
 // ── Realtime SSE channel (/.craft/events) — served by http/frontend nodes ───────────────────────────
 // Identity-gated delivery of job events published in-process via RealtimeBridge. See RealtimeService
 // and docs/realtime-bridge-plan.md. Pure C# — never touches a PowerShell runspace.
-if ((capHttp || capFrontend) && CraftSettings.Realtime.Enabled)
+// OPT-IN: off unless App:Realtime:Enabled=true (or CRAFT_REALTIME_ENABLED=true, which wins). When off the
+// endpoint is never mapped, so /.craft/events falls through to the static/fallback handling like any
+// unknown path, and RealtimeBridge publishes are dropped.
+if ((capHttp || capFrontend) && CraftSettings.Realtime.IsEnabled)
 {
     app.MapGet("/.craft/events", async (HttpContext ctx) =>
     {
@@ -947,6 +950,10 @@ if ((capHttp || capFrontend) && CraftSettings.Realtime.Enabled)
         finally { realtime.Disconnect(userId, connId); }
     });
     logger.LogInformation("[System] Realtime SSE endpoint: /.craft/events");
+}
+else if (capHttp || capFrontend)
+{
+    logger.LogInformation("[System] Realtime SSE endpoint: disabled (set App:Realtime:Enabled=true to enable)");
 }
 
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
