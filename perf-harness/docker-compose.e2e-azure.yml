@@ -37,6 +37,8 @@ services:
       - App__Setup__Enabled=false
       # Enable precompressed (.br/.gz) static serving so the frontend test can assert Brotli.
       - CRAFT_COMPRESSION=true
+      # Realtime SSE is opt-in (off by default) — turn it on so the realtime bridge test can run.
+      - CRAFT_REALTIME_ENABLED=true
       - App__Orchestrator__TablePrefix=E2EOrch
       - App__RateLimit__Enabled=false
       # Scheduler: fast tick so the timer test doesn't wait long

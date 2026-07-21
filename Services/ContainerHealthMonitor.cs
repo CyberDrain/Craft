@@ -9,7 +9,7 @@ namespace Craft.Services;
 /// Azure's warmup probe to time out and forcing a worker reallocation.
 ///
 /// Flow:
-///   1. App starts → record restart attempt to /home/craft/restart-tracker.json
+///   1. App starts → record restart attempt to {home}/restart-tracker.json
 ///   2. If restart count exceeds threshold → ShouldBlockStartup = true, Kestrel never starts,
 ///      Azure health check fails, platform provisions a new worker
 ///   3. If app starts successfully (pool ready) → clear the restart counter
@@ -35,8 +35,9 @@ public class ContainerHealthMonitor
         var homePath = settings.TrackerDirectory;
         if (string.IsNullOrEmpty(homePath))
         {
-            // Default to /home/craft on Linux (Azure App Service), skip on Windows/dev
-            homePath = OperatingSystem.IsLinux() ? "/home/craft" : "";
+            // Default to the app user's home on Linux (writable by the non-root
+            // container); skip on Windows/dev. Override via TrackerDirectory.
+            homePath = OperatingSystem.IsLinux() ? RuntimePaths.Home : "";
         }
 
         _trackerPath = string.IsNullOrEmpty(homePath) ? "" : Path.Combine(homePath, "restart-tracker.json");

@@ -18,12 +18,16 @@ namespace Craft.Services;
 /// One "current message" is stored per active (userId, jobId) so a reconnecting browser resyncs
 /// instantly. Single instance, no backplane — the publisher and the SSE connection must be the same
 /// process (combined role). See docs/realtime-bridge-plan.md.
+///
+/// Opt-in: off unless <c>App:Realtime:Enabled=true</c> (or <c>CRAFT_REALTIME_ENABLED=true</c>). While off
+/// the endpoint is not mapped, publishes are dropped, and no state or timer is held.
 /// </summary>
 public sealed class RealtimeService : IDisposable
 {
     private readonly RealtimeSettings _cfg;
+    private readonly bool _enabled;
     private readonly ILogger<RealtimeService> _logger;
-    private readonly Timer _sweep;
+    private readonly Timer? _sweep;
 
     // Subscription matrix: "userId\0jobId" -> current message. The stored value is the ready-to-write
     // SSE frame, so reconnect replay is a direct copy.
@@ -44,12 +48,15 @@ public sealed class RealtimeService : IDisposable
     public RealtimeService(CraftSettings settings, ILogger<RealtimeService> logger)
     {
         _cfg = settings.Realtime;
+        _enabled = _cfg.IsEnabled; // resolved once — config/env don't change after startup
         _logger = logger;
+        if (!_enabled) return; // opt-in feature is off: no state to sweep, so no timer
+
         var period = TimeSpan.FromMinutes(Math.Clamp(_cfg.EntryTtlMinutes, 1, 1440) / 2.0 + 0.5);
         _sweep = new Timer(_ => SweepExpired(), null, period, period);
     }
 
-    public bool Enabled => _cfg.Enabled;
+    public bool Enabled => _enabled;
 
     private sealed class Entry
     {
@@ -87,7 +94,7 @@ public sealed class RealtimeService : IDisposable
     public void Publish(string userId, string jobId, string? mode, object? data,
         string? urlHref, string? urlLabel, int? status, string? message)
     {
-        if (!_cfg.Enabled) return;
+        if (!_enabled) return;
         if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(jobId)) return;
         if (!Guid.TryParse(jobId, out _))
         {
@@ -262,5 +269,5 @@ public sealed class RealtimeService : IDisposable
         return r;
     }
 
-    public void Dispose() => _sweep.Dispose();
+    public void Dispose() => _sweep?.Dispose();
 }

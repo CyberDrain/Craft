@@ -76,6 +76,7 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=dev
+            BUILD_CONFIGURATION=Debug
             DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
           labels: |

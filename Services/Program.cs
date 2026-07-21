@@ -897,7 +897,10 @@ else
 // ── Realtime SSE channel (/.craft/events) — served by http/frontend nodes ───────────────────────────
 // Identity-gated delivery of job events published in-process via RealtimeBridge. See RealtimeService
 // and docs/realtime-bridge-plan.md. Pure C# — never touches a PowerShell runspace.
-if ((capHttp || capFrontend) && CraftSettings.Realtime.Enabled)
+// OPT-IN: off unless App:Realtime:Enabled=true (or CRAFT_REALTIME_ENABLED=true, which wins). When off the
+// endpoint is never mapped, so /.craft/events falls through to the static/fallback handling like any
+// unknown path, and RealtimeBridge publishes are dropped.
+if ((capHttp || capFrontend) && CraftSettings.Realtime.IsEnabled)
 {
     app.MapGet("/.craft/events", async (HttpContext ctx) =>
     {
@@ -948,6 +951,10 @@ if ((capHttp || capFrontend) && CraftSettings.Realtime.Enabled)
     });
     logger.LogInformation("[System] Realtime SSE endpoint: /.craft/events");
 }
+else if (capHttp || capFrontend)
+{
+    logger.LogInformation("[System] Realtime SSE endpoint: disabled (set App:Realtime:Enabled=true to enable)");
+}
 
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
 // A node without the Http role maps NONE of these, so /api and auth paths fall through to static serving
@@ -987,6 +994,17 @@ app.Use(async (context, next) =>
             // Detect App Service EasyAuth format: has "claims" array but no "userRoles"
             if (root.TryGetProperty("claims", out _) && !root.TryGetProperty("userRoles", out _))
             {
+                // The real identity provider EasyAuth resolved (aad, github, google, …). Source of
+                // truth is the x-ms-client-principal-idp header EasyAuth injects; the decoded
+                // principal's "auth_typ" carries the same value as a fallback. We surface this in
+                // the emitted principal's identityProvider field for audit/display — but NOT on the
+                // outgoing x-ms-client-principal-idp header, which CIPP overloads as a principal-TYPE
+                // signal (aad = API client, azureStaticWebApps = interactive user). See below.
+                var realIdp = context.Request.Headers["x-ms-client-principal-idp"].ToString();
+                if (string.IsNullOrEmpty(realIdp) &&
+                    root.TryGetProperty("auth_typ", out var authTypEl))
+                    realIdp = authTypEl.GetString() ?? "";
+
                 // Extract identity claims
                 string? upn = null;
                 string? oid = null;
@@ -1015,11 +1033,13 @@ app.Use(async (context, next) =>
 
                 if (isAppOnly && !string.IsNullOrEmpty(appId))
                 {
-                    // Service principal — emit SWA-format principal with idp=aad so downstream
-                    // resolves AppName from the ApiClients table using x-ms-client-principal-name.
+                    // Service principal — emit SWA-format principal. The idp header MUST stay "aad"
+                    // because CIPP keys off it to treat this as an API client and resolve AppName
+                    // from the ApiClients table via x-ms-client-principal-name. The real provider
+                    // (always aad for client-credentials) goes in identityProvider for audit.
                     var spFormat = new
                     {
-                        identityProvider = "aad",
+                        identityProvider = realIdp,
                         userId = oid ?? appId,
                         userDetails = appId,
                         userRoles = Array.Empty<string>()
@@ -1042,9 +1062,19 @@ app.Use(async (context, next) =>
                         await context.Response.WriteAsync("Unauthorized: user not in allowedUsers table.");
                         return;
                     }
+                    // Interactive user — identityProvider carries the real provider (aad, github,
+                    // google, …) for audit/display, mirroring SWA's clientPrincipal. The idp header
+                    // MUST stay "azureStaticWebApps" so CIPP treats this as a user (reads userDetails)
+                    // rather than misclassifying an interactive Entra login as an API client.
+                    //
+                    // INVARIANT (CIPP RBAC compat): this object must NOT include a "claims" array and
+                    // MUST have a non-empty userDetails. CIPP's RBAC user branch reconstructs the
+                    // principal — and overwrites userRoles with @('authenticated','anonymous') — when
+                    // it sees claims present AND userDetails blank. We enter this branch only when upn
+                    // is non-empty and emit no claims, so the real roles below survive. Keep it so.
                     var swaFormat = new
                     {
-                        identityProvider = "aad",
+                        identityProvider = realIdp,
                         userId = oid ?? upn,
                         userDetails = upn,
                         userRoles = roles
@@ -1079,7 +1109,7 @@ app.Use(async (context, next) =>
         logger.LogDebug("[Auth] Dev auth bypass: injecting dev principal for {Path}", path);
         var devPrincipal = new
         {
-            identityProvider = "aad",
+            identityProvider = CraftSettings.Auth.DevIdentityProvider,
             userId = CraftSettings.Auth.DevUserId,
             userDetails = CraftSettings.Auth.DevUserDetails,
             userRoles = CraftSettings.Auth.DevRoles.ToArray()
@@ -1087,6 +1117,8 @@ app.Use(async (context, next) =>
         var devJson = System.Text.Json.JsonSerializer.Serialize(devPrincipal);
         var devBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(devJson));
         context.Request.Headers["x-ms-client-principal"] = devBase64;
+        // Keep the idp header as the user-type signal (see the EasyAuth branch above); the
+        // configurable DevIdentityProvider only populates the principal's identityProvider field.
         context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
         context.Request.Headers["x-ms-client-principal-name"] = CraftSettings.Auth.DevUserDetails;
     }
@@ -1109,7 +1141,7 @@ app.MapGet("/.auth/me", (HttpContext context) =>
     {
         var devPrincipal = new
         {
-            identityProvider = "aad",
+            identityProvider = CraftSettings.Auth.DevIdentityProvider,
             userId = CraftSettings.Auth.DevUserId,
             userDetails = CraftSettings.Auth.DevUserDetails,
             userRoles = CraftSettings.Auth.DevRoles.ToArray()
