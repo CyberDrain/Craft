@@ -962,245 +962,234 @@ else if (capHttp || capFrontend)
 if (capHttp)
 {
 
-// Auth middleware: normalizes the EasyAuth-injected principal for downstream PowerShell.
-// 1. App Service EasyAuth (x-ms-client-principal has "claims", no "userRoles")
-//    → transform to SWA format with roles looked up from the allowedUsers table
-// 2. SWA-format principal (already has "userRoles") → pass through as-is
-// 3. No principal header, Development only → inject a dev principal
-app.Use(async (context, next) =>
-{
-    var authStart = CacheProfiler.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-    var path = context.Request.Path.Value ?? "";
-
-    // Skip header injection for static files and /.auth/*
-    if (path.StartsWith("/_next/") || path.StartsWith("/assets/") ||
-        path.StartsWith("/.auth/") || Path.HasExtension(path))
+    // Auth middleware: normalizes the EasyAuth-injected principal for downstream PowerShell.
+    // 1. App Service EasyAuth (x-ms-client-principal has "claims", no "userRoles")
+    //    → transform to SWA format with roles looked up from the allowedUsers table
+    // 2. SWA-format principal (already has "userRoles") → pass through as-is
+    // 3. No principal header, Development only → inject a dev principal
+    app.Use(async (context, next) =>
     {
-        await next();
-        return;
-    }
+        var authStart = CacheProfiler.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var path = context.Request.Path.Value ?? "";
 
-    if (context.Request.Headers.TryGetValue("x-ms-client-principal", out var existingHeader) &&
-        !string.IsNullOrEmpty(existingHeader.ToString()))
-    {
-        // x-ms-client-principal is present — check if it needs transformation
-        try
+        // Skip header injection for static files and /.auth/*
+        if (path.StartsWith("/_next/") || path.StartsWith("/assets/") ||
+            path.StartsWith("/.auth/") || Path.HasExtension(path))
         {
-            var decoded = System.Text.Encoding.UTF8.GetString(
-                Convert.FromBase64String(existingHeader.ToString()));
-            using var doc = System.Text.Json.JsonDocument.Parse(decoded);
-            var root = doc.RootElement;
-
-            // Detect App Service EasyAuth format: has "claims" array but no "userRoles"
-            if (root.TryGetProperty("claims", out _) && !root.TryGetProperty("userRoles", out _))
-            {
-                // The real identity provider EasyAuth resolved (aad, github, google, …). Source of
-                // truth is the x-ms-client-principal-idp header EasyAuth injects; the decoded
-                // principal's "auth_typ" carries the same value as a fallback. We surface this in
-                // the emitted principal's identityProvider field for audit/display — but NOT on the
-                // outgoing x-ms-client-principal-idp header, which CIPP overloads as a principal-TYPE
-                // signal (aad = API client, azureStaticWebApps = interactive user). See below.
-                var realIdp = context.Request.Headers["x-ms-client-principal-idp"].ToString();
-                if (string.IsNullOrEmpty(realIdp) &&
-                    root.TryGetProperty("auth_typ", out var authTypEl))
-                    realIdp = authTypEl.GetString() ?? "";
-
-                // Extract identity claims
-                string? upn = null;
-                string? oid = null;
-                string? appId = null;
-                string? idtyp = null;
-                if (root.TryGetProperty("claims", out var claims))
-                {
-                    foreach (var claim in claims.EnumerateArray())
-                    {
-                        var typ = claim.GetProperty("typ").GetString() ?? "";
-                        var val = claim.GetProperty("val").GetString() ?? "";
-                        if (typ == "preferred_username" || typ == "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
-                            upn ??= val;
-                        else if (typ == "http://schemas.microsoft.com/identity/claims/objectidentifier")
-                            oid ??= val;
-                        else if (typ == "appid" || typ == "azp")
-                            appId ??= val;
-                        else if (typ == "idtyp")
-                            idtyp ??= val;
-                    }
-                }
-
-                // App-only (client-credentials) token: no UPN, has appid, or idtyp=="app"
-                bool isAppOnly = string.IsNullOrEmpty(upn) &&
-                                 (!string.IsNullOrEmpty(appId) || string.Equals(idtyp, "app", StringComparison.OrdinalIgnoreCase));
-
-                if (isAppOnly && !string.IsNullOrEmpty(appId))
-                {
-                    // Service principal — emit SWA-format principal. The idp header MUST stay "aad"
-                    // because CIPP keys off it to treat this as an API client and resolve AppName
-                    // from the ApiClients table via x-ms-client-principal-name. The real provider
-                    // (always aad for client-credentials) goes in identityProvider for audit.
-                    var spFormat = new
-                    {
-                        identityProvider = realIdp,
-                        userId = oid ?? appId,
-                        userDetails = appId,
-                        userRoles = Array.Empty<string>()
-                    };
-                    var spJson = System.Text.Json.JsonSerializer.Serialize(spFormat);
-                    var spBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(spJson));
-                    context.Request.Headers["x-ms-client-principal"] = spBase64;
-                    context.Request.Headers["x-ms-client-principal-idp"] = "aad";
-                    context.Request.Headers["x-ms-client-principal-name"] = appId;
-                }
-                else if (!string.IsNullOrEmpty(upn))
-                {
-                    // Look up user in allowedUsers table for CIPP roles
-                    var roles = await authService.GetUserRoles(upn);
-                    if (roles == null)
-                    {
-                        // User not authorized — strip the header so downstream sees anonymous
-                        context.Request.Headers.Remove("x-ms-client-principal");
-                        context.Response.StatusCode = 401;
-                        await context.Response.WriteAsync("Unauthorized: user not in allowedUsers table.");
-                        return;
-                    }
-                    // Interactive user — identityProvider carries the real provider (aad, github,
-                    // google, …) for audit/display, mirroring SWA's clientPrincipal. The idp header
-                    // MUST stay "azureStaticWebApps" so CIPP treats this as a user (reads userDetails)
-                    // rather than misclassifying an interactive Entra login as an API client.
-                    //
-                    // INVARIANT (CIPP RBAC compat): this object must NOT include a "claims" array and
-                    // MUST have a non-empty userDetails. CIPP's RBAC user branch reconstructs the
-                    // principal — and overwrites userRoles with @('authenticated','anonymous') — when
-                    // it sees claims present AND userDetails blank. We enter this branch only when upn
-                    // is non-empty and emit no claims, so the real roles below survive. Keep it so.
-                    var swaFormat = new
-                    {
-                        identityProvider = realIdp,
-                        userId = oid ?? upn,
-                        userDetails = upn,
-                        userRoles = roles
-                    };
-                    var swaJson = System.Text.Json.JsonSerializer.Serialize(swaFormat);
-                    var swaBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(swaJson));
-                    context.Request.Headers["x-ms-client-principal"] = swaBase64;
-                    context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
-                    context.Request.Headers["x-ms-client-principal-name"] = upn;
-                }
-            }
-            // else: already in SWA format (has userRoles) — pass through as-is. EasyAuth strips
-            // inbound principal headers upstream, so a header reaching us here came from the
-            // trusted front end.
+            await next();
+            return;
         }
-        catch (Exception ex)
+
+        if (context.Request.Headers.TryGetValue("x-ms-client-principal", out var existingHeader) &&
+            !string.IsNullOrEmpty(existingHeader.ToString()))
         {
-            logger.LogWarning(ex, "[Auth] Failed to parse x-ms-client-principal header");
-            // Pass through untouched if we can't parse it
+            // x-ms-client-principal is present — check if it needs transformation
+            try
+            {
+                var decoded = System.Text.Encoding.UTF8.GetString(
+                    Convert.FromBase64String(existingHeader.ToString()));
+                using var doc = System.Text.Json.JsonDocument.Parse(decoded);
+                var root = doc.RootElement;
+
+                // Detect App Service EasyAuth format: has "claims" array but no "userRoles"
+                if (root.TryGetProperty("claims", out _) && !root.TryGetProperty("userRoles", out _))
+                {
+
+                    var realIdp = context.Request.Headers["x-ms-client-principal-idp"].ToString();
+                    if (string.IsNullOrEmpty(realIdp) &&
+                        root.TryGetProperty("auth_typ", out var authTypEl))
+                        realIdp = authTypEl.GetString() ?? "";
+
+                    string? upn = null;
+                    string? preferredUsername = null;
+                    string? oid = null;
+                    string? appId = null;
+                    string? idtyp = null;
+                    if (root.TryGetProperty("claims", out var claims))
+                    {
+                        foreach (var claim in claims.EnumerateArray())
+                        {
+                            var typ = claim.GetProperty("typ").GetString() ?? "";
+                            var val = claim.GetProperty("val").GetString() ?? "";
+                            if (typ == "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn" || typ == "upn")
+                                upn ??= val;
+                            else if (typ == "preferred_username")
+                                preferredUsername ??= val;
+                            else if (typ == "http://schemas.microsoft.com/identity/claims/objectidentifier")
+                                oid ??= val;
+                            else if (typ == "appid" || typ == "azp")
+                                appId ??= val;
+                            else if (typ == "idtyp")
+                                idtyp ??= val;
+                        }
+                    }
+                    // Fall back to preferred_username only when no authoritative upn claim was present.
+                    upn ??= preferredUsername;
+
+                    // App-only (client-credentials) token: no UPN, has appid, or idtyp=="app"
+                    bool isAppOnly = string.IsNullOrEmpty(upn) &&
+                                     (!string.IsNullOrEmpty(appId) || string.Equals(idtyp, "app", StringComparison.OrdinalIgnoreCase));
+
+                    if (isAppOnly && !string.IsNullOrEmpty(appId))
+                    {
+                        // Service principal — emit SWA-format principal. The idp header MUST stay "aad"
+                        // because CIPP keys off it to treat this as an API client and resolve AppName
+                        // from the ApiClients table via x-ms-client-principal-name. The real provider
+                        // (always aad for client-credentials) goes in identityProvider for audit.
+                        var spFormat = new
+                        {
+                            identityProvider = realIdp,
+                            userId = oid ?? appId,
+                            userDetails = appId,
+                            userRoles = Array.Empty<string>()
+                        };
+                        var spJson = System.Text.Json.JsonSerializer.Serialize(spFormat);
+                        var spBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(spJson));
+                        context.Request.Headers["x-ms-client-principal"] = spBase64;
+                        context.Request.Headers["x-ms-client-principal-idp"] = "aad";
+                        context.Request.Headers["x-ms-client-principal-name"] = appId;
+                    }
+                    else if (!string.IsNullOrEmpty(upn))
+                    {
+                        // Look up user in allowedUsers table for CIPP roles
+                        var roles = await authService.GetUserRoles(upn);
+                        if (roles == null)
+                        {
+                            // User not authorized — strip the header so downstream sees anonymous
+                            context.Request.Headers.Remove("x-ms-client-principal");
+                            context.Response.StatusCode = 401;
+                            await context.Response.WriteAsync("Unauthorized: user not in allowedUsers table.");
+                            return;
+                        }
+                        var swaFormat = new
+                        {
+                            identityProvider = realIdp,
+                            userId = oid ?? upn,
+                            userDetails = upn,
+                            userRoles = roles
+                        };
+                        var swaJson = System.Text.Json.JsonSerializer.Serialize(swaFormat);
+                        var swaBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(swaJson));
+                        context.Request.Headers["x-ms-client-principal"] = swaBase64;
+                        context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
+                        context.Request.Headers["x-ms-client-principal-name"] = upn;
+                    }
+                }
+                // else: already in SWA format (has userRoles) — pass through as-is. EasyAuth strips
+                // inbound principal headers upstream, so a header reaching us here came from the
+                // trusted front end.
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[Auth] Failed to parse x-ms-client-principal header");
+                // Pass through untouched if we can't parse it
+            }
+
+            if (CacheProfiler.Enabled) CacheProfiler.RecordAuth(System.Diagnostics.Stopwatch.GetTimestamp() - authStart);
+            await next();
+            return;
+        }
+
+        // No x-ms-client-principal header — local dev injects a dev principal (EasyAuth owns auth in real
+        // deployments, so a missing header there simply means anonymous).
+        if (app.Environment.IsDevelopment())
+        {
+            // Local dev: inject a dev principal so no login is required
+            logger.LogDebug("[Auth] Dev auth bypass: injecting dev principal for {Path}", path);
+            var devPrincipal = new
+            {
+                identityProvider = CraftSettings.Auth.DevIdentityProvider,
+                userId = CraftSettings.Auth.DevUserId,
+                userDetails = CraftSettings.Auth.DevUserDetails,
+                userRoles = CraftSettings.Auth.DevRoles.ToArray()
+            };
+            var devJson = System.Text.Json.JsonSerializer.Serialize(devPrincipal);
+            var devBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(devJson));
+            context.Request.Headers["x-ms-client-principal"] = devBase64;
+            // Keep the idp header as the user-type signal (see the EasyAuth branch above); the
+            // configurable DevIdentityProvider only populates the principal's identityProvider field.
+            context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
+            context.Request.Headers["x-ms-client-principal-name"] = CraftSettings.Auth.DevUserDetails;
         }
 
         if (CacheProfiler.Enabled) CacheProfiler.RecordAuth(System.Diagnostics.Stopwatch.GetTimestamp() - authStart);
         await next();
-        return;
-    }
+    });
 
-    // No x-ms-client-principal header — local dev injects a dev principal (EasyAuth owns auth in real
-    // deployments, so a missing header there simply means anonymous).
-    if (app.Environment.IsDevelopment())
+    // --- Auth endpoints ---
+    // Login/logout/callback are handled by the upstream App Service EasyAuth layer at the platform edge;
+    // Craft maps none of them. In production EasyAuth also serves /.auth/me at the edge, so the handler
+    // below is shadowed — it only does anything in local development.
+
+    // /.auth/me — dev convenience: in Development, return the injected dev principal so the SPA boots
+    // without a login. In production EasyAuth serves this at the edge before it reaches here.
+    app.MapGet("/.auth/me", (HttpContext context) =>
     {
-        // Local dev: inject a dev principal so no login is required
-        logger.LogDebug("[Auth] Dev auth bypass: injecting dev principal for {Path}", path);
-        var devPrincipal = new
+        // Dev mode: return dev principal without requiring login
+        if (app.Environment.IsDevelopment())
         {
-            identityProvider = CraftSettings.Auth.DevIdentityProvider,
-            userId = CraftSettings.Auth.DevUserId,
-            userDetails = CraftSettings.Auth.DevUserDetails,
-            userRoles = CraftSettings.Auth.DevRoles.ToArray()
-        };
-        var devJson = System.Text.Json.JsonSerializer.Serialize(devPrincipal);
-        var devBase64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(devJson));
-        context.Request.Headers["x-ms-client-principal"] = devBase64;
-        // Keep the idp header as the user-type signal (see the EasyAuth branch above); the
-        // configurable DevIdentityProvider only populates the principal's identityProvider field.
-        context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
-        context.Request.Headers["x-ms-client-principal-name"] = CraftSettings.Auth.DevUserDetails;
-    }
-
-    if (CacheProfiler.Enabled) CacheProfiler.RecordAuth(System.Diagnostics.Stopwatch.GetTimestamp() - authStart);
-    await next();
-});
-
-// --- Auth endpoints ---
-// Login/logout/callback are handled by the upstream App Service EasyAuth layer at the platform edge;
-// Craft maps none of them. In production EasyAuth also serves /.auth/me at the edge, so the handler
-// below is shadowed — it only does anything in local development.
-
-// /.auth/me — dev convenience: in Development, return the injected dev principal so the SPA boots
-// without a login. In production EasyAuth serves this at the edge before it reaches here.
-app.MapGet("/.auth/me", (HttpContext context) =>
-{
-    // Dev mode: return dev principal without requiring login
-    if (app.Environment.IsDevelopment())
-    {
-        var devPrincipal = new
-        {
-            identityProvider = CraftSettings.Auth.DevIdentityProvider,
-            userId = CraftSettings.Auth.DevUserId,
-            userDetails = CraftSettings.Auth.DevUserDetails,
-            userRoles = CraftSettings.Auth.DevRoles.ToArray()
-        };
-        return Results.Json(new { clientPrincipal = devPrincipal });
-    }
-    return Results.Json(new { clientPrincipal = (object?)null });
-});
-
-// /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
-// MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
-//
-// Always returns 200, even when PS errors. The SPA uses clientPrincipal:null as the
-// "not authenticated" signal, not HTTP status — returning a 4xx/5xx here makes the
-// frontend retry-storm (seen in the wild as 40+ requests in 6 seconds). When PS
-// throws or returns non-2xx, we wrap with { clientPrincipal: null, permissions: [] }
-// so the SPA boots cleanly into a login UI. Underlying PS errors are still logged
-// at Warning level for diagnosis.
-app.MapGet("/api/me", async (HttpContext context) =>
-{
-    var meFunction = string.IsNullOrEmpty(CraftSettings.Auth.MeEndpointFunction)
-        ? "me"
-        : CraftSettings.Auth.MeEndpointFunction;
-
-    var request = await PowerShellRunnerService.SnapshotRequest(context);
-    var parms = (System.Collections.Hashtable)request["Params"]!;
-    parms["CIPPEndpoint"] = meFunction;
-
-    context.Response.StatusCode = 200;
-    context.Response.ContentType = "application/json";
-
-    try
-    {
-        var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
-        if (result.StatusCode is >= 200 and < 300)
-        {
-            await context.Response.WriteAsync(result.Body);
+            var devPrincipal = new
+            {
+                identityProvider = CraftSettings.Auth.DevIdentityProvider,
+                userId = CraftSettings.Auth.DevUserId,
+                userDetails = CraftSettings.Auth.DevUserDetails,
+                userRoles = CraftSettings.Auth.DevRoles.ToArray()
+            };
+            return Results.Json(new { clientPrincipal = devPrincipal });
         }
-        else
+        return Results.Json(new { clientPrincipal = (object?)null });
+    });
+
+    // /api/me — dispatch to Auth.MeEndpointFunction (or literal "me" if unset).
+    // MeEndpointHandler wrapping is resolved inside ExecuteHttpEndpoint.
+    //
+    // Always returns 200, even when PS errors. The SPA uses clientPrincipal:null as the
+    // "not authenticated" signal, not HTTP status — returning a 4xx/5xx here makes the
+    // frontend retry-storm (seen in the wild as 40+ requests in 6 seconds). When PS
+    // throws or returns non-2xx, we wrap with { clientPrincipal: null, permissions: [] }
+    // so the SPA boots cleanly into a login UI. Underlying PS errors are still logged
+    // at Warning level for diagnosis.
+    app.MapGet("/api/me", async (HttpContext context) =>
+    {
+        var meFunction = string.IsNullOrEmpty(CraftSettings.Auth.MeEndpointFunction)
+            ? "me"
+            : CraftSettings.Auth.MeEndpointFunction;
+
+        var request = await PowerShellRunnerService.SnapshotRequest(context);
+        var parms = (System.Collections.Hashtable)request["Params"]!;
+        parms["CIPPEndpoint"] = meFunction;
+
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = "application/json";
+
+        try
         {
-            logger.LogWarning("[Auth] /api/me PS returned {Status}: {Body}", result.StatusCode, result.Body);
+            var result = await psRunner.ExecuteHttpEndpoint(meFunction, request);
+            if (result.StatusCode is >= 200 and < 300)
+            {
+                await context.Response.WriteAsync(result.Body);
+            }
+            else
+            {
+                logger.LogWarning("[Auth] /api/me PS returned {Status}: {Body}", result.StatusCode, result.Body);
+                await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    clientPrincipal = (object?)null,
+                    permissions = Array.Empty<string>(),
+                    message = "Access denied. Contact your administrator."
+                }));
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[Auth] /api/me failed");
             await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
             {
                 clientPrincipal = (object?)null,
-                permissions = Array.Empty<string>(),
-                message = "Access denied. Contact your administrator."
+                permissions = Array.Empty<string>()
             }));
         }
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "[Auth] /api/me failed");
-        await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
-        {
-            clientPrincipal = (object?)null,
-            permissions = Array.Empty<string>()
-        }));
-    }
-});
+    });
 
 } // end HTTP-role block (auth middleware). Bridges below run for any PS role; the
   // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
@@ -1227,493 +1216,493 @@ StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryServic
 if (capHttp)
 {
 
-// --- Setup API (C# direct — no PS) ---
+    // --- Setup API (C# direct — no PS) ---
 
-// Health endpoint always available — used by startup loading screen for readiness polling
-app.MapGet("/api/setup/health", () =>
-{
-    var info = StartupInfoBridge.GetInfo();
-    return Results.Json(new
+    // Health endpoint always available — used by startup loading screen for readiness polling
+    app.MapGet("/api/setup/health", () =>
     {
-        status = "ok",
-        ready = pool.IsReady,
-        phase = info.Phase,
-        startup = new
+        var info = StartupInfoBridge.GetInfo();
+        return Results.Json(new
         {
-            readinessMode = info.ReadinessMode,
-            warmupMode = info.WarmupMode,
-            cpuCount = info.CpuCount,
-            httpPoolSize = info.HttpPoolSize,
-            bgPoolSize = info.BgPoolSize,
-            sharedModules = info.SharedModuleCount,
-            httpOnlyModules = info.HttpOnlyModuleCount,
-            bgOnlyModules = info.BgOnlyModuleCount,
-            warmupMs = info.WarmupMs,
-            baseWorkerMs = info.BaseWorkerMs,
-            baseFunctions = info.BaseFunctionCount,
-            httpReadyMs = info.HttpReadyMs,
-            httpFunctions = info.HttpFunctionCount,
-            httpPoolFullMs = info.HttpPoolFullMs,
-            bgReadyMs = info.BgReadyMs,
-            bgFunctions = info.BgFunctionCount,
-            fullyReadyMs = info.FullyReadyMs
-        }
+            status = "ok",
+            ready = pool.IsReady,
+            phase = info.Phase,
+            startup = new
+            {
+                readinessMode = info.ReadinessMode,
+                warmupMode = info.WarmupMode,
+                cpuCount = info.CpuCount,
+                httpPoolSize = info.HttpPoolSize,
+                bgPoolSize = info.BgPoolSize,
+                sharedModules = info.SharedModuleCount,
+                httpOnlyModules = info.HttpOnlyModuleCount,
+                bgOnlyModules = info.BgOnlyModuleCount,
+                warmupMs = info.WarmupMs,
+                baseWorkerMs = info.BaseWorkerMs,
+                baseFunctions = info.BaseFunctionCount,
+                httpReadyMs = info.HttpReadyMs,
+                httpFunctions = info.HttpFunctionCount,
+                httpPoolFullMs = info.HttpPoolFullMs,
+                bgReadyMs = info.BgReadyMs,
+                bgFunctions = info.BgFunctionCount,
+                fullyReadyMs = info.FullyReadyMs
+            }
+        });
     });
-});
 
-if (CraftSettings.Setup.Enabled)
-{
-app.MapGet("/setup", (HttpContext context) =>
-{
-    context.Response.ContentType = "text/html; charset=utf-8";
-    return Results.Content(SetupPages.IndexHtml, "text/html");
-});
-
-app.MapGet("/api/setup/status", async (HttpContext context) =>
-{
-    var status = await setupService.GetStatus(context.RequestAborted);
-    return Results.Json(status);
-});
-
-app.MapPost("/api/setup/device-code", async (HttpContext context) =>
-{
-    var result = await setupService.StartDeviceCodeFlow();
-    return Results.Json(result);
-});
-
-app.MapPost("/api/setup/device-code-poll", async (HttpContext context) =>
-{
-    using var reader = new StreamReader(context.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    using var doc = System.Text.Json.JsonDocument.Parse(body);
-    var root = doc.RootElement;
-
-    var deviceCode = root.GetProperty("deviceCode").GetString()!;
-    var result = await setupService.PollDeviceCodeFlow(deviceCode);
-
-    if (result == null)
-        return Results.Json(new { pending = true });
-
-    return Results.Json(new { pending = false, accessToken = result.AccessToken, tenantId = result.TenantId });
-});
-
-app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
-{
-    using var reader = new StreamReader(context.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    using var doc = System.Text.Json.JsonDocument.Parse(body);
-    var root = doc.RootElement;
-
-    var accessToken = root.GetProperty("accessToken").GetString()!;
-    var tenantId = root.GetProperty("tenantId").GetString()!;
-    var redirectUri = root.GetProperty("redirectUri").GetString()!;
-    var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
-
-    var result = await setupService.CreateAuthAppRegistration(accessToken, tenantId, redirectUri, multiTenant);
-    return Results.Json(result);
-});
-
-app.MapPost("/api/setup/configure", async (HttpContext context) =>
-{
-    if (AppLifecycleBridge.IsSetupCompleted())
-        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
-
-    using var reader = new StreamReader(context.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    using var doc = System.Text.Json.JsonDocument.Parse(body);
-    var root = doc.RootElement;
-
-    var appId = root.GetProperty("appId").GetString()!;
-    var clientSecret = root.GetProperty("clientSecret").GetString()!;
-    var tenantId = root.GetProperty("tenantId").GetString()!;
-    var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
-
-    await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
-    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via automated setup");
-    return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
-});
-
-app.MapPost("/api/setup/manual", async (HttpContext context) =>
-{
-    if (AppLifecycleBridge.IsSetupCompleted())
-        return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
-
-    using var reader = new StreamReader(context.Request.Body);
-    var body = await reader.ReadToEndAsync();
-    using var doc = System.Text.Json.JsonDocument.Parse(body);
-    var root = doc.RootElement;
-
-    var appId = root.GetProperty("appId").GetString()!;
-    var clientSecret = root.GetProperty("clientSecret").GetString()!;
-    var tenantId = root.GetProperty("tenantId").GetString()!;
-    var multiTenant = root.TryGetProperty("multiTenant", out var mt2) && mt2.GetBoolean();
-
-    await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
-    AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via manual setup");
-    return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
-});
-
-app.MapPost("/api/setup/seed-user", async (HttpContext context) =>
-{
-    try
+    if (CraftSettings.Setup.Enabled)
     {
-        using var reader = new StreamReader(context.Request.Body);
-        var body = await reader.ReadToEndAsync();
-        using var doc = System.Text.Json.JsonDocument.Parse(body);
-        var root = doc.RootElement;
-
-        var upn = root.GetProperty("upn").GetString()!;
-        await setupService.SeedFirstUser(upn, context.RequestAborted);
-        return Results.Json(new { success = true, message = $"Superadmin user {upn} added successfully." });
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(new { success = false, message = ex.Message }, statusCode: 400);
-    }
-});
-} // end Setup.Enabled
-
-// --- Job Status API (C# direct — no PS overhead) ---
-
-app.MapGet("/API/jobs/summary", (HttpContext context) =>
-{
-    var summary = jobManager.GetSummary();
-    context.Response.ContentType = "application/json";
-    return Results.Ok(summary);
-});
-
-// Worker-allocation snapshot: JobManager queue/active, the concurrency limiter's live gate, and the BG pool's
-// busy/idle workers. Poll it during a fan-out to see the ramp, worker utilization, and I/O idle over time.
-var bgLimiter = app.Services.GetRequiredService<BackgroundTaskLimiter>();
-app.MapGet("/API/jobs/allocation", () => Results.Json(new
-{
-    jm = new { active = jobManager.ActiveCount, queued = jobManager.QueuedCount, maxConcurrency = jobManager.MaxConcurrency },
-    limiter = new { currentMax = bgLimiter.CurrentMax, effectiveMax = bgLimiter.EffectiveMax, overSubscribe = bgLimiter.OverSubscribe, burst = bgLimiter.BurstToCeiling, active = bgLimiter.Active, waiting = bgLimiter.Waiting, httpThrottled = bgLimiter.IsHttpThrottled },
-    pool = new { bgBusy = pool.BgPoolSize - pool.BgAvailable, bgTotal = pool.BgPoolSize, bgAvail = pool.BgAvailable, httpAvail = pool.HttpAvailable }
-}));
-
-app.MapGet("/API/jobs/runs", (HttpContext context) =>
-{
-    var runs = jobManager.GetRunSummaries();
-    context.Response.ContentType = "application/json";
-    return Results.Ok(runs);
-});
-
-app.MapGet("/API/jobs/list", (HttpContext context) =>
-{
-    var runName = context.Request.Query["runName"].ToString();
-    var status = context.Request.Query["status"].ToString();
-    var limitStr = context.Request.Query["limit"].ToString();
-    int? limit = int.TryParse(limitStr, out var l) ? l : null;
-
-    var jobs = jobManager.GetJobs(
-        string.IsNullOrEmpty(runName) ? null : runName,
-        string.IsNullOrEmpty(status) ? null : status,
-        limit);
-    context.Response.ContentType = "application/json";
-    return Results.Ok(jobs);
-});
-
-app.MapPost("/API/runs/cancel", async (HttpContext context) =>
-{
-    var name = context.Request.Query["name"].ToString();
-    if (string.IsNullOrEmpty(name))
-        return Results.BadRequest(new { error = "name parameter is required" });
-
-    var (found, cancelledCount) = await orchestrator.CancelRunAsync(name);
-    if (!found)
-    {
-        // Try with Start- prefix
-        (found, cancelledCount) = await orchestrator.CancelRunAsync($"Start-{name}");
-    }
-    if (!found)
-        return Results.NotFound(new { error = $"No run found for '{name}'" });
-
-    return Results.Ok(new { name, cancelled = cancelledCount, message = $"Cancelled {cancelledCount} pending tasks" });
-});
-
-// Map all discovered PowerShell HTTP endpoints under /API/{EndpointName}
-app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH" }, async (HttpContext context, string endpoint) =>
-{
-    var requestSw = System.Diagnostics.Stopwatch.StartNew();
-    var concurrent = Interlocked.Increment(ref activeRequests);
-
-    try
-    {
-
-        if (!endpoints.ContainsKey(endpoint))
+        app.MapGet("/setup", (HttpContext context) =>
         {
-            context.Response.StatusCode = 404;
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync($"{{\"error\":\"Endpoint '{endpoint}' not found\"}}");
-            return;
+            context.Response.ContentType = "text/html; charset=utf-8";
+            return Results.Content(SetupPages.IndexHtml, "text/html");
+        });
+
+        app.MapGet("/api/setup/status", async (HttpContext context) =>
+        {
+            var status = await setupService.GetStatus(context.RequestAborted);
+            return Results.Json(status);
+        });
+
+        app.MapPost("/api/setup/device-code", async (HttpContext context) =>
+        {
+            var result = await setupService.StartDeviceCodeFlow();
+            return Results.Json(result);
+        });
+
+        app.MapPost("/api/setup/device-code-poll", async (HttpContext context) =>
+        {
+            using var reader = new StreamReader(context.Request.Body);
+            var body = await reader.ReadToEndAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            var deviceCode = root.GetProperty("deviceCode").GetString()!;
+            var result = await setupService.PollDeviceCodeFlow(deviceCode);
+
+            if (result == null)
+                return Results.Json(new { pending = true });
+
+            return Results.Json(new { pending = false, accessToken = result.AccessToken, tenantId = result.TenantId });
+        });
+
+        app.MapPost("/api/setup/create-auth-app", async (HttpContext context) =>
+        {
+            using var reader = new StreamReader(context.Request.Body);
+            var body = await reader.ReadToEndAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            var accessToken = root.GetProperty("accessToken").GetString()!;
+            var tenantId = root.GetProperty("tenantId").GetString()!;
+            var redirectUri = root.GetProperty("redirectUri").GetString()!;
+            var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
+
+            var result = await setupService.CreateAuthAppRegistration(accessToken, tenantId, redirectUri, multiTenant);
+            return Results.Json(result);
+        });
+
+        app.MapPost("/api/setup/configure", async (HttpContext context) =>
+        {
+            if (AppLifecycleBridge.IsSetupCompleted())
+                return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
+            using var reader = new StreamReader(context.Request.Body);
+            var body = await reader.ReadToEndAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            var appId = root.GetProperty("appId").GetString()!;
+            var clientSecret = root.GetProperty("clientSecret").GetString()!;
+            var tenantId = root.GetProperty("tenantId").GetString()!;
+            var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
+
+            await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
+            AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via automated setup");
+            return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+        });
+
+        app.MapPost("/api/setup/manual", async (HttpContext context) =>
+        {
+            if (AppLifecycleBridge.IsSetupCompleted())
+                return Results.Json(new { success = false, message = "Setup already completed. The app is pending restart." }, statusCode: 409);
+
+            using var reader = new StreamReader(context.Request.Body);
+            var body = await reader.ReadToEndAsync();
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            var appId = root.GetProperty("appId").GetString()!;
+            var clientSecret = root.GetProperty("clientSecret").GetString()!;
+            var tenantId = root.GetProperty("tenantId").GetString()!;
+            var multiTenant = root.TryGetProperty("multiTenant", out var mt2) && mt2.GetBoolean();
+
+            await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
+            AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via manual setup");
+            return Results.Json(new { success = true, message = "App Service auth configured. The app will restart to apply changes." });
+        });
+
+        app.MapPost("/api/setup/seed-user", async (HttpContext context) =>
+        {
+            try
+            {
+                using var reader = new StreamReader(context.Request.Body);
+                var body = await reader.ReadToEndAsync();
+                using var doc = System.Text.Json.JsonDocument.Parse(body);
+                var root = doc.RootElement;
+
+                var upn = root.GetProperty("upn").GetString()!;
+                await setupService.SeedFirstUser(upn, context.RequestAborted);
+                return Results.Json(new { success = true, message = $"Superadmin user {upn} added successfully." });
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(new { success = false, message = ex.Message }, statusCode: 400);
+            }
+        });
+    } // end Setup.Enabled
+
+    // --- Job Status API (C# direct — no PS overhead) ---
+
+    app.MapGet("/API/jobs/summary", (HttpContext context) =>
+    {
+        var summary = jobManager.GetSummary();
+        context.Response.ContentType = "application/json";
+        return Results.Ok(summary);
+    });
+
+    // Worker-allocation snapshot: JobManager queue/active, the concurrency limiter's live gate, and the BG pool's
+    // busy/idle workers. Poll it during a fan-out to see the ramp, worker utilization, and I/O idle over time.
+    var bgLimiter = app.Services.GetRequiredService<BackgroundTaskLimiter>();
+    app.MapGet("/API/jobs/allocation", () => Results.Json(new
+    {
+        jm = new { active = jobManager.ActiveCount, queued = jobManager.QueuedCount, maxConcurrency = jobManager.MaxConcurrency },
+        limiter = new { currentMax = bgLimiter.CurrentMax, effectiveMax = bgLimiter.EffectiveMax, overSubscribe = bgLimiter.OverSubscribe, burst = bgLimiter.BurstToCeiling, active = bgLimiter.Active, waiting = bgLimiter.Waiting, httpThrottled = bgLimiter.IsHttpThrottled },
+        pool = new { bgBusy = pool.BgPoolSize - pool.BgAvailable, bgTotal = pool.BgPoolSize, bgAvail = pool.BgAvailable, httpAvail = pool.HttpAvailable }
+    }));
+
+    app.MapGet("/API/jobs/runs", (HttpContext context) =>
+    {
+        var runs = jobManager.GetRunSummaries();
+        context.Response.ContentType = "application/json";
+        return Results.Ok(runs);
+    });
+
+    app.MapGet("/API/jobs/list", (HttpContext context) =>
+    {
+        var runName = context.Request.Query["runName"].ToString();
+        var status = context.Request.Query["status"].ToString();
+        var limitStr = context.Request.Query["limit"].ToString();
+        int? limit = int.TryParse(limitStr, out var l) ? l : null;
+
+        var jobs = jobManager.GetJobs(
+            string.IsNullOrEmpty(runName) ? null : runName,
+            string.IsNullOrEmpty(status) ? null : status,
+            limit);
+        context.Response.ContentType = "application/json";
+        return Results.Ok(jobs);
+    });
+
+    app.MapPost("/API/runs/cancel", async (HttpContext context) =>
+    {
+        var name = context.Request.Query["name"].ToString();
+        if (string.IsNullOrEmpty(name))
+            return Results.BadRequest(new { error = "name parameter is required" });
+
+        var (found, cancelledCount) = await orchestrator.CancelRunAsync(name);
+        if (!found)
+        {
+            // Try with Start- prefix
+            (found, cancelledCount) = await orchestrator.CancelRunAsync($"Start-{name}");
         }
+        if (!found)
+            return Results.NotFound(new { error = $"No run found for '{name}'" });
 
-        logger.LogInformation("[HTTP] {Method} /API/{Endpoint} start concurrent={Concurrent}",
-            context.Request.Method, endpoint, concurrent);
+        return Results.Ok(new { name, cancelled = cancelledCount, message = $"Cancelled {cancelledCount} pending tasks" });
+    });
 
-        // Invalidate cache if requested via query parameter
-        if (context.Request.Query.ContainsKey(cache.InvalidateParam)
-            && string.Equals(context.Request.Query[cache.InvalidateParam], "true", StringComparison.OrdinalIgnoreCase))
+    // Map all discovered PowerShell HTTP endpoints under /API/{EndpointName}
+    app.MapMethods("/API/{endpoint}", new[] { "GET", "POST", "PUT", "DELETE", "PATCH" }, async (HttpContext context, string endpoint) =>
+    {
+        var requestSw = System.Diagnostics.Stopwatch.StartNew();
+        var concurrent = Interlocked.Increment(ref activeRequests);
+
+        try
         {
-            // Scoped invalidation: if scope param is present, only invalidate matching entries
-            var scopeParam = cache.ScopeParam;
-            var scopeValue = !string.IsNullOrEmpty(scopeParam) ? context.Request.Query[scopeParam].ToString() : "";
-            if (!string.IsNullOrEmpty(scopeValue))
-            {
-                cache.InvalidateByScope(scopeValue);
-            }
-            else
-            {
-                cache.InvalidateAll();
-            }
-        }
 
-        // Stale-while-revalidate for GET requests to List* endpoints
-        var isReadEndpoint = context.Request.Method == "GET"
-            && endpoint.StartsWith("List", StringComparison.OrdinalIgnoreCase);
-
-        // Computed once here and reused for the write-back below (was recomputed on the miss path).
-        string? cacheKey = null;
-
-        if (isReadEndpoint)
-        {
-            var cprof = CacheProfiler.Enabled;
-            var t0 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            var userRoleHash = CacheService.GetUserRoleHash(context);
-            var t1 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            cacheKey = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
-            var t2 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            var cached = await cache.Get(cacheKey, endpoint);
-            if (cprof)
+            if (!endpoints.ContainsKey(endpoint))
             {
-                CacheProfiler.SetLogger(logger);
-                CacheProfiler.RecordRequest(t1 - t0, t2 - t1, System.Diagnostics.Stopwatch.GetTimestamp() - t2, cached != null);
+                context.Response.StatusCode = 404;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync($"{{\"error\":\"Endpoint '{endpoint}' not found\"}}");
+                return;
             }
 
-            if (cached != null)
-            {
-                cache.Touch(cacheKey);
-                var ttl = cache.GetTtl(endpoint);
+            logger.LogInformation("[HTTP] {Method} /API/{Endpoint} start concurrent={Concurrent}",
+                context.Request.Method, endpoint, concurrent);
 
-                // Snapshot request BEFORE writing response — HttpContext becomes
-                // unreliable after Response.WriteAsync completes
-                Hashtable? requestSnapshot = null;
-                if (cache.TryStartRefresh(cacheKey))
+            // Invalidate cache if requested via query parameter
+            if (context.Request.Query.ContainsKey(cache.InvalidateParam)
+                && string.Equals(context.Request.Query[cache.InvalidateParam], "true", StringComparison.OrdinalIgnoreCase))
+            {
+                // Scoped invalidation: if scope param is present, only invalidate matching entries
+                var scopeParam = cache.ScopeParam;
+                var scopeValue = !string.IsNullOrEmpty(scopeParam) ? context.Request.Query[scopeParam].ToString() : "";
+                if (!string.IsNullOrEmpty(scopeValue))
                 {
-                    requestSnapshot = await PowerShellRunnerService.SnapshotRequest(context);
+                    cache.InvalidateByScope(scopeValue);
+                }
+                else
+                {
+                    cache.InvalidateAll();
+                }
+            }
+
+            // Stale-while-revalidate for GET requests to List* endpoints
+            var isReadEndpoint = context.Request.Method == "GET"
+                && endpoint.StartsWith("List", StringComparison.OrdinalIgnoreCase);
+
+            // Computed once here and reused for the write-back below (was recomputed on the miss path).
+            string? cacheKey = null;
+
+            if (isReadEndpoint)
+            {
+                var cprof = CacheProfiler.Enabled;
+                var t0 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                var userRoleHash = CacheService.GetUserRoleHash(context);
+                var t1 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                cacheKey = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
+                var t2 = cprof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                var cached = await cache.Get(cacheKey, endpoint);
+                if (cprof)
+                {
+                    CacheProfiler.SetLogger(logger);
+                    CacheProfiler.RecordRequest(t1 - t0, t2 - t1, System.Diagnostics.Stopwatch.GetTimestamp() - t2, cached != null);
                 }
 
-                context.Response.StatusCode = cached.Result.StatusCode;
-                context.Response.ContentType = "application/json";
-                context.Response.Headers["X-Cache"] = cached.IsStale ? "HIT-STALE" : "HIT";
-                context.Response.Headers["X-Cache-Age"] = $"{cached.Age.TotalSeconds:F0}s";
-                context.Response.Headers["X-Cache-TTL"] = $"{ttl.TotalSeconds:F0}s";
-                context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
-                await context.Response.WriteAsync(cached.Result.Body);
-
-                // Kick off background refresh with the pre-captured snapshot
-                if (requestSnapshot != null)
+                if (cached != null)
                 {
-                    var capturedEndpoint = endpoint;
-                    var capturedCacheKey = cacheKey;
-                    var capturedGeneration = cache.Generation;
+                    cache.Touch(cacheKey);
+                    var ttl = cache.GetTtl(endpoint);
 
-                    _ = Task.Run(async () =>
+                    // Snapshot request BEFORE writing response — HttpContext becomes
+                    // unreliable after Response.WriteAsync completes
+                    Hashtable? requestSnapshot = null;
+                    if (cache.TryStartRefresh(cacheKey))
                     {
-                        try
-                        {
-                            await cache.WaitForBgRefreshSlot(capturedEndpoint);
-                            var freshResult = await psRunner.ExecuteHttpScript(capturedEndpoint, requestSnapshot);
-                            if (freshResult.StatusCode is >= 200 and < 400)
-                            {
-                                cache.SetIfSameGeneration(capturedCacheKey, freshResult, capturedGeneration);
+                        requestSnapshot = await PowerShellRunnerService.SnapshotRequest(context);
+                    }
 
-                                // Check if the refreshed result wants to trigger an orchestrator run
-                                if (freshResult.Body.Contains("_orchestratorTrigger"))
+                    context.Response.StatusCode = cached.Result.StatusCode;
+                    context.Response.ContentType = "application/json";
+                    context.Response.Headers["X-Cache"] = cached.IsStale ? "HIT-STALE" : "HIT";
+                    context.Response.Headers["X-Cache-Age"] = $"{cached.Age.TotalSeconds:F0}s";
+                    context.Response.Headers["X-Cache-TTL"] = $"{ttl.TotalSeconds:F0}s";
+                    context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
+                    await context.Response.WriteAsync(cached.Result.Body);
+
+                    // Kick off background refresh with the pre-captured snapshot
+                    if (requestSnapshot != null)
+                    {
+                        var capturedEndpoint = endpoint;
+                        var capturedCacheKey = cacheKey;
+                        var capturedGeneration = cache.Generation;
+
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await cache.WaitForBgRefreshSlot(capturedEndpoint);
+                                var freshResult = await psRunner.ExecuteHttpScript(capturedEndpoint, requestSnapshot);
+                                if (freshResult.StatusCode is >= 200 and < 400)
                                 {
-                                    try
+                                    cache.SetIfSameGeneration(capturedCacheKey, freshResult, capturedGeneration);
+
+                                    // Check if the refreshed result wants to trigger an orchestrator run
+                                    if (freshResult.Body.Contains("_orchestratorTrigger"))
                                     {
-                                        using var doc = System.Text.Json.JsonDocument.Parse(freshResult.Body);
-                                        if (doc.RootElement.TryGetProperty("_orchestratorTrigger", out var trigger) && trigger.GetBoolean())
+                                        try
                                         {
-                                            var cmd = doc.RootElement.GetProperty("command").GetString()!;
-                                            var planner = doc.RootElement.GetProperty("plannerScript").GetString()!;
-                                            var taskScr = doc.RootElement.GetProperty("taskScript").GetString()!;
-                                            var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 2;
-                                            var plannerPath = psRunner.FindScript(planner);
-                                            var taskPath = psRunner.FindScript(taskScr);
-                                            if (plannerPath != null && taskPath != null)
+                                            using var doc = System.Text.Json.JsonDocument.Parse(freshResult.Body);
+                                            if (doc.RootElement.TryGetProperty("_orchestratorTrigger", out var trigger) && trigger.GetBoolean())
                                             {
-                                                _ = orchestrator.StartOrResumeRun(cmd, plannerPath, taskPath, priority, CancellationToken.None);
-                                                logger.LogInformation("[API] Orchestrator triggered via bg refresh: {Command} P{Priority}", cmd, priority);
+                                                var cmd = doc.RootElement.GetProperty("command").GetString()!;
+                                                var planner = doc.RootElement.GetProperty("plannerScript").GetString()!;
+                                                var taskScr = doc.RootElement.GetProperty("taskScript").GetString()!;
+                                                var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 2;
+                                                var plannerPath = psRunner.FindScript(planner);
+                                                var taskPath = psRunner.FindScript(taskScr);
+                                                if (plannerPath != null && taskPath != null)
+                                                {
+                                                    _ = orchestrator.StartOrResumeRun(cmd, plannerPath, taskPath, priority, CancellationToken.None);
+                                                    logger.LogInformation("[API] Orchestrator triggered via bg refresh: {Command} P{Priority}", cmd, priority);
+                                                }
                                             }
                                         }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        logger.LogWarning(ex, "Failed to parse orchestrator trigger from background refresh");
+                                        catch (Exception ex)
+                                        {
+                                            logger.LogWarning(ex, "Failed to parse orchestrator trigger from background refresh");
+                                        }
                                     }
                                 }
                             }
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogError(ex, "Background refresh failed: /API/{Endpoint}", capturedEndpoint);
-                        }
-                        finally
-                        {
-                            cache.ReleaseBgRefreshSlot(capturedEndpoint);
-                            cache.FinishRefresh(capturedCacheKey);
-                        }
-                    });
-                }
-                return;
-            }
-        }
-
-        logger.LogInformation("[HTTP] /API/{Endpoint} executing concurrent={Concurrent}",
-            endpoint, concurrent);
-
-        var result = await psRunner.ExecuteHttpScript(endpoint, context);
-
-        // Invalidate cache on write operations (POST/PUT/DELETE/PATCH)
-        if (context.Request.Method != "GET")
-        {
-            // If scope param is configured and present, only invalidate matching entries
-            var scopeParam = cache.ScopeParam;
-            var scopeValue = !string.IsNullOrEmpty(scopeParam) ? context.Request.Query[scopeParam].ToString() : "";
-            if (!string.IsNullOrEmpty(scopeValue))
-            {
-                cache.InvalidateByScope(scopeValue);
-            }
-            else
-            {
-                // No scope context — can't scope the invalidation, clear everything
-                cache.InvalidateAll();
-            }
-        }
-
-        // Cache successful GET List* responses (reuse the key computed on the read path — no recompute).
-        if (isReadEndpoint && cacheKey != null && result.StatusCode is >= 200 and < 400)
-        {
-            await cache.Set(cacheKey, result);
-        }
-
-        context.Response.StatusCode = result.StatusCode;
-        context.Response.ContentType = "application/json";
-        context.Response.Headers["X-Cache"] = "MISS";
-        context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
-
-        // Check if the PS function wants us to trigger an orchestrator run
-        if (result.StatusCode == 200 && result.Body.Contains("_orchestratorTrigger"))
-        {
-            try
-            {
-                using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
-                if (doc.RootElement.TryGetProperty("_orchestratorTrigger", out var trigger) && trigger.GetBoolean())
-                {
-                    var cmd = doc.RootElement.GetProperty("command").GetString()!;
-                    var planner = doc.RootElement.GetProperty("plannerScript").GetString()!;
-                    var taskScr = doc.RootElement.GetProperty("taskScript").GetString()!;
-                    var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 2;
-                    var plannerPath = psRunner.FindScript(planner);
-                    var taskPath = psRunner.FindScript(taskScr);
-                    if (plannerPath != null && taskPath != null)
-                    {
-                        _ = orchestrator.StartOrResumeRun(cmd, plannerPath, taskPath, priority, CancellationToken.None);
-                        logger.LogInformation("[API] Orchestrator triggered: {Command} P{Priority}", cmd, priority);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Failed to parse orchestrator trigger from response");
-            }
-        }
-
-        // Check if the PS function wants us to run a simple background script
-        if (result.StatusCode == 200 && result.Body.Contains("_scriptTrigger"))
-        {
-            try
-            {
-                using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
-                if (doc.RootElement.TryGetProperty("_scriptTrigger", out var trigger) && trigger.GetBoolean())
-                {
-                    var cmd = doc.RootElement.GetProperty("command").GetString()!;
-                    var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 5;
-                    var scriptPath = psRunner.FindScript(cmd);
-                    if (scriptPath != null)
-                    {
-                        jobManager.Enqueue(cmd, priority, async ct =>
-                        {
-                            await psRunner.ExecuteScript(cmd);
+                            catch (Exception ex)
+                            {
+                                logger.LogError(ex, "Background refresh failed: /API/{Endpoint}", capturedEndpoint);
+                            }
+                            finally
+                            {
+                                cache.ReleaseBgRefreshSlot(capturedEndpoint);
+                                cache.FinishRefresh(capturedCacheKey);
+                            }
                         });
-                        logger.LogInformation("[API] Script triggered: {Command} P{Priority}", cmd, priority);
                     }
-                    else
-                    {
-                        logger.LogWarning("[API] Script not found for trigger: {Command}", cmd);
-                    }
+                    return;
                 }
             }
-            catch (Exception ex)
-            {
-                logger.LogWarning(ex, "Failed to parse script trigger from response");
-            }
-        }
 
-        // Check if the PS function wants us to cancel an orchestrator run
-        if (result.StatusCode == 200 && result.Body.Contains("_cancelTrigger"))
-        {
-            try
+            logger.LogInformation("[HTTP] /API/{Endpoint} executing concurrent={Concurrent}",
+                endpoint, concurrent);
+
+            var result = await psRunner.ExecuteHttpScript(endpoint, context);
+
+            // Invalidate cache on write operations (POST/PUT/DELETE/PATCH)
+            if (context.Request.Method != "GET")
             {
-                using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
-                if (doc.RootElement.TryGetProperty("_cancelTrigger", out var trigger) && trigger.GetBoolean())
+                // If scope param is configured and present, only invalidate matching entries
+                var scopeParam = cache.ScopeParam;
+                var scopeValue = !string.IsNullOrEmpty(scopeParam) ? context.Request.Query[scopeParam].ToString() : "";
+                if (!string.IsNullOrEmpty(scopeValue))
                 {
-                    var cmd = doc.RootElement.GetProperty("command").GetString()!;
-                    var (found, cancelledCount) = await orchestrator.CancelRunAsync(cmd);
-                    if (!found)
-                        (found, cancelledCount) = await orchestrator.CancelRunAsync($"Start-{cmd}");
-
-                    if (found)
-                    {
-                        logger.LogInformation("[API] Run cancelled: {Command} ({Cancelled} pending tasks)", cmd, cancelledCount);
-                        // Rewrite response with actual cancel result
-                        result = new ScriptResult
-                        {
-                            StatusCode = 200,
-                            Body = System.Text.Json.JsonSerializer.Serialize(new { name = cmd, cancelled = cancelledCount, message = $"Cancelled {cancelledCount} pending tasks" })
-                        };
-                    }
-                    else
-                    {
-                        result = new ScriptResult
-                        {
-                            StatusCode = 404,
-                            Body = System.Text.Json.JsonSerializer.Serialize(new { error = $"No run found for '{cmd}'" })
-                        };
-                    }
-                    context.Response.StatusCode = result.StatusCode;
+                    cache.InvalidateByScope(scopeValue);
+                }
+                else
+                {
+                    // No scope context — can't scope the invalidation, clear everything
+                    cache.InvalidateAll();
                 }
             }
-            catch (Exception ex)
+
+            // Cache successful GET List* responses (reuse the key computed on the read path — no recompute).
+            if (isReadEndpoint && cacheKey != null && result.StatusCode is >= 200 and < 400)
             {
-                logger.LogWarning(ex, "Failed to parse cancel trigger from response");
+                await cache.Set(cacheKey, result);
             }
+
+            context.Response.StatusCode = result.StatusCode;
+            context.Response.ContentType = "application/json";
+            context.Response.Headers["X-Cache"] = "MISS";
+            context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
+
+            // Check if the PS function wants us to trigger an orchestrator run
+            if (result.StatusCode == 200 && result.Body.Contains("_orchestratorTrigger"))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
+                    if (doc.RootElement.TryGetProperty("_orchestratorTrigger", out var trigger) && trigger.GetBoolean())
+                    {
+                        var cmd = doc.RootElement.GetProperty("command").GetString()!;
+                        var planner = doc.RootElement.GetProperty("plannerScript").GetString()!;
+                        var taskScr = doc.RootElement.GetProperty("taskScript").GetString()!;
+                        var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 2;
+                        var plannerPath = psRunner.FindScript(planner);
+                        var taskPath = psRunner.FindScript(taskScr);
+                        if (plannerPath != null && taskPath != null)
+                        {
+                            _ = orchestrator.StartOrResumeRun(cmd, plannerPath, taskPath, priority, CancellationToken.None);
+                            logger.LogInformation("[API] Orchestrator triggered: {Command} P{Priority}", cmd, priority);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to parse orchestrator trigger from response");
+                }
+            }
+
+            // Check if the PS function wants us to run a simple background script
+            if (result.StatusCode == 200 && result.Body.Contains("_scriptTrigger"))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
+                    if (doc.RootElement.TryGetProperty("_scriptTrigger", out var trigger) && trigger.GetBoolean())
+                    {
+                        var cmd = doc.RootElement.GetProperty("command").GetString()!;
+                        var priority = doc.RootElement.TryGetProperty("priority", out var pVal) ? pVal.GetInt32() : 5;
+                        var scriptPath = psRunner.FindScript(cmd);
+                        if (scriptPath != null)
+                        {
+                            jobManager.Enqueue(cmd, priority, async ct =>
+                            {
+                                await psRunner.ExecuteScript(cmd);
+                            });
+                            logger.LogInformation("[API] Script triggered: {Command} P{Priority}", cmd, priority);
+                        }
+                        else
+                        {
+                            logger.LogWarning("[API] Script not found for trigger: {Command}", cmd);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to parse script trigger from response");
+                }
+            }
+
+            // Check if the PS function wants us to cancel an orchestrator run
+            if (result.StatusCode == 200 && result.Body.Contains("_cancelTrigger"))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(result.Body);
+                    if (doc.RootElement.TryGetProperty("_cancelTrigger", out var trigger) && trigger.GetBoolean())
+                    {
+                        var cmd = doc.RootElement.GetProperty("command").GetString()!;
+                        var (found, cancelledCount) = await orchestrator.CancelRunAsync(cmd);
+                        if (!found)
+                            (found, cancelledCount) = await orchestrator.CancelRunAsync($"Start-{cmd}");
+
+                        if (found)
+                        {
+                            logger.LogInformation("[API] Run cancelled: {Command} ({Cancelled} pending tasks)", cmd, cancelledCount);
+                            // Rewrite response with actual cancel result
+                            result = new ScriptResult
+                            {
+                                StatusCode = 200,
+                                Body = System.Text.Json.JsonSerializer.Serialize(new { name = cmd, cancelled = cancelledCount, message = $"Cancelled {cancelledCount} pending tasks" })
+                            };
+                        }
+                        else
+                        {
+                            result = new ScriptResult
+                            {
+                                StatusCode = 404,
+                                Body = System.Text.Json.JsonSerializer.Serialize(new { error = $"No run found for '{cmd}'" })
+                            };
+                        }
+                        context.Response.StatusCode = result.StatusCode;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to parse cancel trigger from response");
+                }
+            }
+
+            await context.Response.WriteAsync(result.Body);
+
+        } // end try
+        finally
+        {
+            var remaining = Interlocked.Decrement(ref activeRequests);
+            requestSw.Stop();
+            logger.LogDebug("[HTTP] /API/{Endpoint} done {ElapsedMs}ms remaining={Remaining}",
+                endpoint, requestSw.ElapsedMilliseconds, remaining);
         }
-
-        await context.Response.WriteAsync(result.Body);
-
-    } // end try
-    finally
-    {
-        var remaining = Interlocked.Decrement(ref activeRequests);
-        requestSw.Stop();
-        logger.LogDebug("[HTTP] /API/{Endpoint} done {ElapsedMs}ms remaining={Remaining}",
-            endpoint, requestSw.ElapsedMilliseconds, remaining);
-    }
-});
+    });
 
 } // end HTTP-role block (setup / jobs / PowerShell dispatch)
 
