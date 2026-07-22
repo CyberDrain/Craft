@@ -1,0 +1,56 @@
+# Azure-native E2E regression harness — CRAFT in the COMBINED role (Frontend + Http + Background) over
+# Azurite (the AzureTables provider via the storage emulator). Exercises health/readiness, API dispatch,
+# the orchestrator fan-out, the scheduler/timer, and the realtime SSE bridge. Driven by scripts/run-e2e.ps1.
+name: craft-e2e-azure
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: craft-e2e-az-azurite
+    command: >
+      azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+      --location /workspace --loose --skipApiVersionCheck
+    networks: [e2eaznet]
+
+  sut:
+    image: ${SUT_IMAGE:-craft:ci}
+    platform: linux/amd64
+    container_name: craft-e2e-az-sut
+    cpus: 2
+    ports:
+      - "${SUT_PORT:-5399}:8080"
+    volumes:
+      - ./api-harness/API:/app/API:ro       # PerfApi module + e2e-timers.json scheduler config
+      - ./e2e-frontend:/app/Frontend:ro     # static frontend fixture (html pages + a precompressed .br)
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      # Combined deployment role — one process serves the frontend, the API, and background workers.
+      - CRAFT_SERVE_FRONTEND=true
+      - CRAFT_SERVE_API=true
+      - CRAFT_RUN_BACKGROUND=true
+      - App__Scripts__HttpModules__0=PerfApi
+      - App__Worker__IgnoreSkuProfiles=true
+      - App__Worker__HttpPoolSize=2
+      - App__Worker__BgPoolSize=4
+      - App__ReadinessMode=Immediate
+      - App__Setup__Enabled=false
+      # Enable precompressed (.br/.gz) static serving so the frontend test can assert Brotli.
+      - CRAFT_COMPRESSION=true
+      # Realtime SSE is opt-in (off by default) — turn it on so the realtime bridge test can run.
+      - CRAFT_REALTIME_ENABLED=true
+      - App__Orchestrator__TablePrefix=E2EOrch
+      - App__RateLimit__Enabled=false
+      # Scheduler: fast tick so the timer test doesn't wait long
+      - App__Scheduler__ConfigFile=e2e-timers.json
+      - App__Scheduler__CheckIntervalSeconds=5
+      # Azurite (well-known devstoreaccount1 key)
+      - AzureWebJobsStorage=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1;
+      - CRAFT_LOG_LEVEL=Information
+      - Logging__LogLevel__Default=Warning
+    depends_on: [azurite]
+    networks: [e2eaznet]
+
+networks:
+  e2eaznet:
+    name: craft-e2e-aznet

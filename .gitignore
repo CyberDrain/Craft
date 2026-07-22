@@ -1,0 +1,28 @@
+# Build output
+bin/
+obj/
+
+# Runtime-generated files
+_startup.ps1
+_http_bundle.ps1
+_cache/
+
+# IDE / editor
+.vs/
+*.user
+*.suo
+*.csproj.user
+.vscode/
+.copilot-memory/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Local settings (contains secrets)
+appsettings.*.local.json
+local.settings.json
+.env

@@ -1,0 +1,85 @@
+name: "Build: Dev Container"
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'build/**'
+      - 'docker/**'
+      - 'Runtime/**'
+      - 'Services/**'
+      - 'appsettings.json'
+      - 'Craft.csproj'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# Cancel an in-flight dev build when a newer commit is pushed to dev.
+concurrency:
+  group: dev-container
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve version from latest release tag
+        id: version
+        run: |
+          TAG=$(git tag --sort=-v:refname | head -1)
+          TAG=${TAG:-v0.0.0}
+          BASE="${TAG#v}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "app_version=${BASE}-dev.${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Set lower case image name
+        run: echo "IMAGE_NAME_LC=${REPO,,}" >> $GITHUB_ENV
+        env:
+          REPO: ${{ github.repository }}
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+            COMMIT_SHA=${{ github.sha }}
+            IMAGE_TAG=dev
+            BUILD_CONFIGURATION=Debug
+            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:dev
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Craft - Dev Build
+            org.opencontainers.image.revision=${{ github.sha }}

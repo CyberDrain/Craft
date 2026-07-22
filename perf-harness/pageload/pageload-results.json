@@ -1,0 +1,452 @@
+[
+  {
+    "route": "/",
+    "navOk": true,
+    "requests": 65,
+    "jsRequests": 34,
+    "totalKB": 1410,
+    "jsKB": 1306,
+    "fcpMs": 1245,
+    "lcpMs": 0,
+    "dclMs": 1194,
+    "loadMs": 1831,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/81df7f84-ed5cc5aa67bd4985.js",
+        "kb": 69,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/95cb80bc-481909edab6ab630.js",
+        "kb": 55,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/identity/administration/users",
+    "navOk": true,
+    "requests": 92,
+    "jsRequests": 38,
+    "totalKB": 2031,
+    "jsKB": 1369,
+    "fcpMs": 862,
+    "lcpMs": 0,
+    "dclMs": 800,
+    "loadMs": 2822,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/endpoint/MEM/devices",
+    "navOk": true,
+    "requests": 90,
+    "jsRequests": 36,
+    "totalKB": 2050,
+    "jsKB": 1357,
+    "fcpMs": 667,
+    "lcpMs": 0,
+    "dclMs": 624,
+    "loadMs": 3259,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/endpoint/MEM/list-compliance-policies",
+    "navOk": true,
+    "requests": 89,
+    "jsRequests": 38,
+    "totalKB": 2023,
+    "jsKB": 1360,
+    "fcpMs": 769,
+    "lcpMs": 0,
+    "dclMs": 728,
+    "loadMs": 2657,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/email/administration/mailboxes",
+    "navOk": true,
+    "requests": 85,
+    "jsRequests": 37,
+    "totalKB": 2022,
+    "jsKB": 1361,
+    "fcpMs": 664,
+    "lcpMs": 0,
+    "dclMs": 621,
+    "loadMs": 2334,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/tenant/administration/tenants",
+    "navOk": true,
+    "requests": 83,
+    "jsRequests": 35,
+    "totalKB": 2016,
+    "jsKB": 1355,
+    "fcpMs": 658,
+    "lcpMs": 0,
+    "dclMs": 617,
+    "loadMs": 2302,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/tenant/tools/graph-explorer",
+    "navOk": true,
+    "requests": 84,
+    "jsRequests": 36,
+    "totalKB": 2050,
+    "jsKB": 1356,
+    "fcpMs": 822,
+    "lcpMs": 0,
+    "dclMs": 785,
+    "loadMs": 2252,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/security/defender/list-defender",
+    "navOk": true,
+    "requests": 79,
+    "jsRequests": 36,
+    "totalKB": 2017,
+    "jsKB": 1354,
+    "fcpMs": 656,
+    "lcpMs": 0,
+    "dclMs": 617,
+    "loadMs": 1549,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  },
+  {
+    "route": "/cipp/settings",
+    "navOk": true,
+    "requests": 95,
+    "jsRequests": 35,
+    "totalKB": 2053,
+    "jsKB": 1360,
+    "fcpMs": 722,
+    "lcpMs": 0,
+    "dclMs": 673,
+    "loadMs": 1899,
+    "topRequests": [
+      {
+        "url": "/_next/static/chunks/pages/_app-16f20198b6c76223.js",
+        "kb": 533,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/6833-494a85e231d59cff.js",
+        "kb": 227,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "other"
+      },
+      {
+        "url": "/_next/static/chunks/3709-a355f943441e7c3f.js",
+        "kb": 80,
+        "enc": "br",
+        "type": "script"
+      },
+      {
+        "url": "/_next/static/chunks/6902.d96b1e588009847b.js",
+        "kb": 72,
+        "enc": "br",
+        "type": "script"
+      }
+    ]
+  }
+]

@@ -1,0 +1,65 @@
+# BG-worker perf harness — CRAFT in backend mode (Http + Background) so an HTTP call can enqueue an
+# orchestrator batch that the background workers process. Same CRAFT image; mode + module come from here.
+#
+#   pwsh scripts\run-bg.ps1 -Tasks 3000 -DispatchTiming
+#
+# The orchestrator persists run/task state to Azure Table storage, so Azurite is required (unlike the
+# http-only api harness). The PS-invoke dispatch cost is isolated by the profiler's `run` segment regardless
+# of the surrounding table I/O.
+name: craft-perf-bg
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: craft-perf-bg-azurite
+    command: >
+      azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+      --location /workspace --loose --skipApiVersionCheck
+    networks: [perfbgnet]
+
+  sut:
+    image: ${SUT_IMAGE:-craft:local}
+    platform: linux/amd64
+    container_name: craft-perf-bg-sut
+    cpus: ${SUT_CPUS:-2}
+    ports:
+      - "${SUT_PORT:-5298}:8080"
+    volumes:
+      - ./api-harness/API:/app/API:ro
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      # Backend mode: serve /api (to accept the enqueue call) AND run background workers (to process tasks).
+      - CRAFT_SERVE_API=true
+      - CRAFT_RUN_BACKGROUND=true
+      - App__Scripts__HttpModules__0=PerfApi
+      - App__Worker__IgnoreSkuProfiles=true
+      - App__Worker__HttpPoolSize=${HTTP_POOL:-2}
+      - App__Worker__BgPoolSize=${BG_POOL:-4}
+      - App__ReadinessMode=Immediate
+      - App__Setup__Enabled=false
+      - App__Orchestrator__TablePrefix=PerfBgOrch
+      # BackgroundTaskLimiter tuning (top-level config keys). run-orch.ps1 A/Bs the ramp behavior.
+      # Defaults reproduce the app defaults on a small box (base 2, scale-up after 15s, ceiling = BG pool).
+      - BackgroundBaseConcurrency=${BG_BASE:-2}
+      - BackgroundScaleUpAfterSeconds=${BG_SCALEUP:-15}
+      - BackgroundMaxConcurrency=${BG_CEILING:-8}
+      - BackgroundBurstToCeiling=${BG_BURST:-false}
+      - BackgroundOverSubscribe=${BG_OVERSUB:-0}
+      # Batched status writer (#3). run-orch.ps1 -NoBatch sets false to A/B the per-task-write "before".
+      - App__Orchestrator__BatchStatusWrites=${BATCH_WRITES:-true}
+      - App__Orchestrator__DurableRunningBarrier=${DURABLE_BARRIER:-true}
+      - App__Orchestrator__StatusFlushIntervalMs=${FLUSH_MS:-25}
+      - CRAFT_LOG_LEVEL=Warning
+      - Logging__LogLevel__Default=Warning
+      - CRAFT_DISPATCH_TIMING=${DISPATCH_TIMING:-}
+      # Reused pipeline thread default on; run-bg.ps1 -NoReuseThread sets false for A/B (must be a valid bool).
+      - App__Worker__ReuseRunspaceThread=${REUSE_THREAD:-true}
+      # Azurite (well-known devstoreaccount1 key)
+      - AzureWebJobsStorage=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1;
+    depends_on: [azurite]
+    networks: [perfbgnet]
+
+networks:
+  perfbgnet:
+    name: craft-perf-bgnet

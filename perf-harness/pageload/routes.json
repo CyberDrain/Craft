@@ -1,0 +1,11 @@
+[
+  "/",
+  "/identity/administration/users",
+  "/endpoint/MEM/devices",
+  "/endpoint/MEM/list-compliance-policies",
+  "/email/administration/mailboxes",
+  "/tenant/administration/tenants",
+  "/tenant/tools/graph-explorer",
+  "/security/defender/list-defender",
+  "/cipp/settings"
+]

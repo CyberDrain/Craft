@@ -1,0 +1,57 @@
+# Perf harness — System Under Test (SUT) + Azurite storage emulator.
+#
+# The SUT image is parameterised so the SAME harness measures any build:
+#   SUT_IMAGE=cipp-ng:perf-baseline   docker compose ... up   # before
+#   SUT_IMAGE=cipp-ng:perf-optimized  docker compose ... up   # after
+#
+# Test-config choices (see README "Why these settings"):
+#  - ASPNETCORE_ENVIRONMENT=Production  -> real origin path, dev proxy OFF
+#  - App__ReadinessMode=Immediate       -> Kestrel up immediately; we poll /api/setup/health
+#  - small fixed worker pool + Warning logs -> isolate the static-serving signal, identical across runs
+name: craft-perf
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: craft-perf-azurite
+    command: >
+      azurite
+      --blobHost 0.0.0.0
+      --queueHost 0.0.0.0
+      --tableHost 0.0.0.0
+      --location /workspace
+      --loose
+      --skipApiVersionCheck
+    networks: [perfnet]
+
+  sut:
+    image: ${SUT_IMAGE:-cipp-ng:perf-baseline}
+    platform: linux/amd64
+    container_name: craft-perf-sut
+    # Pin CPU for consistent, SKU-representative results (default 2 vCPU ~ Azure B2/P1v3).
+    # .NET honors the cgroup quota, so Environment.ProcessorCount inside the app becomes ~SUT_CPUS.
+    cpus: ${SUT_CPUS:-2}
+    ports:
+      - "${SUT_PORT:-5197}:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      # Static-serving isolation / determinism
+      - App__Setup__Enabled=false
+      - App__ReadinessMode=Immediate
+      - App__Worker__IgnoreSkuProfiles=true
+      - App__Worker__HttpPoolSize=1
+      - App__Worker__BgPoolSize=1
+      - CRAFT_LOG_LEVEL=Warning
+      - CRAFT_VERBOSE=false
+      - Logging__LogLevel__Default=Warning
+      # Storage (Azurite, well-known devstoreaccount1 key)
+      - AzureWebJobsStorage=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1;
+      - NonLocalHostAzurite=true
+      - CIPPNG=true
+    depends_on: [azurite]
+    networks: [perfnet]
+
+networks:
+  perfnet:
+    name: craft-perfnet

@@ -1,0 +1,9 @@
+[
+  {
+    "Id": "e2e-perf-timer",
+    "Command": "Invoke-PerfTimerTick",
+    "Description": "E2E: increments a shared-cache counter every 5s so the harness can confirm the scheduler fired a task on a background worker.",
+    "Cron": "*/5 * * * * *",
+    "Priority": 0
+  }
+]
