@@ -1176,7 +1176,7 @@ if (capHttp)
                 {
                     clientPrincipal = (object?)null,
                     permissions = Array.Empty<string>(),
-                    message = "Access denied. Contact your administrator."
+                    message = "Access denied, are you logged in? Using the correct account? If you are, contact your administrator to get access."
                 }));
             }
         }
