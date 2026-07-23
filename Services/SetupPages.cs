@@ -91,6 +91,17 @@ public static class SetupPages
             font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem;
         }
         .device-code-box a { color: #60a5fa; text-decoration: underline; }
+        .device-code-copy {
+            display: inline-flex; align-items: center; gap: 0.5rem;
+            background: #1e293b; border: 1px solid #334155; border-radius: 0.375rem;
+            padding: 0.25rem 0.75rem; margin-top: 0.5rem; cursor: pointer;
+        }
+        .device-code-copy:hover { border-color: #3b82f6; }
+        .device-code-copy .copy-btn {
+            background: none; border: none; color: #60a5fa; cursor: pointer;
+            font-size: 0.8rem; padding: 0.25rem 0.5rem;
+        }
+        .device-code-copy .copy-btn:hover { color: #93c5fd; }
         .disabled-section { opacity: 0.4; pointer-events: none; }
     </style>
 </head>
@@ -128,7 +139,10 @@ public static class SetupPages
         <div id="device-code-display" class="hidden">
             <div class="device-code-box">
                 <div>Go to <a id="device-link" href="https://microsoft.com/devicelogin" target="_blank">microsoft.com/devicelogin</a> and enter:</div>
-                <div class="code" id="device-user-code"></div>
+                <div class="device-code-copy" onclick="copyDeviceCode()" title="Click to copy">
+                    <span class="code" id="device-user-code"></span>
+                    <button type="button" class="copy-btn" id="device-code-copy-btn">Copy</button>
+                </div>
                 <div class="hint">Waiting for you to sign in...</div>
             </div>
         </div>
@@ -309,6 +323,26 @@ public static class SetupPages
         const el = document.getElementById(elId);
         el.textContent = msg;
         el.className = 'status ' + type;
+    }
+
+    async function copyDeviceCode() {
+        const code = document.getElementById('device-user-code').textContent;
+        if (!code) return;
+        const btn = document.getElementById('device-code-copy-btn');
+        try {
+            await navigator.clipboard.writeText(code);
+        } catch {
+            // Clipboard API unavailable (e.g. non-HTTPS) — fall back to a text selection
+            const range = document.createRange();
+            range.selectNodeContents(document.getElementById('device-user-code'));
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand('copy');
+            sel.removeAllRanges();
+        }
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
     }
 
     async function startAutomatedSetup() {
