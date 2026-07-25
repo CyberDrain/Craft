@@ -1,0 +1,237 @@
+# CRAFT — editor/analyzer configuration.
+#
+# This file is the arbiter for style arguments: if it isn't encoded here, it isn't a rule.
+# Severities are deliberate:
+#   error / warning — mechanical, auto-fixable by `dotnet format`, and enforced in CI
+#   suggestion      — opinionated choices surfaced in the IDE but never failing a build
+#
+# Verify locally with:  dotnet format --verify-no-changes
+# Apply locally with:   dotnet format
+
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# MUST be set explicitly. With `end_of_line` unset, `dotnet format` falls back to the platform default
+# — CRLF on Windows, LF on Linux — so the same source passes the format check on a developer's Windows
+# checkout and fails inside the Linux build container. Paired with `* text=auto eol=lf` in
+# .gitattributes so the working tree matches on every platform.
+end_of_line = lf
+
+[*.{json,jsonc,yml,yaml}]
+indent_size = 2
+
+[*.{md,markdown}]
+trim_trailing_whitespace = false
+
+[*.{ps1,psm1,psd1}]
+indent_size = 4
+
+[*.cs]
+indent_size = 4
+
+# ── Language conventions ────────────────────────────────────────────────────────────────────────────
+# `using` placement and ordering. ImplicitUsings is on, so most files carry few of these.
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = false
+
+# File-scoped namespaces. Already 100% adopted across Services/ — enforced so it stays that way.
+csharp_style_namespace_declarations = file_scoped:warning
+
+# `var`. The house position: use it when the type is already obvious from the right-hand side
+# (`new`, casts, factory calls), spell the type out otherwise. Left at `suggestion` — the IDE nudges,
+# the build stays quiet, and nobody has to rewrite 900 existing lines to land this file.
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_var_elsewhere = false:suggestion
+
+# Modern C# the codebase already leans on.
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = true:suggestion
+csharp_style_expression_bodied_accessors = true:suggestion
+csharp_style_pattern_matching_over_is_with_cast_check = true:suggestion
+csharp_style_pattern_matching_over_as_with_null_check = true:suggestion
+csharp_style_prefer_switch_expression = true:suggestion
+csharp_style_prefer_not_pattern = true:suggestion
+csharp_style_inlined_variable_declaration = true:suggestion
+csharp_prefer_simple_using_statement = true:suggestion
+csharp_style_throw_expression = true:suggestion
+csharp_style_conditional_delegate_call = true:suggestion
+csharp_prefer_braces = when_multiline:suggestion
+
+dotnet_style_object_initializer = true:suggestion
+dotnet_style_collection_initializer = true:suggestion
+dotnet_style_prefer_conditional_expression_over_assignment = true:suggestion
+dotnet_style_prefer_conditional_expression_over_return = true:suggestion
+dotnet_style_null_propagation = true:suggestion
+dotnet_style_coalesce_expression = true:suggestion
+dotnet_style_prefer_compound_assignment = true:suggestion
+dotnet_style_prefer_auto_properties = true:suggestion
+
+# Qualification: the codebase never uses `this.` — keep it that way.
+dotnet_style_qualification_for_field = false:warning
+dotnet_style_qualification_for_property = false:warning
+dotnet_style_qualification_for_method = false:warning
+dotnet_style_qualification_for_event = false:warning
+
+dotnet_style_predefined_type_for_locals_parameters_members = true:warning
+dotnet_style_predefined_type_for_member_access = true:warning
+
+# Modifier order, matching what's already in Services/.
+csharp_preferred_modifier_order = public,private,protected,internal,file,static,extern,new,virtual,abstract,sealed,override,readonly,unsafe,required,volatile,async:warning
+dotnet_style_readonly_field = true:suggestion
+dotnet_style_require_accessibility_modifiers = for_non_interface_members:warning
+
+# ── Naming ──────────────────────────────────────────────────────────────────────────────────────────
+# Encodes the conventions already in the codebase: _instanceField, s_staticField, PascalCase for
+# everything public. These are the .NET runtime team's conventions.
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+dotnet_naming_style.camel_case.capitalization = camel_case
+
+dotnet_naming_style.underscore_camel_case.capitalization = camel_case
+dotnet_naming_style.underscore_camel_case.required_prefix = _
+
+dotnet_naming_style.s_underscore_camel_case.capitalization = camel_case
+dotnet_naming_style.s_underscore_camel_case.required_prefix = s_
+
+dotnet_naming_symbols.private_instance_fields.applicable_kinds = field
+dotnet_naming_symbols.private_instance_fields.applicable_accessibilities = private
+dotnet_naming_symbols.private_instance_fields.required_modifiers =
+
+dotnet_naming_symbols.private_static_fields.applicable_kinds = field
+dotnet_naming_symbols.private_static_fields.applicable_accessibilities = private
+dotnet_naming_symbols.private_static_fields.required_modifiers = static
+
+dotnet_naming_symbols.constants.applicable_kinds = field
+dotnet_naming_symbols.constants.applicable_accessibilities = *
+dotnet_naming_symbols.constants.required_modifiers = const
+
+dotnet_naming_symbols.public_members.applicable_kinds = property,method,event,namespace,class,struct,interface,enum,delegate
+dotnet_naming_symbols.public_members.applicable_accessibilities = public,internal,protected,protected_internal,private_protected
+
+dotnet_naming_symbols.parameters_and_locals.applicable_kinds = parameter,local
+
+# const wins over the static-field rule, so it is declared first.
+dotnet_naming_rule.constants_are_pascal_case.symbols = constants
+dotnet_naming_rule.constants_are_pascal_case.style = pascal_case
+dotnet_naming_rule.constants_are_pascal_case.severity = suggestion
+
+dotnet_naming_rule.private_static_fields_are_s_prefixed.symbols = private_static_fields
+dotnet_naming_rule.private_static_fields_are_s_prefixed.style = s_underscore_camel_case
+dotnet_naming_rule.private_static_fields_are_s_prefixed.severity = suggestion
+
+dotnet_naming_rule.private_instance_fields_are_underscore_prefixed.symbols = private_instance_fields
+dotnet_naming_rule.private_instance_fields_are_underscore_prefixed.style = underscore_camel_case
+dotnet_naming_rule.private_instance_fields_are_underscore_prefixed.severity = suggestion
+
+dotnet_naming_rule.public_members_are_pascal_case.symbols = public_members
+dotnet_naming_rule.public_members_are_pascal_case.style = pascal_case
+dotnet_naming_rule.public_members_are_pascal_case.severity = suggestion
+
+dotnet_naming_rule.parameters_and_locals_are_camel_case.symbols = parameters_and_locals
+dotnet_naming_rule.parameters_and_locals_are_camel_case.style = camel_case
+dotnet_naming_rule.parameters_and_locals_are_camel_case.severity = suggestion
+
+# ── Formatting (whitespace/newlines — all auto-fixed by `dotnet format`) ─────────────────────────────
+csharp_new_line_before_open_brace = all
+csharp_new_line_before_else = true
+csharp_new_line_before_catch = true
+csharp_new_line_before_finally = true
+csharp_new_line_before_members_in_object_initializers = true
+csharp_new_line_before_members_in_anonymous_types = true
+csharp_new_line_between_query_expression_clauses = true
+
+csharp_indent_case_contents = true
+csharp_indent_switch_labels = true
+csharp_indent_labels = one_less_than_current
+csharp_indent_block_contents = true
+csharp_indent_braces = false
+csharp_indent_case_contents_when_block = false
+
+csharp_space_after_cast = false
+csharp_space_after_keywords_in_control_flow_statements = true
+csharp_space_before_colon_in_inheritance_clause = true
+csharp_space_after_colon_in_inheritance_clause = true
+csharp_space_around_binary_operators = before_and_after
+csharp_space_between_method_declaration_parameter_list_parentheses = false
+csharp_space_between_method_declaration_empty_parameter_list_parentheses = false
+csharp_space_between_method_declaration_name_and_open_parenthesis = false
+csharp_space_between_method_call_parameter_list_parentheses = false
+csharp_space_between_method_call_empty_parameter_list_parentheses = false
+csharp_space_between_method_call_name_and_opening_parenthesis = false
+csharp_space_between_parentheses = false
+csharp_space_between_square_brackets = false
+csharp_space_before_open_square_brackets = false
+csharp_space_after_comma = true
+csharp_space_before_comma = false
+csharp_space_after_dot = false
+csharp_space_before_dot = false
+csharp_space_after_semicolon_in_for_statement = true
+csharp_space_before_semicolon_in_for_statement = false
+
+csharp_preserve_single_line_blocks = true
+csharp_preserve_single_line_statements = true
+
+# ── Analyzer severities ─────────────────────────────────────────────────────────────────────────────
+# The build is warning-clean today (0 warnings) and CI keeps it that way. Anything raised to `warning`
+# below must be at zero occurrences when it lands, otherwise it belongs at `suggestion` until the
+# backlog is cleared.
+
+# IDE0005: remove unnecessary usings — mechanical, auto-fixable.
+dotnet_diagnostic.IDE0005.severity = warning
+
+# IDE0055: formatting violations. This is what makes `dotnet format --verify-no-changes` meaningful.
+dotnet_diagnostic.IDE0055.severity = warning
+
+# IDE0161: file-scoped namespace.
+dotnet_diagnostic.IDE0161.severity = warning
+
+dotnet_diagnostic.IDE0059.severity = suggestion   # unnecessary value assignment
+dotnet_diagnostic.IDE0060.severity = suggestion   # unused parameter
+
+# Permanently off — deliberate choices, not backlog.
+dotnet_diagnostic.CA1848.severity = none          # LoggerMessage source-gen delegates: not adopting
+dotnet_diagnostic.CA2007.severity = none          # ConfigureAwait: no SynchronizationContext in ASP.NET Core
+
+# ── Analyzer rules: cleared backlog ─────────────────────────────────────────────────────────────────
+# `AnalysisLevel=latest-recommended` originally surfaced 71 pre-existing findings, held at `suggestion`
+# so the build could land warning-clean. They have all been worked through and the rules are now
+# enforced at `warning`, so the fence ratchets forward and cannot slip back.
+#
+# What the culture pass actually found — these were correctness bugs, not style:
+#   * AuthService and SetupService compared authorization row keys with culture-sensitive StartsWith.
+#   * SetupService.SeedFirstUser lowercased a UPN with ToLower() while AuthService used
+#     ToLowerInvariant(). Under a Turkish locale those two disagree on "I"/"i", so a seeded user could
+#     fail to match the row that was just written for them.
+# All string comparisons on identity keys are now explicitly ordinal/invariant.
+dotnet_diagnostic.CA1310.severity = warning
+dotnet_diagnostic.CA1304.severity = warning
+dotnet_diagnostic.CA1305.severity = warning
+dotnet_diagnostic.CA1311.severity = warning
+dotnet_diagnostic.CA1001.severity = warning
+dotnet_diagnostic.CA1816.severity = warning
+dotnet_diagnostic.CA1852.severity = warning
+dotnet_diagnostic.CA1805.severity = warning
+dotnet_diagnostic.CA1869.severity = warning
+dotnet_diagnostic.CA1866.severity = warning
+dotnet_diagnostic.CA1861.severity = warning
+dotnet_diagnostic.CA1822.severity = warning
+dotnet_diagnostic.CA1859.severity = warning
+dotnet_diagnostic.CA1725.severity = warning
+
+# CA1051 (visible instance fields) is enforced, with two justified per-type suppressions at the
+# declaration sites: WorkerStats and CacheEntry hold volatile fields and Interlocked targets, and
+# neither is expressible as a property. Those suppressions carry their reasoning inline.
+dotnet_diagnostic.CA1051.severity = warning
+
+# ── Tests ───────────────────────────────────────────────────────────────────────────────────────────
+# Test method names use Subject_Scenario_Expectation with underscores. That IS the convention here and
+# it is what makes a failing test name readable in CI output, so the identifier rule does not apply.
+[tests/**/*.cs]
+dotnet_diagnostic.CA1707.severity = none

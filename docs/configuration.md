@@ -1,6 +1,20 @@
 # Craft Configuration Guide
 
-Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
+Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section.
+
+## Where defaults come from
+
+**Craft ships no `appsettings.json`.** Every setting's default is the C# property initialiser in
+[`Services/CraftSettings.cs`](../Services/CraftSettings.cs) — that file is the single source of truth, and a
+deployment that sets nothing at all gets exactly those values.
+
+[`appsettings.example.jsonc`](../appsettings.example.jsonc) is an annotated reference listing every key
+alongside its default. It is **documentation only**: the `.jsonc` extension keeps it out of the
+`appsettings*.json` content glob in `Craft.csproj`, so it is never copied to the published output or the
+container image. It carries comments, which strict JSON does not allow — hence the extension.
+
+Copy out of it only the keys you are actually changing. Restating a default in your own config creates a
+value that silently goes stale the day the default moves.
 
 ## Configuration Hierarchy
 
@@ -9,9 +23,13 @@ Settings are merged in priority order (highest wins):
 1. **Environment variables** — `App__Worker__BgPoolSize=8`
 2. **`Properties/launchSettings.json`** — profile env vars injected by `dotnet run` / Visual Studio (local dev only, ignored in Docker/production)
 3. **`appsettings.{Environment}.json`** — e.g. `appsettings.Development.json` (loaded when `ASPNETCORE_ENVIRONMENT=Development`)
-4. **`appsettings.json`** — base defaults (always loaded, all environments)
+4. **`appsettings.json`** — supplied by *your* app, if you supply one (always loaded, all environments)
+5. **C# property defaults** in `Services/CraftSettings.cs` — the floor; always present
 
-Both appsettings files are always used in every context (local `dotnet run`, Docker, production). The environment-specific file overlays onto the base — it doesn't replace it. Values in the environment file win over the base file for the same key.
+Both appsettings files are optional. When both are present the environment-specific file overlays onto the
+base — it doesn't replace it — and values in the environment file win for the same key. Note that both are
+gitignored in this repo, since a local `appsettings.json` is the file most likely to hold a storage
+connection string.
 
 Environment variables use `__` (double underscore) as the section separator:
 
@@ -718,7 +736,7 @@ Craft separates its own built-in scripts from application content:
 
 1. **Place compiled PS modules** in `API/Modules/`
 2. **Place frontend build** in `Frontend/` (static files served automatically)
-3. **Create `appsettings.json`** with your `App:` config (use the base file as a template)
+3. **Configure `App:` settings** — either `App__*` environment variables (preferred for containers) or your own `appsettings.json`, using [`appsettings.example.jsonc`](../appsettings.example.jsonc) as the reference. Set only what you're changing; everything else falls back to the defaults in `Services/CraftSettings.cs`.
 4. **Set `AzureWebJobsStorage`** to a valid Azure Storage connection string (or `UseDevelopmentStorage=true` for Azurite)
 5. **Run:** `dotnet run` or `docker compose up`
 

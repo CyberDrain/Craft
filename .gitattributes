@@ -1,0 +1,26 @@
+# Line-ending policy.
+#
+# LF everywhere, in the repo AND in the working tree on every platform. This is not cosmetic:
+# `dotnet format` derives its expected line ending from .editorconfig, and when `end_of_line` is
+# unset it falls back to the PLATFORM default — CRLF on Windows, LF on Linux. That made the
+# formatter pass on a Windows checkout and fail inside the Linux build container on the exact same
+# source, which with TreatWarningsAsErrors turns into a broken `docker build` that reproduces
+# nowhere else. Pinning eol=lf here and `end_of_line = lf` in .editorconfig keeps the two agreeing.
+#
+# CRAFT runs on Linux; the .ps1 runtime scripts and the Dockerfile are all consumed there.
+* text=auto eol=lf
+
+# Binary — never translate.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.br  binary
+*.gz  binary
+*.zip binary
+*.dll binary
+*.pdf binary

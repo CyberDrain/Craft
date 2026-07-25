@@ -1,0 +1,60 @@
+<Project>
+
+  <!--
+    Shared build settings for every project in the repo (Craft.csproj and anything under tests/).
+    Per-project settings stay in the .csproj; anything that should be true everywhere lives here.
+
+    NOTE for build/Dockerfile: this file must be COPYied alongside Craft.csproj *before* `dotnet restore`,
+    otherwise restore and build evaluate different properties.
+  -->
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!--
+      Run the built-in .NET analyzers and surface IDE code-style rules (IDE****) during `dotnet build`,
+      not only in the IDE. Severities are set in .editorconfig — this switch is what makes the build
+      honour them. The repo builds warning-clean; keep it that way.
+    -->
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!--
+      Required for IDE0005 (unused usings) to run on build at all — Roslyn cannot report it without a
+      documentation file. CRAFT is an app, not a published package, so the generated .xml is a build
+      artifact nobody consumes; CS1591 (missing XML comment on a public member) is therefore noise and
+      is suppressed. Everything else the doc build reports stays on.
+    -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!--
+      CS1591 — missing XML comment on a public member.
+      CS1573 — some but not all parameters documented. Without this, documenting the one parameter that
+               genuinely needs explaining forces empty <param/> tags for the self-evident ones, which is
+               noise that makes the useful documentation harder to find.
+    -->
+    <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+
+    <!--
+      Enabled now that the analyzer backlog is cleared and every rule in .editorconfig is enforced at
+      `warning`. The condition for turning this on was zero outstanding warnings, which the repo meets.
+      If a future SDK adds a rule that produces new warnings, fix them or set the rule's severity
+      explicitly in .editorconfig — do not reach for /p:TreatWarningsAsErrors=false.
+    -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Product>CRAFT</Product>
+    <Company>CyberDrain</Company>
+    <Authors>CyberDrain</Authors>
+    <RepositoryUrl>https://github.com/CyberDrain/CRAFT</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+</Project>

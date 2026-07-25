@@ -1,0 +1,33 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Craft", "Craft.csproj", "{5360BB79-F828-400C-B848-7429B0040F82}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{BF4CE7B8-A874-4059-B557-5368C7A013EA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Craft.Tests", "tests\Craft.Tests\Craft.Tests.csproj", "{185BC64D-BDDD-4684-BEDC-66F9BE9671E1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5360BB79-F828-400C-B848-7429B0040F82}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5360BB79-F828-400C-B848-7429B0040F82}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5360BB79-F828-400C-B848-7429B0040F82}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5360BB79-F828-400C-B848-7429B0040F82}.Release|Any CPU.Build.0 = Release|Any CPU
+		{185BC64D-BDDD-4684-BEDC-66F9BE9671E1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{185BC64D-BDDD-4684-BEDC-66F9BE9671E1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{185BC64D-BDDD-4684-BEDC-66F9BE9671E1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{185BC64D-BDDD-4684-BEDC-66F9BE9671E1}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{185BC64D-BDDD-4684-BEDC-66F9BE9671E1} = {BF4CE7B8-A874-4059-B557-5368C7A013EA}
+	EndGlobalSection
+EndGlobal

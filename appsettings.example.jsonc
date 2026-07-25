@@ -1,0 +1,372 @@
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// CRAFT — annotated configuration reference.
+//
+// THIS FILE IS NOT LOADED. It is documentation. CRAFT ships no appsettings.json: the Craft.csproj
+// content glob is `appsettings*.json`, which this `.jsonc` name deliberately does not match, so nothing
+// here reaches the published output or the container image.
+//
+// It is `.jsonc` rather than `.json` because it contains comments. ASP.NET Core's JSON configuration
+// provider happens to tolerate them (it parses with JsonCommentHandling.Skip), but they are not valid
+// JSON per the spec, and a file named `.json` that no generic tool, schema validator or linter can read
+// is a trap. The extension now matches the contents.
+//
+// TO CONFIGURE A DEPLOYMENT, pick one:
+//   1. Environment variables — App__Worker__HttpPoolSize=4, App__Auth__CookieName=..., and the CRAFT_*
+//      shorthands. This is what the E2E harness and most deployments use. Highest precedence.
+//   2. Your own appsettings.json, supplied by the downstream app image (COPY it to /app) or dropped in
+//      the project root for local `dotnet run`.
+//
+// EVERY VALUE BELOW IS ALREADY THE BUILT-IN DEFAULT. The defaults are the C# property initialisers in
+// Services/CraftSettings.cs — that file is the single source of truth. Copy out only the keys you are
+// actually changing; restating a default here just creates something that silently goes stale when the
+// default moves.
+//
+// Full prose documentation: docs/configuration.md
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+{
+  // Framework-level (root, NOT under "App"). Both shown here are the ASP.NET Core defaults.
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+
+  "App": {
+    // Display name shown in logs and diagnostics
+    "Name": "Craft",
+
+    // ── Deployment roles (capabilities) ──
+    // One image, three independent switches for split deployments. Leave all unset (the default) to run the
+    // full monolith: Frontend + Http + Background. If you set ANY of the three, the host uses exactly those
+    // (unset → off). Environment overrides (take precedence): CRAFT_SERVE_FRONTEND, CRAFT_SERVE_API,
+    // CRAFT_RUN_BACKGROUND (each true/false).
+    // Presets: frontend | http | background | backend (http+bg) | frontend+http | combined (default).
+    // NOTE: a node that triggers orchestrations from HTTP must also carry Background (use "backend"/"combined").
+    // "Roles": { "Frontend": true, "Http": true, "Background": false },
+
+    // ── Health probe ──
+    // Role-agnostic liveness/readiness endpoint. Enabled by default at /healthz. Relocate or disable it via
+    // App:Health:Path / App:Health:Enabled, or the CRAFT_HEALTH_PATH / CRAFT_HEALTH_ENABLED env vars (win).
+    // "Health": { "Enabled": true, "Path": "/healthz" },
+
+    // Controls when Kestrel starts accepting connections:
+    // "Immediate" — Kestrel starts first, init runs in background (default, fast startup)
+    // "HttpReady" — Kestrel starts after HTTP worker pool is ready
+    // "AllReady"  — Kestrel starts after all worker pools are fully initialized
+    // "ReadinessMode": "Immediate",
+
+    // Kestrel request timeout (seconds). Determines how long Kestrel waits for a complete
+    // request before aborting. If not set (or 0), derives from Worker.HttpTimeoutSeconds
+    // if > 0, else defaults to 600 (10 minutes). Recommended: set slightly higher than
+    // HttpTimeoutSeconds to give workers time to respond before Kestrel drops the connection.
+    // "KestrelTimeoutSeconds": 130,
+
+    // ── Kestrel request limits (DoS protection) ──
+    // Applied unconditionally at startup (independent of the timeout above). Values shown are
+    // the defaults — no config needed.
+    // "Limits": {
+    //   // Max request body size in MB. Default 100. Set to 0 for unlimited (not recommended).
+    //   "MaxRequestBodyMB": 100,
+    //   // Max concurrent TCP connections. Default 200. Set to 0 or a negative value for unlimited.
+    //   "MaxConcurrentConnections": 200
+    // },
+
+    // ── Request rate limiting ──
+    // Per-client fixed-window limiter. ENABLED BY DEFAULT (300 requests / 10s per client),
+    // partitioned by the authenticated principal name (x-ms-client-principal-name), falling back to
+    // the first X-Forwarded-For hop so anonymous callers behind the App Service load balancer aren't
+    // collapsed into a single bucket. Requests over the limit get HTTP 429. Set "Enabled": false to
+    // turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true can also force it on.
+    // "RateLimit": {
+    //   "Enabled": true,
+    //   "PermitPerWindow": 300,   // requests allowed per window, per client
+    //   "WindowSeconds": 10,      // window length in seconds
+    //   "QueueLimit": 0           // requests queued at the limit before rejecting (0 = reject immediately)
+    // },
+
+    // Realtime SSE channel served at /.craft/events. Downstream code publishes job events through
+    // [Craft.Services.RealtimeBridge]::Publish($userId,$jobId,"start|update|end",$data); browsers consume
+    // them. In-memory, single instance.
+    // OFF BY DEFAULT — set "Enabled": true below to turn it on (env override, wins: CRAFT_REALTIME_ENABLED
+    // =true/false). While off, /.craft/events is not mapped and Publish calls are no-ops.
+    "Realtime": {
+      "Enabled": false
+
+      // Tuning (values shown are the defaults — no config needed):
+      // "MaxMessageBytes": 16384,   // per-event data cap; over this the payload is dropped + a 413 frame sent
+      // "MaxActiveJobs": 10000,     // max stored (userId, jobId) entries
+      // "MaxConnections": 1000,     // max concurrent SSE streams
+      // "PerConnectionQueue": 256,  // buffered frames per connection before oldest is dropped
+      // "HeartbeatSeconds": 20,     // keep-alive comment interval
+      // "EntryTtlMinutes": 60       // backstop eviction for jobs that never send "end"
+    },
+
+    // File-backed logging with rotation (all values below are defaults — no config needed)
+    // "FileLogging": {
+    //   "Directory": "",              // default: /logs (Linux) or {BaseDir}/logs (Windows)
+    //   "FilePrefix": "craft",        // files: craft.log, craft.1.log, craft.2.log, ...
+    //   "MaxFileSizeMB": 10,          // rotate when current file exceeds this size
+    //   "MaxFileCount": 10,           // keep at most N rotated files (total: N+1 including current)
+    //   "TimestampFormat": "yyyy-MM-ddTHH:mm:ss.fffZ",
+    //   "IncludeCategory": false,     // include logger category name in log lines
+    //   "LogLevel": "Information"     // Trace|Debug|Information|Warning|Error|Critical
+    //                                 // Also controls PS stream capture:
+    //                                 //   Debug  → enables Write-Debug
+    //                                 //   Trace  → enables Write-Debug + Write-Verbose
+    //                                 // Override via CRAFT_LOG_LEVEL env var
+    // },
+
+    "Worker": {
+      // Number of dedicated HTTP request workers (each handles one request at a time)
+      "HttpPoolSize": 2,
+      // Number of background workers for scheduler, orchestrator, and queue tasks
+      "BgPoolSize": 4,
+
+      // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
+      // Default true — the biggest per-request dispatch win (~50% of PS-invoke cost; see
+      // docs/dispatch-analysis.md). Set false only to A/B or if a module misbehaves on a long-lived thread.
+      // "ReuseRunspaceThread": true,
+
+      // Host-tier pool sizing. When set, the first matching entry overrides
+      // HttpPoolSize/BgPoolSize above based on the runtime environment.
+      //   SkuEnv: name of the env var to read for the host tier identifier
+      //           (e.g. "WEBSITE_SKU" on Azure App Service). Omit or "" = wildcard.
+      //   Sku:    expected value of that env var, compared case-insensitively
+      //           (e.g. "Basic", "PremiumV3"). Ignored when SkuEnv is empty.
+      //   Cpu:    compared to Environment.ProcessorCount (respects cgroup limits in
+      //           Docker). Omit or 0 = match any CPU count.
+      // First match wins. No match (or any parse failure) leaves the baseline above.
+      // Set IgnoreSkuProfiles: true to disable this entirely.
+      // "IgnoreSkuProfiles": false,
+      // "SkuProfiles": [
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 1, "HttpPoolSize": 2, "BgPoolSize": 2 },
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 2, "HttpPoolSize": 3, "BgPoolSize": 4 },
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 4, "HttpPoolSize": 4, "BgPoolSize": 4 },
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 2, "HttpPoolSize": 4, "BgPoolSize": 8 },
+      //   { "Cpu": 8,                                              "HttpPoolSize": 6, "BgPoolSize": 12 }
+      // ],
+
+      // Maximum execution time (seconds) for HTTP request handlers
+      // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed
+      // 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints
+      // "HttpTimeoutSeconds": 0,
+
+      // Maximum execution time (seconds) for background jobs (scheduler, orchestrator tasks)
+      // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed
+      // 0 = no timeout (default). Recommended: 600-3600 for background jobs
+      // "BgTimeoutSeconds": 0,
+
+      // Extra env vars injected into every runspace
+      // "EnvVars": { "MY_VAR": "value" },
+
+      // Additional env var names set to the API root path (alongside $env:CRAFT_ROOT)
+      // "RootPathVars": ["MyAppRoot"],
+
+      // Scripts run once on first worker for warmup (after module import, errors non-fatal)
+      // "WarmupScripts": ["Get-MyAuth | Out-Null"],
+
+      // .NET assemblies loaded into each runspace (paths relative to API/)
+      // "SharedAssemblies": ["Shared/MyLib.dll"],
+
+      // Inject shared Synchronized Hashtables into module scopes for cross-runspace state
+      // "ModuleInjections": [{ "Module": "MyModule", "Variable": "tokenCache", "CacheKey": "TokenCache" }],
+
+      // Scripts run after init on EVERY worker (not just the first)
+      // "PostInitScripts": [],
+
+      // Module directory names to skip during import
+      // "SkipModules": [],
+
+      // JSON files preloaded into PowerShell variables at startup
+      // "JsonPreloads": [{ "File": "Config/perms.json", "Variable": "Permissions", "Scope": "global", "AsHashtable": true }]
+    },
+
+    "Auth": {
+      // Session cookie name
+      "CookieName": "craft-session",
+      // Azure Table for user → role mappings (UPN as RowKey, Roles as JSON array)
+      "UserTableName": "allowedUsers"
+
+      // Storage connection for the allowedUsers table (empty = use AzureWebJobsStorage)
+      // "UserStorageConnection": "",
+
+      // Roles for the auto-login dev principal (Development mode only, ignored in Production)
+      // "DevRoles": ["admin", "authenticated", "anonymous"],
+
+      // Identity provider label on the auto-login dev principal's identityProvider field
+      // (Development mode only). Default: "aad". Set to "github", "google", etc. to mimic another
+      // EasyAuth provider for audit/display. Does NOT change the user-vs-API-client classification —
+      // the dev principal is always treated as an interactive user.
+      // "DevIdentityProvider": "aad",
+
+      // PowerShell function dispatched for /api/me (empty = literal "me")
+      // "MeEndpointFunction": "",
+
+      // Optional wrapper PS function for /api/me. When set, the wrapper is invoked
+      // instead of MeEndpointFunction directly, and MeEndpointFunction is passed
+      // in via Request.Params.CIPPEndpoint so the wrapper can dispatch internally.
+      // Empty (default) = invoke MeEndpointFunction directly.
+      // Example (CIPP): "New-CippCoreRequest"
+      // "MeEndpointHandler": ""
+
+      // ── Production auth is configured via environment variables or KV references: ──
+      // WEBSITE_AUTH_CLIENT_ID           = Azure AD app registration client ID
+      // AUTH_SECRET                      = Azure AD client secret
+      // WEBSITE_AUTH_AAD_ALLOWED_TENANTS = Tenant ID (or "common" for multi-tenant)
+    },
+
+    // ── Storage backend (Azure Tables) ──
+    // The allowedUsers table (Auth) and orchestrator state resolve their connection as an explicit
+    // per-feature setting (e.g. Auth:UserStorageConnection) → the AzureWebJobsStorage env var. If
+    // neither is set the host FAILS TO START rather than silently falling back to the local emulator.
+    // "Storage": {
+    //   // Allow the local storage emulator fallback when no connection string is configured.
+    //   // Default false (fail closed). Also enabled by CRAFT_ALLOW_DEV_STORAGE=true or
+    //   // ASPNETCORE_ENVIRONMENT=Development.
+    //   "AllowDevelopmentStorage": false,
+    //   // Max concurrent TCP connections to a single storage endpoint (Azure Tables provider). Azure
+    //   // Table is HTTP/1.1 (no multiplexing), so this ceilings simultaneous in-flight requests and
+    //   // stops a job fan-out exhausting the host's ~128 outbound-connection/SNAT budget on App Service.
+    //   // Default 30 (matches the Function Apps setting). Set to 0 or a negative value for unlimited.
+    //   // Env: CRAFT_STORAGE_MAX_CONNECTIONS_PER_SERVER.
+    //   "MaxConnectionsPerServer": 30,
+    //   // Minutes a pooled storage connection is reused before recycling (DNS/SNAT hygiene). Default 30.
+    //   // Set to 0 or a negative value to disable recycling. Env: CRAFT_STORAGE_POOLED_CONNECTION_LIFETIME_MINUTES.
+    //   "PooledConnectionLifetimeMinutes": 30
+    // },
+
+    // "Setup": {
+    //   "Enabled": false,
+    //   "BootstrapClientId": "1950a258-227b-4e31-a9cf-717495945fc2",
+    //   "AuthAppDisplayName": "",
+    //   // RedirectToLoginPage | AllowAnonymous | RejectWith401 | RejectWith404
+    //   "UnauthenticatedClientAction": "RedirectToLoginPage",
+    //   // Paths excluded from EasyAuth (e.g. webhooks): ["/api/Public*", "/.auth/*"]
+    //   "ExcludedPaths": [],
+    //   // Client app IDs allowed to call with access tokens (empty = no restriction)
+    //   "AllowedApplications": [],
+    //   // Extra allowed token audiences beyond "api://{appId}" (empty = only api://{appId})
+    //   "AllowedAudiences": [],
+    //   // Tenant IDs allowed to auth. Empty = setup tenant only (single-tenant issuer).
+    //   // Multiple entries → issuer becomes "common" + WEBSITE_AUTH_AAD_ALLOWED_TENANTS is set.
+    //   "AllowedTenants": [],
+    //   // Store EasyAuth client secret in Key Vault instead of app settings.
+    //   // "auto" = use site name as vault name. Or set explicit vault name.
+    //   // Empty (default) = store secret directly in AUTH_SECRET app setting.
+    //   "KeyVaultName": "",
+    //   // Key Vault secret names for the created SSO app registration's details, written
+    //   // when KeyVaultName is set. Defaults match the names CIPP expects; override to change.
+    //   // AppSecret is also the SecretName the AUTH_SECRET app setting references.
+    //   "SsoSecretNames": { "AppSecret": "SSOAppSecret", "AppId": "SSOAppId", "MultiTenant": "SSOMultiTenant" },
+    //   // Roles assigned to the bootstrap user seeded via /api/setup/seed-user.
+    //   // Empty (default) = ["superadmin"]. Override to match the hosted app's role taxonomy.
+    //   "FirstUserRoles": []
+    // },
+
+    "Scheduler": {
+      // JSON file with task definitions (looked up in API/Config/ then API/)
+      "ConfigFile": "SchedulerTasks.json",
+      // How often (seconds) the scheduler checks for due tasks
+      "CheckIntervalSeconds": 30,
+      // When true, applies the configured timezone to ALL tasks (not just TZOffset=true ones)
+      "ApplyTZOffset": false,
+      // IANA or Windows timezone ID for timezone-aware cron evaluation.
+      // Overridden by env var CraftTZ if set. Empty = UTC.
+      // Examples: "America/New_York", "Europe/London"
+      "Timezone": ""
+    },
+
+    "Orchestrator": {
+      // Prefix for Azure Tables: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results
+      "TablePrefix": "Orchestrator",
+      // Max task interruptions (crash/restart) before marking Failed
+      "MaxRetries": 3,
+      // Batch + coalesce per-task/run status writes off the fan-out critical path (results are never batched).
+      // Default true. Removes the per-task Azure Table write that gates worker throughput — see
+      // docs/orch-analysis.md. Set false for the original per-task writes.
+      // "BatchStatusWrites": true,
+      // Write the pre-invoke "Running" marker under a durable barrier (persisted before the task runs, so
+      // AttemptCount/MaxRetries still bounds poison tasks). Default true. False = eventual (max throughput —
+      // 100% pool utilization — but the marker rides the periodic flush; terminal/run states stay durable).
+      // "DurableRunningBarrier": true,
+      // Status writer flush interval / barrier latency ceiling (ms). Default 25.
+      // "StatusFlushIntervalMs": 25
+    },
+
+    "Cache": {
+      // Whether the in-memory/disk-backed API response cache is active. Omit (default) for auto: ON only
+      // when this node serves BOTH a browser UI and its API (combined / frontend+http roles), OFF for
+      // api-only, worker-only and static-only nodes. Set true/false to force it. Env override (wins):
+      // CRAFT_RESPONSE_CACHE=true/false. When off, no _cache/ dir is created and get/set are no-ops.
+      // "Enabled": true,
+
+      // Bytes budget for keeping cached response bodies in memory (LRU tier over the disk cache) so a HIT
+      // returns from RAM instead of re-reading the file. Default 64 MiB; 0 = disk-only. Big win for large
+      // List* responses (+157% throughput at ~150KB — see docs/cache-analysis.md).
+      // "MaxMemoryBytes": 67108864,
+
+      // Maximum cached responses held in memory
+      "MaxEntries": 1000,
+      // Default TTL (seconds) for cached responses
+      "DefaultTtlSeconds": 600
+
+      // Query parameter that triggers cache invalidation when "true"
+      // "InvalidateParam": "InvalidateCache",
+
+      // Query parameter for scoped invalidation (e.g. per-tenant)
+      // "ScopeParam": "",
+
+      // Per-endpoint TTL overrides (seconds): { "ListUsers": 120 }
+      // "EndpointTtl": {}
+    },
+
+    "Scripts": {
+      // Module directories (under API/Modules/) scanned for HTTP endpoint functions
+      // "HttpModules": [],
+
+      // Optional global HTTP handler. When set, ALL /API/{endpoint} routes are dispatched
+      // through this single PS function instead of invoking the route's function directly.
+      // The endpoint name is passed via Request.Params.CIPPEndpoint so the handler can
+      // dispatch internally. Use when the hosted app expects all routes to go through a
+      // common router (e.g. CIPP's New-CippCoreRequest which does Test-CIPPAccess + telemetry).
+      // Empty (default) = each /API/{endpoint} invokes Invoke-{endpoint} directly.
+      // "HttpHandler": "New-CippCoreRequest",
+
+      // Directories (under API/) scanned for background scripts
+      // "BackgroundScriptDirs": [],
+
+      // RBAC metadata extraction from .ROLE / .FUNCTIONALITY comment-based help
+      "PermissionExtraction": {
+        "Enabled": false
+        // "Modules": [],
+        // "OutputFile": "function-permissions.json"
+      }
+    }
+
+    // Container health monitoring — detects crash loops and forces Azure to
+    // provision a new worker by refusing to start Kestrel after repeated failures.
+    // Tracker file is written to /home/craft/ (Azure Files persistent mount).
+    // "ContainerHealth": {
+    //   "MaxRestarts": 3,         // consecutive crashes before blocking startup (0 = disabled)
+    //   "WindowMinutes": 30,      // only count restarts within this window
+    //   "TrackerDirectory": ""    // default: /home/craft (Linux) or disabled (Windows/dev)
+    // }
+
+    // Frontend response policy. EasyAuth handles auth/redirects at the platform layer;
+    // CRAFT only adds response headers EasyAuth doesn't touch.
+    // "Frontend": {
+    //   // Content-Security-Policy applied to all responses. DEFAULTS to the CIPP-compatible policy
+    //   // shown below — a CSP is emitted secure-by-default even if you don't set this. Override to
+    //   // tighten it, or set to "" to disable. Note: HSTS / X-Content-Type-Options / X-Frame-Options
+    //   // are intentionally NOT emitted here — they are left to the edge (Azure front end) / hosted app.
+    //   "ContentSecurityPolicy": "default-src https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *",
+    //   // Compress static responses. Default true: serve precompressed .br/.gz siblings + on-the-fly
+    //   // fallback. Set false to serve everything raw/identity (no .br/.gz served, no on-the-fly) — e.g.
+    //   // when an upstream CDN (Cloudflare) already compresses, the content doesn't benefit, or for
+    //   // A/B measuring compressed vs raw. Env override: CRAFT_COMPRESSION=true|false (wins over this).
+    //   "Compression": true
+    // }
+  }
+}

@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings come from Directory.Build.props. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <!--
+    Kept current for CVE hygiene: the 17.8.0 test SDK and xunit 2.5.3 dragged in System.Net.Http 4.3.0
+    and System.Text.RegularExpressions 4.3.0, both with High-severity advisories. These never reached
+    the runtime image (see the publish step in build/Dockerfile) but they do show up in an SBOM of the
+    solution, and there is no reason to carry known-vulnerable packages in the test rig.
+  -->
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Craft.csproj" />
+  </ItemGroup>
+
+  <!--
+    The annotated config reference is read by ConfigurationReferenceTests, which asserts every default
+    documented in it still matches the C# property default. Copied rather than embedded so a failure
+    points the reader at the real file they are expected to edit.
+  -->
+  <ItemGroup>
+    <None Include="..\..\appsettings.example.jsonc" CopyToOutputDirectory="PreserveNewest" Link="appsettings.example.jsonc" />
+  </ItemGroup>
+
+</Project>
