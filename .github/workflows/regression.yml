@@ -11,8 +11,12 @@ on:
       - 'docker/**'
       - 'Runtime/**'
       - 'Services/**'
-      - 'appsettings.json'
       - 'Craft.csproj'
+      - 'Craft.sln'
+      - 'tests/**'
+      - 'Directory.Build.props'
+      - 'global.json'
+      - '.editorconfig'
   pull_request:
     branches: [main, dev]
     paths:
@@ -20,8 +24,12 @@ on:
       - 'docker/**'
       - 'Runtime/**'
       - 'Services/**'
-      - 'appsettings.json'
       - 'Craft.csproj'
+      - 'Craft.sln'
+      - 'tests/**'
+      - 'Directory.Build.props'
+      - 'global.json'
+      - '.editorconfig'
   workflow_dispatch:
 
 permissions:
@@ -32,23 +40,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Style gate. Enforces .editorconfig via `dotnet format`, which auto-fixes everything it checks —
+  # a failure here is always resolved by running `dotnet format` locally and committing the result.
+  # Runs before build so a formatting-only mistake fails in ~30s instead of after the E2E suite.
+  lint:
+    name: lint (format + analyzers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No dotnet-version here on purpose: global.json pins the SDK, and setup-dotnet honours it.
+      # That keeps CI, build/Dockerfile and developer machines on one Roslyn + analyzer set.
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Verify formatting (.editorconfig)
+        run: dotnet format Craft.sln --severity warn --verify-no-changes
+
+      # The repo builds at zero warnings with AnalysisLevel=latest-recommended. This asserts it stays
+      # that way without TreatWarningsAsErrors, which would also fail builds on transient SDK warnings.
+      # See the analyzer backlog in .editorconfig for the rules still held at `suggestion`.
+      - name: Assert zero build warnings
+        run: |
+          dotnet build Craft.sln -c Release --nologo --no-incremental 2>&1 | tee build.log
+          count=$(grep -cE ': warning [A-Z]+[0-9]+' build.log || true)
+          if [ "$count" -ne 0 ]; then
+            echo "::error::$count build warning(s) — the build must stay warning-clean."
+            grep -E ': warning [A-Z]+[0-9]+' build.log | sort -u
+            exit 1
+          fi
+          echo "Build is warning-clean."
+
   build:
-    name: build (AzureTables)
+    name: build + unit tests (AzureTables)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          global-json-file: global.json
 
       - name: Build — AzureTables
-        run: dotnet build Craft.csproj -c Release --nologo
+        run: dotnet build Craft.sln -c Release --nologo
+
+      # Fast feedback ahead of the ~15 minute E2E job. Includes the PowerShell-contract guard, which
+      # is the only thing standing between a namespace rename and a runtime break in downstream apps.
+      - name: Unit tests
+        run: dotnet test Craft.sln -c Release --nologo --no-build
 
   e2e:
     name: e2e (combined role, Azurite)
     runs-on: ubuntu-latest
-    needs: build
+    needs: [lint, build]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/global.json",
+  "comment": [
+    "Pins the SDK so local builds, CI (.github/workflows) and build/Dockerfile all compile with the same",
+    "Roslyn and the same analyzer set. Without this, a developer on a newer SDK sees warnings CI never",
+    "reports (and vice versa), which is how a 'clean' build stops meaning anything.",
+    "Bump this in lockstep with setup-dotnet in the workflows and the sdk tag in build/Dockerfile."
+  ],
+  "sdk": {
+    "version": "8.0.400",
+    "rollForward": "latestFeature",
+    "allowPrerelease": false
+  }
+}

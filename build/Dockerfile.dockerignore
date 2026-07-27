@@ -20,3 +20,16 @@ docs/
 .env
 .env.example
 .github/
+
+# Test + benchmark projects. Not needed to build the runtime image, and leaving them out is the second
+# line of defence behind naming Craft.csproj explicitly in the publish step — without both, a solution
+# build drags xunit/testhost/coverlet into the production image.
+tests/
+perf-harness/
+
+# The solution file is deliberately excluded: with it absent, a stray `dotnet publish` with no
+# argument cannot resolve the solution and drag the test project in.
+# NOTE: .editorconfig is deliberately NOT excluded. The image build runs analyzers with
+# TreatWarningsAsErrors, so it must see the same severities as local and CI — drop it and the
+# container silently reverts to default severities and diverges again.
+Craft.sln

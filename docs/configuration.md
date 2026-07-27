@@ -1,6 +1,20 @@
 # Craft Configuration Guide
 
-Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section in `appsettings.json`.
+Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.NET Core's standard configuration system. All application-specific settings live under the `"App"` section.
+
+## Where defaults come from
+
+**Craft ships no `appsettings.json`.** Every setting's default is the C# property initialiser in
+[`Services/CraftSettings.cs`](../Services/CraftSettings.cs) — that file is the single source of truth, and a
+deployment that sets nothing at all gets exactly those values.
+
+[`appsettings.example.jsonc`](../appsettings.example.jsonc) is an annotated reference listing every key
+alongside its default. It is **documentation only**: the `.jsonc` extension keeps it out of the
+`appsettings*.json` content glob in `Craft.csproj`, so it is never copied to the published output or the
+container image. It carries comments, which strict JSON does not allow — hence the extension.
+
+Copy out of it only the keys you are actually changing. Restating a default in your own config creates a
+value that silently goes stale the day the default moves.
 
 ## Configuration Hierarchy
 
@@ -9,9 +23,13 @@ Settings are merged in priority order (highest wins):
 1. **Environment variables** — `App__Worker__BgPoolSize=8`
 2. **`Properties/launchSettings.json`** — profile env vars injected by `dotnet run` / Visual Studio (local dev only, ignored in Docker/production)
 3. **`appsettings.{Environment}.json`** — e.g. `appsettings.Development.json` (loaded when `ASPNETCORE_ENVIRONMENT=Development`)
-4. **`appsettings.json`** — base defaults (always loaded, all environments)
+4. **`appsettings.json`** — supplied by *your* app, if you supply one (always loaded, all environments)
+5. **C# property defaults** in `Services/CraftSettings.cs` — the floor; always present
 
-Both appsettings files are always used in every context (local `dotnet run`, Docker, production). The environment-specific file overlays onto the base — it doesn't replace it. Values in the environment file win over the base file for the same key.
+Both appsettings files are optional. When both are present the environment-specific file overlays onto the
+base — it doesn't replace it — and values in the environment file win for the same key. Note that both are
+gitignored in this repo, since a local `appsettings.json` is the file most likely to hold a storage
+connection string.
 
 Environment variables use `__` (double underscore) as the section separator:
 
@@ -438,12 +456,71 @@ In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET en
   // When a write clears cache, only entries with matching scope value are evicted.
   "ScopeParam": "tenantFilter",
 
+  // Endpoints never cached, whatever the query string says.
+  // Case-insensitive; "*" matches any run of characters.
+  "ExcludedEndpoints": ["ListLogs", "ListScheduled*"],
+
+  // Query parameter a request must carry before its response may be cached at all.
+  // Empty (default) = every eligible read is cached.
+  "RequiredParam": "tenantFilter",
+
+  // Values of RequiredParam that skip the cache (case-insensitive).
+  "ExcludedParamValues": ["AllTenants"],
+
+  // Request header that bypasses the cache for a single call. Empty disables the check.
+  "NoCacheHeader": "x-craft-no-cache",
+
   // Per-endpoint TTL overrides (seconds). Key = endpoint name.
   "EndpointTtl": {
     "ListTenants": 300,
     "ListUsers": 120
   }
 }
+```
+
+#### What gets cached
+
+A response is cached only when **both** gates agree:
+
+1. **The handler** is a side-effect-free read — a `GET` to a `List*` endpoint. This is the naming
+   convention, and it is not configurable.
+2. **The request** passes the admission policy below.
+
+The policy is evaluated in this order, and the first failure wins:
+
+| Gate | `X-Cache-Bypass` when it fails |
+| --- | --- |
+| Endpoint matches `ExcludedEndpoints` | `excluded-endpoint` |
+| `NoCacheHeader` sent with any value other than `false`/`0`/`no` | `no-cache-header` |
+| `RequiredParam` missing from the query string | `missing-required-param` |
+| `RequiredParam` present but blank | `empty-required-param` |
+| `RequiredParam` value listed in `ExcludedParamValues` | `excluded-param-value` |
+
+A bypassed request neither reads from nor writes to the cache, so it can never collide with an entry
+stored by a differently-scoped caller, and it answers with `X-Cache: BYPASS`. `X-Cache: MISS` still
+means what it always did — the request was eligible and there was simply no entry for it.
+
+All of these are inert by default (`RequiredParam` empty, no excluded values, no excluded endpoints),
+so an existing deployment that upgrades keeps caching exactly what it cached before until it opts in.
+
+**`ExcludedEndpoints` vs `RequiredParam`.** They cover different cases and are worth using together.
+`RequiredParam` classifies in bulk: everything that does not take the scoping parameter drops out
+without anyone having to enumerate it. `ExcludedEndpoints` handles the exceptions that rule cannot see
+— an endpoint that *does* take `tenantFilter` and is still a poor cache candidate, because it is
+cheap, near-realtime, or answered per user rather than per tenant. Patterns accept `*` anywhere
+(`ListLog*`, `*Logs`, `List*Audit*`), matched case-insensitively against the endpoint name as it
+appears in the route.
+
+**Why require a parameter at all.** `List*` endpoints that take no scope parameter — a tenant list, a
+log tail, the scheduler view — are usually fast, query-shaped and answered per user. Caching them buys
+little and invites key collisions between users whose results legitimately differ. Requiring
+`tenantFilter` keeps the cache to the calls where it pays for itself, and, because every cached key
+then contains `tenantFilter=…`, it also makes `ScopeParam` invalidation exact.
+
+Per-call bypass:
+
+```bash
+curl -H "x-craft-no-cache: true" https://example/API/ListUsers?tenantFilter=contoso.com
 ```
 
 ---
@@ -676,7 +753,10 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
 
     "Cache": {
       "InvalidateParam": "InvalidateCIPPCache",
-      "ScopeParam": "tenantFilter"
+      "ScopeParam": "tenantFilter",
+      "RequiredParam": "tenantFilter",
+      "ExcludedParamValues": ["AllTenants"],
+      "ExcludedEndpoints": ["ListLogs", "ListScheduledItems"]
     },
 
     "Scripts": {
@@ -718,7 +798,7 @@ Craft separates its own built-in scripts from application content:
 
 1. **Place compiled PS modules** in `API/Modules/`
 2. **Place frontend build** in `Frontend/` (static files served automatically)
-3. **Create `appsettings.json`** with your `App:` config (use the base file as a template)
+3. **Configure `App:` settings** — either `App__*` environment variables (preferred for containers) or your own `appsettings.json`, using [`appsettings.example.jsonc`](../appsettings.example.jsonc) as the reference. Set only what you're changing; everything else falls back to the defaults in `Services/CraftSettings.cs`.
 4. **Set `AzureWebJobsStorage`** to a valid Azure Storage connection string (or `UseDevelopmentStorage=true` for Azurite)
 5. **Run:** `dotnet run` or `docker compose up`
 

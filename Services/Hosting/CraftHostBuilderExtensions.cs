@@ -1,0 +1,229 @@
+using System.IO.Compression;
+using System.Threading.RateLimiting;
+using Craft.Auth;
+using Craft.Caching;
+using Craft.Configuration;
+using Craft.Orchestration;
+using Craft.PowerShellHost;
+using Craft.Realtime;
+using Craft.Services;
+using Craft.Setup;
+using Craft.Storage;
+using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Logging.Console;
+using Microsoft.Extensions.Options;
+
+namespace Craft.Hosting;
+
+/// <summary>
+/// Host wiring, split out of <c>Program.cs</c> so startup reads as a short sequence of named steps
+/// rather than several hundred lines of inline configuration.
+/// </summary>
+public static class CraftHostBuilderExtensions
+{
+    /// <summary>
+    /// Resolves the Kestrel request timeout in seconds: an explicit <c>KestrelTimeoutSeconds</c> wins,
+    /// otherwise it derives from <c>Worker.HttpTimeoutSeconds</c>, otherwise 600s.
+    /// </summary>
+    /// <remarks>
+    /// Deriving from the worker timeout matters: if Kestrel gives up before the PowerShell worker does,
+    /// the caller sees a connection abort while the script keeps running and holding a runspace.
+    /// </remarks>
+    public static int ResolveKestrelTimeoutSeconds(CraftSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var timeout = settings.KestrelTimeoutSeconds;
+        if (timeout > 0) return timeout;
+
+        return settings.Worker.HttpTimeoutSeconds > 0 ? settings.Worker.HttpTimeoutSeconds : 600;
+    }
+
+    /// <summary>
+    /// Kestrel limits: request timeouts, HTTP/2 tuning, and the DoS-relevant caps (body size,
+    /// connection count, slow-loris minimum data rates). The caps apply regardless of the timeout.
+    /// </summary>
+    public static WebApplicationBuilder ConfigureCraftKestrel(
+        this WebApplicationBuilder builder, CraftSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var timeout = ResolveKestrelTimeoutSeconds(settings);
+
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(timeout);
+            options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(Math.Min(60, timeout));
+
+            // HTTP/2 — better multiplexing for the browser UI.
+            options.Limits.Http2.MaxStreamsPerConnection = 100;
+            options.Limits.Http2.HeaderTableSize = 4096;
+            options.Limits.Http2.MaxFrameSize = 16384;
+            options.Limits.Http2.MaxRequestHeaderFieldSize = 8192;
+            options.Limits.Http2.InitialConnectionWindowSize = 131072;
+            options.Limits.Http2.InitialStreamWindowSize = 98304;
+
+            // Request body cap. Default 100 MB; 0 means unlimited.
+            var maxBodyMb = settings.Limits.MaxRequestBodyMB;
+            options.Limits.MaxRequestBodySize = maxBodyMb > 0 ? maxBodyMb * 1024L * 1024L : null;
+
+            // Concurrent connection cap. Default 200; <= 0 hands the decision to the OS.
+            var maxConn = settings.Limits.MaxConcurrentConnections;
+            options.Limits.MaxConcurrentConnections = maxConn > 0 ? maxConn : null;
+            options.Limits.MaxConcurrentUpgradedConnections = maxConn > 0 ? maxConn : null;
+
+            // Slow-loris protection.
+            options.Limits.MinRequestBodyDataRate =
+                new MinDataRate(bytesPerSecond: 240, gracePeriod: TimeSpan.FromSeconds(5));
+            options.Limits.MinResponseDataRate =
+                new MinDataRate(bytesPerSecond: 240, gracePeriod: TimeSpan.FromSeconds(5));
+        });
+
+        return builder;
+    }
+
+    /// <summary>
+    /// File logging with rotation plus a timestamped console sink, both honouring the configured level
+    /// (<c>App:FileLogging:LogLevel</c>, overridable with <c>CRAFT_LOG_LEVEL</c>).
+    /// </summary>
+    /// <returns>
+    /// The resolved level. Startup logs it, and it also gates PowerShell stream capture — at Debug,
+    /// Write-Debug is captured; at Trace, Write-Verbose as well.
+    /// </returns>
+    public static LogLevel AddCraftLogging(this WebApplicationBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        var fileLoggingSettings = new FileLoggingSettings();
+        builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
+        var level = fileLoggingSettings.ParsedLogLevel;
+
+        var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, level);
+        builder.Logging.AddProvider(fileLoggerProvider);
+        LogBridge.Initialize(fileLoggerProvider);
+
+        builder.Logging.AddSimpleConsole(options =>
+        {
+            options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
+            options.SingleLine = true;
+        });
+
+        if (level > LogLevel.Debug)
+        {
+            builder.Logging.AddFilter<ConsoleLoggerProvider>(l => l >= LogLevel.Information);
+
+            // Framework logging is noise at Information and above.
+            builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+            builder.Logging.AddFilter("Microsoft.Hosting", LogLevel.Warning);
+            builder.Logging.AddFilter("Microsoft.Extensions.Hosting", LogLevel.Warning);
+        }
+
+        return level;
+    }
+
+    private static readonly string[] second = new[] { "application/json", "text/json", "application/javascript", "text/javascript" };
+
+    /// <summary>Response compression, matching Azure Static Web Apps behaviour.</summary>
+    public static IServiceCollection AddCraftResponseCompression(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.AddResponseCompression(options =>
+        {
+            options.EnableForHttps = true;
+            options.Providers.Add<BrotliCompressionProvider>();
+            options.Providers.Add<GzipCompressionProvider>();
+            options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
+                second);
+        });
+
+        // Fastest, not Optimal: these run on the request path on a small container, where the extra
+        // CPU costs more than the bytes saved. Precompressed .br/.gz siblings cover the static assets.
+        services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
+        services.Configure<GzipCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers the Craft service graph. Background hosted services are registered only on nodes
+    /// carrying the Background role — every node builds the same object graph, but only a Background
+    /// node actually runs the scheduler, job manager and stats sampler.
+    /// </summary>
+    public static IServiceCollection AddCraftServices(this IServiceCollection services, CraftRoles roles)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(roles);
+
+        services.AddSingleton<ICraftTableStore, AzureTableStore>();
+        services.AddSingleton<StorageHealthMonitor>();
+        services.AddSingleton<RealtimeService>();
+
+        services.AddSingleton<ScriptRepository>();
+        services.AddSingleton<PowerShellWorkerPool>();
+        services.AddSingleton<PowerShellRunnerService>();
+
+        services.AddSingleton(sp => new CacheService(
+            sp.GetRequiredService<ILogger<CacheService>>(),
+            sp.GetRequiredService<CraftSettings>(),
+            roles.ResponseCacheEnabled));
+
+        services.AddSingleton<BackgroundTaskLimiter>();
+        services.AddSingleton<JobManager>();
+        services.AddSingleton<OrchestratorTableStore>();
+        services.AddSingleton<OrchestratorStatusWriter>();
+        services.AddSingleton<OrchestratorService>();
+        services.AddSingleton<AuthService>();
+        services.AddSingleton<SetupService>();
+        services.AddSingleton<SchedulerService>();
+        services.AddSingleton<StatsHistoryService>();
+
+        if (roles.Background)
+        {
+            services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
+            services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
+            services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
+        }
+
+        services.AddSingleton(sp =>
+        {
+            var health = sp.GetRequiredService<IOptions<CraftSettings>>().Value.ContainerHealth;
+            var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContainerHealthMonitor>();
+            return new ContainerHealthMonitor(logger, health);
+        });
+
+        return services;
+    }
+
+    /// <summary>
+    /// Per-client fixed-window rate limiter so a single caller cannot exhaust the small HTTP worker
+    /// pool. Enabled by default; turn off with <c>App:RateLimit:Enabled=false</c>.
+    /// </summary>
+    public static IServiceCollection AddCraftRateLimiter(
+        this IServiceCollection services, CraftSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(settings);
+
+        if (!settings.RateLimit.IsEnabled) return services;
+
+        services.AddRateLimiter(options =>
+        {
+            options.RejectionStatusCode = 429;
+            options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+                RateLimitPartition.GetFixedWindowLimiter(
+                    RateLimitPartitionKey.Resolve(context),
+                    _ => new FixedWindowRateLimiterOptions
+                    {
+                        PermitLimit = Math.Max(1, settings.RateLimit.PermitPerWindow),
+                        Window = TimeSpan.FromSeconds(Math.Max(1, settings.RateLimit.WindowSeconds)),
+                        QueueLimit = Math.Max(0, settings.RateLimit.QueueLimit),
+                        QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                    }));
+        });
+
+        return services;
+    }
+}

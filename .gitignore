@@ -23,6 +23,11 @@ Thumbs.db
 *.log
 
 # Local settings (contains secrets)
-appsettings.*.local.json
+# CRAFT ships no appsettings.json — appsettings.example.jsonc is the annotated reference, and real
+# config comes from App__* env vars or a file the downstream app supplies. Anything matching
+# appsettings*.json here is therefore somebody's local override, which is exactly the file most likely
+# to hold a storage connection string. Keep it out of the repo.
+appsettings.json
+appsettings.*.json
 local.settings.json
 .env
