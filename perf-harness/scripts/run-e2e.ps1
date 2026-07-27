@@ -38,6 +38,8 @@ function Add-Result($area, $name, $pass, $perf, $detail) {
   Write-Host ("  [{0}] {1,-12} {2,-18} {3,-8} {4}" -f $tag, $area, $name, $perf, $detail) -ForegroundColor $(if ($pass) { 'Green' } else { 'Red' })
 }
 function Api($path) { try { return Invoke-RestMethod "$base$path" -TimeoutSec 20 } catch { return $null } }
+# Same, but against an absolute URL — the throwaway containers further down run on their own ports.
+function Json($url) { try { return Invoke-RestMethod $url -TimeoutSec 20 } catch { return $null } }
 # Low-level fetch via curl (control over Accept-Encoding + raw response headers). Returns status, request
 # time, transfer size, the raw header block, and the body. Cross-platform.
 function Fetch($url, $extra = @()) {
@@ -128,8 +130,15 @@ try {
   # ── Security headers ────────────────────────────────────────────────────────
   try {
     $resp = Invoke-WebRequest "$base/API/PerfPing" -TimeoutSec 20 -SkipHttpErrorCheck
-    $csp  = $resp.Headers['Content-Security-Policy']
+    $csp  = "$($resp.Headers['Content-Security-Policy'])"
     Add-Result 'security' 'csp-header' ([bool]$csp) '-' "CSP present"
+
+    # connect-src falls back to default-src. A policy gated on the https: scheme alone refuses the
+    # app's own same-origin fetches the moment it is served over http — which is how the setup
+    # wizard's status call ended up blocked in the browser while curl saw a healthy 200.
+    $dsrc = ($csp -split ';' | Where-Object { $_.Trim().StartsWith('default-src') }) -join ''
+    $selfOk = $dsrc -match "'self'"
+    Add-Result 'security' 'csp-allows-self' $selfOk '-' "default-src allows the app's own origin"
   } catch { Add-Result 'security' 'csp-header' $false '-' $_.Exception.Message }
 
   # ── Dev-mode principal injection ──────────────────────────────────────────────
@@ -154,6 +163,102 @@ try {
     Add-Result 'dev-auth' 'auth-me-dev-principal' $meOk '-' "Development /.auth/me -> userDetails=$($me.clientPrincipal.userDetails)"
   }
   finally { docker rm -f craft-e2e-devauth 2>&1 | Out-Null }
+
+  # ── First-run setup wizard ────────────────────────────────────────────────────
+  # The main stack runs with App__Setup__Enabled=false (setup is a first-run-only path), so the wizard
+  # gets its own throwaway container on the Azurite network, with its own users table so the run is
+  # repeatable.
+  #
+  # Setup mode is opt-in — the hosted app calls RequestSetupMode() when it works out it cannot
+  # configure itself — and there is no env var for it, so this container asks for it the same way a
+  # real app does: a WarmupScript on the first worker. Which means the check below also covers the
+  # part an operator actually experiences first, the redirect onto the wizard.
+  #
+  # From there it walks the whole contract the wizard's UI state is derived from: serve the page,
+  # read status on an empty table, seed a superadmin, and see the status flip. A regression in any of
+  # these is what leaves an operator staring at a greyed-out Add Superadmin button.
+  Info "setup: launching a wizard-enabled container ..."
+  docker rm -f craft-e2e-setup 2>&1 | Out-Null
+  $azConn = 'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1;'
+  docker run -d --name craft-e2e-setup --network craft-e2e-aznet -p '5402:8080' `
+    -e ASPNETCORE_ENVIRONMENT=Production -e CRAFT_SERVE_API=true `
+    -e App__Setup__Enabled=true -e App__ReadinessMode=Immediate `
+    -e App__Worker__IgnoreSkuProfiles=true -e App__Worker__HttpPoolSize=1 -e App__Worker__BgPoolSize=1 `
+    -e 'App__Worker__WarmupScripts__0=[Craft.Services.AppLifecycleBridge]::RequestSetupMode("e2e")' `
+    -e Auth__UserTableName=e2esetupusers -e App__RateLimit__Enabled=false `
+    -e DOTNET_gcServer=0 `
+    -e "AzureWebJobsStorage=$azConn" `
+    $SutImage 2>&1 | Out-Null
+  try {
+    $setupBase = 'http://127.0.0.1:5402'
+    $upn = 'e2e-admin@contoso.com'
+
+    # Setup mode is live once a browser hitting / is steered to the wizard. Polling on that rather
+    # than on a fixed sleep also makes the redirect itself an assertion.
+    $redir = $null; $dl = (Get-Date).AddSeconds(180)
+    while ((Get-Date) -lt $dl) {
+      $r = try { Invoke-WebRequest $setupBase -TimeoutSec 5 -MaximumRedirection 0 -SkipHttpErrorCheck } catch { $null }
+      if ($r -and $r.StatusCode -eq 302 -and "$($r.Headers.Location)" -match '/setup') { $redir = $r; break }
+      Start-Sleep -Seconds 2
+    }
+    Add-Result 'setup' 'enters-setup-mode' ([bool]$redir) '-' "RequestSetupMode() -> / redirects to $($redir.Headers.Location)"
+
+    # The wizard's own API stays reachable while the rest of the app is refused — an operator reaches
+    # this page precisely because nothing else works yet.
+    $blocked = Invoke-WebRequest "$setupBase/api/PerfPing" -TimeoutSec 20 -SkipHttpErrorCheck
+    Add-Result 'setup' 'app-api-refused' ($blocked.StatusCode -eq 503) '-' "app API -> HTTP $($blocked.StatusCode) while setup pending"
+
+    # The page itself. The markers assert the fixed page shipped: the branch table is present and the
+    # seed button is not hard-disabled in the markup (it used to be, and was only ever re-enabled by
+    # the status fetch below — so one failed request killed the whole wizard silently).
+    $pg = Fetch "$setupBase/setup"
+    $btn = if ($pg.Body -match '<button[^>]*id="btn-seed"[^>]*>') { $Matches[0] } else { '' }
+    $pgOk = ($pg.Code -eq 200) -and ($pg.Body -match 'Add Superadmin') -and
+            ($pg.Body -match 'craft:wizard-state') -and $btn -and ($btn -notmatch '\bdisabled\b')
+    Add-Result 'setup' 'serve-wizard' $pgOk ("{0}ms" -f $pg.TimeMs) "/setup 200 + branch table + button not hard-disabled"
+
+    # Empty table: storage reachable, no users. This is what unlocks step 1 and keeps step 2 locked.
+    $st = Json "$setupBase/api/setup/status"
+    $emptyOk = $st -and $st.usersStatus -and ($st.usersStatus.connected -eq $true) -and ($st.usersStatus.hasUsers -eq $false)
+    Add-Result 'setup' 'status-empty' $emptyOk '-' "connected=$($st.usersStatus.connected) hasUsers=$($st.usersStatus.hasUsers)"
+
+    # Seed the first superadmin.
+    $seed = try {
+      Invoke-RestMethod "$setupBase/api/setup/seed-user" -Method Post -TimeoutSec 30 `
+        -ContentType 'application/json' -Body (@{ upn = $upn } | ConvertTo-Json)
+    } catch { $null }
+    Add-Result 'setup' 'seed-first-user' ($seed.success -eq $true) '-' "message=$($seed.message)"
+
+    # The round trip the page polls for: after a successful seed, status must report hasUsers, which
+    # is what ungreys the authentication step.
+    $after = Json "$setupBase/api/setup/status"
+    $flipOk = $after -and $after.usersStatus -and ($after.usersStatus.hasUsers -eq $true)
+    Add-Result 'setup' 'status-flips' $flipOk '-' "hasUsers=$($after.usersStatus.hasUsers) after seed"
+
+    # The server-side guard the page deliberately fails open against: with status unreadable the
+    # wizard leaves the button clickable, so this endpoint — not a greyed button — has to be what
+    # protects a table that already has users. The message is asserted, not just the status code:
+    # bad JSON and an unreachable store also produce a 400, and neither of those proves the guard ran.
+    $again = Invoke-WebRequest "$setupBase/api/setup/seed-user" -Method Post -TimeoutSec 30 `
+      -ContentType 'application/json' -Body (@{ upn = 'second@contoso.com' } | ConvertTo-Json) -SkipHttpErrorCheck
+    $body = try { $again.Content | ConvertFrom-Json } catch { $null }
+    $guardOk = ($again.StatusCode -eq 400) -and ($body.success -eq $false) -and
+               ($body.message -match 'already contains users')
+    Add-Result 'setup' 'reseed-refused' $guardOk '-' "HTTP $($again.StatusCode) — $($body.message)"
+
+    # ...and the refusal is not a one-off: the table is still guarded on a retry, and the first user
+    # is still the one that is there. The e2e cannot enumerate the table over HTTP — that "nothing was
+    # written" invariant is pinned by SetupWizardStatusTests — but a table that had silently accepted
+    # the second write would still be reporting hasUsers here, so this is the reachable half.
+    $third = Invoke-WebRequest "$setupBase/api/setup/seed-user" -Method Post -TimeoutSec 30 `
+      -ContentType 'application/json' -Body (@{ upn = $upn } | ConvertTo-Json) -SkipHttpErrorCheck
+    $thirdBody = try { $third.Content | ConvertFrom-Json } catch { $null }
+    $stillOk = ($third.StatusCode -eq 400) -and ($thirdBody.message -match 'already contains users') -and
+               ((Json "$setupBase/api/setup/status").usersStatus.hasUsers -eq $true)
+    Add-Result 'setup' 'reseed-stays-refused' $stillOk '-' "re-seeding the original UPN is refused too"
+  }
+  catch { Add-Result 'setup' 'wizard-flow' $false '-' $_.Exception.Message }
+  finally { docker rm -f craft-e2e-setup 2>&1 | Out-Null }
 
   # ── Frontend static serving ─────────────────────────────────────────────────
   # Two static HTML pages served correctly + fast, and a compressible asset served precompressed

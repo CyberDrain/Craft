@@ -90,6 +90,12 @@ jobs:
       - name: Unit tests
         run: dotnet test Craft.sln -c Release --nologo --no-build
 
+      # The setup wizard is an embedded HTML page, so its branch table is the one piece of shipped
+      # logic dotnet test cannot reach. node --test with no package.json and no install — the runner
+      # is built in, and ubuntu-latest already has Node.
+      - name: Unit tests (setup wizard)
+        run: node --test "tests/setup-wizard/**/*.test.mjs"
+
   e2e:
     name: e2e (combined role, Azurite)
     runs-on: ubuntu-latest
