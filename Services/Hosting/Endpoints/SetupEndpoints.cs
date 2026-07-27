@@ -64,8 +64,19 @@ public static class SetupEndpoints
             return Results.Content(SetupPages.IndexHtml, "text/html");
         });
 
+        // Block-bodied on purpose. `async (HttpContext c) => Results.Json(...)` is implicitly
+        // convertible to RequestDelegate, so MapGet binds the RequestDelegate overload instead of the
+        // Delegate one: the IResult is computed and then thrown away, and the caller gets an empty
+        // 200 with no Content-Type. That is not a hypothetical — it shipped, and it took the setup
+        // wizard down with it, because the page's `await res.json()` threw on the empty body and left
+        // every control disabled. An explicit `return` makes the lambda inconvertible to
+        // RequestDelegate and forces the overload that writes the result. Guarded by
+        // EndpointShapeTests and by the setup block of perf-harness/scripts/run-e2e.ps1.
         app.MapGet("/api/setup/status", async (HttpContext context) =>
-            Results.Json(await setupService.GetStatus(context.RequestAborted)));
+        {
+            var status = await setupService.GetStatus(context.RequestAborted);
+            return Results.Json(status);
+        });
 
         app.MapPost("/api/setup/device-code", async () =>
             Results.Json(await setupService.StartDeviceCodeFlow()));

@@ -37,4 +37,14 @@
     <None Include="..\..\appsettings.example.jsonc" CopyToOutputDirectory="PreserveNewest" Link="appsettings.example.jsonc" />
   </ItemGroup>
 
+  <!--
+    Endpoint sources, read by EndpointShapeTests. The shape it checks (an expression-bodied
+    `async (HttpContext c) => Results.Json(...)`, which silently binds MapGet's RequestDelegate
+    overload and discards the result) compiles cleanly and has no runtime signature to assert on
+    without standing up a server, so the source itself is the thing under test.
+  -->
+  <ItemGroup>
+    <None Include="..\..\Services\Hosting\Endpoints\*.cs" CopyToOutputDirectory="PreserveNewest" LinkBase="EndpointSources" />
+  </ItemGroup>
+
 </Project>

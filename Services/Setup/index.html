@@ -109,7 +109,11 @@
         <p>Add the first superadmin user before configuring authentication. This user will have full access to the application.</p>
         <label for="seed-upn">User Principal Name (email)</label>
         <input type="text" id="seed-upn" placeholder="admin@contoso.com">
-        <button class="btn btn-primary" id="btn-seed" onclick="seedFirstUser()" disabled>Add Superadmin</button>
+        <!-- Deliberately NOT disabled in the markup. The button used to ship disabled and was only
+             ever enabled by the status fetch below, so any hiccup on that one request left the whole
+             wizard permanently dead with no explanation. Enabled state is now owned by
+             decideWizardState() and the empty-input case is caught on click. -->
+        <button class="btn btn-primary" id="btn-seed" onclick="seedFirstUser()">Add Superadmin</button>
         <div id="seed-status" class="status"></div>
     </div>
 
@@ -187,7 +191,6 @@
 
 <script>
     let setupState = {};
-    let pollTimer = null;
     let autoMultiTenant = false;
     let manualMultiTenant = false;
 
@@ -211,75 +214,198 @@
         }
     }
 
-    (async function() {
+    // ── Wizard state ─────────────────────────────────────────────────────────────────────────────
+    // Everything interactive on this page is derived from `wizard` by decideWizardState() and applied
+    // by applyWizardState(). Nothing is enabled or disabled ad hoc, and no control's usable state
+    // hangs off a single un-retried network call. That was the original defect: btn-seed shipped
+    // disabled and was enabled from exactly one branch of one fetch whose only error handler was a
+    // console.error, so a slow container, a storage timeout, or a non-JSON error body left the page
+    // permanently inert — greyed button, greyed step 2, and not a word about why.
+    const wizard = {
+        stepOneDone: false,   // sticky: a superadmin is known to exist. Never goes back to false.
+        stepOneMessage: '',   // the success text to keep showing once it does.
+        attempted: false,     // a status read has finished at least once (success or failure)
+        status: null,         // last successful /api/setup/status payload, or null if unreadable
+        error: null,          // why the last read failed, if it did
+        seedInFlight: false   // a seed POST owns the status line while it runs
+    };
+
+    // <craft:wizard-state>
+    // Pure branch table: what we know about the host -> what the page should look like. Extracted for
+    // the same reason SetupGate is — the branch table is the whole behaviour, and it is the part that
+    // broke. No DOM, no fetch, no globals. Covered by tests/setup-wizard/.
+    function decideWizardState(input) {
+        const status = input && input.status;
+        const users = status && status.usersStatus;
+
+        // Step 1 is settled — we either seeded a user or read that one exists. Sticky on purpose: a
+        // status poll that fails later must not re-lock a wizard part-way through a device-code flow.
+        if (input && input.stepOneDone) {
+            return {
+                seedEnabled: false, userSectionDone: true, authEnabled: true, retrying: false,
+                message: input.stepOneMessage || 'Superadmin user added.', messageType: 'success'
+            };
+        }
+
+        // The first read has not come back yet. Step 1 is already usable — the button must never wait
+        // on the network — but there is nothing to report, so report nothing. Without this the page
+        // flashes a "could not read status" error on every load, before it has even tried.
+        if (!status && !(input && input.attempted)) {
+            return {
+                seedEnabled: true, userSectionDone: false, authEnabled: false, retrying: true,
+                message: '', messageType: ''
+            };
+        }
+
+        // Status unreadable. Fail OPEN on step 1: /api/setup/seed-user enforces the same invariant
+        // server-side (it refuses a non-empty table), so greying the button out buys no safety — it
+        // only produces a wizard nobody can use. The auth sections stay locked, because opening those
+        // without knowing whether a superadmin exists is how an operator gets locked out of the app
+        // they just finished configuring.
+        if (!status) {
+            return {
+                seedEnabled: true, userSectionDone: false, authEnabled: false, retrying: true,
+                message: 'Could not read setup status'
+                    + (input && input.error ? ' (' + input.error + ')' : '')
+                    + '. Retrying automatically — you can still add the first user.',
+                messageType: 'error'
+            };
+        }
+
+        // Reached storage and it said no. Same reasoning: the seed attempt is what produces the real
+        // diagnostic, so let the operator make it.
+        if (!users || !users.connected) {
+            return {
+                seedEnabled: true, userSectionDone: false, authEnabled: false, retrying: true,
+                message: 'Cannot connect to storage: ' + ((users && users.error) || 'Unknown error')
+                    + '. Adding a user will fail until storage is reachable.',
+                messageType: 'error'
+            };
+        }
+
+        if (users.hasUsers) {
+            return {
+                seedEnabled: false, userSectionDone: true, authEnabled: true, retrying: false,
+                message: 'Users already exist in the table. Proceed to authentication setup below.',
+                messageType: 'success'
+            };
+        }
+
+        // Storage reachable, table empty: the normal first-run path.
+        return {
+            seedEnabled: true, userSectionDone: false, authEnabled: false, retrying: false,
+            message: '', messageType: ''
+        };
+    }
+
+    // Returns null when a /api/setup/status response is usable, or a short reason when it is not.
+    // The empty-200 case is not hypothetical: the route bound MapGet's RequestDelegate overload and
+    // wrote nothing at all, so res.ok was true, there was no Content-Type, and res.json() threw on an
+    // empty body. Checking res.ok alone would not have caught it.
+    function statusReadError(ok, httpStatus, contentType) {
+        if (!ok) return 'HTTP ' + httpStatus;
+        if (!(contentType || '').includes('json')) return 'unexpected non-JSON response';
+        return null;
+    }
+    // </craft:wizard-state>
+
+    // Key of the message currently on screen, so the 5s poll only rewrites the status line when the
+    // state genuinely changes instead of stomping on something the operator is mid-way through reading.
+    let lastMessage = null;
+
+    function applyWizardState() {
+        const state = decideWizardState(wizard);
+
+        document.getElementById('btn-seed').disabled = !state.seedEnabled || wizard.seedInFlight;
+        document.getElementById('user-section').classList.toggle('disabled-section', state.userSectionDone);
+        document.getElementById('auto-section').classList.toggle('disabled-section', !state.authEnabled);
+        document.getElementById('manual-section').classList.toggle('disabled-section', !state.authEnabled);
+
+        // Written on every change, including a change to no message at all — a state that has
+        // recovered has to be able to clear the error it recovered from, or the page keeps showing a
+        // problem it no longer has.
+        const key = state.messageType + '|' + state.message;
+        if (key !== lastMessage) {
+            showStatus('seed-status', state.message, state.messageType);
+            lastMessage = key;
+        }
+        return state;
+    }
+
+    // Rejects on anything that is not a JSON 200. A 503 from the startup gate, an HTML holding page
+    // from a proxy, and a storage probe that never answers all used to land in a bare catch and take
+    // the page down with them; each has to become a visible, retried error instead.
+    async function loadStatus() {
+        const options = { cache: 'no-store' };
+        if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+            options.signal = AbortSignal.timeout(20000);
+        }
+        const res = await fetch('/api/setup/status', options);
+        const problem = statusReadError(res.ok, res.status, res.headers.get('Content-Type'));
+        if (problem) throw new Error(problem);
+        return await res.json();
+    }
+
+    // One-shot page furniture that depends on the status payload.
+    let chromeApplied = false;
+    function applyPageChrome(status) {
+        if (chromeApplied) return;
+        chromeApplied = true;
+        if (status.appName) document.getElementById('page-title').textContent = status.appName + ' Setup';
+        if (status.authAppDisplayName) {
+            document.getElementById('manual-app-name').textContent = status.authAppDisplayName;
+        }
+        if (!status.isRunningInAppService || !status.hasManagedIdentity) {
+            showBanner('Warning: No managed identity detected. ARM self-configuration may fail. Use manual setup instead.');
+        }
+    }
+
+    // The initial read and the background refresh are the same operation, so a failed first attempt
+    // recovers on its own rather than bricking the page for the rest of the session.
+    async function refreshStatus() {
         try {
-            const res = await fetch('/api/setup/status');
-            setupState = await res.json();
-            document.getElementById('page-title').textContent = setupState.appName + ' Setup';
-            if (setupState.authAppDisplayName) {
-                document.getElementById('manual-app-name').textContent = setupState.authAppDisplayName;
-            }
-            document.getElementById('manual-redirect-uri').textContent = window.location.origin + '/.auth/login/aad/callback';
-            if (setupState.isEasyAuthConfigured) {
-                showBanner('Authentication is already configured. This page will redirect shortly.');
+            const status = await loadStatus();
+            wizard.status = status;
+            wizard.error = null;
+            setupState = status;
+
+            applyPageChrome(status);
+
+            if (status.isSetupCompleted || status.isEasyAuthConfigured) {
+                showRestartScreen();
                 return;
             }
-            if (!setupState.isRunningInAppService || !setupState.hasManagedIdentity) {
-                showBanner('Warning: No managed identity detected. ARM self-configuration may fail. Use manual setup instead.');
-            }
-
-            // Handle user table status
-            const us = setupState.usersStatus;
-            if (!us || !us.connected) {
-                // Connection error — disable user section
-                document.getElementById('btn-seed').disabled = true;
-                showStatus('seed-status', 'Cannot connect to storage: ' + (us?.error || 'Unknown error'), 'error');
-            } else if (us.hasUsers) {
-                // Users already exist — skip to auth setup
-                document.getElementById('user-section').classList.add('disabled-section');
-                showStatus('seed-status', 'Users already exist in the table. Proceed to authentication setup below.', 'success');
-                enableAuthSections();
-            } else {
-                // No users — enable the seed form, keep auth disabled
-                document.getElementById('btn-seed').disabled = false;
+            if (status.usersStatus && status.usersStatus.hasUsers && !wizard.stepOneDone) {
+                wizard.stepOneDone = true;
+                wizard.stepOneMessage = 'Users already exist in the table. Proceed to authentication setup below.';
             }
         } catch (e) {
-            console.error('Failed to load status', e);
+            wizard.status = null;
+            wizard.error = e && e.message ? e.message : String(e);
+            console.error('[setup] status read failed', e);
+        } finally {
+            wizard.attempted = true;
         }
-    })();
 
-    // Background poll — detect setup completion from any session
-    let statusPollTimer = setInterval(async () => {
-        try {
-            const res = await fetch('/api/setup/status', { cache: 'no-store' });
-            if (!res.ok) return;
-            const status = await res.json();
-            if (status.isSetupCompleted || status.isEasyAuthConfigured) {
-                clearInterval(statusPollTimer);
-                showRestartScreen();
-            }
-        } catch (e) {
-            // Setup endpoint may be unavailable during restart — ignore
-        }
-    }, 5000);
-
-    function enableAuthSections() {
-        document.getElementById('auto-section').classList.remove('disabled-section');
-        document.getElementById('manual-section').classList.remove('disabled-section');
+        if (!wizard.seedInFlight) applyWizardState();
     }
 
     async function seedFirstUser() {
         const upn = document.getElementById('seed-upn').value.trim();
-        if (!upn) {
+        if (!upn || upn.indexOf('@') < 1 || upn.endsWith('@')) {
             showStatus('seed-status', 'Please enter a valid email address.', 'error');
+            lastMessage = null;
             return;
         }
 
         const btn = document.getElementById('btn-seed');
+        wizard.seedInFlight = true;
         btn.disabled = true;
         btn.textContent = 'Adding user...';
         showStatus('seed-status', 'Adding superadmin user...', 'info');
+        lastMessage = null;
 
+        let failure = null;
         try {
             const res = await fetch('/api/setup/seed-user', {
                 method: 'POST',
@@ -287,18 +413,37 @@
                 body: JSON.stringify({ upn })
             });
 
-            const data = await res.json();
-            if (!res.ok || !data.success) throw new Error(data.message || 'Failed to add user');
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.success) {
+                throw new Error(data.message || 'Failed to add user (HTTP ' + res.status + ')');
+            }
 
-            showStatus('seed-status', data.message, 'success');
-            document.getElementById('user-section').classList.add('disabled-section');
-            enableAuthSections();
+            wizard.stepOneDone = true;
+            wizard.stepOneMessage = data.message;
         } catch (e) {
-            showStatus('seed-status', 'Error: ' + e.message, 'error');
-            btn.disabled = false;
+            failure = e && e.message ? e.message : String(e);
+        } finally {
+            wizard.seedInFlight = false;
             btn.textContent = 'Add Superadmin';
+            applyWizardState();
+            // Written after applyWizardState, and deliberately without touching lastMessage: the
+            // failure stays on screen until the underlying state actually changes.
+            if (failure) showStatus('seed-status', 'Error: ' + failure, 'error');
         }
     }
+
+    // Independent of the status read — the manual instructions are useless with the placeholder in them.
+    document.getElementById('manual-redirect-uri').textContent =
+        window.location.origin + '/.auth/login/aad/callback';
+
+    // Enter in the UPN field submits — the button is one tab stop away and people expect it.
+    document.getElementById('seed-upn').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !document.getElementById('btn-seed').disabled) seedFirstUser();
+    });
+
+    let statusPollTimer = setInterval(refreshStatus, 5000);
+    applyWizardState();
+    refreshStatus();
 
     function showBanner(msg) {
         const el = document.getElementById('status-banner');
@@ -482,7 +627,11 @@
             btn.textContent = 'Configure';
         }
     }
+    let restartScreenShown = false;
     function showRestartScreen() {
+        // Reachable from the poller, the automated flow and the manual flow — only build it once.
+        if (restartScreenShown) return;
+        restartScreenShown = true;
         // Stop background status polling
         clearInterval(statusPollTimer);
         // Hide setup sections, show restart status
