@@ -456,12 +456,71 @@ In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET en
   // When a write clears cache, only entries with matching scope value are evicted.
   "ScopeParam": "tenantFilter",
 
+  // Endpoints never cached, whatever the query string says.
+  // Case-insensitive; "*" matches any run of characters.
+  "ExcludedEndpoints": ["ListLogs", "ListScheduled*"],
+
+  // Query parameter a request must carry before its response may be cached at all.
+  // Empty (default) = every eligible read is cached.
+  "RequiredParam": "tenantFilter",
+
+  // Values of RequiredParam that skip the cache (case-insensitive).
+  "ExcludedParamValues": ["AllTenants"],
+
+  // Request header that bypasses the cache for a single call. Empty disables the check.
+  "NoCacheHeader": "x-craft-no-cache",
+
   // Per-endpoint TTL overrides (seconds). Key = endpoint name.
   "EndpointTtl": {
     "ListTenants": 300,
     "ListUsers": 120
   }
 }
+```
+
+#### What gets cached
+
+A response is cached only when **both** gates agree:
+
+1. **The handler** is a side-effect-free read — a `GET` to a `List*` endpoint. This is the naming
+   convention, and it is not configurable.
+2. **The request** passes the admission policy below.
+
+The policy is evaluated in this order, and the first failure wins:
+
+| Gate | `X-Cache-Bypass` when it fails |
+| --- | --- |
+| Endpoint matches `ExcludedEndpoints` | `excluded-endpoint` |
+| `NoCacheHeader` sent with any value other than `false`/`0`/`no` | `no-cache-header` |
+| `RequiredParam` missing from the query string | `missing-required-param` |
+| `RequiredParam` present but blank | `empty-required-param` |
+| `RequiredParam` value listed in `ExcludedParamValues` | `excluded-param-value` |
+
+A bypassed request neither reads from nor writes to the cache, so it can never collide with an entry
+stored by a differently-scoped caller, and it answers with `X-Cache: BYPASS`. `X-Cache: MISS` still
+means what it always did — the request was eligible and there was simply no entry for it.
+
+All of these are inert by default (`RequiredParam` empty, no excluded values, no excluded endpoints),
+so an existing deployment that upgrades keeps caching exactly what it cached before until it opts in.
+
+**`ExcludedEndpoints` vs `RequiredParam`.** They cover different cases and are worth using together.
+`RequiredParam` classifies in bulk: everything that does not take the scoping parameter drops out
+without anyone having to enumerate it. `ExcludedEndpoints` handles the exceptions that rule cannot see
+— an endpoint that *does* take `tenantFilter` and is still a poor cache candidate, because it is
+cheap, near-realtime, or answered per user rather than per tenant. Patterns accept `*` anywhere
+(`ListLog*`, `*Logs`, `List*Audit*`), matched case-insensitively against the endpoint name as it
+appears in the route.
+
+**Why require a parameter at all.** `List*` endpoints that take no scope parameter — a tenant list, a
+log tail, the scheduler view — are usually fast, query-shaped and answered per user. Caching them buys
+little and invites key collisions between users whose results legitimately differ. Requiring
+`tenantFilter` keeps the cache to the calls where it pays for itself, and, because every cached key
+then contains `tenantFilter=…`, it also makes `ScopeParam` invalidation exact.
+
+Per-call bypass:
+
+```bash
+curl -H "x-craft-no-cache: true" https://example/API/ListUsers?tenantFilter=contoso.com
 ```
 
 ---
@@ -694,7 +753,10 @@ The CIPP application's `appsettings.Development.json` shows a full real-world co
 
     "Cache": {
       "InvalidateParam": "InvalidateCIPPCache",
-      "ScopeParam": "tenantFilter"
+      "ScopeParam": "tenantFilter",
+      "RequiredParam": "tenantFilter",
+      "ExcludedParamValues": ["AllTenants"],
+      "ExcludedEndpoints": ["ListLogs", "ListScheduledItems"]
     },
 
     "Scripts": {

@@ -40,11 +40,20 @@ public class CacheService : IDisposable
     // Control params excluded from cache key generation
     private readonly HashSet<string> _excludedParams;
 
+    // Per-request admission policy (required param / excluded values / bypass header)
+    private readonly ResponseCachePolicy _policy;
+
     /// <summary>Name of the query parameter used for scoped cache invalidation.</summary>
     public string ScopeParam => _settings.Cache.ScopeParam;
 
     /// <summary>Name of the query parameter that triggers full cache invalidation.</summary>
     public string InvalidateParam => _settings.Cache.InvalidateParam;
+
+    /// <summary>
+    /// Which requests are allowed into the cache at all. Callers must consult this before both the
+    /// read and the write, so an excluded request neither serves nor populates an entry.
+    /// </summary>
+    public ResponseCachePolicy Policy => _policy;
 
     /// <summary>Whether the cache is active. When false, all get/set/invalidate operations are no-ops.</summary>
     public bool Enabled => _enabled;
@@ -72,6 +81,8 @@ public class CacheService : IDisposable
             _endpointTtls[endpoint] = TimeSpan.FromSeconds(seconds);
         }
 
+        _policy = ResponseCachePolicy.FromSettings(settings.Cache);
+
         if (!_enabled)
         {
             // Disabled: no disk footprint, no orphan scan, no eviction timer. All operations short-circuit.
@@ -80,6 +91,20 @@ public class CacheService : IDisposable
             return;
         }
         _logger.LogWarning("[Cache] enabled; in-memory body tier budget = {Bytes} bytes", _maxMemoryBytes);
+
+        if (_policy.ExcludedEndpointCount > 0)
+            _logger.LogInformation("[Cache] admission policy: {Count} endpoint(s) excluded outright",
+                _policy.ExcludedEndpointCount);
+
+        if (_policy.HasRequiredParam)
+            _logger.LogInformation(
+                "[Cache] admission policy: requires ?{Param}= and skips {Count} excluded value(s)",
+                _policy.RequiredParam, _policy.ExcludedValueCount);
+        else if (_policy.ExcludedValueCount > 0)
+            // Excluded values are values *of the required param*, so on their own they gate nothing.
+            _logger.LogWarning(
+                "[Cache] App:Cache:ExcludedParamValues is set but App:Cache:RequiredParam is empty — " +
+                "the excluded values are being ignored. Set RequiredParam to make them take effect.");
 
         Directory.CreateDirectory(_cachePath);
 

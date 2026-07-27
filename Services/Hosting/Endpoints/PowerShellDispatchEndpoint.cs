@@ -63,12 +63,25 @@ public static class PowerShellDispatchEndpoint
 
                 ApplyRequestedInvalidation(context, cache);
 
-                var isReadEndpoint = IsCacheableRead(context.Request.Method, endpoint);
+                // Two separate gates. IsCacheableRead is about the handler — does its name promise a
+                // side-effect-free read. The policy is about this request — is caching it worthwhile
+                // and safe (see ResponseCachePolicy). Both must agree before the cache is touched at
+                // all, so an excluded request neither serves from nor writes to it.
+                var useCache = IsCacheableRead(context.Request.Method, endpoint);
+                string? cacheBypassReason = null;
+
+                if (useCache && !cache.Policy.Allows(endpoint, context.Request, out cacheBypassReason))
+                {
+                    useCache = false;   // still a read — just not one this cache should hold
+
+                    logger.LogDebug("[HTTP] /API/{Endpoint} cache bypassed: {Reason}",
+                        endpoint, cacheBypassReason);
+                }
 
                 // Computed once on the read path and reused for the write-back below.
                 string? cacheKey = null;
 
-                if (isReadEndpoint)
+                if (useCache)
                 {
                     var cached = await TryReadCacheAsync(context, cache, endpoint, logger);
                     cacheKey = cached.Key;
@@ -89,13 +102,17 @@ public static class PowerShellDispatchEndpoint
                 // Writes can invalidate anything, so they clear the cache regardless of endpoint name.
                 if (context.Request.Method != "GET") InvalidateForWrite(context, cache);
 
-                if (isReadEndpoint && cacheKey is not null && result.StatusCode is >= 200 and < 400)
+                if (useCache && cacheKey is not null && result.StatusCode is >= 200 and < 400)
                     await cache.Set(cacheKey, result);
 
                 context.Response.StatusCode = result.StatusCode;
                 context.Response.ContentType = HandlerHeaders.ResolveContentType(result.ContentType);
                 HandlerHeaders.Apply(context.Response, result.Headers);
-                context.Response.Headers["X-Cache"] = "MISS";
+                // BYPASS vs MISS matters when someone asks why an endpoint never caches: MISS means it
+                // was eligible and simply had no entry, BYPASS means the policy kept it out.
+                context.Response.Headers["X-Cache"] = cacheBypassReason is null ? "MISS" : "BYPASS";
+                if (cacheBypassReason is not null)
+                    context.Response.Headers["X-Cache-Bypass"] = cacheBypassReason;
                 context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
                 if (result.StatusCode == 200)

@@ -318,6 +318,24 @@
       // Query parameter for scoped invalidation (e.g. per-tenant)
       // "ScopeParam": "",
 
+      // Endpoints never cached, whatever the query string says. Case-insensitive; "*" matches any run of
+      // characters. For reads the param rules can't classify — log tails, scheduler views, anything whose
+      // result depends on who is asking. e.g. [ "ListLogs", "ListScheduled*" ]
+      // "ExcludedEndpoints": [],
+
+      // Query parameter a request must carry before its response may be cached. Empty (default) = cache
+      // every eligible read. Set it to the param that makes a response distinct (CIPP: "tenantFilter")
+      // so endpoints that don't take it — ListTenants, log tails, the scheduler view — are never cached.
+      // "RequiredParam": "",
+
+      // Values of RequiredParam that skip the cache (case-insensitive). Only meaningful with RequiredParam.
+      // e.g. [ "AllTenants" ] — an all-tenant result is a different shape from any single-tenant one.
+      // "ExcludedParamValues": [],
+
+      // Request header that bypasses the cache for a single call (no read, no write). Empty = no header
+      // check. Any non-empty value bypasses except an explicit "false"/"0"/"no".
+      // "NoCacheHeader": "x-craft-no-cache",
+
       // Per-endpoint TTL overrides (seconds): { "ListUsers": 120 }
       // "EndpointTtl": {}
     },
