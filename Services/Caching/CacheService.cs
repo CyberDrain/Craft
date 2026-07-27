@@ -182,7 +182,7 @@ public class CacheService : IDisposable
             if (CacheProfiler.Enabled) CacheProfiler.RecordMemHit();
             return new CachedResponse
             {
-                Result = new ScriptResult { StatusCode = entry.StatusCode, Body = memBody },
+                Result = ToResult(entry, memBody),
                 CachedAt = entry.CachedAt,
                 IsStale = age > ttl,
                 Age = age,
@@ -203,7 +203,7 @@ public class CacheService : IDisposable
 
             return new CachedResponse
             {
-                Result = new ScriptResult { StatusCode = entry.StatusCode, Body = body },
+                Result = ToResult(entry, body),
                 CachedAt = entry.CachedAt,
                 IsStale = age > ttl,
                 Age = age,
@@ -216,6 +216,19 @@ public class CacheService : IDisposable
             return null;
         }
     }
+
+    /// <summary>
+    /// Rebuilds a response from an index entry and its body. The headers dictionary is shared, not
+    /// copied — nothing downstream mutates it, and copying it on every cache hit would defeat the
+    /// point of the in-memory tier.
+    /// </summary>
+    private static ScriptResult ToResult(CacheEntry entry, string body) => new()
+    {
+        StatusCode = entry.StatusCode,
+        Body = body,
+        Headers = entry.Headers,
+        ContentType = entry.ContentType
+    };
 
     /// <summary>Charge a body to the in-memory tier (idempotent per entry), evicting LRU bodies if over budget.</summary>
     private void StoreBody(CacheEntry entry, string body)
@@ -285,7 +298,9 @@ public class CacheService : IDisposable
                 StatusCode = result.StatusCode,
                 CachedAt = DateTime.UtcNow,
                 LastAccessedAt = DateTime.UtcNow,
-                FilePath = filePath
+                FilePath = filePath,
+                Headers = result.Headers,
+                ContentType = result.ContentType
             };
             // Populate the in-memory body BEFORE publishing the entry, so any concurrent Get that sees the
             // new entry always sees its body (the stale-while-revalidate refresh republishes constantly —

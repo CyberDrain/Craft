@@ -10,4 +10,18 @@ public class ScriptResult
 {
     public int StatusCode { get; set; } = 200;
     public string Body { get; set; } = "{}";
+
+    /// <summary>
+    /// Response headers the handler asked for, already normalised by
+    /// <see cref="Craft.Hosting.HandlerHeaders.FromPowerShell"/>. Null when the handler set none,
+    /// which is the overwhelmingly common case — a redirect's <c>Location</c> is the reason this
+    /// exists.
+    /// </summary>
+    public Dictionary<string, string>? Headers { get; set; }
+
+    /// <summary>
+    /// Content type the handler asked for. Null means
+    /// <see cref="Craft.Hosting.HandlerHeaders.DefaultContentType"/>.
+    /// </summary>
+    public string? ContentType { get; set; }
 }

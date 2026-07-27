@@ -829,6 +829,8 @@ public class PowerShellRunnerService : IDisposable
 
             int? statusCode = null;
             object? body = null;
+            object? headers = null;
+            object? contentType = null;
             bool found = false;
 
             if (result.BaseObject is Hashtable ht)
@@ -837,6 +839,8 @@ public class PowerShellRunnerService : IDisposable
                 {
                     statusCode = ParseStatusCode(ht.ContainsKey("StatusCode") ? ht["StatusCode"] : null);
                     body = ht.ContainsKey("Body") ? ht["Body"] : null;
+                    headers = ht["Headers"];
+                    contentType = ht["ContentType"];
                     found = true;
                 }
             }
@@ -848,6 +852,8 @@ public class PowerShellRunnerService : IDisposable
                 {
                     statusCode = ParseStatusCode(scProp?.Value);
                     body = bodyProp?.Value;
+                    headers = result.Properties["Headers"]?.Value;
+                    contentType = result.Properties["ContentType"]?.Value;
                     found = true;
                 }
             }
@@ -871,7 +877,13 @@ public class PowerShellRunnerService : IDisposable
                 {
                     jsonBody = ConvertPsObjectToJson(body);
                 }
-                return new ScriptResult { StatusCode = statusCode ?? 200, Body = jsonBody };
+                return new ScriptResult
+                {
+                    StatusCode = statusCode ?? 200,
+                    Body = jsonBody,
+                    Headers = HandlerHeaders.FromPowerShell(AsDictionary(headers)),
+                    ContentType = Unwrap(contentType) as string,
+                };
             }
         }
 
@@ -880,6 +892,21 @@ public class PowerShellRunnerService : IDisposable
             : "{}";
         return new ScriptResult { StatusCode = 200, Body = fallbackBody };
     }
+
+    /// <summary>
+    /// Peels the PSObject wrapper off a property value. PowerShell hands back the raw .NET object
+    /// most of the time but not always, and the difference is invisible until a cast silently
+    /// returns null.
+    /// </summary>
+    private static object? Unwrap(object? value) =>
+        value is PSObject pso ? pso.BaseObject : value;
+
+    /// <summary>
+    /// A response's <c>Headers</c> as a dictionary, or null if the handler set something that is not
+    /// one. <c>HttpResponseContext.Headers</c> is a <see cref="Hashtable"/>; a handler returning a
+    /// plain <c>@{...}</c> literal produces the same thing.
+    /// </summary>
+    private static IDictionary? AsDictionary(object? value) => Unwrap(value) as IDictionary;
 
     private static int ParseStatusCode(object? value)
     {

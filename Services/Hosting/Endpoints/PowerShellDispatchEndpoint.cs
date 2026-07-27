@@ -93,7 +93,8 @@ public static class PowerShellDispatchEndpoint
                     await cache.Set(cacheKey, result);
 
                 context.Response.StatusCode = result.StatusCode;
-                context.Response.ContentType = "application/json";
+                context.Response.ContentType = HandlerHeaders.ResolveContentType(result.ContentType);
+                HandlerHeaders.Apply(context.Response, result.Headers);
                 context.Response.Headers["X-Cache"] = "MISS";
                 context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
@@ -104,7 +105,8 @@ public static class PowerShellDispatchEndpoint
                     result = await HandleCancelTriggerAsync(result, orchestrator, logger, context);
                 }
 
-                await context.Response.WriteAsync(result.Body);
+                if (HandlerHeaders.AllowsBody(result.StatusCode))
+                    await context.Response.WriteAsync(result.Body);
             }
             finally
             {
@@ -184,12 +186,15 @@ public static class PowerShellDispatchEndpoint
             requestSnapshot = await PowerShellRunnerService.SnapshotRequest(context);
 
         context.Response.StatusCode = cached.Result.StatusCode;
-        context.Response.ContentType = "application/json";
+        context.Response.ContentType = HandlerHeaders.ResolveContentType(cached.Result.ContentType);
+        HandlerHeaders.Apply(context.Response, cached.Result.Headers);
         context.Response.Headers["X-Cache"] = cached.IsStale ? "HIT-STALE" : "HIT";
         context.Response.Headers["X-Cache-Age"] = $"{cached.Age.TotalSeconds:F0}s";
         context.Response.Headers["X-Cache-TTL"] = $"{ttl.TotalSeconds:F0}s";
         context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
-        await context.Response.WriteAsync(cached.Result.Body);
+
+        if (HandlerHeaders.AllowsBody(cached.Result.StatusCode))
+            await context.Response.WriteAsync(cached.Result.Body);
 
         if (requestSnapshot is null) return;
 

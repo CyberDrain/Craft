@@ -15,6 +15,17 @@ public class CacheEntry
     public DateTime LastAccessedAt { get; set; }
     public required string FilePath { get; set; }
 
+    /// <summary>
+    /// Handler headers to replay on a hit. Lives in the index rather than on disk, exactly like
+    /// <see cref="StatusCode"/> — orphan cache files are deleted at startup, so the body file never
+    /// outlives the metadata that describes it. A cached redirect is useless without this: the
+    /// status replays, the <c>Location</c> does not, and the response dead-ends in the browser.
+    /// </summary>
+    public Dictionary<string, string>? Headers { get; set; }
+
+    /// <summary>Content type to replay on a hit. Null = <c>application/json</c>.</summary>
+    public string? ContentType { get; set; }
+
     /// <summary>In-memory copy of the body (null = not resident; read from FilePath). Guarded by the mem tier.</summary>
     public volatile string? Body;
     /// <summary>Approx bytes charged to the memory budget for <see cref="Body"/> (chars × 2).</summary>

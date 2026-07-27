@@ -80,6 +80,21 @@ Same rule, different reason, for `Microsoft.Azure.Functions.PowerShellWorker.Htt
 namespace must match the real Azure Functions worker type because hosted-app routers match on
 `PSObject.TypeNames`.
 
+All four of its properties reach the wire — `StatusCode`, `Body`, `Headers` and `ContentType` — so a
+handler can redirect:
+
+```powershell
+return [HttpResponseContext]@{
+    StatusCode = [HttpStatusCode]::Found
+    Headers    = @{ Location = $Url }
+}
+```
+
+Header values are normalised by `Craft.Hosting.HandlerHeaders` before they are written: CR/LF is
+stripped, empty values are dropped rather than emitted as empty headers, and the headers Kestrel
+computes for itself (`Content-Length`, `Transfer-Encoding`, `Connection`, `Host`, …) are refused.
+Headers are cached and replayed alongside the status and body, so a cached redirect still redirects.
+
 ## Tests
 
 ```bash
