@@ -77,8 +77,9 @@
     // Per-client fixed-window limiter. ENABLED BY DEFAULT (300 requests / 10s per client),
     // partitioned by the authenticated principal name (x-ms-client-principal-name), falling back to
     // the first X-Forwarded-For hop so anonymous callers behind the App Service load balancer aren't
-    // collapsed into a single bucket. Requests over the limit get HTTP 429. Set "Enabled": false to
-    // turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true can also force it on.
+    // collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
+    // Set "Enabled": false to turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true
+    // can also force it on.
     // "RateLimit": {
     //   "Enabled": true,
     //   "PermitPerWindow": 300,   // requests allowed per window, per client

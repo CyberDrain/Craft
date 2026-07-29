@@ -19,7 +19,10 @@ public class RateLimitSettings
     /// <summary>Window length in seconds. Default 10.</summary>
     public int WindowSeconds { get; set; } = 10;
 
-    /// <summary>Requests queued when the limit is hit before rejecting with 429. Default 0 (reject immediately).</summary>
+    /// <summary>
+    /// Requests queued when the limit is hit before rejecting with 429. Default 0 (reject
+    /// immediately). Rejections carry a <c>Retry-After</c> header.
+    /// </summary>
     public int QueueLimit { get; set; }
 
     /// <summary>Resolved enabled state, honouring the CRAFT_RATELIMIT_ENABLED environment override.</summary>

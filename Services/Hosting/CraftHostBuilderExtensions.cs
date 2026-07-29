@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO.Compression;
 using System.Threading.RateLimiting;
 using Craft.Auth;
@@ -198,8 +199,30 @@ public static class CraftHostBuilderExtensions
     }
 
     /// <summary>
+    /// Seconds to advertise in <c>Retry-After</c> on a throttled response. Prefers the limiter's own
+    /// estimate of when a permit next frees up, falling back to the whole window — a safe upper bound
+    /// for a fixed window, and the only figure available when the lease carries no metadata.
+    /// </summary>
+    /// <remarks>
+    /// Rounded up, and floored at one second, on purpose. Truncating a 0.4s wait to
+    /// <c>Retry-After: 0</c> tells a well-behaved client to retry immediately, which turns being
+    /// throttled into a hot loop — the opposite of what the header is for.
+    /// </remarks>
+    public static int ResolveRetryAfterSeconds(RateLimitLease lease, TimeSpan window)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+
+        var retryAfter = lease.TryGetMetadata(MetadataName.RetryAfter, out var metadata)
+            ? metadata
+            : window;
+
+        return Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
+    }
+
+    /// <summary>
     /// Per-client fixed-window rate limiter so a single caller cannot exhaust the small HTTP worker
-    /// pool. Enabled by default; turn off with <c>App:RateLimit:Enabled=false</c>.
+    /// pool. Enabled by default; turn off with <c>App:RateLimit:Enabled=false</c>. Throttled requests
+    /// get a 429 carrying <c>Retry-After</c>.
     /// </summary>
     public static IServiceCollection AddCraftRateLimiter(
         this IServiceCollection services, CraftSettings settings)
@@ -209,16 +232,30 @@ public static class CraftHostBuilderExtensions
 
         if (!settings.RateLimit.IsEnabled) return services;
 
+        var window = TimeSpan.FromSeconds(Math.Max(1, settings.RateLimit.WindowSeconds));
+
         services.AddRateLimiter(options =>
         {
             options.RejectionStatusCode = 429;
+
+            // Without this the 429 carries no timing hint at all and every caller has to invent its
+            // own backoff. Retry-After is the one thing HTTP clients and SDKs already know how to
+            // honour unprompted, so emitting it is what makes the limit self-documenting.
+            options.OnRejected = (context, _) =>
+            {
+                context.HttpContext.Response.Headers.RetryAfter =
+                    ResolveRetryAfterSeconds(context.Lease, window)
+                        .ToString(CultureInfo.InvariantCulture);
+                return ValueTask.CompletedTask;
+            };
+
             options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
                 RateLimitPartition.GetFixedWindowLimiter(
                     RateLimitPartitionKey.Resolve(context),
                     _ => new FixedWindowRateLimiterOptions
                     {
                         PermitLimit = Math.Max(1, settings.RateLimit.PermitPerWindow),
-                        Window = TimeSpan.FromSeconds(Math.Max(1, settings.RateLimit.WindowSeconds)),
+                        Window = window,
                         QueueLimit = Math.Max(0, settings.RateLimit.QueueLimit),
                         QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                     }));

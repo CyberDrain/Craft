@@ -66,9 +66,8 @@ builder.Services.AddCraftRateLimiter(craftSettings);
 
 var app = builder.Build();
 
-// Rate limiter middleware — only added when the limiter is registered above.
-if (craftSettings.RateLimit.IsEnabled)
-    app.UseRateLimiter();
+// NOTE: the rate limiter middleware is deliberately NOT registered here. It runs after the auth
+// middleware further down so it can partition on the caller's identity — see the comment there.
 
 // HTTP diagnostic listener — tracks DNS, TLS, socket connect, and HTTP request timing
 // from ALL HttpClient instances (including those inside PowerShell's Invoke-RestMethod)
@@ -330,6 +329,19 @@ if (capHttp)
 
 } // end HTTP-role block (auth middleware). Bridges below run for any PS role; the
   // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
+
+// Rate limiter middleware — only added when the limiter is registered on the service collection.
+//
+// Position is load-bearing, do not hoist this back to the top of the pipeline:
+//   * It must run AFTER UseCraftAuth. App-only callers (client-credentials API clients) arrive with
+//     no usable x-ms-client-principal-name — the auth middleware derives it from the token's appid.
+//     Limiting before that ran collapsed every API client behind a shared egress IP into one bucket.
+//   * It must run AFTER static file serving. A cold frontend load pulls dozens of assets, and
+//     counting those against the caller's budget could throttle a user for opening a page.
+// Left outside the capHttp block on purpose: a frontend-only node has no auth middleware and no
+// worker pool, but should still be protected, partitioned by origin address as before.
+if (CraftSettings.RateLimit.IsEnabled)
+    app.UseRateLimiter();
 
 // Concurrent request tracking for diagnostics. A holder object, not an int: the dispatch endpoint
 // is registered elsewhere and a lambda cannot capture a ref local.

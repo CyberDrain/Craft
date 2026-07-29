@@ -1,3 +1,4 @@
+using System.Threading.RateLimiting;
 using Craft.Configuration;
 using Craft.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -101,5 +102,70 @@ public class RateLimitPartitionKeyTests
     public void NothingIdentifying_StillProducesAStableKey()
     {
         Assert.Equal("anonymous", RateLimitPartitionKey.Resolve(new DefaultHttpContext()));
+    }
+}
+
+/// <summary>
+/// Retry-After is the only backoff signal a throttled caller gets, so a wrong value is worse than
+/// none: too low and well-behaved clients hammer the limiter, too high and they stall needlessly.
+/// </summary>
+public class RetryAfterTests
+{
+    private sealed class Lease(TimeSpan? retryAfter) : RateLimitLease
+    {
+        public override bool IsAcquired => false;
+
+        public override IEnumerable<string> MetadataNames =>
+            retryAfter is null ? [] : [MetadataName.RetryAfter.Name];
+
+        public override bool TryGetMetadata(string metadataName, out object? metadata)
+        {
+            if (retryAfter is not null && metadataName == MetadataName.RetryAfter.Name)
+            {
+                metadata = retryAfter.Value;
+                return true;
+            }
+
+            metadata = null;
+            return false;
+        }
+    }
+
+    [Fact]
+    public void UsesTheLimitersOwnEstimateWhenItOffersOne()
+    {
+        var seconds = CraftHostBuilderExtensions.ResolveRetryAfterSeconds(
+            new Lease(TimeSpan.FromSeconds(4)), TimeSpan.FromSeconds(10));
+
+        Assert.Equal(4, seconds);
+    }
+
+    [Fact]
+    public void NoMetadata_FallsBackToTheFullWindow()
+    {
+        // The window is the worst case for a fixed-window limiter, so it is always safe to advertise.
+        var seconds = CraftHostBuilderExtensions.ResolveRetryAfterSeconds(
+            new Lease(null), TimeSpan.FromSeconds(10));
+
+        Assert.Equal(10, seconds);
+    }
+
+    [Fact]
+    public void SubSecondWait_RoundsUpRatherThanTellingTheClientToRetryImmediately()
+    {
+        // Truncating to 0 would turn a throttle into a hot retry loop.
+        var seconds = CraftHostBuilderExtensions.ResolveRetryAfterSeconds(
+            new Lease(TimeSpan.FromMilliseconds(400)), TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, seconds);
+    }
+
+    [Fact]
+    public void PartialSecond_RoundsUpSoTheClientNeverRetriesEarly()
+    {
+        var seconds = CraftHostBuilderExtensions.ResolveRetryAfterSeconds(
+            new Lease(TimeSpan.FromMilliseconds(2100)), TimeSpan.FromSeconds(10));
+
+        Assert.Equal(3, seconds);
     }
 }
