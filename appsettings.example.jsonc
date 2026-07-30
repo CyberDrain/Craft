@@ -380,10 +380,13 @@
     //   // shown below — a CSP is emitted secure-by-default even if you don't set this. Override to
     //   // tighten it, or set to "" to disable. Note: HSTS / X-Content-Type-Options / X-Frame-Options
     //   // are intentionally NOT emitted here — they are left to the edge (Azure front end) / hosted app.
-    //   // Keep 'self' in default-src if you override this: it is what allows the app's own same-origin
-    //   // fetches when it is reached over http (TLS-terminating proxy, self-hosted, local docker).
-    //   // Dropping it leaves the policy scheme-gated on https: and every same-origin XHR is blocked.
-    //   "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *",
+    //   // Keep 'self' in default-src AND connect-src if you override this: it is what allows the app's
+    //   // own same-origin fetches when it is reached over http (TLS-terminating proxy, self-hosted,
+    //   // local docker). Dropping it leaves the policy scheme-gated on https: and every same-origin
+    //   // XHR is blocked. Keep data: in connect-src too: wasm inlined as a data: URL (Emscripten
+    //   // SINGLE_FILE, e.g. yoga-layout under @react-pdf/renderer) is fetched, not scripted, so it is
+    //   // connect-src that gates it — and keeping it out of default-src keeps it out of script-src.
+    //   "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; connect-src 'self' https: blob: data:; object-src 'self' blob:; img-src 'self' blob: data: *",
     //   // Compress static responses. Default true: serve precompressed .br/.gz siblings + on-the-fly
     //   // fallback. Set false to serve everything raw/identity (no .br/.gz served, no on-the-fly) — e.g.
     //   // when an upstream CDN (Cloudflare) already compresses, the content doesn't benefit, or for
