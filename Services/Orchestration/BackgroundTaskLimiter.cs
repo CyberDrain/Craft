@@ -117,7 +117,12 @@ public class BackgroundTaskLimiter : IDisposable
         // table writes and queue at the worker checkout while the pool stays full. 0 = off (strict pool cap).
         _overSubscribe = Math.Max(0, configuration.GetValue("BackgroundOverSubscribe", 0));
 
-        _currentMax = BaseConcurrency;
+        // Clamp to the ceiling. BaseConcurrency derives from ProcessorCount while CeilingConcurrency
+        // derives from BgPoolSize, so a small pool on a big host (e.g. BgPoolSize=2 on 4 cores) started
+        // the limiter ABOVE its own ceiling and admitted more tasks than there are BG workers. The
+        // surplus then blocked in CheckoutBackground's untimed BlockingCollection.Take(). Every other
+        // path already clamps (see ScaleUp(int)); only construction did not.
+        _currentMax = Math.Min(BaseConcurrency, CeilingConcurrency);
 
         // Monitor timer: checks queue and HTTP pressure every 10s
         _monitorTimer = new Timer(MonitorCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));

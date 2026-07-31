@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Craft.Configuration;
@@ -23,7 +24,7 @@ namespace Craft.Orchestration;
 ///   6. After 3 interruptions (host crash/reboot), a task is marked Failed
 ///   7. PostExecStatus tracks PostExecution lifecycle for crash resilience
 /// </summary>
-public class OrchestratorService
+public class OrchestratorService : IJobDescriptorStateWriter
 {
     internal readonly ILogger<OrchestratorService> _logger;
     private readonly PowerShellRunnerService _psRunner;
@@ -36,8 +37,22 @@ public class OrchestratorService
     private readonly ConcurrentDictionary<string, bool> _activePlanners = new();
     private readonly ConcurrentDictionary<string, OrchestratorRun> _activeRuns = new();
     private readonly ConcurrentDictionary<string, ConcurrentBag<string>> _childRuns = new();
+
+    /// <summary>
+    /// Child runs seen in storage at startup but not yet processed by <see cref="ResumeInterruptedRunsAsync"/>.
+    /// They count as incomplete: without this, a parent processed BEFORE its child would find the child
+    /// absent from <see cref="_activeRuns"/> (nothing has resumed it yet) and conclude it had finished.
+    /// Each name is cleared as its run is processed, whichever way that goes.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _recoveringChildren = new();
     private readonly ConcurrentDictionary<string, Timer> _runStatusTimers = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledRuns = new();
+
+    /// <summary>
+    /// Resolved task-script path per run. One entry per RUN (not per task), so a 738-task fan-out costs
+    /// one string reference instead of 738 captured ones. Populated at dispatch, dropped at finalize.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, string> _taskScriptPaths = new();
 
     /// <summary>
     /// Get the Reference for a given run name, or null if not found/no reference set.
@@ -80,6 +95,62 @@ public class OrchestratorService
         _store = store;
         _writer = writer;
         _settings = settings;
+
+        // The queue holds descriptors; this is how they become work again at dispatch time, and how
+        // operator changes to a queued task are made durable.
+        _jobManager.SetWorkResolver(ResolveTaskWorkAsync);
+        _jobManager.SetDescriptorStateWriter(this);
+    }
+
+    // ─── IJobDescriptorStateWriter ───
+    // Operator actions on a QUEUED task. Both mutate the live run graph (so the in-memory view and
+    // CheckRunCompletion stay consistent) and queue a durable write through the same coalescing
+    // status writer the task lifecycle already uses — which guarantees a flush before the run
+    // finalizes and a final drain on shutdown.
+
+    /// <summary>Persist a per-task priority override so recovery re-queues at the operator's priority.</summary>
+    public void PriorityChanged(JobDescriptor descriptor, int newPriority)
+    {
+        if (!TryFindLive(descriptor, out _, out var task)) return;
+
+        lock (_lock) task.Priority = newPriority;
+        _writer.QueueTask(descriptor.RunName, task);
+    }
+
+    /// <summary>
+    /// Persist a cancellation. Without this the task row stays Pending and
+    /// <see cref="ResumeInterruptedRunsAsync"/> re-queues it after a restart — the job comes back.
+    /// </summary>
+    public void Cancelled(JobDescriptor descriptor)
+    {
+        if (!TryFindLive(descriptor, out var run, out var task)) return;
+
+        lock (_lock)
+        {
+            if (task.Status is "Completed" or "Failed" or "Cancelled") return;
+            task.Status = "Cancelled";
+            task.LastError = "Cancelled by user";
+            task.CompletedUtc = DateTime.UtcNow;
+            task.Parameters = null!;
+            // Cancelling the last outstanding task can complete the run.
+            CheckRunCompletion(run);
+        }
+        _writer.QueueTask(descriptor.RunName, task);
+    }
+
+    /// <summary>
+    /// Resolve a descriptor to its LIVE run and task instances. Operator actions only apply to QUEUED
+    /// jobs, whose run is by definition still active, so a miss means the job is no longer
+    /// cancellable/reprioritizable and there is nothing to persist.
+    /// </summary>
+    private bool TryFindLive(JobDescriptor descriptor,
+        [NotNullWhen(true)] out OrchestratorRun? run,
+        [NotNullWhen(true)] out OrchestratorTaskItem? task)
+    {
+        task = null;
+        if (!_activeRuns.TryGetValue(descriptor.RunName, out run)) return false;
+        lock (_lock) task = run.Tasks.FirstOrDefault(t => t.Id == descriptor.TaskId);
+        return task != null;
     }
 
     /// <summary>
@@ -232,8 +303,24 @@ public class OrchestratorService
     {
         await _store.InitializeAsync();
 
-        var runNames = await _store.ListRunsAsync();
-        foreach (var runName in runNames)
+        // Rebuild parent→child links BEFORE processing anything. _childRuns is in-memory, so without
+        // this a resumed parent has no registered children, AllChildRunsComplete answers true, and the
+        // parent can finalize (and fire PostExecution) while its children are still running — exactly
+        // what the child-run guard exists to prevent. One partition scan, no task rows.
+        var summaries = await _store.ListRunSummariesAsync();
+        var reattached = 0;
+        foreach (var child in summaries)
+        {
+            if (string.IsNullOrEmpty(child.ParentRunName)) continue;
+            if (child.Status is not "Running") continue;   // terminal children cannot block a parent
+            _childRuns.GetOrAdd(child.ParentRunName, _ => new ConcurrentBag<string>()).Add(child.Name);
+            _recoveringChildren.TryAdd(child.Name, true);
+            reattached++;
+        }
+        if (reattached > 0)
+            _logger.LogInformation("[Scheduler] Reattached {Count} in-flight child runs to their parents", reattached);
+
+        foreach (var runName in summaries.Select(s => s.Name))
         {
             try
             {
@@ -303,6 +390,13 @@ public class OrchestratorService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Scheduler] Failed to process interrupted run: {Name}", runName);
+            }
+            finally
+            {
+                // This run is no longer awaiting recovery, however it went. If it was resumed it is now
+                // in _activeRuns and still blocks its parent; if it finalized or could not be resumed,
+                // it must stop blocking. Clearing here covers every path including the failure one.
+                _recoveringChildren.TryRemove(runName, out _);
             }
         }
 
@@ -394,6 +488,8 @@ public class OrchestratorService
     private void DispatchPendingTasks(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
     {
         _activeRuns.TryAdd(run.Name, run);
+        // Registered before anything is enqueued — the resolver reads it on the dispatch side.
+        _taskScriptPaths[run.Name] = taskPath;
 
         // Start periodic status timer (every 60s) for this run
         if (!_runStatusTimers.ContainsKey(run.Name))
@@ -406,20 +502,99 @@ public class OrchestratorService
 
         foreach (var task in pending)
         {
-            DispatchSingleTask(run, task, taskPath, priority, ct);
+            DispatchSingleTask(run, task, priority);
         }
 
         _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
             pending.Count, run.Name, priority);
     }
 
-    private void DispatchSingleTask(OrchestratorRun run, OrchestratorTaskItem task, string taskPath, int priority, CancellationToken ct)
+    /// <summary>
+    /// Enqueue one task BY IDENTITY. The JobManager holds only (runName, taskId, priority) — no run
+    /// graph, no task, no script path, no service reference — and calls back into
+    /// <see cref="ResolveTaskWorkAsync"/> at dispatch time to rebuild the work.
+    /// </summary>
+    private void DispatchSingleTask(OrchestratorRun run, OrchestratorTaskItem task, int priority)
     {
+        // A per-task override (set by an operator reprioritizing this job) wins over the run's
+        // priority; null — the normal case — inherits. Because the override is persisted, this holds
+        // across a restart rather than reverting when the run is re-queued from storage.
         _jobManager.Enqueue(
-            name: $"{run.Name}-{task.Id}",
-            priority: priority,
-            runName: run.Name,
-            work: async (jobCt) =>
+            new JobDescriptor(run.Name, task.Id, task.Priority ?? priority),
+            name: $"{run.Name}-{task.Id}");
+    }
+
+    /// <summary>
+    /// Rebuild the work for a queued task. Registered on the JobManager at startup.
+    ///
+    /// Resolution order matters, for correctness before cost:
+    ///   1. the live run in <see cref="_activeRuns"/>, if present — this is the steady-state path and
+    ///      costs ZERO storage reads;
+    ///   2. table storage, if the run is not in memory (crash recovery, or a run finalized and evicted
+    ///      while its tasks were still queued).
+    ///
+    /// Step 1 is not an optimization, it is a requirement. <see cref="CheckRunCompletion"/> decides
+    /// finalization by inspecting <c>run.Tasks</c>, and the task work mutates <c>task.Status</c> in
+    /// place. Handing out a freshly-deserialized task object would mutate a copy the live run graph
+    /// never sees, and no run would ever finalize. Object identity — not the field values — is the one
+    /// piece of state here that is genuinely not rehydratable.
+    /// </summary>
+    private async Task<Func<CancellationToken, Task>?> ResolveTaskWorkAsync(JobDescriptor descriptor, CancellationToken ct)
+    {
+        if (!_taskScriptPaths.TryGetValue(descriptor.RunName, out var taskPath))
+        {
+            _logger.LogWarning("[Orchestrator] No task script path known for run {Run} — dropping {Task}",
+                descriptor.RunName, descriptor.TaskId);
+            return null;
+        }
+
+        OrchestratorRun? run;
+        OrchestratorTaskItem? task;
+
+        if (_activeRuns.TryGetValue(descriptor.RunName, out var liveRun))
+        {
+            run = liveRun;
+            lock (_lock)
+            {
+                task = liveRun.Tasks.FirstOrDefault(t => t.Id == descriptor.TaskId);
+            }
+        }
+        else
+        {
+            // Run is no longer in memory — rehydrate it. This is the same read the crash-recovery path
+            // already performs (ResumeInterruptedRunsAsync), which resumed 421 runs in seconds.
+            run = await _store.GetRunAsync(descriptor.RunName);
+            task = run?.Tasks.FirstOrDefault(t => t.Id == descriptor.TaskId);
+            if (run != null && task != null)
+            {
+                // Re-establish the live graph so sibling tasks share this instance and completion
+                // tracking works, exactly as it does on the resume path.
+                run = _activeRuns.GetOrAdd(run.Name, run);
+                task = run.Tasks.FirstOrDefault(t => t.Id == descriptor.TaskId) ?? task;
+            }
+        }
+
+        if (run == null || task == null)
+        {
+            _logger.LogDebug("[Orchestrator] Stale descriptor {Run}/{Task} — no longer in storage",
+                descriptor.RunName, descriptor.TaskId);
+            return null;
+        }
+
+        // Already terminal (e.g. cancelled, or completed by a previous attempt while queued).
+        lock (_lock)
+        {
+            if (task.Status is "Completed" or "Failed" or "Cancelled")
+                return null;
+        }
+
+        return BuildTaskWork(run, task, taskPath);
+    }
+
+    private Func<CancellationToken, Task> BuildTaskWork(OrchestratorRun run, OrchestratorTaskItem task, string taskPath)
+    {
+        return
+            async (jobCt) =>
             {
                 // Check if run was cancelled while this job was queued
                 if (_cancelledRuns.ContainsKey(run.Name))
@@ -445,7 +620,22 @@ public class OrchestratorService
                 }
                 // Pre-script "Running" write is awaited — the durability marker for crash recovery. Batched
                 // across concurrently-starting tasks by the status writer, but still durable before the invoke.
-                await _writer.MarkRunningAsync(run.Name, task);
+                try
+                {
+                    await _writer.MarkRunningAsync(run.Name, task, jobCt);
+                }
+                catch (MarkerNotPersistedException ex)
+                {
+                    // DEFERRAL, not failure. The marker never landed, so storage still has this task
+                    // Pending — running it now would break the poison-task bound that the marker exists
+                    // to provide. Put the in-memory copy back to Pending so it agrees with storage, give
+                    // the slot up, and retry. Nothing is lost: even if this process dies first, recovery
+                    // re-queues it from the Pending row.
+                    lock (_lock) { task.Status = "Pending"; }
+                    DeferTask(run, task, ex);
+                    return;
+                }
+                _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
 
                 try
                 {
@@ -504,8 +694,7 @@ public class OrchestratorService
                     _logger.LogError(ex, "[Scheduler] Task failed: {TaskId}", task.Id);
                     throw; // Let JobManager also track the failure
                 }
-            }
-        );
+            };
     }
 
     /// <summary>
@@ -520,6 +709,40 @@ public class OrchestratorService
         // (guaranteed flushed before the run finalizes). Previously two individual fire-and-forget writes.
         _writer.QueueTask(run.Name, task);
         _writer.QueueRun(run);
+    }
+
+    /// <summary>Deferrals per task while storage is unable to accept the durable marker. In-memory and
+    /// intentionally so — it bounds retries within one process life, nothing more.</summary>
+    private readonly ConcurrentDictionary<string, int> _deferrals = new();
+
+    /// <summary>Cap on in-process retries before a task is left for the next recovery pass to pick up.</summary>
+    private const int MaxDeferrals = 3;
+
+    /// <summary>
+    /// Re-queue a task whose durable marker could not be written, so it retries once storage recovers
+    /// instead of waiting for a restart. Bounded: after <see cref="MaxDeferrals"/> the task is simply
+    /// left Pending, which is already the durable state — recovery re-queues it on the next startup.
+    /// </summary>
+    private static string DeferralKey(string runName, string taskId) => $"{runName}{taskId}";
+
+    private void DeferTask(OrchestratorRun run, OrchestratorTaskItem task, Exception cause)
+    {
+        var count = _deferrals.AddOrUpdate(DeferralKey(run.Name, task.Id), 1, (_, c) => c + 1);
+
+        if (count > MaxDeferrals)
+        {
+            _logger.LogError(cause,
+                "[Scheduler] Task {TaskId} in {Run} deferred {Count} times — leaving it Pending for the next recovery",
+                task.Id, run.Name, count);
+            return;
+        }
+
+        _logger.LogWarning(
+            "[Scheduler] Task {TaskId} in {Run} could not be marked Running (attempt {Count}/{Max}) — re-queued, slot released",
+            task.Id, run.Name, count, MaxDeferrals);
+
+        _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
+            name: $"{run.Name}-{task.Id}");
     }
 
     private void LogRunStatus(OrchestratorRun run)
@@ -583,7 +806,8 @@ public class OrchestratorService
     {
         if (!_childRuns.TryGetValue(runName, out var children))
             return true;
-        return !children.Any(childName => _activeRuns.ContainsKey(childName));
+        return !children.Any(childName =>
+            _activeRuns.ContainsKey(childName) || _recoveringChildren.ContainsKey(childName));
     }
 
     private async Task FinalizeRunAsync(OrchestratorRun run)
@@ -607,6 +831,7 @@ public class OrchestratorService
 
         _activeRuns.TryRemove(run.Name, out _);
         _cancelledRuns.TryRemove(run.Name, out _);
+        _taskScriptPaths.TryRemove(run.Name, out _);
         _runStatusTimers.TryRemove(run.Name, out var timer);
         timer?.Dispose();
 
@@ -667,14 +892,21 @@ public class OrchestratorService
                 run.PostExecStatus = "Running";
                 await _store.UpsertRunAsync(run);
 
-                // Stream results to a temp file instead of building a massive in-memory string
-                // from the full entity list. For large runs (738+ tasks), the aggregated JSON can
-                // be 50-150 MB. Streaming to file first means we only ever hold ONE copy of the
-                // data (the file read), not two (entity list + serialized JSON).
+                // Stream results to a temp file rather than building the aggregate in memory. For large
+                // runs (738+ tasks) that aggregate is 50-150 MB, and StreamResultsToFileAsync now holds
+                // one chunk at a time rather than the whole entity set (it used to buffer every result
+                // row into a dictionary before writing a byte, so "streaming" still peaked at the full
+                // payload in UTF-16 — roughly 2x the stored size — before this ran).
+                //
+                // The remaining copy is ResultsJson below: the PS contract takes the aggregate as a
+                // string, so it is read back as one Large Object Heap allocation and PowerShell copies
+                // it again on ConvertFrom-Json. Removing THAT needs a contract change with the
+                // configured PostExecFunction (App:Orchestrator:PostExecFunction), whose downstream
+                // Push-* consumers live outside this repo.
                 var tempFile = Path.Combine(Path.GetTempPath(), $"craft-postexec-{Guid.NewGuid():N}.json");
                 try
                 {
-                    await _store.StreamResultsToFileAsync(run.Name, tempFile);
+                    await _store.StreamResultsToFileAsync(run.Name, tempFile, jobCt);
                     var fileSize = new FileInfo(tempFile).Length;
                     var fileSizeMB = fileSize / (1024.0 * 1024.0);
                     _logger.LogInformation(

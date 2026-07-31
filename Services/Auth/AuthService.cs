@@ -217,6 +217,12 @@ public class AuthService : IDisposable
         // Nothing here owns unmanaged resources directly, but suppressing finalization keeps a
         // derived type that adds a finalizer from having to re-implement IDisposable to do it.
         GC.SuppressFinalize(this);
-        throw new NotImplementedException();
+
+        // This was a leftover `throw new NotImplementedException()` from the IDisposable stub. DI
+        // disposes singletons in reverse creation order and does not catch, so it aborted the whole
+        // chain: every service created before AuthService (the worker pool, runner, cache, realtime,
+        // script repo, table store) was skipped, and the host exited with an unhandled exception on
+        // EVERY shutdown.
+        _allowedUsersLock.Dispose();
     }
 }

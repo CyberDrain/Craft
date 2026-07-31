@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Craft.Configuration;
@@ -63,6 +64,8 @@ public class OrchestratorTableStore
                 ["PostExecFunctionName"] = run.PostExecFunctionName,
                 ["PostExecParametersJson"] = run.PostExecParametersJson,
                 ["PostExecStatus"] = run.PostExecStatus,
+                ["Reference"] = run.Reference,
+                ["ParentRunName"] = run.ParentRunName,
                 ["TaskCount"] = run.Tasks.Count
             }
         };
@@ -86,7 +89,12 @@ public class OrchestratorTableStore
             TaskScriptName = runRow.GetString("TaskScriptName"),
             PostExecFunctionName = runRow.GetString("PostExecFunctionName"),
             PostExecParametersJson = runRow.GetString("PostExecParametersJson"),
-            PostExecStatus = runRow.GetString("PostExecStatus")
+            PostExecStatus = runRow.GetString("PostExecStatus"),
+            // Both were in-memory only until now: a resumed run came back with a null Reference
+            // (so FindRunByReference could not see it) and a null ParentRunName (so its finalize
+            // never re-checked the parent). Absent on rows written before this existed.
+            Reference = runRow.GetString("Reference"),
+            ParentRunName = runRow.GetString("ParentRunName")
         };
 
         var tasks = new List<OrchestratorTaskItem>();
@@ -112,6 +120,8 @@ public class OrchestratorTableStore
                 Parameters = parameters,
                 AttemptCount = taskRow.GetInt32("AttemptCount") ?? 0,
                 LastError = taskRow.GetString("LastError"),
+                // Absent on rows written before per-task priority existed — null means "inherit the run's".
+                Priority = taskRow.GetInt32("Priority"),
                 CompletedUtc = taskRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime
             });
         }
@@ -129,6 +139,26 @@ public class OrchestratorTableStore
         return names;
     }
 
+    /// <summary>
+    /// List every run's identity and parentage without loading its tasks.
+    ///
+    /// One scan of the single "Run" partition. <see cref="GetRunAsync"/> would answer the same question
+    /// but does a task-partition query per run, so using it to rebuild parent/child links at startup
+    /// would load every task of every run — the opposite of what recovery should cost.
+    /// </summary>
+    public async Task<List<OrchestratorRunSummary>> ListRunSummariesAsync()
+    {
+        var summaries = new List<OrchestratorRunSummary>();
+        await foreach (var row in _store.QueryPartitionAsync(_runsTable, "Run"))
+        {
+            summaries.Add(new OrchestratorRunSummary(
+                row.RowKey,
+                row.GetString("Status") ?? "Pending",
+                row.GetString("ParentRunName")));
+        }
+        return summaries;
+    }
+
     /// <summary>Upsert a single task row.</summary>
     public Task UpsertTaskAsync(string runName, OrchestratorTaskItem task) =>
         _store.UpsertAsync(_tasksTable, BuildTaskRow(runName, task));
@@ -143,10 +173,48 @@ public class OrchestratorTableStore
     /// per-request limits. Used by the batched status writer; the large-result path
     /// (<see cref="StoreResultAsync"/>) is untouched.
     /// </summary>
-    public async Task WriteTaskStatusBatchAsync(IReadOnlyList<TaskStatusWrite> writes)
+    /// <returns>
+    /// The run names whose writes did NOT persist. Callers must retry these rather than dropping them —
+    /// they are terminal task states, and losing one means a finished task looks Pending forever.
+    /// An empty list means everything landed.
+    /// </returns>
+    public async Task<IReadOnlyList<string>> WriteTaskStatusBatchAsync(IReadOnlyList<TaskStatusWrite> writes,
+        int maxConcurrency = 8, CancellationToken ct = default)
     {
-        foreach (var group in writes.GroupBy(w => w.RunName))
-            await _store.UpsertBatchAsync(_tasksTable, group.Key, group.Select(BuildTaskRow).ToList());
+        // Grouped by run because a batch has to share a partition key. Run these with bounded
+        // concurrency instead of one after another: the workload that broke this was ~600 runs of a
+        // single task each, so "batching" degenerated into hundreds of sequential round-trips inside
+        // one flush — with the single drain loop, and therefore every task waiting on its durable
+        // marker, blocked for the whole duration.
+        var groups = writes.GroupBy(w => w.RunName).ToList();
+        if (groups.Count == 0) return [];
+
+        var failed = new System.Collections.Concurrent.ConcurrentBag<string>();
+        using var gate = new SemaphoreSlim(Math.Max(1, maxConcurrency));
+
+        var tasks = groups.Select(async group =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                await _store.UpsertBatchAsync(_tasksTable, group.Key, group.Select(BuildTaskRow).ToList(), ct);
+            }
+            catch (Exception ex)
+            {
+                // One run's failure must not discard the other 599. Record it and carry on; the caller
+                // requeues just this run.
+                failed.Add(group.Key);
+                _logger.LogWarning(ex, "[OrchestratorStore] Task status write failed for run {Run} ({Count} tasks) — will retry",
+                    group.Key, group.Count());
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+        return failed.ToList();
     }
 
     private static StoreRow BuildTaskRow(string runName, OrchestratorTaskItem task) => new(runName, task.Id)
@@ -157,6 +225,7 @@ public class OrchestratorTableStore
             ["ParametersJson"] = JsonSerializer.Serialize(task.Parameters, s_jsonOptions),
             ["AttemptCount"] = task.AttemptCount,
             ["LastError"] = task.LastError,
+            ["Priority"] = task.Priority,
             ["CompletedUtc"] = task.CompletedUtc.HasValue
                 ? new DateTimeOffset(task.CompletedUtc.Value, TimeSpan.Zero)
                 : (DateTimeOffset?)null
@@ -171,6 +240,7 @@ public class OrchestratorTableStore
             ["ParametersJson"] = w.ParametersJson,
             ["AttemptCount"] = w.AttemptCount,
             ["LastError"] = w.LastError,
+            ["Priority"] = w.Priority,
             ["CompletedUtc"] = w.CompletedUtc.HasValue
                 ? new DateTimeOffset(w.CompletedUtc.Value, TimeSpan.Zero)
                 : (DateTimeOffset?)null
@@ -244,111 +314,156 @@ public class OrchestratorTableStore
         }
     }
 
-    /// <summary>Get all result JSON strings for a run, reassembling any chunked/multi-row results.</summary>
-    public async Task<string[]> GetResultsAsync(string runName)
+    /// <summary>
+    /// Get all result JSON strings for a run, reassembling any chunked/multi-row results.
+    ///
+    /// Buffers every result by signature — prefer <see cref="StreamResultsAsync"/> or
+    /// <see cref="StreamResultsToFileAsync"/> for run-sized payloads.
+    /// </summary>
+    public async Task<string[]> GetResultsAsync(string runName, CancellationToken ct = default)
     {
-        var grouped = await LoadResultGroupsAsync(runName);
-
         var results = new List<string>();
-        foreach (var (_, rows) in grouped)
-        {
-            var sorted = rows.OrderBy(e => e.GetInt32("PartIndex") ?? 0).ToList();
-            var totalChunks = sorted.Select(e => e.GetInt32("ResultChunkCount")).FirstOrDefault(c => c.HasValue) ?? 0;
-
-            if (totalChunks == 0)
-            {
-                var json = sorted[0].GetString("ResultJson");
-                if (!string.IsNullOrEmpty(json))
-                    results.Add(json);
-                continue;
-            }
-
-            var sb = new StringBuilder();
-            AppendChunks(sb, sorted, totalChunks);
-            if (sb.Length > 0)
-                results.Add(sb.ToString());
-        }
-
+        await foreach (var result in StreamResultsAsync(runName, ct))
+            results.Add(result);
         return results.ToArray();
     }
 
     /// <summary>
-    /// Stream all result JSON strings for a run directly to a file, reassembling any chunked/multi-row
-    /// results on the fly. Avoids loading all results into one in-memory string. Writes a JSON array.
+    /// Stream each run result, reassembled, as it becomes available from the backing store.
+    ///
+    /// Nothing is buffered except spill groups still waiting for their remaining rows, so a run whose
+    /// results each fit in one row holds ONE row at a time regardless of how many there are.
     /// </summary>
-    public async Task StreamResultsToFileAsync(string runName, string filePath)
+    public async IAsyncEnumerable<string> StreamResultsAsync(string runName,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var grouped = await LoadResultGroupsAsync(runName);
+        await foreach (var chunks in StreamResultChunkGroupsAsync(runName, ct))
+            yield return chunks.Count == 1 ? chunks[0] : string.Concat(chunks);
+    }
 
-        await using var writer = new StreamWriter(filePath, append: false, Encoding.UTF8, bufferSize: 65536);
-        await writer.WriteAsync('[');
-        var first = true;
+    /// <summary>
+    /// Stream all result JSON strings for a run directly to a file, reassembling any chunked/multi-row
+    /// results on the fly. Writes a JSON array.
+    ///
+    /// Chunks are written individually, so the largest allocation this makes is one chunk
+    /// (<see cref="MaxPropertyChars"/>) — the reassembled result is never built as a string.
+    /// </summary>
+    public async Task StreamResultsToFileAsync(string runName, string filePath, CancellationToken ct = default)
+    {
+        var count = 0;
 
-        foreach (var (_, rows) in grouped)
+        await using (var writer = new StreamWriter(filePath, append: false, Encoding.UTF8, bufferSize: 65536))
         {
-            var sorted = rows.OrderBy(e => e.GetInt32("PartIndex") ?? 0).ToList();
-            var totalChunks = sorted.Select(e => e.GetInt32("ResultChunkCount")).FirstOrDefault(c => c.HasValue) ?? 0;
+            await writer.WriteAsync('[');
+            var first = true;
 
+            await foreach (var chunks in StreamResultChunkGroupsAsync(runName, ct))
+            {
+                if (!first) await writer.WriteAsync(',');
+                foreach (var chunk in chunks)
+                    await writer.WriteAsync(chunk);
+                first = false;
+                count++;
+            }
+
+            await writer.WriteAsync(']');
+        }
+
+        _logger.LogInformation("[OrchestratorStore] Streamed {Count} results to {Path} for run {Name}",
+            count, filePath, runName);
+    }
+
+    /// <summary>
+    /// The shared core: yields each logical result as its ordered chunk list, as soon as that result is
+    /// complete, and drops every row it has finished with.
+    ///
+    /// This used to be LoadResultGroupsAsync, which materialized EVERY result row for the run into a
+    /// dictionary before a single byte was written — so the callers named "stream" held the entire
+    /// payload (as UTF-16, ~2x the stored size) before they started. For a 738-task run whose aggregate
+    /// is 50-150MB that was a few hundred MB against a 2398MB heap cap, concurrently per post-execution.
+    ///
+    /// Rows are grouped by (OriginalEntityId ?? RowKey) and completed by chunk count rather than by
+    /// arrival order, so this makes no assumption about the order
+    /// <see cref="ICraftTableStore.QueryPartitionAsync"/> returns rows in — the interface promises none.
+    /// </summary>
+    private async IAsyncEnumerable<IReadOnlyList<string>> StreamResultChunkGroupsAsync(string runName,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        // Allocated only if this run actually has a result too large for a single row.
+        Dictionary<string, PendingResult>? pending = null;
+
+        await foreach (var row in _store.QueryPartitionAsync(_resultsTable, runName, ct))
+        {
+            var totalChunks = row.GetInt32("ResultChunkCount") ?? 0;
+
+            // Fast path: the whole result is one property on this row. Emit and release it.
             if (totalChunks == 0)
             {
-                var json = sorted[0].GetString("ResultJson");
-                if (!string.IsNullOrEmpty(json))
-                {
-                    if (!first) await writer.WriteAsync(',');
-                    await writer.WriteAsync(json);
-                    first = false;
-                }
+                var json = row.GetString("ResultJson");
+                if (!string.IsNullOrEmpty(json)) yield return new[] { json };
                 continue;
             }
 
-            if (!first) await writer.WriteAsync(',');
-            for (int i = 0; i < totalChunks; i++)
-            {
-                var propName = $"ResultJson_{i}";
-                foreach (var row in sorted)
-                {
-                    var chunk = row.GetString(propName);
-                    if (chunk != null) { await writer.WriteAsync(chunk); break; }
-                }
-            }
-            first = false;
-        }
-
-        await writer.WriteAsync(']');
-
-        _logger.LogInformation("[OrchestratorStore] Streamed {Count} results to {Path} for run {Name}",
-            grouped.Count, filePath, runName);
-    }
-
-    /// <summary>Load all result rows for a run, grouped by logical result (root row + any spill rows).</summary>
-    private async Task<Dictionary<string, List<StoreRow>>> LoadResultGroupsAsync(string runName)
-    {
-        var grouped = new Dictionary<string, List<StoreRow>>(StringComparer.OrdinalIgnoreCase);
-        await foreach (var row in _store.QueryPartitionAsync(_resultsTable, runName))
-        {
             var originalId = row.GetString("OriginalEntityId");
             var key = !string.IsNullOrEmpty(originalId) ? originalId : row.RowKey;
-            if (!grouped.TryGetValue(key, out var group))
+
+            pending ??= new Dictionary<string, PendingResult>(StringComparer.OrdinalIgnoreCase);
+            if (!pending.TryGetValue(key, out var group))
+                pending[key] = group = new PendingResult(totalChunks);
+
+            group.Absorb(row);
+
+            // Chunked but single-row results complete on their first (only) row.
+            if (group.IsComplete)
             {
-                group = new List<StoreRow>();
-                grouped[key] = group;
+                pending.Remove(key);
+                if (group.HasContent) yield return group.Chunks;
             }
-            group.Add(row);
         }
-        return grouped;
+
+        // A spill row never arrived (partial write, or cleanup raced us). Emit what we have rather than
+        // silently dropping the result, and say so.
+        if (pending is { Count: > 0 })
+        {
+            foreach (var (key, group) in pending)
+            {
+                _logger.LogWarning(
+                    "[OrchestratorStore] Result {Key} in run {Run} is incomplete: {Have}/{Total} chunks present",
+                    key, runName, group.PresentCount, group.TotalChunks);
+                if (group.HasContent) yield return group.Chunks;
+            }
+        }
     }
 
-    private static void AppendChunks(StringBuilder sb, List<StoreRow> sorted, int totalChunks)
+    /// <summary>
+    /// A result being reassembled from chunks spread over one or more rows. Holds only this result's
+    /// chunks — never the <see cref="StoreRow"/>s they came from.
+    /// </summary>
+    private sealed class PendingResult(int totalChunks)
     {
-        for (int i = 0; i < totalChunks; i++)
+        private readonly string[] _chunks = new string[totalChunks];
+
+        public int TotalChunks => _chunks.Length;
+        public int PresentCount { get; private set; }
+        public bool IsComplete => PresentCount == _chunks.Length;
+        public bool HasContent => _chunks.Any(c => !string.IsNullOrEmpty(c));
+
+        /// <summary>Take any chunks this row carries that we do not already have.</summary>
+        public void Absorb(StoreRow row)
         {
-            var propName = $"ResultJson_{i}";
-            foreach (var row in sorted)
+            for (var i = 0; i < _chunks.Length; i++)
             {
-                var chunk = row.GetString(propName);
-                if (chunk != null) { sb.Append(chunk); break; }
+                if (_chunks[i] != null) continue;
+                var chunk = row.GetString($"ResultJson_{i}");
+                if (chunk == null) continue;
+                _chunks[i] = chunk;
+                PresentCount++;
             }
         }
+
+        /// <summary>The chunks in index order. Missing chunks (incomplete result) are skipped.</summary>
+        public IReadOnlyList<string> Chunks =>
+            PresentCount == _chunks.Length ? _chunks : _chunks.Where(c => c != null).ToArray();
     }
 
     /// <summary>Delete all entities across the 3 tables for a completed run.</summary>
