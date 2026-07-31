@@ -26,6 +26,9 @@ public sealed class OrchestratorStatusWriter : IDisposable
     private readonly bool _enabled;
     private readonly bool _durableBarrier;
     private readonly int _flushIntervalMs;
+    private readonly TimeSpan _barrierTimeout;
+    private readonly TimeSpan _flushTimeout;
+    private readonly int _flushConcurrency;
 
     // Match the read path (OrchestratorTableStore serializes/deserializes ParametersJson camelCase).
     private static readonly JsonSerializerOptions s_json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
@@ -47,19 +50,30 @@ public sealed class OrchestratorStatusWriter : IDisposable
         _enabled = settings.Orchestrator.BatchStatusWrites;
         _durableBarrier = settings.Orchestrator.DurableRunningBarrier;
         _flushIntervalMs = Math.Max(5, settings.Orchestrator.StatusFlushIntervalMs);
+        _barrierTimeout = TimeSpan.FromSeconds(Math.Max(1, settings.Orchestrator.RunningBarrierTimeoutSeconds));
+        _flushTimeout = TimeSpan.FromSeconds(Math.Max(1, settings.Orchestrator.StatusFlushTimeoutSeconds));
+        _flushConcurrency = Math.Max(1, settings.Orchestrator.StatusFlushConcurrency);
         _drainLoop = _enabled ? Task.Run(DrainLoopAsync) : Task.CompletedTask;
-        _logger.LogInformation("[Orchestrator] StatusWriter: enabled={E} durableBarrier={B} flushMs={F}",
-            _enabled, _durableBarrier, _flushIntervalMs);
+        _logger.LogInformation(
+            "[Orchestrator] StatusWriter: enabled={E} durableBarrier={B} flushMs={F} barrierTimeout={BT}s flushTimeout={FT}s concurrency={C}",
+            _enabled, _durableBarrier, _flushIntervalMs, _barrierTimeout.TotalSeconds, _flushTimeout.TotalSeconds,
+            _flushConcurrency);
     }
 
     private static string Key(string run, string task) => run + "" + task;
     private static TaskStatusWrite Snap(string run, OrchestratorTaskItem t) => new(
-        run, t.Id, t.Status, JsonSerializer.Serialize(t.Parameters, s_json), t.AttemptCount, t.LastError, t.CompletedUtc);
+        run, t.Id, t.Status, JsonSerializer.Serialize(t.Parameters, s_json), t.AttemptCount, t.LastError,
+        t.CompletedUtc, t.Priority);
 
     /// <summary>Persist the pre-invoke "Running" marker durably before the task runs. Under the barrier it is
     /// batched with other concurrently-starting tasks (N tasks → ~1 transaction) yet still lands before the
     /// invoke. Disabled → the original per-task awaited write.</summary>
-    public async Task MarkRunningAsync(string runName, OrchestratorTaskItem task)
+    /// <exception cref="TimeoutException">
+    /// The marker did not persist within <c>RunningBarrierTimeoutSeconds</c>. The caller must treat this
+    /// as a DEFERRAL, not a failure: nothing was written, so storage still has the task Pending and it
+    /// is safe — and necessary — to retry it.
+    /// </exception>
+    public async Task MarkRunningAsync(string runName, OrchestratorTaskItem task, CancellationToken ct = default)
     {
         if (!_enabled) { await _store.UpsertTaskAsync(runName, task); return; }
         if (!_durableBarrier) { QueueTask(runName, task); return; } // eventual mode (weaker poison guarantee)
@@ -71,7 +85,48 @@ public sealed class OrchestratorStatusWriter : IDisposable
             barrier = _barrier.Task;
         }
         _signal.Release();
-        await barrier; // completes only after the batch containing this marker is written
+
+        // Bounded. This wait sits between dispatch and worker checkout while holding a JobManager slot,
+        // so waiting forever converts a slow flush into a whole-host outage — observed in production as
+        // 8/8 slots held, every BG worker idle, 1,919 jobs queued and nothing moving until a restart.
+        try
+        {
+            if (await CompletesWithinAsync(barrier, _barrierTimeout, ct)) return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The flush carrying this marker failed. It has been requeued, but THIS task must not start:
+            // the marker is not in storage, so its retry bound would not hold.
+            throw new MarkerNotPersistedException(
+                $"Durable 'Running' marker for {runName}/{task.Id} did not persist: {ex.Message}", ex);
+        }
+
+        throw new MarkerNotPersistedException(
+            $"Durable 'Running' marker for {runName}/{task.Id} did not persist within " +
+            $"{_barrierTimeout.TotalSeconds:F0}s. The task was not started and remains Pending.");
+    }
+
+    /// <summary>
+    /// Await <paramref name="work"/> with a ceiling. True if it finished (and any exception it carried
+    /// is rethrown), false if the ceiling was hit first.
+    /// </summary>
+    private static async Task<bool> CompletesWithinAsync(Task work, TimeSpan limit, CancellationToken ct)
+    {
+        if (work.IsCompleted) { await work; return true; }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var timer = Task.Delay(limit, cts.Token);
+        var winner = await Task.WhenAny(work, timer);
+        cts.Cancel(); // stop the timer whichever way this went, so it cannot outlive the call
+
+        if (winner != work)
+        {
+            ct.ThrowIfCancellationRequested();
+            return false;
+        }
+
+        await work; // observe a flush failure as an exception rather than a silent success
+        return true;
     }
 
     /// <summary>Queue a task's (usually terminal) status — non-blocking, coalesced, flushed by the drain loop.
@@ -93,13 +148,27 @@ public sealed class OrchestratorStatusWriter : IDisposable
 
     /// <summary>Flush all currently-pending writes and await their persistence. Call before finalizing a run
     /// so terminal task states + run state are durable before post-execution reads results.</summary>
-    public async Task FlushAsync()
+    public async Task FlushAsync(CancellationToken ct = default)
     {
         if (!_enabled) return;
         Task barrier;
         lock (_lock) { barrier = _barrier.Task; }
         _signal.Release();
-        await barrier;
+
+        // Bounded for the same reason as the Running marker: this is awaited by FinalizeRunAsync, and an
+        // unbounded wait meant no run could finalize while a flush was stuck. Requeue-on-failure means a
+        // timeout here does not lose the writes — they persist on a later flush or on the shutdown drain,
+        // so finalization proceeds rather than blocking on transient storage trouble.
+        try
+        {
+            if (await CompletesWithinAsync(barrier, _barrierTimeout, ct)) return;
+            _logger.LogWarning("[Orchestrator] Flush barrier not met within {Sec}s — pending writes remain queued",
+                _barrierTimeout.TotalSeconds);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[Orchestrator] Flush barrier reported a failed write — requeued for retry");
+        }
     }
 
     private async Task DrainLoopAsync()
@@ -108,12 +177,30 @@ public sealed class OrchestratorStatusWriter : IDisposable
         {
             try { await _signal.WaitAsync(_flushIntervalMs, _cts.Token); }
             catch (OperationCanceledException) { break; }
-            await FlushOnceAsync();
+
+            // FlushOnceAsync used to be called outside any try. Anything escaping it — an OOM while
+            // formatting the error log is enough — killed this loop silently, and a dead loop means no
+            // barrier is ever completed again, so every task hangs at its durable marker forever.
+            // This loop must not be able to die while the process lives.
+            try { await FlushOnceAsync(_flushTimeout); }
+            catch (Exception ex) { LogSafely(ex, "status flush"); }
         }
-        await FlushOnceAsync(); // final drain on shutdown
+
+        // Final drain on shutdown. Deliberately NOT bounded by _cts (which is already cancelled) and
+        // given a generous ceiling: this is the last chance for terminal task states to reach storage.
+        try { await FlushOnceAsync(TimeSpan.FromSeconds(30), ignoreShutdown: true); }
+        catch (Exception ex) { LogSafely(ex, "final status drain"); }
     }
 
-    private async Task FlushOnceAsync()
+    /// <summary>Log without letting the logger itself take the drain loop down (it allocates, and this
+    /// path runs under exactly the memory pressure that makes allocation fail).</summary>
+    private void LogSafely(Exception ex, string what)
+    {
+        try { _logger.LogError(ex, "[Orchestrator] Unhandled error during {What} — drain loop continues", what); }
+        catch { /* nothing useful left to do; staying alive matters more than reporting */ }
+    }
+
+    private async Task FlushOnceAsync(TimeSpan timeout, bool ignoreShutdown = false)
     {
         Dictionary<string, TaskStatusWrite> tasks;
         Dictionary<string, OrchestratorRun> runs;
@@ -132,21 +219,88 @@ public sealed class OrchestratorStatusWriter : IDisposable
             runs = _pendingRuns; _pendingRuns = new();
         }
 
+        using var cts = ignoreShutdown
+            ? new CancellationTokenSource(timeout)
+            : CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        if (!ignoreShutdown) cts.CancelAfter(timeout);
+
+        var unwritten = new List<string>();
+        Exception? failure = null;
+
         try
         {
             if (tasks.Count > 0)
-                await _store.WriteTaskStatusBatchAsync(tasks.Values.ToList());
+                unwritten.AddRange(await _store.WriteTaskStatusBatchAsync(tasks.Values.ToList(), _flushConcurrency, cts.Token));
+
             foreach (var run in runs.Values)
             {
                 try { await _store.UpsertRunAsync(run); }
-                catch (Exception ex) { _logger.LogWarning(ex, "[Orchestrator] Run status write failed for {Run}", run.Name); }
+                catch (Exception ex)
+                {
+                    unwritten.Add(run.Name);
+                    _logger.LogWarning(ex, "[Orchestrator] Run status write failed for {Run} — will retry", run.Name);
+                }
             }
-            done.TrySetResult();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[Orchestrator] Status flush failed ({Tasks} tasks, {Runs} runs)", tasks.Count, runs.Count);
-            done.TrySetException(ex); // barrier waiters observe the failure (task gets marked Failed, as today)
+            // Timed out or the store threw wholesale — treat EVERYTHING in this snapshot as unwritten.
+            failure = ex;
+            unwritten.AddRange(tasks.Values.Select(t => t.RunName));
+            unwritten.AddRange(runs.Keys);
+            _logger.LogError(ex, "[Orchestrator] Status flush failed ({Tasks} tasks, {Runs} runs) — requeued for retry",
+                tasks.Count, runs.Count);
+        }
+
+        // Durability: anything that did not reach storage goes back on the pending set. Dropping it
+        // (the previous behaviour on any exception) silently lost terminal task states — a completed
+        // task would look Pending forever and be re-run by the next recovery.
+        if (unwritten.Count > 0) Requeue(tasks, runs, unwritten);
+
+        // The barrier may ONLY report success when this batch actually persisted. Waiters cannot tell
+        // which run in the batch was theirs, so any un-persisted write has to fail all of them — a
+        // waiter that returns successfully goes on to run its task, and running a task whose "Running"
+        // marker never landed is exactly the poison-retry hole the marker exists to close. Failing here
+        // is cheap: the writes are requeued, and the waiters defer and retry.
+        if (failure != null)
+            done.TrySetException(failure);
+        else if (unwritten.Count > 0)
+            done.TrySetException(new InvalidOperationException(
+                $"{unwritten.Count} status write(s) did not persist and were requeued"));
+        else
+            done.TrySetResult();
+    }
+
+    /// <summary>
+    /// Put un-persisted writes back. <see cref="Dictionary{TKey,TValue}.TryAdd"/>, not assignment: a
+    /// NEWER state for the same task may have arrived while the flush was in flight, and the retry of a
+    /// stale snapshot must never overwrite it.
+    /// </summary>
+    private void Requeue(Dictionary<string, TaskStatusWrite> tasks, Dictionary<string, OrchestratorRun> runs,
+        List<string> unwrittenRuns)
+    {
+        var retry = new HashSet<string>(unwrittenRuns, StringComparer.OrdinalIgnoreCase);
+        var restored = 0;
+
+        lock (_lock)
+        {
+            foreach (var (key, write) in tasks)
+            {
+                if (!retry.Contains(write.RunName)) continue;
+                if (_pendingTasks.TryAdd(key, write)) restored++;
+            }
+            foreach (var (name, run) in runs)
+            {
+                if (!retry.Contains(name)) continue;
+                if (_pendingRuns.TryAdd(name, run)) restored++;
+            }
+        }
+
+        if (restored > 0)
+        {
+            _signal.Release(); // make sure the next flush actually runs
+            _logger.LogWarning("[Orchestrator] Requeued {Count} un-persisted status writes across {Runs} runs",
+                restored, retry.Count);
         }
     }
 

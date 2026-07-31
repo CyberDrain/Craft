@@ -586,11 +586,13 @@ EasyAuth handles auth, redirects, and excluded paths at the App Service platform
 ```jsonc
 "Frontend": {
   // Content-Security-Policy applied to all responses. Null/empty = no CSP set.
-  "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *"
+  "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; connect-src 'self' https: blob: data:; object-src 'self' blob:; img-src 'self' blob: data: *"
 }
 ```
 
-If you override this, keep `'self'` in `default-src`. `connect-src` falls back to `default-src`, so a policy that only lists the `https:` scheme blocks the app's own same-origin `fetch` calls whenever it is reached over http — behind a TLS-terminating proxy, self-hosted, or in local docker. `'self'` permits exactly one origin, so it does not widen a policy that already allows every `https:` host.
+If you override this, keep `'self'` in both `default-src` and `connect-src`. A policy that only lists the `https:` scheme blocks the app's own same-origin `fetch` calls whenever it is reached over http — behind a TLS-terminating proxy, self-hosted, or in local docker. `'self'` permits exactly one origin, so it does not widen a policy that already allows every `https:` host.
+
+Keep `data:` in `connect-src` as well. Emscripten `SINGLE_FILE` builds inline their WebAssembly as a `data:application/octet-stream;base64,…` URL and then `fetch` it, which `connect-src` gates — wasm-backed layout and parsing libraries are commonly shipped this way. Such loaders normally fall back to decoding the base64 in JavaScript, so blocking it costs a failed request and a console error rather than breaking the feature, but there is no reason to pay for it. It belongs in `connect-src` and not in `default-src`, which would also hand `data:` to `script-src`.
 
 ---
 

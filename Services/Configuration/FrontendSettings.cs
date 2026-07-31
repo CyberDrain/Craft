@@ -21,9 +21,20 @@ public class FrontendSettings
     /// a loosening — <c>'self'</c> permits exactly one origin, while the <c>https:</c> already there
     /// permits every https host there is.
     /// </para>
+    /// <para>
+    /// <c>connect-src</c> is spelled out because it needs one source <c>default-src</c> should not
+    /// have: <c>data:</c>. Emscripten <c>SINGLE_FILE</c> builds inline their wasm as a
+    /// <c>data:application/octet-stream;base64,…</c> URL and then <c>fetch</c> it, which is a
+    /// <c>connect-src</c> request; wasm-backed layout and parsing libraries are commonly shipped this
+    /// way. The loader falls back to decoding the base64 itself, so a block only costs a failed
+    /// request and a console error, but there is no reason to pay it. Listing it here rather than in
+    /// <c>default-src</c> keeps <c>data:</c> out of <c>script-src</c>, where it is an XSS vector.
+    /// Everything else mirrors <c>default-src</c>, so this is parity plus <c>data:</c>; note that
+    /// <c>ws:</c>/<c>wss:</c> are absent from both, so cross-origin websockets stay blocked.
+    /// </para>
     /// </summary>
     public string? ContentSecurityPolicy { get; set; } =
-        "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *";
+        "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; connect-src 'self' https: blob: data:; object-src 'self' blob:; img-src 'self' blob: data: *";
 
     /// <summary>
     /// Whether the host compresses static responses. Default true.

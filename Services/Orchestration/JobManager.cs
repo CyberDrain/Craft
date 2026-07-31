@@ -27,6 +27,19 @@ namespace Craft.Orchestration;
 ///   from the PriorityQueue. This means a P0 audit-log task that arrives
 ///   while 400 P2 DB-cache tasks are queued will run as soon as a slot frees up,
 ///   rather than waiting behind all 400 P2 tasks (which is what FIFO does).
+///
+/// Two invariants keep this loop live, both learned from production stalls:
+///
+///   1. THE LOOP NEVER RUNS JOB WORK ON ITS OWN THREAD. Jobs are handed to the thread pool.
+///      An async method body runs synchronously on its caller until its first real await, so any
+///      synchronous block inside a job — e.g. PowerShellRunnerService.ExecuteScript, which opens with
+///      an untimed CheckoutBackground → BlockingCollection.Take() before any await — would otherwise
+///      park this loop entirely. That produced hour-long windows with a full queue, free capacity and
+///      zero dispatches, reported by the limiter as the maximally-misleading "1 active, 0 waiting"
+///      (the loop holds at most one outstanding AcquireAsync, so parked elsewhere it counts as none).
+///
+///   2. THE LOOP NEVER DOES I/O. Descriptor rehydration happens inside the dispatched task, for the
+///      same reason.
 /// </summary>
 public class JobManager : BackgroundService
 {
@@ -45,7 +58,14 @@ public class JobManager : BackgroundService
     private readonly ConcurrentDictionary<string, JobRecord> _jobs = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
     private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
+
+    /// <summary>Live queue epoch per reprioritized job. Only populated by <see cref="ChangePriority"/>.</summary>
+    private readonly ConcurrentDictionary<string, int> _reprioritized = new();
     private long _totalProcessed;
+
+    // ── Descriptor rehydration + durability ──
+    private volatile JobWorkResolver? _resolver;
+    private volatile IJobDescriptorStateWriter? _stateWriter;
 
     // ── Cleanup ──
     private readonly Timer _cleanupTimer;
@@ -98,12 +118,77 @@ public class JobManager : BackgroundService
 
         lock (_queueLock)
         {
-            _pendingQueue.Enqueue(new QueuedJob(record, work), priority);
+            _pendingQueue.Enqueue(new QueuedJob(record, work, null), priority);
         }
         _itemAvailable.Release();
 
         _logger.LogDebug("[JobManager] Enqueued: {Name} P{Priority} run={Run} ({Queued} queued, {Active} active)",
             name, priority, runName ?? "-", QueuedCount, _activeCount);
+
+        return jobId;
+    }
+
+    /// <summary>
+    /// Register the resolver that turns a <see cref="JobDescriptor"/> into runnable work at dispatch
+    /// time. Called once at startup by <see cref="OrchestratorService"/>. Without a resolver, descriptor
+    /// jobs fail fast rather than silently vanishing.
+    /// </summary>
+    public void SetWorkResolver(JobWorkResolver resolver) => _resolver = resolver;
+
+    /// <summary>
+    /// Register the sink that persists operator-initiated changes to queued descriptor jobs
+    /// (reprioritize, cancel) so they survive a restart. Called at startup alongside
+    /// <see cref="SetWorkResolver"/>. Optional: without it those changes stay in-memory only.
+    /// </summary>
+    public void SetDescriptorStateWriter(IJobDescriptorStateWriter writer) => _stateWriter = writer;
+
+    /// <summary>
+    /// Find the live queue entry for a job id. Superseded entries (an older epoch left behind by
+    /// <see cref="ChangePriority"/>) are skipped. Caller must hold <see cref="_queueLock"/>.
+    /// </summary>
+    private QueuedJob? FindLiveEntry(JobRecord record)
+    {
+        foreach (var (entry, _) in _pendingQueue.UnorderedItems)
+        {
+            if (!ReferenceEquals(entry.Record, record)) continue;
+            if (_reprioritized.TryGetValue(record.Id, out var live) && entry.Epoch != live) continue;
+            return entry;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Enqueue a job by IDENTITY rather than by closure. The queue then retains only
+    /// (runName, taskId, priority) plus the tracking record — no captured run graph, no captured task,
+    /// no delegate — and the work is rehydrated at dispatch time by the registered resolver.
+    ///
+    /// The job id is the caller-supplied <paramref name="name"/>, which is already unique per
+    /// (run, task); descriptor jobs deliberately do NOT mint a Guid-suffixed id, because that second
+    /// string was measured to be the single largest per-job allocation in the queue.
+    /// </summary>
+    public string Enqueue(JobDescriptor descriptor, string name, string? id = null)
+    {
+        var jobId = id ?? name;
+        var record = new JobRecord
+        {
+            Id = jobId,
+            Name = name,
+            RunName = descriptor.RunName,
+            Priority = descriptor.Priority,
+            Status = "Queued",
+            QueuedUtc = DateTime.UtcNow
+        };
+
+        _jobs.TryAdd(jobId, record);
+
+        lock (_queueLock)
+        {
+            _pendingQueue.Enqueue(new QueuedJob(record, null, descriptor), descriptor.Priority);
+        }
+        _itemAvailable.Release();
+
+        _logger.LogDebug("[JobManager] Enqueued descriptor: {Name} P{Priority} run={Run} ({Queued} queued, {Active} active)",
+            name, descriptor.Priority, descriptor.RunName, QueuedCount, _activeCount);
 
         return jobId;
     }
@@ -147,9 +232,20 @@ public class JobManager : BackgroundService
                     continue;
                 }
 
-                // Skip cancelled jobs — release the slot and move on
+                // Superseded by a ChangePriority re-enqueue — the live entry is elsewhere in the queue.
+                if (_reprioritized.TryGetValue(job.Record.Id, out var liveEpoch) && job.Epoch != liveEpoch)
+                {
+                    _limiter.ReleaseSlot();
+                    continue;
+                }
+
+                // Skip cancelled jobs — release the slot and move on.
+                // The work ref must go too: CancelJob only marks the id, so leaving the entry here
+                // stranded the captured closure (and everything it captured) in _pendingWork forever —
+                // nothing else ever removes it, not even CleanupOldJobs.
                 if (_cancelledJobIds.TryRemove(job.Record.Id, out _))
                 {
+                    _pendingWork.TryRemove(job.Record.Id, out _);
                     _limiter.ReleaseSlot();
                     continue;
                 }
@@ -159,8 +255,10 @@ public class JobManager : BackgroundService
 
                 Interlocked.Increment(ref _activeCount);
 
-                // 4. Fire-and-forget: job runs asynchronously, releases slot on completion
-                _ = RunJobAsync(job, stoppingToken);
+                // 4. Hand the job to the thread pool — see invariant 1 on the class. This loop must get
+                //    straight back to _itemAvailable/AcquireAsync; running RunJobAsync inline lets any
+                //    synchronous block inside the job stop dispatch for the whole process.
+                _ = Task.Run(() => RunJobAsync(job, stoppingToken), CancellationToken.None);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -195,7 +293,20 @@ public class JobManager : BackgroundService
                     job.Record.Name, job.Record.Priority, queueTime.TotalSeconds, _activeCount);
             }
 
-            await job.Work(ct);
+            // Rehydrate descriptor jobs here — on the thread pool, never on the dispatch loop.
+            var work = job.Work ?? await ResolveWorkAsync(job.Descriptor!.Value, ct);
+
+            if (work == null)
+            {
+                // The task is gone or already terminal (e.g. finalized by crash recovery while queued).
+                // Not a failure: the queue entry is simply stale.
+                job.Record.Status = "Skipped";
+                job.Record.CompletedUtc = DateTime.UtcNow;
+                _logger.LogDebug("[JobManager] Skipped stale descriptor: {Name}", job.Record.Name);
+                return;
+            }
+
+            await work(ct);
 
             job.Record.Status = "Completed";
             job.Record.CompletedUtc = DateTime.UtcNow;
@@ -331,7 +442,10 @@ public class JobManager : BackgroundService
 
     // ─── Job Management ───
 
-    /// <summary>Cancel a queued job (running jobs cannot be cancelled via this method).</summary>
+    /// <summary>
+    /// Cancel a queued job (running jobs cannot be cancelled via this method).
+    /// Descriptor jobs are also cancelled durably, so recovery does not re-queue them.
+    /// </summary>
     public bool CancelJob(string jobId)
     {
         if (!_jobs.TryGetValue(jobId, out var record)) return false;
@@ -341,6 +455,12 @@ public class JobManager : BackgroundService
         record.CompletedUtc = DateTime.UtcNow;
         record.LastError = "Cancelled by user";
         _cancelledJobIds.TryAdd(jobId, true);
+
+        JobDescriptor? descriptor;
+        lock (_queueLock) descriptor = FindLiveEntry(record)?.Descriptor;
+        if (descriptor is { } d)
+            NotifyStateWriter(w => w.Cancelled(d), "cancellation", record.Name);
+
         _logger.LogInformation("[JobManager] Cancelled: {Name} ({Id})", record.Name, jobId);
         return true;
     }
@@ -348,18 +468,38 @@ public class JobManager : BackgroundService
     /// <summary>Cancel all queued jobs in a run group.</summary>
     public int CancelRun(string runName)
     {
-        var cancelled = 0;
-        foreach (var record in _jobs.Values.Where(j => j.RunName == runName && j.Status == "Queued"))
+        var toCancel = _jobs.Values.Where(j => j.RunName == runName && j.Status == "Queued").ToList();
+        if (toCancel.Count == 0) return 0;
+
+        // Collect descriptors in ONE pass under the lock — a scan per job would be O(n²) on a run
+        // whose queue depth is in the hundreds.
+        var descriptors = new List<JobDescriptor>(toCancel.Count);
+        lock (_queueLock)
+        {
+            var wanted = toCancel.ToDictionary(r => r.Id, r => r);
+            foreach (var (entry, _) in _pendingQueue.UnorderedItems)
+            {
+                if (entry.Descriptor is not { } d) continue;
+                if (!wanted.TryGetValue(entry.Record.Id, out var rec)) continue;
+                if (!ReferenceEquals(entry.Record, rec)) continue;
+                if (_reprioritized.TryGetValue(rec.Id, out var live) && entry.Epoch != live) continue;
+                descriptors.Add(d);
+            }
+        }
+
+        foreach (var record in toCancel)
         {
             record.Status = "Cancelled";
             record.CompletedUtc = DateTime.UtcNow;
             record.LastError = "Run cancelled by user";
             _cancelledJobIds.TryAdd(record.Id, true);
-            cancelled++;
         }
-        if (cancelled > 0)
-            _logger.LogInformation("[JobManager] Cancelled run {Run}: {Count} jobs", runName, cancelled);
-        return cancelled;
+
+        foreach (var d in descriptors)
+            NotifyStateWriter(w => w.Cancelled(d), "cancellation", $"{d.RunName}-{d.TaskId}");
+
+        _logger.LogInformation("[JobManager] Cancelled run {Run}: {Count} jobs", runName, toCancel.Count);
+        return toCancel.Count;
     }
 
     /// <summary>Remove a completed/failed/cancelled job from tracking.</summary>
@@ -373,41 +513,68 @@ public class JobManager : BackgroundService
 
     /// <summary>
     /// Change a queued job's priority. Updates the record immediately.
-    /// The PriorityQueue doesn't support re-ordering, so the job is cancelled
-    /// and re-enqueued with the new priority (preserving the original work function).
+    /// The PriorityQueue doesn't support re-ordering, so the job is re-enqueued at the new priority and
+    /// the superseded entry is retired by epoch when it reaches the front.
+    ///
+    /// Epochs, not the cancelled-id set, because that set is keyed by job id and cannot tell the two
+    /// entries apart: the previous implementation added the id, re-enqueued, then removed the id again
+    /// so the NEW entry would not be skipped — which left the OLD entry live as well, and the job ran
+    /// twice. <see cref="_reprioritized"/> is only populated when a job is actually reprioritized, so
+    /// the normal path costs one missing lookup and no memory.
     /// </summary>
     public bool ChangePriority(string jobId, int newPriority)
     {
         if (!_jobs.TryGetValue(jobId, out var record)) return false;
         if (record.Status != "Queued") return false;
 
-        // Find and remove the old entry by marking it cancelled, then re-enqueue
-        // with the new priority using a stored work reference
-        if (_pendingWork.TryRemove(jobId, out var work))
+        QueuedJob? superseded;
+        lock (_queueLock)
         {
-            _cancelledJobIds.TryAdd(jobId, true);
+            superseded = FindLiveEntry(record);
 
-            // Update the record's priority
-            record.Priority = newPriority;
-
-            // Re-enqueue with new priority
-            lock (_queueLock)
+            if (superseded == null)
             {
-                _pendingQueue.Enqueue(new QueuedJob(record, work), newPriority);
+                // Already dispatched from the queue — display-only update.
+                record.Priority = newPriority;
+                _logger.LogInformation("[JobManager] Priority updated (display only): {Name} → P{Priority}",
+                    record.Name, newPriority);
+                return true;
             }
-            _itemAvailable.Release();
 
-            // Remove from cancelled set so the re-queued entry won't be skipped
-            _cancelledJobIds.TryRemove(jobId, out _);
-
-            _logger.LogInformation("[JobManager] Reprioritized: {Name} → P{Priority}", record.Name, newPriority);
-            return true;
+            // Re-enqueue carries the same payload as the entry it supersedes — descriptor jobs stay
+            // descriptor jobs rather than being downgraded to a closure.
+            var epoch = _reprioritized.AddOrUpdate(jobId, 1, (_, e) => e + 1);
+            record.Priority = newPriority;
+            _pendingQueue.Enqueue(superseded with { Epoch = epoch }, newPriority);
         }
+        _itemAvailable.Release();
 
-        // Fallback: just update the record (work ref not found — already dispatched from queue)
-        record.Priority = newPriority;
-        _logger.LogInformation("[JobManager] Priority updated (display only): {Name} → P{Priority}", record.Name, newPriority);
+        // Persist outside the queue lock — the sink writes through to storage.
+        if (superseded.Descriptor is { } descriptor)
+            NotifyStateWriter(w => w.PriorityChanged(descriptor, newPriority), "priority change", record.Name);
+
+        _logger.LogInformation("[JobManager] Reprioritized: {Name} → P{Priority}", record.Name, newPriority);
         return true;
+    }
+
+    /// <summary>
+    /// Invoke the durability sink without letting a storage failure fail the operator's in-memory
+    /// action — the queue has already been reordered / the job already marked cancelled, and throwing
+    /// here would report failure for a change that did take effect in this process.
+    /// </summary>
+    private void NotifyStateWriter(Action<IJobDescriptorStateWriter> action, string what, string jobName)
+    {
+        var writer = _stateWriter;
+        if (writer == null) return;
+        try
+        {
+            action(writer);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[JobManager] Failed to persist {What} for {Name} — it will not survive a restart",
+                what, jobName);
+        }
     }
 
     /// <summary>Get detailed job list with queue wait times.</summary>
@@ -446,6 +613,28 @@ public class JobManager : BackgroundService
             .ToList();
     }
 
+    /// <summary>
+    /// Turn a descriptor into runnable work. Throws if no resolver is registered — a descriptor that
+    /// cannot be resolved must surface as a failed job, not a silently dropped one.
+    /// </summary>
+    private async Task<Func<CancellationToken, Task>?> ResolveWorkAsync(JobDescriptor descriptor, CancellationToken ct)
+    {
+        var resolver = _resolver
+            ?? throw new InvalidOperationException(
+                $"No JobWorkResolver registered — cannot dispatch descriptor {descriptor.RunName}/{descriptor.TaskId}");
+
+        return await resolver(descriptor, ct);
+    }
+
     // ── Internal Types ──
-    private sealed record QueuedJob(JobRecord Record, Func<CancellationToken, Task> Work);
+
+    /// <summary>
+    /// A queue entry carries EITHER an inline closure (simple scheduled scripts, post-execution) OR a
+    /// descriptor to rehydrate (orchestrator fan-out, which is where the depth actually comes from).
+    /// </summary>
+    private sealed record QueuedJob(JobRecord Record, Func<CancellationToken, Task>? Work, JobDescriptor? Descriptor)
+    {
+        /// <summary>Bumped by <see cref="ChangePriority"/>; entries below the live epoch are superseded.</summary>
+        public int Epoch { get; init; }
+    }
 }

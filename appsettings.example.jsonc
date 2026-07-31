@@ -77,8 +77,9 @@
     // Per-client fixed-window limiter. ENABLED BY DEFAULT (300 requests / 10s per client),
     // partitioned by the authenticated principal name (x-ms-client-principal-name), falling back to
     // the first X-Forwarded-For hop so anonymous callers behind the App Service load balancer aren't
-    // collapsed into a single bucket. Requests over the limit get HTTP 429. Set "Enabled": false to
-    // turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true can also force it on.
+    // collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
+    // Set "Enabled": false to turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true
+    // can also force it on.
     // "RateLimit": {
     //   "Enabled": true,
     //   "PermitPerWindow": 300,   // requests allowed per window, per client
@@ -292,7 +293,21 @@
       // 100% pool utilization — but the marker rides the periodic flush; terminal/run states stay durable).
       // "DurableRunningBarrier": true,
       // Status writer flush interval / barrier latency ceiling (ms). Default 25.
-      // "StatusFlushIntervalMs": 25
+      // "StatusFlushIntervalMs": 25,
+      // How long a task waits for its durable "Running" marker before deferring (seconds). Default 90.
+      // This wait sits between dispatch and worker checkout while holding a JobManager slot, so leaving it
+      // unbounded turns a stalled flush into a host-wide outage. On timeout the task is deferred and
+      // retried, never failed — the marker did not land, so storage still has it Pending.
+      // Must exceed StatusFlushTimeoutSeconds.
+      // "RunningBarrierTimeoutSeconds": 90,
+      // Ceiling on a single flush of coalesced status writes (seconds). Default 30. The drain loop is one
+      // loop: an unbounded storage call inside a flush stops every status write in the process. Writes
+      // that do not complete are requeued and retried, so a timeout never loses one.
+      // "StatusFlushTimeoutSeconds": 30,
+      // Per-run status writes in flight within one flush. Default 8. Writes group by run (a batch must
+      // share a partition key), so a workload of many single-task runs — e.g. one run per tenant — would
+      // otherwise serialize into hundreds of round-trips per flush. 1 = original sequential behaviour.
+      // "StatusFlushConcurrency": 8
     },
 
     "Cache": {
@@ -379,10 +394,13 @@
     //   // shown below — a CSP is emitted secure-by-default even if you don't set this. Override to
     //   // tighten it, or set to "" to disable. Note: HSTS / X-Content-Type-Options / X-Frame-Options
     //   // are intentionally NOT emitted here — they are left to the edge (Azure front end) / hosted app.
-    //   // Keep 'self' in default-src if you override this: it is what allows the app's own same-origin
-    //   // fetches when it is reached over http (TLS-terminating proxy, self-hosted, local docker).
-    //   // Dropping it leaves the policy scheme-gated on https: and every same-origin XHR is blocked.
-    //   "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; object-src 'self' blob:; img-src 'self' blob: data: *",
+    //   // Keep 'self' in default-src AND connect-src if you override this: it is what allows the app's
+    //   // own same-origin fetches when it is reached over http (TLS-terminating proxy, self-hosted,
+    //   // local docker). Dropping it leaves the policy scheme-gated on https: and every same-origin
+    //   // XHR is blocked. Keep data: in connect-src too: wasm inlined as a data: URL (Emscripten
+    //   // SINGLE_FILE, e.g. yoga-layout under @react-pdf/renderer) is fetched, not scripted, so it is
+    //   // connect-src that gates it — and keeping it out of default-src keeps it out of script-src.
+    //   "ContentSecurityPolicy": "default-src 'self' https: blob: 'unsafe-eval' 'unsafe-inline'; connect-src 'self' https: blob: data:; object-src 'self' blob:; img-src 'self' blob: data: *",
     //   // Compress static responses. Default true: serve precompressed .br/.gz siblings + on-the-fly
     //   // fallback. Set false to serve everything raw/identity (no .br/.gz served, no on-the-fly) — e.g.
     //   // when an upstream CDN (Cloudflare) already compresses, the content doesn't benefit, or for

@@ -32,6 +32,34 @@ public class OrchestratorSettings
     public int StatusFlushIntervalMs { get; set; } = 25;
 
     /// <summary>
+    /// How long a task will wait for its durable "Running" marker before giving up (seconds, default 90).
+    ///
+    /// This wait sits between the JobManager dispatching a task and that task checking out a worker, so
+    /// an unbounded one is a whole-host outage: production wedged for 101 and 75 minutes with all 8
+    /// limiter slots held by tasks blocked here, every BG worker idle, and the heap at 24% of its cap.
+    /// On timeout the task is deferred, NOT failed — the marker never landed, so storage still has it
+    /// Pending and it is retried. Must exceed <see cref="StatusFlushTimeoutSeconds"/>, since a waiter
+    /// may need the in-flight flush to finish plus one more.
+    /// </summary>
+    public int RunningBarrierTimeoutSeconds { get; set; } = 90;
+
+    /// <summary>
+    /// Ceiling on one flush of coalesced status writes (seconds, default 30). The drain loop is a single
+    /// loop, so an unbounded storage call inside a flush stops every status write and every barrier
+    /// waiter in the process. Writes that do not complete are put back and retried on the next flush.
+    /// </summary>
+    public int StatusFlushTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// How many per-run status writes may be in flight within one flush (default 8).
+    ///
+    /// Writes are grouped by run because a batch must share a partition key. The workload that broke
+    /// this was ~600 runs of ONE task each (one per tenant), which turned a "batch" into hundreds of
+    /// sequential round-trips inside a single flush. 1 restores the old sequential behaviour.
+    /// </summary>
+    public int StatusFlushConcurrency { get; set; } = 8;
+
+    /// <summary>
     /// PowerShell function used to execute individual orchestrator tasks.
     /// Receives a hashtable with task parameters.
     /// </summary>

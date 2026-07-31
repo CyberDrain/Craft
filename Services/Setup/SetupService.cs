@@ -165,7 +165,8 @@ public class SetupService
     // ── App Registration Creation ──
 
     /// <summary>
-    /// Creates (or updates) the EasyAuth app registration with a client secret.
+    /// Creates a new EasyAuth app registration with a client secret. Existing
+    /// registrations in the tenant are never searched for or reused.
     /// Handles app management policy exemption if the tenant blocks password creation.
     /// </summary>
     public async Task<AppRegistrationResult> CreateAuthAppRegistration(
@@ -180,67 +181,40 @@ public class SetupService
         var appDisplayName = ResolveAuthAppDisplayName();
         var callbackUri = redirectUri.TrimEnd('/') + "/.auth/login/aad/callback";
 
-        // 1. Check for existing app
-        var existingApp = await FindExistingApp(accessToken, appDisplayName, ct);
+        // 1. Create a new app registration — existing apps are never reused, so we
+        // only ever add a secret to a registration this run just created.
+        _logger.LogInformation("[Setup] Creating new app registration: {Name}", appDisplayName);
 
-        string appObjectId;
-        string appId;
-
-        if (existingApp != null)
+        var createBody = new
         {
-            appObjectId = existingApp.Value.GetProperty("id").GetString()!;
-            appId = existingApp.Value.GetProperty("appId").GetString()!;
-            _logger.LogInformation("[Setup] Found existing app registration: {AppId}", appId);
-
-            // Update redirect URIs
-            var patchBody = new
+            displayName = appDisplayName,
+            signInAudience = multiTenant ? "AzureADMultipleOrgs" : "AzureADMyOrg",
+            web = new
             {
-                web = new
-                {
-                    redirectUris = new[] { callbackUri },
-                    implicitGrantSettings = new { enableIdTokenIssuance = true }
-                }
-            };
-            await GraphRequest(HttpMethod.Patch,
-                $"https://graph.microsoft.com/v1.0/applications/{appObjectId}",
-                accessToken, patchBody, ct);
-        }
-        else
-        {
-            // 2. Create new app registration
-            _logger.LogInformation("[Setup] Creating new app registration: {Name}", appDisplayName);
+                redirectUris = new[] { callbackUri },
+                implicitGrantSettings = new { enableIdTokenIssuance = true }
+            }
+        };
 
-            var createBody = new
-            {
-                displayName = appDisplayName,
-                signInAudience = multiTenant ? "AzureADMultipleOrgs" : "AzureADMyOrg",
-                web = new
-                {
-                    redirectUris = new[] { callbackUri },
-                    implicitGrantSettings = new { enableIdTokenIssuance = true }
-                }
-            };
+        var createResponse = await GraphRequest(HttpMethod.Post,
+            "https://graph.microsoft.com/v1.0/applications",
+            accessToken, createBody, ct);
 
-            var createResponse = await GraphRequest(HttpMethod.Post,
-                "https://graph.microsoft.com/v1.0/applications",
-                accessToken, createBody, ct);
+        var appObjectId = createResponse.GetProperty("id").GetString()!;
+        var appId = createResponse.GetProperty("appId").GetString()!;
 
-            appObjectId = createResponse.GetProperty("id").GetString()!;
-            appId = createResponse.GetProperty("appId").GetString()!;
+        _logger.LogInformation("[Setup] Created app registration: {AppId} (objectId: {ObjId})", appId, appObjectId);
 
-            _logger.LogInformation("[Setup] Created app registration: {AppId} (objectId: {ObjId})", appId, appObjectId);
+        // 2. Create service principal
+        await CreateServicePrincipalSafe(accessToken, appId, ct);
 
-            // 3. Create service principal
-            await CreateServicePrincipalSafe(accessToken, appId, ct);
+        // Wait briefly for replication
+        await Task.Delay(2000, ct);
 
-            // Wait briefly for replication
-            await Task.Delay(2000, ct);
-        }
-
-        // 4. Handle app management policy exemption (must happen before addPassword)
+        // 3. Handle app management policy exemption (must happen before addPassword)
         await EnsurePolicyExemption(accessToken, appId, appObjectId, ct);
 
-        // 5. Create client secret with retry logic
+        // 4. Create client secret with retry logic
         var secret = await CreateAppSecretWithRetry(accessToken, appObjectId, appDisplayName, ct);
 
         _logger.LogInformation("[Setup] App registration complete: {AppId}", appId);
@@ -935,19 +909,6 @@ public class SetupService
         var body = new System.Text.Json.Nodes.JsonObject { ["properties"] = propsNode };
         await ArmRequest(HttpMethod.Put, uri, token, body, ct);
         return true;
-    }
-
-    private static async Task<JsonElement?> FindExistingApp(string accessToken, string displayName, CancellationToken ct)
-    {
-        var encodedName = Uri.EscapeDataString(displayName);
-        var result = await GraphRequestSafe(HttpMethod.Get,
-            $"https://graph.microsoft.com/v1.0/applications?$filter=displayName eq '{encodedName}'",
-            accessToken, ct: ct);
-
-        if (result == null) return null;
-
-        var values = result.Value.GetProperty("value").EnumerateArray().ToList();
-        return values.Count > 0 ? values[^1] : null;
     }
 
     private async Task CreateServicePrincipalSafe(string accessToken, string appId, CancellationToken ct)
