@@ -180,6 +180,20 @@
       // Module directory names to skip during import
       // "SkipModules": [],
 
+      // Minimum .NET thread-pool threads. 0 (default) = derive from the pool sizes:
+      // max(cores*4, 32, HttpPoolSize + BgPoolSize + 16).
+      //
+      // PowerShell has no async story — every outbound call a script makes blocks a thread for the
+      // whole round trip, so N workers can park N threads at once. Above this minimum the CLR injects
+      // threads at roughly ONE PER SECOND, so a worker pool larger than the minimum cannot reach its
+      // own concurrency until that ramp finishes, and pays it again on every restart.
+      // Measured on 1 core with a fixed floor of 32: a pool of 48 served 5.5 req/s over a 15s window
+      // and 120 req/s over 60s — same config, the ramp just fell in a different place.
+      //
+      // Leave at 0 unless you have measured your workload. Env: CRAFT_MIN_THREADS.
+      // (DOTNET_ThreadPool_MinThreads does NOT work — the host overwrites it at startup.)
+      // "MinThreads": 0,
+
       // JSON files preloaded into PowerShell variables at startup
       // "JsonPreloads": [{ "File": "Config/perms.json", "Variable": "Permissions", "Scope": "global", "AsHashtable": true }]
     },
@@ -236,6 +250,41 @@
     //   // Minutes a pooled storage connection is reused before recycling (DNS/SNAT hygiene). Default 30.
     //   // Set to 0 or a negative value to disable recycling. Env: CRAFT_STORAGE_POOLED_CONNECTION_LIFETIME_MINUTES.
     //   "PooledConnectionLifetimeMinutes": 30
+    // },
+
+    // ── Native C# endpoints ──
+    // Endpoints written in C# rather than PowerShell, dispatched alongside them. Off unless you name
+    // the assemblies to scan, and costs nothing when off.
+    //
+    // NOT primarily a latency feature. Measured on one core at 40 req/s, a PowerShell endpoint that
+    // returns a constant costs 3.19ms median against 2.33ms for a C# one on the same host — so
+    // PowerShell dispatch is ~0.86ms and the rest is Kestrel, middleware and the container network,
+    // which this does not change. It is for the two things PowerShell cannot do: await (a PS endpoint
+    // holds a runspace AND a thread for every outbound call, which is why throughput follows
+    // HttpPoolSize / upstream_rtt), and stream (a PS endpoint returning a large result materialises it
+    // per concurrent caller — one measured 648 MiB of RSS at 8 concurrent).
+    //
+    // A native route is mapped at its literal path, and a literal route outranks the PowerShell
+    // catch-all, so endpoints migrate ONE AT A TIME with the PowerShell function still loaded as the
+    // rollback.
+    // "Endpoints": {
+    //   "Enabled": false,
+    //   // Absolute, or relative to the API base path.
+    //   "Assemblies": ["bin/MyApp.Endpoints.dll"],
+    //   // PreferNative (default) | PreferPowerShell | Fail
+    //   // Fail is the safer setting for CI, where a route shadow should be caught before it ships.
+    //   // PreferNative is the default because on a config-driven runtime a hard startup failure turns
+    //   // an accidental shadow into a failed rolling deploy.
+    //   "OnCollision": "PreferNative",
+    //   // In-flight request limits. Distinct from RateLimit, which is per-client; these bound TOTAL
+    //   // simultaneous work. Matters most with Worker:HttpPoolSize=0, where there is no runspace pool
+    //   // to act as the implicit cap. 0 = unbounded.
+    //   "MaxConcurrency": 0,
+    //   // Per-route overrides, keyed by route. Overrides the endpoint's own declaration; set 0 to
+    //   // remove a limit an endpoint declared.
+    //   "Concurrency": { "MyBigDownload": 4 },
+    //   // Seconds a request waits for a slot before being shed with 503. 0 = each endpoint's own.
+    //   "QueueTimeoutSeconds": 0
     // },
 
     // "Setup": {

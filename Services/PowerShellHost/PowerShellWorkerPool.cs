@@ -42,10 +42,16 @@ public class PowerShellWorkerPool : IDisposable
         _settings = settings;
         _apiBasePath = Path.Combine(AppContext.BaseDirectory, "API");
 
-        _httpPoolSize = Math.Max(1, settings.Worker.HttpPoolSize);
+        // 0 is meaningful and must survive: it means "this node hosts no PowerShell over HTTP", which is
+        // how an app whose endpoints are all native runs without paying for runspaces nothing dispatches
+        // to. Clamping it to 1 would build a worker, load every module into it, and hold the memory for
+        // the process lifetime. Anything below 0 is a typo, not an intent.
+        _httpPoolSize = Math.Max(0, settings.Worker.HttpPoolSize);
         _bgPoolSize = Math.Max(1, settings.Worker.BgPoolSize);
 
-        _httpPool = new BlockingCollection<PowerShellWorker>(_httpPoolSize);
+        // BlockingCollection rejects a bounded capacity of 0. The pool is never populated in that case,
+        // so the capacity is arbitrary — it just has to be legal.
+        _httpPool = new BlockingCollection<PowerShellWorker>(Math.Max(1, _httpPoolSize));
         _bgPool = new BlockingCollection<PowerShellWorker>(_bgPoolSize);
     }
 
@@ -60,7 +66,14 @@ public class PowerShellWorkerPool : IDisposable
         if (!enableHttp && !enableBg)
         {
             _httpReady.Set(); _ready.Set(); _bgReady.Set();
-            _logger.LogWarning("[System] Pool.Initialize called with no pools enabled — nothing to do");
+
+            // A deliberate opt-out, not a misconfiguration: an app serving only native endpoints has
+            // no PowerShell to host. Every other route to "no pools" is a role mistake and stays a
+            // warning, because it means this node will accept requests it cannot serve.
+            if (_httpPoolSize == 0)
+                _logger.LogInformation("[System] No PowerShell pools (Worker:HttpPoolSize=0) — native endpoints only");
+            else
+                _logger.LogWarning("[System] Pool.Initialize called with no pools enabled — nothing to do");
             return;
         }
 
@@ -305,7 +318,8 @@ public class PowerShellWorkerPool : IDisposable
             // doesn't block on a pool this node never populates.
             _httpReady.Set();
             _ready.Set();
-            _logger.LogInformation("[System] HTTP pool disabled (no Http role) — no HTTP workers created");
+            _logger.LogInformation("[System] HTTP pool disabled ({Reason}) — no HTTP workers created",
+                _httpPoolSize == 0 ? "Worker:HttpPoolSize=0" : "no Http role");
         }
 
         if (enableBg && enableHttp)

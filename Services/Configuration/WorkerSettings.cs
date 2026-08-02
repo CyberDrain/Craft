@@ -5,7 +5,16 @@ namespace Craft.Configuration;
 /// </summary>
 public class WorkerSettings
 {
-    /// <summary>Number of workers reserved for HTTP request handling.</summary>
+    /// <summary>
+    /// Number of workers reserved for HTTP request handling.
+    ///
+    /// <para>
+    /// <b>0 means no PowerShell HTTP hosting at all</b> — for an application whose HTTP endpoints are
+    /// all native C#. The pool is then never built, so the node pays neither runspace construction at
+    /// startup nor their resident memory, and readiness is signalled immediately so the startup gate
+    /// does not wait for a pool that will never exist.
+    /// </para>
+    /// </summary>
     public int HttpPoolSize { get; set; } = 2;
 
     /// <summary>Number of workers reserved for background jobs (scheduler, orchestrator, queue).</summary>
@@ -25,6 +34,32 @@ public class WorkerSettings
     /// that want to opt out of host-tier scaling.
     /// </summary>
     public bool IgnoreSkuProfiles { get; set; }
+
+    /// <summary>
+    /// Minimum .NET thread-pool worker/completion threads. <b>0 (default) = derive from the pool
+    /// sizes</b>, which is almost always what you want; set a number only to pin it.
+    ///
+    /// <para>
+    /// This matters far more than it looks. PowerShell has no async story, so every outbound call a
+    /// script makes — <c>Invoke-RestMethod</c>, or any <c>.GetAwaiter().GetResult()</c> against an
+    /// HttpClient — blocks a thread for the whole round trip. A pool of N workers can therefore have
+    /// N threads parked at once. Above the thread-pool minimum the CLR injects new threads at roughly
+    /// <b>one per second</b>, so a worker pool larger than the minimum cannot actually reach its own
+    /// concurrency until that ramp finishes.
+    /// </para>
+    ///
+    /// <para>
+    /// Measured on a 1-core container with the old fixed floor of 32: a pool of 48 served 5.5 req/s
+    /// with a 17.5s p95 over a 15-second window, and 120 req/s with a 0.8s p95 over 60 seconds —
+    /// same configuration, the difference being only whether the injection ramp fell inside the
+    /// measurement. In production that ramp is a real cold-start cost on every restart.
+    /// </para>
+    ///
+    /// Env override: <c>CRAFT_MIN_THREADS</c>. Note that the .NET
+    /// <c>DOTNET_ThreadPool_MinThreads</c> variable does NOT work here — the host calls
+    /// <c>ThreadPool.SetMinThreads</c> at startup, which overwrites it.
+    /// </summary>
+    public int MinThreads { get; set; }
 
     /// <summary>
     /// Maximum execution time in seconds for a single HTTP request handler.

@@ -42,6 +42,38 @@ public static class CraftHostBuilderExtensions
     }
 
     /// <summary>
+    /// Resolves the .NET thread-pool minimum: an explicit <c>Worker:MinThreads</c> (or
+    /// <c>CRAFT_MIN_THREADS</c>) wins, otherwise it is derived from the worker pools.
+    /// </summary>
+    /// <remarks>
+    /// The derived floor is <c>HttpPoolSize + BgPoolSize + 16</c>, never below the old
+    /// <c>max(ProcessorCount * 4, 32)</c>.
+    /// <para>
+    /// The pool term is the important part. PowerShell blocks a thread for the duration of every
+    /// outbound call it makes, so a pool of N workers can park N threads simultaneously; if the
+    /// thread-pool minimum is below that, the CLR has to inject the difference at about one thread
+    /// per second before the pool can reach its own concurrency. Sizing the minimum off cores alone
+    /// — as this did — meant a 1-core container floored at 32 and any pool above that paid the ramp
+    /// on every restart.
+    /// </para>
+    /// The +16 is headroom for the runtime's own work (Kestrel, timers, the storage SDK) so those do
+    /// not have to contend with parked PowerShell threads for the same minimum.
+    /// </remarks>
+    public static int ResolveMinThreads(CraftSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        if (int.TryParse(Environment.GetEnvironmentVariable("CRAFT_MIN_THREADS"), out var fromEnv) && fromEnv > 0)
+            return fromEnv;
+
+        if (settings.Worker.MinThreads > 0) return settings.Worker.MinThreads;
+
+        var baseline = Math.Max(Environment.ProcessorCount * 4, 32);
+        var forPools = settings.Worker.HttpPoolSize + settings.Worker.BgPoolSize + 16;
+        return Math.Max(baseline, forPools);
+    }
+
+    /// <summary>
     /// Kestrel limits: request timeouts, HTTP/2 tuning, and the DoS-relevant caps (body size,
     /// connection count, slow-loris minimum data rates). The caps apply regardless of the timeout.
     /// </summary>
