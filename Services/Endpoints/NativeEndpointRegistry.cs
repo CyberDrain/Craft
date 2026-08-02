@@ -10,8 +10,27 @@ public sealed record NativeEndpointDescriptor(
     CraftEndpointAttribute Metadata);
 
 /// <summary>
-/// Finds native endpoints in the assemblies an application names, and decides what happens when one
-/// collides with a PowerShell route.
+/// Everything the configured assemblies contribute to the host: HTTP endpoints, at most one central
+/// handler, scheduled tasks, and the successfully-scanned assemblies themselves (service modules are
+/// discovered per assembly, so an assembly shipping only a handler or only tasks still gets its DI
+/// registrations).
+/// </summary>
+public sealed record NativeEndpointCatalog(
+    IReadOnlyList<NativeEndpointDescriptor> Endpoints,
+    Type? HandlerType,
+    IReadOnlyList<NativeTaskDescriptor> ScheduledTasks,
+    IReadOnlyList<Assembly> Assemblies)
+{
+    /// <summary>The catalog of a deployment that configured nothing.</summary>
+    public static NativeEndpointCatalog Empty { get; } = new([], null, [], []);
+
+    public bool IsEmpty =>
+        Endpoints.Count == 0 && HandlerType is null && ScheduledTasks.Count == 0;
+}
+
+/// <summary>
+/// Finds native endpoints, the central handler and scheduled tasks in the assemblies an application
+/// names, and decides what happens when an endpoint collides with a PowerShell route.
 ///
 /// <para>
 /// Assemblies load into the DEFAULT load context deliberately, and there is no
@@ -28,18 +47,21 @@ public sealed record NativeEndpointDescriptor(
 public static class NativeEndpointRegistry
 {
     /// <summary>
-    /// Loads the configured assemblies and returns every endpoint found in them.
+    /// Loads the configured assemblies and returns everything found in them.
     /// </summary>
     /// <param name="apiBasePath">Base directory relative paths in configuration resolve against.</param>
-    public static IReadOnlyList<NativeEndpointDescriptor> Discover(
+    public static NativeEndpointCatalog Discover(
         EndpointSettings settings, string apiBasePath, ILogger logger)
     {
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(logger);
 
-        if (!settings.Enabled || settings.Assemblies.Count == 0) return [];
+        if (!settings.Enabled || settings.Assemblies.Count == 0) return NativeEndpointCatalog.Empty;
 
-        var found = new List<NativeEndpointDescriptor>();
+        var endpoints = new List<NativeEndpointDescriptor>();
+        var handlerCandidates = new List<Type>();
+        var taskCandidates = new List<Type>();
+        var assemblies = new List<Assembly>();
         var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var entry in settings.Assemblies)
@@ -61,28 +83,42 @@ public static class NativeEndpointRegistry
             try
             {
                 var assembly = Assembly.LoadFrom(path);
-                var count = 0;
+                var endpointCount = 0;
+                var taskCount = 0;
 
                 foreach (var type in assembly.GetTypes())
                 {
                     if (type.IsAbstract || type.IsInterface) continue;
-                    if (!typeof(ICraftEndpoint).IsAssignableFrom(type)) continue;
 
-                    var metadata = type.GetCustomAttribute<CraftEndpointAttribute>();
-                    if (metadata is null)
+                    if (typeof(ICraftEndpoint).IsAssignableFrom(type))
                     {
-                        logger.LogWarning(
-                            "[Endpoints] {Type} implements ICraftEndpoint but has no [CraftEndpoint] " +
-                            "attribute, so it has no route and was skipped.", type.FullName);
-                        continue;
+                        var metadata = type.GetCustomAttribute<CraftEndpointAttribute>();
+                        if (metadata is null)
+                        {
+                            logger.LogWarning(
+                                "[Endpoints] {Type} implements ICraftEndpoint but has no [CraftEndpoint] " +
+                                "attribute, so it has no route and was skipped.", type.FullName);
+                            continue;
+                        }
+
+                        endpoints.Add(new NativeEndpointDescriptor(metadata.Route, type, metadata));
+                        endpointCount++;
                     }
 
-                    found.Add(new NativeEndpointDescriptor(metadata.Route, type, metadata));
-                    count++;
+                    if (typeof(ICraftEndpointHandler).IsAssignableFrom(type))
+                        handlerCandidates.Add(type);
+
+                    if (typeof(ICraftScheduledTask).IsAssignableFrom(type))
+                    {
+                        taskCandidates.Add(type);
+                        taskCount++;
+                    }
                 }
 
-                logger.LogInformation("[Endpoints] {Assembly}: {Count} native endpoint(s)",
-                    Path.GetFileName(path), count);
+                assemblies.Add(assembly);
+                logger.LogInformation(
+                    "[Endpoints] {Assembly}: {Count} native endpoint(s), {Tasks} scheduled task(s)",
+                    Path.GetFileName(path), endpointCount, taskCount);
             }
             catch (ReflectionTypeLoadException ex)
             {
@@ -98,33 +134,113 @@ public static class NativeEndpointRegistry
             }
         }
 
-        return found;
+        return new NativeEndpointCatalog(
+            endpoints,
+            SelectHandler(handlerCandidates),
+            BuildScheduledTasks(taskCandidates, logger),
+            assemblies);
     }
 
     /// <summary>
-    /// Registers discovered endpoints (and any application service modules in the same assemblies)
-    /// with the container.
+    /// Picks the application's central handler, or null when it ships none.
+    /// </summary>
+    /// <remarks>
+    /// Two handlers is a startup failure, not a policy choice: which one authorized requests would
+    /// come down to assembly scan order, and unlike a route collision there is no "shadowed" log
+    /// line a reader could notice — the losing handler would simply never run.
+    /// </remarks>
+    internal static Type? SelectHandler(IReadOnlyList<Type> candidates)
+    {
+        if (candidates.Count > 1)
+        {
+            throw new InvalidOperationException(
+                "Multiple ICraftEndpointHandler implementations found: " +
+                string.Join(", ", candidates.Select(t => t.FullName)) +
+                ". CRAFT dispatches every Central endpoint through ONE central handler; " +
+                "which of these ran would depend on assembly scan order. Keep one.");
+        }
+
+        return candidates.Count == 1 ? candidates[0] : null;
+    }
+
+    /// <summary>
+    /// Builds descriptors for the discovered scheduled tasks, skipping (with a log line) classes
+    /// that implement the interface but never named their Command.
+    /// </summary>
+    internal static IReadOnlyList<NativeTaskDescriptor> BuildScheduledTasks(
+        IReadOnlyList<Type> candidates, ILogger logger)
+    {
+        var tasks = new List<NativeTaskDescriptor>();
+        var commands = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var type in candidates)
+        {
+            var metadata = type.GetCustomAttribute<CraftScheduledTaskAttribute>();
+            if (metadata is null)
+            {
+                logger.LogWarning(
+                    "[Endpoints] {Type} implements ICraftScheduledTask but has no [CraftScheduledTask] " +
+                    "attribute, so no timer Command can reach it and it was skipped.", type.FullName);
+                continue;
+            }
+
+            if (!commands.Add(metadata.Command))
+            {
+                // Same reasoning as duplicate routes: which implementation a timer fired would be
+                // assembly scan order, and there is no rollback story that explains that.
+                throw new InvalidOperationException(
+                    $"Duplicate native scheduled task Command '{metadata.Command}' " +
+                    $"(declared again by {type.FullName}). Two [CraftScheduledTask] types answer " +
+                    "to the same timer Command; rename one.");
+            }
+
+            tasks.Add(new NativeTaskDescriptor(metadata.Command, type, metadata));
+        }
+
+        return tasks;
+    }
+
+    /// <summary>
+    /// Registers the catalog with the container: endpoint and task types at their declared
+    /// lifetimes, the central handler, the scheduler's task lookup, and any application service
+    /// modules found in the scanned assemblies.
     /// </summary>
     public static IServiceCollection AddNativeEndpoints(
         this IServiceCollection services,
-        IReadOnlyList<NativeEndpointDescriptor> endpoints,
+        NativeEndpointCatalog catalog,
         IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(services);
-        ArgumentNullException.ThrowIfNull(endpoints);
+        ArgumentNullException.ThrowIfNull(catalog);
 
-        var modulesDone = new HashSet<Assembly>();
-
-        foreach (var endpoint in endpoints)
+        foreach (var endpoint in catalog.Endpoints)
         {
             services.Add(new ServiceDescriptor(
                 endpoint.ImplementationType, endpoint.ImplementationType, endpoint.Metadata.Lifetime));
+        }
 
-            // An application hosted as a plugin has no Program.cs of its own, so this is its only
-            // opportunity to register the services its endpoints inject.
-            var assembly = endpoint.ImplementationType.Assembly;
-            if (!modulesDone.Add(assembly)) continue;
+        if (catalog.HandlerType is not null)
+        {
+            // Singleton like the endpoints it wraps: hold caches and pooled clients in fields.
+            services.AddSingleton(typeof(ICraftEndpointHandler), catalog.HandlerType);
+        }
 
+        foreach (var task in catalog.ScheduledTasks)
+        {
+            services.Add(new ServiceDescriptor(
+                task.ImplementationType, task.ImplementationType, task.Metadata.Lifetime));
+        }
+
+        // Replaces the Empty instance the host registered — last registration wins on resolve —
+        // so SchedulerService sees the discovered set without a conditional in its constructor.
+        if (catalog.ScheduledTasks.Count > 0)
+            services.AddSingleton(new NativeScheduledTasks(catalog.ScheduledTasks));
+
+        // An application hosted as a plugin has no Program.cs of its own, so this is its only
+        // opportunity to register the services its endpoints and tasks inject. Scanned per assembly
+        // rather than per endpoint: an assembly shipping only the handler or only tasks still counts.
+        foreach (var assembly in catalog.Assemblies)
+        {
             foreach (var type in assembly.GetTypes())
             {
                 if (type.IsAbstract || !typeof(ICraftServiceModule).IsAssignableFrom(type)) continue;

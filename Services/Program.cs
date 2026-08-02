@@ -63,17 +63,18 @@ builder.ConfigureCraftKestrel(craftSettings);
 var configuredLogLevel = builder.AddCraftLogging();
 
 builder.Services.AddCraftResponseCompression();
-// ── Native C# endpoints ────────────────────────────────────────────────────────────────────────────
-// Discovered before the container is built so the endpoint types and any application service module
-// they ship can be registered into it. Costs nothing when no assemblies are configured.
-var nativeEndpoints = NativeEndpointRegistry.Discover(
+// ── Native C# endpoints and scheduled tasks ────────────────────────────────────────────────────────
+// Discovered before the container is built so the endpoint/task types, the central handler and any
+// application service module they ship can be registered into it. Costs nothing when no assemblies
+// are configured.
+var nativeCatalog = NativeEndpointRegistry.Discover(
     craftSettings.Endpoints,
     Path.Combine(AppContext.BaseDirectory, "API"),
     LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Craft.Endpoints"));
 
 builder.Services.AddCraftServices(roles);
-if (nativeEndpoints.Count > 0)
-    builder.Services.AddNativeEndpoints(nativeEndpoints, builder.Configuration);
+if (!nativeCatalog.IsEmpty)
+    builder.Services.AddNativeEndpoints(nativeCatalog, builder.Configuration);
 builder.Services.AddCraftRateLimiter(craftSettings);
 
 var app = builder.Build();
@@ -186,7 +187,14 @@ void RunInitialization()
     if (capHttp && !enableHttpPool)
         logger.LogInformation("[System] HTTP worker pool disabled (Worker:HttpPoolSize=0) — PowerShell HTTP endpoints are not hosted");
 
-    pool.Initialize(enableHttp: enableHttpPool, enableBg: capBackground);
+    // BgPoolSize = 0 is the same opt-out for the background side: the app's scheduled work is all
+    // native tasks, which run on the .NET thread pool, so BG runspaces would never be checked out.
+    // The disabled pool signals its ready event immediately, so the scheduler still starts.
+    var enableBgPool = capBackground && CraftSettings.Worker.BgPoolSize > 0;
+    if (capBackground && !enableBgPool)
+        logger.LogInformation("[System] BG worker pool disabled (Worker:BgPoolSize=0) — native scheduled tasks only");
+
+    pool.Initialize(enableHttp: enableHttpPool, enableBg: enableBgPool);
 
     // Pool is ready — clear the restart counter so we don't carry stale crash state
     healthMonitor.ClearRestartCounter();
@@ -397,10 +405,10 @@ if (capHttp)
     // Native C# endpoints. Mapped before the PowerShell dispatcher, though ASP.NET route precedence
     // would put a literal segment ahead of /API/{endpoint} regardless — which is what lets an app
     // migrate one endpoint at a time with the PowerShell function still loaded as the rollback.
-    if (nativeEndpoints.Count > 0)
+    if (nativeCatalog.Endpoints.Count > 0)
     {
         var mappable = NativeEndpointRegistry.ResolveCollisions(
-            nativeEndpoints, endpoints.Keys, CraftSettings.Endpoints.OnCollision, logger);
+            nativeCatalog.Endpoints, endpoints.Keys, CraftSettings.Endpoints.OnCollision, logger);
         app.MapCraftNativeEndpoints(mappable, activeRequests, logger, CraftSettings.Endpoints);
     }
 

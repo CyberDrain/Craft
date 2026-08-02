@@ -31,7 +31,12 @@ public class NativeEndpointDiscoveryTests
     public void DisabledByDefault()
     {
         // A deployment that configures nothing must pay nothing — no assembly loading, no reflection.
-        Assert.Empty(NativeEndpointRegistry.Discover(Off, AppContext.BaseDirectory, NullLogger.Instance));
+        var catalog = NativeEndpointRegistry.Discover(Off, AppContext.BaseDirectory, NullLogger.Instance);
+
+        Assert.True(catalog.IsEmpty);
+        Assert.Empty(catalog.Endpoints);
+        Assert.Null(catalog.HandlerType);
+        Assert.Empty(catalog.ScheduledTasks);
     }
 
     [Fact]
@@ -39,7 +44,8 @@ public class NativeEndpointDiscoveryTests
     {
         var settings = new EndpointSettings { Enabled = true };
 
-        Assert.Empty(NativeEndpointRegistry.Discover(settings, AppContext.BaseDirectory, NullLogger.Instance));
+        Assert.True(NativeEndpointRegistry.Discover(
+            settings, AppContext.BaseDirectory, NullLogger.Instance).IsEmpty);
     }
 
     [Fact]
@@ -49,7 +55,8 @@ public class NativeEndpointDiscoveryTests
         // the log names the path. Throwing here would turn one bad setting into a failed deploy.
         var settings = new EndpointSettings { Enabled = true, Assemblies = ["does-not-exist.dll"] };
 
-        Assert.Empty(NativeEndpointRegistry.Discover(settings, AppContext.BaseDirectory, NullLogger.Instance));
+        Assert.True(NativeEndpointRegistry.Discover(
+            settings, AppContext.BaseDirectory, NullLogger.Instance).IsEmpty);
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using Craft.Configuration;
+using Craft.Endpoints;
 using Craft.PowerShellHost;
 using Craft.Services;
 using Craft.Storage;
@@ -22,6 +23,8 @@ public class SchedulerService : BackgroundService
     private readonly CraftSettings _settings;
     private readonly PowerShellWorkerPool _pool;
     private readonly StorageHealthMonitor _storageHealth;
+    private readonly NativeScheduledTasks _nativeTasks;
+    private readonly IServiceProvider _services;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
     private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
@@ -37,7 +40,9 @@ public class SchedulerService : BackgroundService
         JobManager jobManager,
         CraftSettings settings,
         PowerShellWorkerPool pool,
-        StorageHealthMonitor storageHealth)
+        StorageHealthMonitor storageHealth,
+        NativeScheduledTasks nativeTasks,
+        IServiceProvider services)
     {
         _logger = logger;
         _psRunner = psRunner;
@@ -47,6 +52,8 @@ public class SchedulerService : BackgroundService
         _settings = settings;
         _pool = pool;
         _storageHealth = storageHealth;
+        _nativeTasks = nativeTasks;
+        _services = services;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -105,7 +112,23 @@ public class SchedulerService : BackgroundService
                         _logger.LogInformation("[Scheduler] Firing: {Command}", task.Command);
                         _lastRun[task.Id] = now;
 
-                        if (task.IsOrchestrator)
+                        if (_nativeTasks.TryGet(task.Command, out var native))
+                        {
+                            if (task.IsOrchestrator)
+                            {
+                                // Also reported once at load; repeated here because LoadConfig's
+                                // report is easy to scroll past and this timer will otherwise look
+                                // like it silently never runs.
+                                _logger.LogWarning(
+                                    "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — skipped",
+                                    task.Command);
+                            }
+                            else
+                            {
+                                EnqueueNativeTask(task, native, now);
+                            }
+                        }
+                        else if (task.IsOrchestrator)
                         {
                             // Fan-out/fan-in: planner = Command, task script derived from Command
                             // Convention: strip "Start-" prefix → "Invoke-{rest}Task"
@@ -160,6 +183,48 @@ public class SchedulerService : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Enqueues one firing of a native task through the same JobManager the PowerShell path uses, so
+    /// priority ordering, job records and the background concurrency limiter apply identically. The
+    /// delegate runs on the .NET thread pool — no runspace is involved, which is what makes
+    /// <c>Worker:BgPoolSize=0</c> a workable configuration for an all-native application.
+    /// </summary>
+    private void EnqueueNativeTask(SchedulerTask task, NativeTaskDescriptor native, DateTimeOffset fireTime)
+    {
+        if (FindScript(task.Command) is not null)
+        {
+            // Same rule as route collisions: native wins, and the shadowing is never silent.
+            _logger.LogWarning(
+                "[Scheduler] {Command}: a PowerShell function of the same name is shadowed by the native task",
+                task.Command);
+        }
+
+        var timeoutSeconds = _settings.Worker.BgTimeoutSeconds;
+
+        _jobManager.Enqueue(
+            name: task.Command,
+            priority: task.Priority,
+            work: async ct =>
+            {
+                // BgTimeoutSeconds stops a PowerShell pipeline forcibly; for native code the honest
+                // equivalent is cooperative cancellation. A task that ignores its token runs on —
+                // documented on ICraftScheduledTask, and not worth a watchdog thread to pretend
+                // otherwise.
+                using var timeout = timeoutSeconds > 0
+                    ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+                    : null;
+                timeout?.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+                var instance = (ICraftScheduledTask)_services.GetRequiredService(native.ImplementationType);
+                await instance.RunAsync(
+                    new CraftTaskContext(task.Id, task.Command, task.Parameters, fireTime),
+                    timeout?.Token ?? ct);
+            });
+
+        _logger.LogInformation("[Scheduler] Enqueued native task: {Command} P{Priority}",
+            task.Command, task.Priority);
+    }
+
     private void LoadConfig()
     {
         // Scheduler config file path is relative to the API base directory.
@@ -178,6 +243,18 @@ public class SchedulerService : BackgroundService
             var json = File.ReadAllText(path);
             _tasks = JsonSerializer.Deserialize<List<SchedulerTask>>(json, s_taskFileOptions) ?? [];
             _logger.LogInformation("[Scheduler] Loaded {Count} tasks from {Path}", _tasks.Count, path);
+
+            // The orchestrator's planner/task split is a PowerShell construct; native code that
+            // wants fan-out writes Task.WhenAll itself. Reported at load — where a config mistake
+            // should surface — and again at fire time, where it would otherwise look like a timer
+            // that silently never runs.
+            foreach (var task in _tasks.Where(t => t.IsOrchestrator && _nativeTasks.TryGet(t.Command, out _)))
+            {
+                _logger.LogError(
+                    "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — this " +
+                    "timer will not fire. Remove the flag, or do the fan-out inside the task.",
+                    task.Command);
+            }
         }
         catch (Exception ex)
         {

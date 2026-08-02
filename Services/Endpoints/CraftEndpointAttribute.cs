@@ -2,6 +2,28 @@
 namespace Craft.Endpoints;
 
 /// <summary>
+/// Whether a native endpoint is dispatched through the application's central handler
+/// (<see cref="ICraftEndpointHandler"/>) or invoked directly.
+/// </summary>
+public enum EndpointDispatch
+{
+    /// <summary>
+    /// Routed through the central handler when the application registered one. The default, and the
+    /// safe direction for it: an endpoint that forgets to declare a dispatch mode gets the
+    /// application's authorization, not an accidentally-public route.
+    /// </summary>
+    Central,
+
+    /// <summary>
+    /// Bypasses the central handler. For endpoints that authenticate differently (a webhook
+    /// verifying a signature) or deliberately serve anonymous callers (a public redirect). This is a
+    /// property of the endpoint's security design, which is why it is declared here in code rather
+    /// than in configuration — flipping a route to Direct should be a code review, not a YAML edit.
+    /// </summary>
+    Direct,
+}
+
+/// <summary>
 /// Marks a class as a native endpoint and declares its route and metadata. The C# counterpart of the
 /// PowerShell convention where <c>Invoke-GetIPInfo</c> becomes <c>/API/GetIPInfo</c> and the
 /// <c>.ROLE</c> / <c>.FUNCTIONALITY</c> doc tags feed the permission map.
@@ -57,4 +79,12 @@ public sealed class CraftEndpointAttribute : Attribute
     /// per-request allocation, and lets an endpoint keep a pooled HttpClient in a field.
     /// </summary>
     public ServiceLifetime Lifetime { get; init; } = ServiceLifetime.Singleton;
+
+    /// <summary>
+    /// Whether requests to this endpoint go through the application's central handler
+    /// (<see cref="ICraftEndpointHandler"/>). Defaults to <see cref="EndpointDispatch.Central"/>;
+    /// with no handler registered the two modes behave identically, so existing applications are
+    /// unaffected until they ship one.
+    /// </summary>
+    public EndpointDispatch Dispatch { get; init; } = EndpointDispatch.Central;
 }

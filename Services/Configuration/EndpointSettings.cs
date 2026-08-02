@@ -44,6 +44,20 @@ public class EndpointSettings
     public string OnCollision { get; set; } = "PreferNative";
 
     /// <summary>
+    /// Refuse to start when endpoints declare Central dispatch and no <c>ICraftEndpointHandler</c>
+    /// was found in the scanned assemblies. Default false: a handler-less application simply
+    /// dispatches every endpoint directly, which is exactly the pre-handler behaviour.
+    /// </summary>
+    /// <remarks>
+    /// Set it true — in CI at minimum — for applications whose authorization lives in the central
+    /// handler. For them a missing handler does not mean "less middleware"; it means every Central
+    /// endpoint is reachable with no auth check at all, and that should fail the deploy, not ship.
+    /// The same reasoning as <see cref="OnCollision"/>=Fail, and the same split applies: hard-fail
+    /// is right where a human sees the failure before traffic does.
+    /// </remarks>
+    public bool RequireHandler { get; set; }
+
+    /// <summary>
     /// Blanket in-flight limit for native endpoints that declare none. 0 (default) means unbounded.
     /// </summary>
     /// <remarks>

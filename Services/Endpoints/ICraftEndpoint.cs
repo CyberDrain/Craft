@@ -39,14 +39,45 @@ public interface ICraftEndpoint
 }
 
 /// <summary>
-/// Runs before every native endpoint, for concerns an application applies across all of them.
+/// The single central entrypoint for native endpoints — the C# counterpart of
+/// <c>Scripts:HttpHandler</c>, which funnels every PowerShell request through one router function.
+/// Applications put cross-endpoint authorization here: resolve the principal, check the plan or the
+/// role (the endpoint's declared <see cref="CraftEndpointAttribute.Role"/> is on
+/// <see cref="CraftRequest.Endpoint"/>), then invoke the endpoint through the supplied
+/// <see cref="CraftEndpointNext"/> — or don't.
 ///
 /// <para>
-/// This is not optional infrastructure for some apps: when <c>Scripts:HttpHandler</c> is set, EVERY
-/// PowerShell request funnels through one router function, and applications use that router to do
-/// authorization. A native endpoint bypasses the router completely, so an app relying on it would
-/// silently lose that check on the first endpoint it migrated. A filter is where that check moves to.
+/// Wraps the endpoint rather than merely preceding it, so a handler can also time the call or
+/// post-process the result. Endpoints opt out per-route with
+/// <see cref="EndpointDispatch.Direct"/> — the escape hatch <c>Scripts:HttpHandler</c> never needed,
+/// because a PowerShell app's public routes (a webhook, a redirect) are exactly the ones that
+/// migrate to native first.
 /// </para>
+///
+/// <para>
+/// Discovered in the same assembly scan as the endpoints, registered as a singleton. At most one per
+/// application: two handlers would make "which auth ran" a function of assembly scan order, so a
+/// second one fails startup. Zero is legal — every endpoint then dispatches as if Direct, which is
+/// exactly the pre-handler behaviour. Deployments whose security model depends on the handler
+/// existing should set <c>App:Endpoints:RequireHandler=true</c> (in CI at minimum).
+/// </para>
+/// </summary>
+public interface ICraftEndpointHandler
+{
+    /// <summary>Handles one Central-dispatch request. Call <paramref name="invokeEndpoint"/> to run
+    /// the endpoint, or return without calling it to short-circuit.</summary>
+    ValueTask<CraftResult> HandleAsync(
+        CraftRequest request, CraftEndpointNext invokeEndpoint, CancellationToken ct);
+}
+
+/// <summary>Invokes the endpoint an <see cref="ICraftEndpointHandler"/> is wrapping.</summary>
+public delegate ValueTask<CraftResult> CraftEndpointNext();
+
+/// <summary>
+/// Runs before every native endpoint — including <see cref="EndpointDispatch.Direct"/> ones, which
+/// is the property that distinguishes it from <see cref="ICraftEndpointHandler"/>. Use a filter for
+/// concerns that must also cover the public routes (request telemetry, IP throttling); use the
+/// handler for authorization, which is precisely what a public route opts out of.
 ///
 /// Returning a result short-circuits the request; returning null continues to the endpoint.
 /// </summary>

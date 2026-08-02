@@ -4,6 +4,7 @@ using System.Threading.RateLimiting;
 using Craft.Auth;
 using Craft.Caching;
 using Craft.Configuration;
+using Craft.Endpoints;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Realtime;
@@ -210,6 +211,10 @@ public static class CraftHostBuilderExtensions
         services.AddSingleton<OrchestratorService>();
         services.AddSingleton<AuthService>();
         services.AddSingleton<SetupService>();
+        // The scheduler's native-task lookup. Empty here; AddNativeEndpoints registers the
+        // discovered set on top when the application ships any, and last registration wins on
+        // resolve — so SchedulerService injects it unconditionally either way.
+        services.AddSingleton(NativeScheduledTasks.Empty);
         services.AddSingleton<SchedulerService>();
         services.AddSingleton<StatsHistoryService>();
 

@@ -120,9 +120,13 @@
     // },
 
     "Worker": {
-      // Number of dedicated HTTP request workers (each handles one request at a time)
+      // Number of dedicated HTTP request workers (each handles one request at a time).
+      // 0 = build no HTTP runspaces at all — for apps whose routes are all native C# endpoints.
       "HttpPoolSize": 2,
-      // Number of background workers for scheduler, orchestrator, and queue tasks
+      // Number of background workers for scheduler, orchestrator, and queue tasks.
+      // 0 = build no BG runspaces at all — for apps whose scheduled work is all native C# tasks
+      // (they run on the .NET thread pool; the scheduler and JobManager still start). With both
+      // sizes 0 the container hosts no PowerShell whatsoever.
       "BgPoolSize": 4,
 
       // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
@@ -267,6 +271,17 @@
     // A native route is mapped at its literal path, and a literal route outranks the PowerShell
     // catch-all, so endpoints migrate ONE AT A TIME with the PowerShell function still loaded as the
     // rollback.
+    //
+    // The same assembly scan also finds:
+    //   - ONE central handler (ICraftEndpointHandler) — the native counterpart of Scripts:HttpHandler.
+    //     Every endpoint whose [CraftEndpoint] declares Dispatch=Central (the default) routes through
+    //     it; endpoints that authenticate differently (webhooks) or serve anonymous callers declare
+    //     Dispatch=Direct in code. Two handlers fail startup; zero is legal (all endpoints dispatch
+    //     direct, the pre-handler behaviour).
+    //   - Native scheduled tasks (ICraftScheduledTask + [CraftScheduledTask("Command")]) — fired by
+    //     the scheduler from the SAME timer file as PowerShell commands. A timer Command resolves
+    //     native-first, then falls back to the PS script table. They run on the .NET thread pool via
+    //     the JobManager, so Worker:BgPoolSize=0 is a workable all-native configuration.
     // "Endpoints": {
     //   "Enabled": false,
     //   // Absolute, or relative to the API base path.
@@ -276,6 +291,11 @@
     //   // PreferNative is the default because on a config-driven runtime a hard startup failure turns
     //   // an accidental shadow into a failed rolling deploy.
     //   "OnCollision": "PreferNative",
+    //   // Refuse to start when Central-dispatch endpoints exist but no ICraftEndpointHandler was
+    //   // found. Default false (a handler-less app simply dispatches everything direct). Set true —
+    //   // in CI at minimum — when authorization lives in the handler: without it a missing handler
+    //   // means every Central route serves with NO central check, and that should fail the deploy.
+    //   "RequireHandler": false,
     //   // In-flight request limits. Distinct from RateLimit, which is per-client; these bound TOTAL
     //   // simultaneous work. Matters most with Worker:HttpPoolSize=0, where there is no runspace pool
     //   // to act as the implicit cap. 0 = unbounded.

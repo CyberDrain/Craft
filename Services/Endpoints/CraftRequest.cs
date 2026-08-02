@@ -22,10 +22,11 @@ public sealed class CraftRequest
 {
     private CraftPrincipal? _user;
 
-    internal CraftRequest(HttpContext http, string route)
+    internal CraftRequest(HttpContext http, string route, CraftEndpointAttribute endpoint)
     {
         Http = http;
         Route = route;
+        Endpoint = endpoint;
     }
 
     /// <summary>The underlying context. Use it for anything this view does not expose.</summary>
@@ -33,6 +34,14 @@ public sealed class CraftRequest
 
     /// <summary>Route segment that matched, without the <c>/API/</c> prefix.</summary>
     public string Route { get; }
+
+    /// <summary>
+    /// The endpoint's declared metadata. This is how a central handler makes per-endpoint decisions
+    /// without a lookup table of its own: <see cref="CraftEndpointAttribute.Role"/> is the native
+    /// equivalent of the <c>.ROLE</c> doc tag the PowerShell router reads from
+    /// function-permissions.json.
+    /// </summary>
+    public CraftEndpointAttribute Endpoint { get; }
 
     public string Method => Http.Request.Method;
 

@@ -12,6 +12,7 @@ Craft/
 │   ├── Program.cs               # Host startup, middleware, endpoint mapping
 │   ├── Bridges/                 # PowerShell-facing API surface  → namespace Craft.Services (PINNED)
 │   ├── Configuration/           # Settings types, one per file   → Craft.Configuration
+│   ├── Endpoints/               # Native C# endpoint/task contracts → Craft.Endpoints
 │   ├── PowerShellHost/          # Runspace workers, pool, script repo → Craft.PowerShellHost
 │   ├── Orchestration/           # Orchestrator, scheduler, jobs  → Craft.Orchestration
 │   ├── Storage/                 # Azure Table stores, health     → Craft.Storage

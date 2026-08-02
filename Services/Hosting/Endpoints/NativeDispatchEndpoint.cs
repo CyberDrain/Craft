@@ -38,6 +38,32 @@ public static class NativeDispatchEndpoint
 
         settings ??= new EndpointSettings();
 
+        // The handler is discovered at startup and registered as a singleton, so its presence is a
+        // startup-time fact — resolve it once here rather than per request.
+        var handler = app.Services.GetService<ICraftEndpointHandler>();
+        EnsureHandlerRequirement(settings, handler is not null, endpoints);
+
+        if (handler is not null)
+        {
+            var direct = endpoints
+                .Where(e => e.Metadata.Dispatch == EndpointDispatch.Direct)
+                .Select(e => e.Route)
+                .ToList();
+
+            logger.LogInformation(
+                "[Endpoints] Central handler {Handler}: {Count} route(s) dispatch through it",
+                handler.GetType().Name, endpoints.Count - direct.Count);
+
+            // Never silent: this list is the set of routes the application's authorization does NOT
+            // cover, which makes it the security review checklist.
+            if (direct.Count > 0)
+            {
+                logger.LogInformation(
+                    "[Endpoints] {Count} route(s) dispatch DIRECT, bypassing the central handler: {Routes}",
+                    direct.Count, string.Join(", ", direct));
+            }
+        }
+
         foreach (var endpoint in endpoints)
         {
             var descriptor = endpoint;
@@ -64,7 +90,7 @@ public static class NativeDispatchEndpoint
             }
 
             app.MapMethods(path, descriptor.Metadata.Methods,
-                (HttpContext context) => Handle(context, descriptor, activeRequests, logger));
+                (HttpContext context) => Handle(context, descriptor, handler, activeRequests, logger));
         }
 
         if (endpoints.Count > 0)
@@ -76,9 +102,52 @@ public static class NativeDispatchEndpoint
         return app;
     }
 
+    /// <summary>
+    /// Fails startup when the deployment declared its security model depends on a central handler
+    /// and none was discovered. Only Central endpoints count: an all-Direct application has nothing
+    /// for a handler to protect, so requiring one would reject a configuration that is already
+    /// exactly what it claims to be.
+    /// </summary>
+    internal static void EnsureHandlerRequirement(
+        EndpointSettings settings,
+        bool handlerPresent,
+        IReadOnlyList<NativeEndpointDescriptor> endpoints)
+    {
+        if (!settings.RequireHandler || handlerPresent) return;
+
+        var central = endpoints
+            .Where(e => e.Metadata.Dispatch == EndpointDispatch.Central)
+            .Select(e => e.Route)
+            .ToList();
+        if (central.Count == 0) return;
+
+        throw new InvalidOperationException(
+            "App:Endpoints:RequireHandler is true but no ICraftEndpointHandler was discovered, and " +
+            $"{central.Count} endpoint(s) declare Central dispatch: {string.Join(", ", central)}. " +
+            "Without the handler these routes would serve with no central check at all. Ship a " +
+            "handler in a scanned assembly, or set RequireHandler=false if that is intended.");
+    }
+
+    /// <summary>
+    /// Runs the endpoint, routed through the central handler when the endpoint's dispatch mode asks
+    /// for one and the application registered one.
+    /// </summary>
+    internal static ValueTask<CraftResult> ExecuteAsync(
+        CraftRequest request,
+        ICraftEndpoint endpoint,
+        ICraftEndpointHandler? handler,
+        CancellationToken ct)
+    {
+        if (handler is null || request.Endpoint.Dispatch != EndpointDispatch.Central)
+            return endpoint.HandleAsync(request, ct);
+
+        return handler.HandleAsync(request, () => endpoint.HandleAsync(request, ct), ct);
+    }
+
     private static async Task Handle(
         HttpContext context,
         NativeEndpointDescriptor descriptor,
+        ICraftEndpointHandler? handler,
         RequestCounter activeRequests,
         ILogger logger)
     {
@@ -114,11 +183,11 @@ public static class NativeDispatchEndpoint
             var endpoint = (ICraftEndpoint)context.RequestServices
                 .GetRequiredService(descriptor.ImplementationType);
 
-            var request = new CraftRequest(context, descriptor.Route);
+            var request = new CraftRequest(context, descriptor.Route, descriptor.Metadata);
 
-            // Application-wide filters run first. This is where an app that used a PowerShell router
-            // (Scripts:HttpHandler) for authorization moves that check to — without it, a native
-            // endpoint bypasses the router entirely and loses it.
+            // Application-wide filters run first, for EVERY endpoint — including Direct ones, which
+            // is what distinguishes a filter from the central handler. Telemetry and IP throttling
+            // belong here; authorization belongs in the handler, where Direct routes can opt out.
             foreach (var filter in context.RequestServices.GetServices<ICraftEndpointFilter>())
             {
                 var shortCircuit = await filter.BeforeAsync(request, ct);
@@ -129,7 +198,7 @@ public static class NativeDispatchEndpoint
                 }
             }
 
-            var result = await endpoint.HandleAsync(request, ct);
+            var result = await ExecuteAsync(request, endpoint, handler, ct);
             await result.WriteAsync(context, ct);
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)

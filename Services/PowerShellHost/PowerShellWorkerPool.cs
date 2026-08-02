@@ -67,11 +67,14 @@ public class PowerShellWorkerPool : IDisposable
         {
             _httpReady.Set(); _ready.Set(); _bgReady.Set();
 
-            // A deliberate opt-out, not a misconfiguration: an app serving only native endpoints has
-            // no PowerShell to host. Every other route to "no pools" is a role mistake and stays a
-            // warning, because it means this node will accept requests it cannot serve.
-            if (_httpPoolSize == 0)
-                _logger.LogInformation("[System] No PowerShell pools (Worker:HttpPoolSize=0) — native endpoints only");
+            // A deliberate opt-out, not a misconfiguration: an app serving only native endpoints
+            // (HttpPoolSize=0) and/or native scheduled tasks (BgPoolSize=0) has no PowerShell to
+            // host. Every other route to "no pools" is a role mistake and stays a warning, because
+            // it means this node will accept requests it cannot serve.
+            if (_httpPoolSize == 0 || _bgPoolSize == 0)
+                _logger.LogInformation(
+                    "[System] No PowerShell pools (Worker:HttpPoolSize={Http}, BgPoolSize={Bg}) — native endpoints/tasks only",
+                    _httpPoolSize, _bgPoolSize);
             else
                 _logger.LogWarning("[System] Pool.Initialize called with no pools enabled — nothing to do");
             return;
@@ -391,7 +394,8 @@ public class PowerShellWorkerPool : IDisposable
         }
         else
         {
-            _logger.LogInformation("[System] BG pool disabled (no Background role) — no BG workers created");
+            _logger.LogInformation(
+                "[System] BG pool disabled (no Background role, or Worker:BgPoolSize=0) — no BG workers created");
         }
 
         _bgReady.Set();
