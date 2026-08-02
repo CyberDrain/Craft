@@ -1,6 +1,6 @@
-using Craft.Configuration;
 using System.Collections.Concurrent;
 using System.Globalization;
+using Craft.Configuration;
 using Craft.Endpoints;
 
 namespace Craft.Hosting.Endpoints;
