@@ -60,12 +60,16 @@ public readonly struct CraftResult
         IReadOnlyDictionary<string, string>? headers = null) =>
         new(Kind.Json, status, "application/json", headers, text: rawJson);
 
-    /// <summary>Serializes <paramref name="value"/> with System.Text.Json.</summary>
+    /// <summary>
+    /// Serializes <paramref name="value"/> with System.Text.Json, using <see cref="CraftJson.Web"/> —
+    /// camelCase, matching what every JavaScript client and every other ASP.NET Core endpoint expects.
+    /// Pass <paramref name="options"/> when a payload's shape is dictated by something else.
+    /// </summary>
     public static CraftResult Json<T>(T value, int status = 200,
         JsonSerializerOptions? options = null,
         IReadOnlyDictionary<string, string>? headers = null) =>
         new(Kind.Json, status, "application/json", headers,
-            text: JsonSerializer.Serialize(value, options));
+            text: JsonSerializer.Serialize(value, options ?? CraftJson.Web));
 
     public static CraftResult Bytes(ReadOnlyMemory<byte> payload, string contentType,
         int status = 200, IReadOnlyDictionary<string, string>? headers = null) =>

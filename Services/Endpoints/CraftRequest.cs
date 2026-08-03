@@ -67,14 +67,21 @@ public sealed class CraftRequest
     /// </summary>
     public CraftPrincipal User => _user ??= CraftPrincipal.FromHeaders(Http.Request.Headers);
 
-    /// <summary>Deserializes the body. Returns default when the body is empty.</summary>
+    /// <summary>
+    /// Deserializes the body. Returns default when the body is empty.
+    /// <para>
+    /// Defaults to <see cref="CraftJson.Web"/>, so <c>{"hostname":"x"}</c> binds to a <c>Hostname</c>
+    /// property exactly as it would in a minimal API. Pass <paramref name="options"/> for an endpoint
+    /// whose payload is not yours to define.
+    /// </para>
+    /// </summary>
     public async ValueTask<T?> ReadJsonAsync<T>(
         JsonSerializerOptions? options = null, CancellationToken ct = default)
     {
         if (Http.Request.ContentLength == 0) return default;
 
         // Straight off the request pipe — no intermediate string, and no PSObject graph.
-        return await JsonSerializer.DeserializeAsync<T>(Http.Request.Body, options, ct);
+        return await JsonSerializer.DeserializeAsync<T>(Http.Request.Body, options ?? CraftJson.Web, ct);
     }
 
     /// <summary>Reads the body as text, for endpoints that proxy it onward untouched.</summary>
