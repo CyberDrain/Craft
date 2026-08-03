@@ -997,6 +997,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 string? batchNumber = null;
                 string? queueName = null;
                 string? customerId = null;
+                string? standardName = null;
+                string? templateId = null;
+                string? templateListValue = null;
 
                 foreach (var prop in element.EnumerateObject())
                 {
@@ -1014,12 +1017,32 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         collectionType = prop.Value.GetString();
                     if (prop.Name.Equals("Name", StringComparison.OrdinalIgnoreCase))
                         name = prop.Value.GetString();
-                    if (prop.Name.Equals("TenantFilter", StringComparison.OrdinalIgnoreCase))
+                    if (prop.Name.Equals("TenantFilter", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
                         tenantFilter = prop.Value.GetString();
                     if (prop.Name.Equals("FunctionName", StringComparison.OrdinalIgnoreCase))
                         functionName = prop.Value.GetString();
                     if (prop.Name.Equals("SuiteName", StringComparison.OrdinalIgnoreCase))
                         suiteName = prop.Value.GetString();
+                    if (prop.Name.Equals("Standard", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                        standardName = prop.Value.GetString();
+                    if (prop.Name.Equals("TemplateId", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.String)
+                        templateId = prop.Value.GetString();
+
+                    // Template-backed standards (Intune / Conditional Access) expand one standards
+                    // template into several items that all carry the same TemplateId — only
+                    // Settings.TemplateList.value separates them.
+                    if (prop.Name.Equals("Settings", StringComparison.OrdinalIgnoreCase)
+                        && prop.Value.ValueKind == JsonValueKind.Object
+                        && prop.Value.TryGetProperty("TemplateList", out var tmplList)
+                        && tmplList.ValueKind == JsonValueKind.Object
+                        && tmplList.TryGetProperty("value", out var tmplValue)
+                        && tmplValue.ValueKind == JsonValueKind.String)
+                    {
+                        templateListValue = tmplValue.GetString();
+                    }
                     if (prop.Name.Equals("BatchNumber", StringComparison.OrdinalIgnoreCase))
                         batchNumber = prop.Value.ToString();
                     if (prop.Name.Equals("QueueName", StringComparison.OrdinalIgnoreCase)
@@ -1029,18 +1052,39 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         && prop.Value.ValueKind == JsonValueKind.String)
                         customerId = prop.Value.GetString();
 
-                    // Extract tenant from nested Tenant object (e.g. audit log batch items)
-                    if (tenantFilter == null && prop.Name.Equals("Tenant", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.Object
-                        && prop.Value.TryGetProperty("defaultDomainName", out var ddn)
-                        && ddn.ValueKind == JsonValueKind.String)
+                    // Tenant is either a plain domain string (e.g. standards batch items) or a
+                    // nested tenant object (e.g. audit log batch items). TenantFilter still wins.
+                    if (tenantFilter == null && prop.Name.Equals("Tenant", StringComparison.OrdinalIgnoreCase))
                     {
-                        tenantFilter = ddn.GetString();
+                        if (prop.Value.ValueKind == JsonValueKind.String)
+                        {
+                            tenantFilter = prop.Value.GetString();
+                        }
+                        else if (prop.Value.ValueKind == JsonValueKind.Object
+                            && prop.Value.TryGetProperty("defaultDomainName", out var ddn)
+                            && ddn.ValueKind == JsonValueKind.String)
+                        {
+                            tenantFilter = ddn.GetString();
+                        }
                     }
                 }
 
-                // Build a unique task ID from available distinguishing properties
-                var label = collectionType ?? suiteName ?? name ?? functionName ?? "unknown";
+                // Build a unique task ID from available distinguishing properties. Standards batch
+                // items all share FunctionName = 'CIPPStandard', so fold in the Standard name.
+                var label = collectionType ?? suiteName ?? name
+                    ?? (functionName != null && standardName != null
+                        ? $"{functionName}_{standardName}"
+                        : functionName)
+                    ?? standardName ?? "unknown";
+
+                // Standards items sharing a Standard name are separated by their template identity.
+                // Mirrors the API key CIPP itself uses for rerun detection (Push-CIPPStandard).
+                if (standardName != null)
+                {
+                    if (templateId != null) label = $"{label}_{templateId}";
+                    if (templateListValue != null) label = $"{label}_{templateListValue}";
+                }
+
                 var tenant = tenantFilter ?? queueName ?? customerId ?? "unknown";
                 var taskId = batchNumber != null ? $"{label}_{tenant}_b{batchNumber}" : $"{label}_{tenant}";
 
