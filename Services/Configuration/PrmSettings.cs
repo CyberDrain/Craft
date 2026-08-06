@@ -49,15 +49,13 @@ public class PrmSettings
     public const string OidcWellKnownPath = "/.well-known/openid-configuration";
 
     /// <summary>
-    /// Master switch. When enabled and the app settings below hold valid JSON, Craft serves them
-    /// and the setup reconcile keeps the well-known paths in EasyAuth's excludedPaths. When a
-    /// setting is absent its document is not served — presence is the per-instance
-    /// "an OAuth resource exists here" signal, written and cleared by the hosted app.
-    /// </summary>
-    public bool Enabled { get; set; }
-
-    /// <summary>
     /// Name of the app setting (environment variable) holding the complete PRM JSON document.
+    /// There is no separate enable switch: the presence of this setting (or
+    /// <see cref="AuthServerSettingName"/>) IS the per-instance "an OAuth resource exists here"
+    /// signal — the hosted app writes it to turn the feature on and clears it to turn it off, and
+    /// the setup reconcile keeps the well-known paths in EasyAuth's excludedPaths exactly while
+    /// one of them is present. App setting changes restart the container, so both the documents
+    /// and the exclusions converge on the same boot.
     /// </summary>
     public string SettingName { get; set; } = "CRAFT_PRM";
 

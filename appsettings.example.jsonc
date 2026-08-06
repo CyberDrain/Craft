@@ -346,14 +346,16 @@
     //     serves the JSON only; authorize/token stay at Entra, registration is a hosted-app route.
     // A literal {origin} anywhere in the JSON is replaced per-request with https://{host}
     // (RFC 9728 requires `resource` to equal the URL the client connects to — only the request
-    // knows it once custom domains exist). Setting absent = that document 404s.
-    // Exists because the platform's own PRM (preview) pins authorization_servers to the SSO
-    // issuer (multi-tenant SSO advertises /common, which a single-tenant resource app rejects
-    // with AADSTS50194). While enabled, the setup reconcile auto-appends the well-known paths to
-    // EasyAuth's ExcludedPaths. Leave WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES UNSET — that setting
-    // activates the platform document, which intercepts the path before Craft sees it.
+    // knows it once custom domains exist). There is NO separate enable switch: presence of the
+    // app settings IS the switch — the hosted app writes them to turn discovery on and clears
+    // them to turn it off; the setup reconcile auto-appends/removes the well-known paths in
+    // EasyAuth's ExcludedPaths accordingly (app setting changes restart the container, so both
+    // converge on the same boot). Exists because the platform's own PRM (preview) pins
+    // authorization_servers to the SSO issuer (multi-tenant SSO advertises /common, which a
+    // single-tenant resource app rejects with AADSTS50194). Leave
+    // WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES UNSET — that setting activates the platform document,
+    // which intercepts the path before Craft sees it.
     // "Prm": {
-    //   "Enabled": false,
     //   "SettingName": "CRAFT_PRM",
     //   "AuthServerSettingName": "CRAFT_PRM_AS"
     // },

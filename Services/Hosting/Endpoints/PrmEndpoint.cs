@@ -35,12 +35,6 @@ public static class PrmEndpoint
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(logger);
 
-        if (!settings.Prm.Enabled)
-        {
-            logger.LogInformation("[Prm] Protected resource metadata: disabled");
-            return app;
-        }
-
         var getEnv = (Func<string, string?>)Environment.GetEnvironmentVariable;
 
         var prmTemplate = ResolveTemplate(settings.Prm.SettingName, getEnv, logger);
@@ -59,7 +53,7 @@ public static class PrmEndpoint
         if (prmTemplate is null && asTemplate is null)
         {
             logger.LogInformation(
-                "[Prm] Enabled but neither app setting '{Prm}' nor '{As}' is set — nothing served",
+                "[Prm] Neither app setting '{Prm}' nor '{As}' is set — OAuth discovery documents not served",
                 settings.Prm.SettingName, settings.Prm.AuthServerSettingName);
             return app;
         }

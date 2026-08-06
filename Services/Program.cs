@@ -347,9 +347,10 @@ if (storageHealth != null) _ = storageHealth.RefreshAsync(); // prime the cache 
 app.MapCraftHealthEndpoint(roles, storageHealth, logger);
 app.MapCraftRealtimeEndpoint(roles, CraftSettings, logger);
 
-// OAuth protected resource metadata (RFC 9728) for MCP/OAuth client discovery. Anonymous by design —
-// the setup reconcile keeps the well-known path in EasyAuth's excludedPaths while App:Prm is enabled.
-// See Services/Hosting/Endpoints/PrmEndpoint.cs.
+// OAuth discovery documents (RFC 9728 PRM + optional RFC 8414 AS metadata) for MCP/OAuth client
+// discovery, served verbatim from app settings. Anonymous by design — the setup reconcile keeps the
+// well-known paths in EasyAuth's excludedPaths while the settings are present (their presence is
+// the feature switch). See Services/Hosting/Endpoints/PrmEndpoint.cs.
 app.MapCraftPrmEndpoint(CraftSettings, logger);
 
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────

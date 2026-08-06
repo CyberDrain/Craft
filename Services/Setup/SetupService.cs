@@ -712,16 +712,22 @@ public class SetupService
     }
 
     /// <summary>
-    /// The configured excluded paths plus, when Craft serves protected resource metadata
-    /// (App:Prm:Enabled), the well-known PRM path — anonymous discovery requests must reach the
-    /// container instead of being redirected/rejected by EasyAuth. Trailing wildcard covers the
-    /// path-suffixed variants (RFC 9728 §3). Used by both the initial authsettingsV2 write and
+    /// The configured excluded paths plus, while a PRM/AS document app setting is present (see
+    /// <see cref="PrmSettings"/> — presence is the feature switch), the well-known discovery
+    /// paths — anonymous discovery requests must reach the container instead of being
+    /// redirected/rejected by EasyAuth. Trailing wildcard covers the path-suffixed variants
+    /// (RFC 8414/9728). App setting changes restart the container, so the exclusions and the
+    /// documents converge on the same warmup. Used by both the initial authsettingsV2 write and
     /// ReconcileAuthPolicy so the two never disagree on the desired state.
     /// </summary>
     private List<string> EffectiveExcludedPaths()
     {
         var paths = new List<string>(_settings.Setup.ExcludedPaths);
-        if (!_settings.Prm.Enabled) return paths;
+
+        var prmConfigured =
+            !string.IsNullOrWhiteSpace(GetSettingValue(_settings.Prm.SettingName)) ||
+            !string.IsNullOrWhiteSpace(GetSettingValue(_settings.Prm.AuthServerSettingName));
+        if (!prmConfigured) return paths;
 
         string[] wellKnown =
         [
@@ -735,6 +741,9 @@ public class SetupService
                 paths.Add(prefix + "*");
         }
         return paths;
+
+        static string? GetSettingValue(string name) =>
+            string.IsNullOrWhiteSpace(name) ? null : Environment.GetEnvironmentVariable(name);
     }
 
     /// <summary>
