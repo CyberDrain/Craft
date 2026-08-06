@@ -163,10 +163,13 @@ Controls the PowerShell runspace pools that execute all scripts.
 "Worker": {
   // Number of dedicated HTTP request workers. Each handles one request at a time.
   // Increase if you see HTTP requests queuing during concurrent load.
+  // 0 = build no HTTP runspaces — for apps whose routes are all native C# endpoints.
   "HttpPoolSize": 2,
 
   // Number of background workers for scheduler, orchestrator, and queue tasks.
   // Higher = more parallel orchestrator tasks, but more memory.
+  // 0 = build no BG runspaces — for apps whose scheduled work is all native C# tasks (the
+  // scheduler and JobManager still run; native tasks execute on the .NET thread pool).
   "BgPoolSize": 4,
 
   // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
@@ -330,6 +333,14 @@ Drives the cron-based background task system.
 - **Cron** — 6-field format (seconds included): `sec min hour day month weekday`
 - **Priority** — Lower number = higher priority in the job queue
 - **IsSystem** — System tasks can't be disabled from the UI
+
+**How `Command` resolves.** Native-first: if a scanned assembly ships a
+`[CraftScheduledTask("<Command>")]` class (see [Native C# endpoints](#native-c-endpoints-and-scheduled-tasks)),
+the timer fires that; otherwise the PowerShell script table is consulted, exactly as before. A name
+present in both worlds fires the native task and logs the shadowed PowerShell function — same rule,
+same visibility, as route collisions. `IsOrchestratorOverride` is not supported on native commands
+(the planner/task split is a PowerShell construct; native code does its own fan-out) and is rejected
+at load with an error naming the timer.
 
 ---
 
@@ -555,6 +566,82 @@ Controls where the host discovers PowerShell scripts.
   }
 }
 ```
+
+### Native C# endpoints and scheduled tasks
+
+HTTP endpoints and scheduled tasks written in C#, hosted alongside the PowerShell ones. Off unless
+you name the assemblies to scan; costs nothing when off.
+
+```jsonc
+"Endpoints": {
+  "Enabled": true,
+
+  // Absolute, or relative to the API base path.
+  "Assemblies": ["bin/MyApp.dll"],
+
+  // What to do when a native endpoint claims a route a PowerShell function already has:
+  // PreferNative (default) | PreferPowerShell (instant rollback) | Fail (right for CI).
+  "OnCollision": "PreferNative",
+
+  // Refuse to start when Central-dispatch endpoints exist but no ICraftEndpointHandler was found.
+  // Default false. Set true (in CI at minimum) when authorization lives in the central handler.
+  "RequireHandler": false,
+
+  // Blanket in-flight limit for endpoints that declare none, and per-route overrides.
+  // With HttpPoolSize=0 nothing else caps concurrent work — see the comments in EndpointSettings.cs.
+  "MaxConcurrency": 0,
+  "Concurrency": { "GeoDBDownload": 4 },
+  "QueueTimeoutSeconds": 0
+}
+```
+
+The assembly scan discovers four things:
+
+| Contract | Purpose |
+|---|---|
+| `ICraftEndpoint` + `[CraftEndpoint("Route")]` | An HTTP endpoint at `/API/{Route}` |
+| `ICraftEndpointHandler` | THE central entrypoint — at most one per app |
+| `ICraftScheduledTask` + `[CraftScheduledTask("Command")]` | A scheduled task fired from the timer file |
+| `ICraftServiceModule` | DI registrations for an app with no `Program.cs` of its own |
+
+**The central handler.** The native counterpart of `Scripts:HttpHandler`: one place every
+authenticated API call funnels through (resolve principal → check role/plan → invoke, or refuse).
+It wraps the endpoint (`HandleAsync(request, invokeEndpoint, ct)`), so it can short-circuit,
+pass through, or post-process. Endpoints opt out per-route in code:
+
+```csharp
+[CraftEndpoint("StripeWebhook", Dispatch = EndpointDispatch.Direct)]   // signature IS the auth
+[CraftEndpoint("QrRedirect", Dispatch = EndpointDispatch.Direct)]      // deliberately anonymous
+[CraftEndpoint("EditLink", Role = "qr.edit")]                          // Central (default) — handler
+                                                                       // reads Role off request.Endpoint
+```
+
+`Dispatch` defaults to `Central`, so a route that never thought about it gets the application's
+authorization rather than becoming accidentally public. Direct routes are listed in the startup log —
+that line is the security-review checklist. Two handlers fail startup (which one ran would be
+assembly scan order); zero is legal and means every endpoint dispatches direct, exactly the
+pre-handler behaviour. `ICraftEndpointFilter` still runs before *every* endpoint including Direct
+ones — filters are for telemetry and throttling that public routes must not escape; the handler is
+for authorization, which is precisely what a public route opts out of.
+
+**Native scheduled tasks.** Fired by the scheduler from the same timer file as PowerShell commands
+(`Command` resolves native-first — see [Scheduler](#scheduler)), enqueued through the same
+`JobManager`, so priority ordering, job records and the background concurrency limiter apply
+unchanged. They run on the .NET thread pool: no runspace is involved, which is what makes the
+all-native configuration real —
+
+```
+Worker:HttpPoolSize=0   no HTTP runspaces (all routes native)
+Worker:BgPoolSize=0     no BG runspaces  (all scheduled work native)
+```
+
+With both at 0 the container hosts no PowerShell at all and startup logs
+`No PowerShell pools — native endpoints/tasks only`. One semantic difference to design for:
+`Worker:BgTimeoutSeconds` stops a PS pipeline forcibly, but a native task is cancelled
+*cooperatively* — pass the token to everything that accepts one, because a task that ignores it
+runs on.
+
+---
 
 ### Realtime (SSE)
 

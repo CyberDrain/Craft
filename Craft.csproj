@@ -79,4 +79,13 @@
     <EmbeddedResource Include="Services\Setup\*.html" LogicalName="Craft.Setup.%(Filename)%(Extension)" />
   </ItemGroup>
 
+  <!--
+    So the test project can reach helpers that are correctly internal to the host — the endpoint
+    dispatch/discovery policies (ExecuteAsync, SelectHandler, BuildScheduledTasks) are authorization
+    plumbing worth testing directly but have no business being public API.
+  -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Craft.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -67,6 +67,9 @@ public class CraftSettings
     /// <summary>Bootstrap setup — built-in first-run wizard for EasyAuth + app registration.</summary>
     public SetupSettings Setup { get; set; } = new();
 
+    /// <summary>OAuth protected resource metadata (RFC 9728) served for MCP/OAuth discovery.</summary>
+    public PrmSettings Prm { get; set; } = new();
+
     /// <summary>Historical stats collection — rolling time-series of worker/job metrics.</summary>
     public StatsHistorySettings StatsHistory { get; set; } = new();
 
@@ -88,6 +91,12 @@ public class CraftSettings
 
     /// <summary>Azure Storage connection policy — see <see cref="StorageSettings"/>. Governs the dev-emulator fallback.</summary>
     public StorageSettings Storage { get; set; } = new();
+
+    /// <summary>
+    /// Native C# endpoints hosted alongside the PowerShell ones. Off unless an application names the
+    /// assemblies to scan. See <see cref="EndpointSettings"/>.
+    /// </summary>
+    public EndpointSettings Endpoints { get; set; } = new();
 
     /// <summary>Kestrel request limits (body size, connection cap). See <see cref="KestrelLimitsSettings"/>.</summary>
     public KestrelLimitsSettings Limits { get; set; } = new();

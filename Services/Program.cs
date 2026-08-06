@@ -1,6 +1,7 @@
 using Craft.Auth;
 using Craft.Caching;
 using Craft.Configuration;
+using Craft.Endpoints;
 using Craft.Hosting;
 using Craft.Hosting.Endpoints;
 using Craft.Orchestration;
@@ -10,13 +11,6 @@ using Craft.Services;
 using Craft.Setup;
 using Craft.Storage;
 using Microsoft.Extensions.Options;
-
-// Ensure .NET ThreadPool has enough threads for concurrent I/O.
-// Default min = ProcessorCount (e.g. 2 on B2 VM), which causes starvation
-// when multiple PowerShell tasks make concurrent HTTP calls.
-ThreadPool.SetMinThreads(
-    Math.Max(Environment.ProcessorCount * 4, 32),
-    Math.Max(Environment.ProcessorCount * 4, 32));
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -44,6 +38,14 @@ if (roles.None)
     Environment.Exit(78); // EX_CONFIG
 }
 
+// ── Thread pool ────────────────────────────────────────────────────────────────────────────────────
+// Must happen before anything schedules work, and after config binding so the pool sizes are known.
+// The default floor scales with the worker pools, not just the core count: PowerShell blocks a
+// thread for the whole of every outbound call, so a pool of N workers can park N threads, and a
+// minimum below that leaves the CLR injecting threads at ~1/second before the pool can reach its own
+// concurrency. See CraftHostBuilderExtensions.ResolveMinThreads.
+var minThreads = CraftHostBuilderExtensions.ResolveMinThreads(craftSettings);
+ThreadPool.SetMinThreads(minThreads, minThreads);
 var capFrontend = roles.Frontend;
 var capHttp = roles.Http;
 var capBackground = roles.Background;
@@ -61,7 +63,18 @@ builder.ConfigureCraftKestrel(craftSettings);
 var configuredLogLevel = builder.AddCraftLogging();
 
 builder.Services.AddCraftResponseCompression();
+// ── Native C# endpoints and scheduled tasks ────────────────────────────────────────────────────────
+// Discovered before the container is built so the endpoint/task types, the central handler and any
+// application service module they ship can be registered into it. Costs nothing when no assemblies
+// are configured.
+var nativeCatalog = NativeEndpointRegistry.Discover(
+    craftSettings.Endpoints,
+    Path.Combine(AppContext.BaseDirectory, "API"),
+    LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Craft.Endpoints"));
+
 builder.Services.AddCraftServices(roles);
+if (!nativeCatalog.IsEmpty)
+    builder.Services.AddNativeEndpoints(nativeCatalog, builder.Configuration);
 builder.Services.AddCraftRateLimiter(craftSettings);
 
 var app = builder.Build();
@@ -156,14 +169,32 @@ void RunInitialization()
         endpoints[kvp.Key] = kvp.Value;
 
     logger.LogInformation("[System] {AppName}: {Count} API endpoints discovered", CraftSettings.Name, endpoints.Count);
-    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} LogLevel={LogLevel}",
+    logger.LogInformation("[System] Pool: HTTP={Http} BG={Bg} MinThreads={MinThreads} LogLevel={LogLevel}",
         CraftSettings.Worker.HttpPoolSize,
         CraftSettings.Worker.BgPoolSize,
+        minThreads,
         configuredLogLevel);
 
     // 3. Initialize PowerShell worker pool (loads modules, creates runspaces).
     //    Build only the pools this node's roles require: Http → HTTP pool, Background → BG pool.
-    pool.Initialize(enableHttp: capHttp, enableBg: capBackground);
+    // HttpPoolSize = 0 means this node hosts no PowerShell HTTP endpoints at all — a fully-native
+    // app. Skipping the pool then is not just a saving (runspace construction, ~1.6 MiB each, plus
+    // the PowerShell SDK's native allocations); it is the difference between paying for a
+    // PowerShell host and not having one. Initialize() signals readiness immediately when no pool is
+    // enabled, so the startup gate below does not block /API/* forever waiting for a pool that will
+    // never exist.
+    var enableHttpPool = capHttp && CraftSettings.Worker.HttpPoolSize > 0;
+    if (capHttp && !enableHttpPool)
+        logger.LogInformation("[System] HTTP worker pool disabled (Worker:HttpPoolSize=0) — PowerShell HTTP endpoints are not hosted");
+
+    // BgPoolSize = 0 is the same opt-out for the background side: the app's scheduled work is all
+    // native tasks, which run on the .NET thread pool, so BG runspaces would never be checked out.
+    // The disabled pool signals its ready event immediately, so the scheduler still starts.
+    var enableBgPool = capBackground && CraftSettings.Worker.BgPoolSize > 0;
+    if (capBackground && !enableBgPool)
+        logger.LogInformation("[System] BG worker pool disabled (Worker:BgPoolSize=0) — native scheduled tasks only");
+
+    pool.Initialize(enableHttp: enableHttpPool, enableBg: enableBgPool);
 
     // Pool is ready — clear the restart counter so we don't carry stale crash state
     healthMonitor.ClearRestartCounter();
@@ -316,6 +347,11 @@ if (storageHealth != null) _ = storageHealth.RefreshAsync(); // prime the cache 
 app.MapCraftHealthEndpoint(roles, storageHealth, logger);
 app.MapCraftRealtimeEndpoint(roles, CraftSettings, logger);
 
+// OAuth protected resource metadata (RFC 9728) for MCP/OAuth client discovery. Anonymous by design —
+// the setup reconcile keeps the well-known path in EasyAuth's excludedPaths while App:Prm is enabled.
+// See Services/Hosting/Endpoints/PrmEndpoint.cs.
+app.MapCraftPrmEndpoint(CraftSettings, logger);
+
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
 // A node without the Http role maps NONE of these, so /api and auth paths fall through to static serving
 // (a Frontend node can expose them from its own static dir) and finally to MapFallback (404 for /api|/.auth).
@@ -370,6 +406,16 @@ if (capHttp)
     // See Services/Hosting/Endpoints/.
     app.MapCraftSetupEndpoints(CraftSettings);
     app.MapCraftJobEndpoints();
+
+    // Native C# endpoints. Mapped before the PowerShell dispatcher, though ASP.NET route precedence
+    // would put a literal segment ahead of /API/{endpoint} regardless — which is what lets an app
+    // migrate one endpoint at a time with the PowerShell function still loaded as the rollback.
+    if (nativeCatalog.Endpoints.Count > 0)
+    {
+        var mappable = NativeEndpointRegistry.ResolveCollisions(
+            nativeCatalog.Endpoints, endpoints.Keys, CraftSettings.Endpoints.OnCollision, logger);
+        app.MapCraftNativeEndpoints(mappable, activeRequests, logger, CraftSettings.Endpoints);
+    }
 
     // Dispatch /API/{endpoint} to the discovered PowerShell function. Owns the response cache,
     // stale-while-revalidate, and post-response trigger handling.

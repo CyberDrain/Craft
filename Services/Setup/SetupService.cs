@@ -511,10 +511,11 @@ public class SetupService
             ["redirectToProvider"] = _settings.Setup.RedirectToProvider
         };
 
-        if (_settings.Setup.ExcludedPaths.Count > 0)
+        var excludedPaths = EffectiveExcludedPaths();
+        if (excludedPaths.Count > 0)
         {
-            globalValidation["excludedPaths"] = _settings.Setup.ExcludedPaths;
-            _logger.LogInformation("[Setup] Excluded paths: {Paths}", string.Join(", ", _settings.Setup.ExcludedPaths));
+            globalValidation["excludedPaths"] = excludedPaths;
+            _logger.LogInformation("[Setup] Excluded paths: {Paths}", string.Join(", ", excludedPaths));
         }
 
         // Build allowed audiences: always include api://{appId}, plus any extras from config
@@ -653,7 +654,7 @@ public class SetupService
         }
 
         var desiredAction = _settings.Setup.UnauthenticatedClientAction;
-        var desiredPaths = _settings.Setup.ExcludedPaths;
+        var desiredPaths = EffectiveExcludedPaths();
         var desiredProvider = _settings.Setup.RedirectToProvider;
 
         var actionMatches = string.Equals(currentAction, desiredAction, StringComparison.OrdinalIgnoreCase);
@@ -708,6 +709,24 @@ public class SetupService
             "[Setup] Reconcile applied — action: {OldAction}→{NewAction}, paths: {OldCount}→{NewCount} ({Reason})",
             currentAction, desiredAction, currentPaths.Count, desiredPaths.Count, reason);
         return true;
+    }
+
+    /// <summary>
+    /// The configured excluded paths plus, when Craft serves protected resource metadata
+    /// (App:Prm:Enabled), the well-known PRM path — anonymous discovery requests must reach the
+    /// container instead of being redirected/rejected by EasyAuth. Trailing wildcard covers the
+    /// path-suffixed variants (RFC 9728 §3). Used by both the initial authsettingsV2 write and
+    /// ReconcileAuthPolicy so the two never disagree on the desired state.
+    /// </summary>
+    private List<string> EffectiveExcludedPaths()
+    {
+        var paths = new List<string>(_settings.Setup.ExcludedPaths);
+        if (_settings.Prm.Enabled
+            && !paths.Any(p => p.StartsWith(PrmSettings.WellKnownPath, StringComparison.OrdinalIgnoreCase)))
+        {
+            paths.Add(PrmSettings.WellKnownPath + "*");
+        }
+        return paths;
     }
 
     /// <summary>
