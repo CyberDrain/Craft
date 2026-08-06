@@ -335,25 +335,27 @@
     //   "FirstUserRoles": []
     // },
 
-    // OAuth 2.0 Protected Resource Metadata (RFC 9728) served by Craft at
-    // /.well-known/oauth-protected-resource — how MCP/OAuth clients discover the authorization
-    // server and scopes for the hosted API. The COMPLETE document lives in one app setting
-    // (SettingName, default CRAFT_PRM) written by the hosted app; Craft serves it verbatim, so
-    // the app controls every field. A literal {origin} anywhere in the JSON is replaced
-    // per-request with https://{host} (RFC 9728 requires `resource` to equal the URL the client
-    // connects to — only the request knows it once custom domains exist). Setting absent = 404.
-    // Metadata only: tokens are still issued by Entra and validated by EasyAuth. Exists because
-    // the platform's own PRM (preview) pins authorization_servers to the SSO issuer
-    // (multi-tenant SSO advertises /common, which a single-tenant resource app rejects with
-    // AADSTS50194). While enabled, the setup reconcile auto-appends the well-known path to
+    // OAuth discovery documents served by Craft from app settings, verbatim — the hosted app
+    // controls every field. Two documents:
+    //   /.well-known/oauth-protected-resource (RFC 9728, from SettingName, default CRAFT_PRM):
+    //     how MCP/OAuth clients discover the authorization server and scopes for the hosted API.
+    //   /.well-known/oauth-authorization-server + /.well-known/openid-configuration (RFC 8414,
+    //     from AuthServerSettingName, default CRAFT_PRM_AS, optional): an authorization server
+    //     document the app authors itself — typically mirroring Entra's endpoints verbatim while
+    //     adding a registration_endpoint (dynamic client registration, which Entra lacks). Craft
+    //     serves the JSON only; authorize/token stay at Entra, registration is a hosted-app route.
+    // A literal {origin} anywhere in the JSON is replaced per-request with https://{host}
+    // (RFC 9728 requires `resource` to equal the URL the client connects to — only the request
+    // knows it once custom domains exist). Setting absent = that document 404s.
+    // Exists because the platform's own PRM (preview) pins authorization_servers to the SSO
+    // issuer (multi-tenant SSO advertises /common, which a single-tenant resource app rejects
+    // with AADSTS50194). While enabled, the setup reconcile auto-appends the well-known paths to
     // EasyAuth's ExcludedPaths. Leave WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES UNSET — that setting
     // activates the platform document, which intercepts the path before Craft sees it.
-    // Example document: {"resource":"{origin}/api/ExecMcp","authorization_servers":
-    // ["https://login.microsoftonline.com/<tenantId>/v2.0"],"scopes_supported":
-    // ["https://<host>/user_impersonation"],"bearer_methods_supported":["header"]}
     // "Prm": {
     //   "Enabled": false,
-    //   "SettingName": "CRAFT_PRM"
+    //   "SettingName": "CRAFT_PRM",
+    //   "AuthServerSettingName": "CRAFT_PRM_AS"
     // },
 
     "Scheduler": {
