@@ -347,6 +347,11 @@ if (storageHealth != null) _ = storageHealth.RefreshAsync(); // prime the cache 
 app.MapCraftHealthEndpoint(roles, storageHealth, logger);
 app.MapCraftRealtimeEndpoint(roles, CraftSettings, logger);
 
+// OAuth protected resource metadata (RFC 9728) for MCP/OAuth client discovery. Anonymous by design —
+// the setup reconcile keeps the well-known path in EasyAuth's excludedPaths while App:Prm is enabled.
+// See Services/Hosting/Endpoints/PrmEndpoint.cs.
+app.MapCraftPrmEndpoint(CraftSettings, logger);
+
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
 // A node without the Http role maps NONE of these, so /api and auth paths fall through to static serving
 // (a Frontend node can expose them from its own static dir) and finally to MapFallback (404 for /api|/.auth).

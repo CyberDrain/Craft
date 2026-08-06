@@ -335,6 +335,27 @@
     //   "FirstUserRoles": []
     // },
 
+    // OAuth 2.0 Protected Resource Metadata (RFC 9728) served by Craft at
+    // /.well-known/oauth-protected-resource — how MCP/OAuth clients discover the authorization
+    // server and scopes for the hosted API. The COMPLETE document lives in one app setting
+    // (SettingName, default CRAFT_PRM) written by the hosted app; Craft serves it verbatim, so
+    // the app controls every field. A literal {origin} anywhere in the JSON is replaced
+    // per-request with https://{host} (RFC 9728 requires `resource` to equal the URL the client
+    // connects to — only the request knows it once custom domains exist). Setting absent = 404.
+    // Metadata only: tokens are still issued by Entra and validated by EasyAuth. Exists because
+    // the platform's own PRM (preview) pins authorization_servers to the SSO issuer
+    // (multi-tenant SSO advertises /common, which a single-tenant resource app rejects with
+    // AADSTS50194). While enabled, the setup reconcile auto-appends the well-known path to
+    // EasyAuth's ExcludedPaths. Leave WEBSITE_AUTH_PRM_DEFAULT_WITH_SCOPES UNSET — that setting
+    // activates the platform document, which intercepts the path before Craft sees it.
+    // Example document: {"resource":"{origin}/api/ExecMcp","authorization_servers":
+    // ["https://login.microsoftonline.com/<tenantId>/v2.0"],"scopes_supported":
+    // ["https://<host>/user_impersonation"],"bearer_methods_supported":["header"]}
+    // "Prm": {
+    //   "Enabled": false,
+    //   "SettingName": "CRAFT_PRM"
+    // },
+
     "Scheduler": {
       // JSON file with task definitions (looked up in API/Config/ then API/)
       "ConfigFile": "SchedulerTasks.json",

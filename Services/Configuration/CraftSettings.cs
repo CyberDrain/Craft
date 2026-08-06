@@ -67,6 +67,9 @@ public class CraftSettings
     /// <summary>Bootstrap setup — built-in first-run wizard for EasyAuth + app registration.</summary>
     public SetupSettings Setup { get; set; } = new();
 
+    /// <summary>OAuth protected resource metadata (RFC 9728) served for MCP/OAuth discovery.</summary>
+    public PrmSettings Prm { get; set; } = new();
+
     /// <summary>Historical stats collection — rolling time-series of worker/job metrics.</summary>
     public StatsHistorySettings StatsHistory { get; set; } = new();
 
