@@ -34,10 +34,25 @@ public class PrmSettings
     public const string WellKnownPath = "/.well-known/oauth-protected-resource";
 
     /// <summary>
-    /// Master switch. When enabled and the app setting named by <see cref="SettingName"/> holds
-    /// valid JSON, Craft serves it and the setup reconcile keeps the well-known path in EasyAuth's
-    /// excludedPaths. When the setting is absent, nothing is served — its presence is the
-    /// per-instance "an OAuth resource exists here" signal, written and cleared by the hosted app.
+    /// Authorization server metadata path (RFC 8414). Served when the app setting named by
+    /// <see cref="AuthServerSettingName"/> is present — the hosted app uses this to advertise an
+    /// authorization server document of its own (typically mirroring Entra's endpoints verbatim
+    /// while adding a <c>registration_endpoint</c>, the one thing Entra does not offer). Craft
+    /// serves the document; it never implements any of the endpoints named inside it.
+    /// </summary>
+    public const string AuthServerWellKnownPath = "/.well-known/oauth-authorization-server";
+
+    /// <summary>
+    /// OIDC discovery alias (same document): MCP clients are required to try both this and
+    /// <see cref="AuthServerWellKnownPath"/> when resolving an authorization server.
+    /// </summary>
+    public const string OidcWellKnownPath = "/.well-known/openid-configuration";
+
+    /// <summary>
+    /// Master switch. When enabled and the app settings below hold valid JSON, Craft serves them
+    /// and the setup reconcile keeps the well-known paths in EasyAuth's excludedPaths. When a
+    /// setting is absent its document is not served — presence is the per-instance
+    /// "an OAuth resource exists here" signal, written and cleared by the hosted app.
     /// </summary>
     public bool Enabled { get; set; }
 
@@ -45,4 +60,10 @@ public class PrmSettings
     /// Name of the app setting (environment variable) holding the complete PRM JSON document.
     /// </summary>
     public string SettingName { get; set; } = "CRAFT_PRM";
+
+    /// <summary>
+    /// Name of the app setting (environment variable) holding the complete authorization server
+    /// metadata JSON document (RFC 8414). Optional — absent means only the PRM is served.
+    /// </summary>
+    public string AuthServerSettingName { get; set; } = "CRAFT_PRM_AS";
 }

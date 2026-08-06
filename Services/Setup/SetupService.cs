@@ -721,10 +721,18 @@ public class SetupService
     private List<string> EffectiveExcludedPaths()
     {
         var paths = new List<string>(_settings.Setup.ExcludedPaths);
-        if (_settings.Prm.Enabled
-            && !paths.Any(p => p.StartsWith(PrmSettings.WellKnownPath, StringComparison.OrdinalIgnoreCase)))
+        if (!_settings.Prm.Enabled) return paths;
+
+        string[] wellKnown =
+        [
+            PrmSettings.WellKnownPath,
+            PrmSettings.AuthServerWellKnownPath,
+            PrmSettings.OidcWellKnownPath,
+        ];
+        foreach (var prefix in wellKnown)
         {
-            paths.Add(PrmSettings.WellKnownPath + "*");
+            if (!paths.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+                paths.Add(prefix + "*");
         }
         return paths;
     }

@@ -4,16 +4,19 @@ using Craft.Configuration;
 namespace Craft.Hosting.Endpoints;
 
 /// <summary>
-/// Serves OAuth 2.0 Protected Resource Metadata (RFC 9728) at
-/// <c>/.well-known/oauth-protected-resource</c> (and any path-suffixed variant), which is how MCP
-/// clients discover the authorization server and scopes for the hosted API.
+/// Serves the OAuth discovery documents at their well-known paths: Protected Resource Metadata
+/// (RFC 9728) at <c>/.well-known/oauth-protected-resource</c>, and — when the hosted app provides
+/// one — authorization server metadata (RFC 8414) at <c>/.well-known/oauth-authorization-server</c>
+/// plus its OIDC discovery alias. Together these are how MCP clients discover the authorization
+/// server, scopes, and (via a <c>registration_endpoint</c> in the AS document) how to obtain a
+/// client ID without any manual configuration.
 ///
 /// <para>
-/// The entire document comes verbatim from one app setting — Craft adds nothing and interprets
-/// nothing beyond the per-request <c>{origin}</c> substitution. Metadata only: no authorize, token
-/// or registration endpoints live here; the document points clients at Entra and EasyAuth remains
-/// the sole token validator. See <see cref="PrmSettings"/> for why this exists instead of the
-/// platform's own PRM preview.
+/// Every document comes verbatim from one app setting — Craft adds nothing and interprets nothing
+/// beyond the per-request <c>{origin}</c> substitution. Metadata only: none of the endpoints named
+/// inside the documents are implemented here; authorize/token belong to Entra, registration to the
+/// hosted app, and EasyAuth remains the sole token validator. See <see cref="PrmSettings"/> for why
+/// this exists instead of the platform's own PRM preview.
 /// </para>
 /// </summary>
 public static class PrmEndpoint
@@ -22,8 +25,8 @@ public static class PrmEndpoint
     public const string OriginPlaceholder = "{origin}";
 
     /// <summary>
-    /// Maps the well-known routes when PRM is enabled and the configured app setting holds valid
-    /// JSON. The template is read once at startup — app setting changes restart the container.
+    /// Maps the well-known routes for each document whose app setting holds valid JSON. Templates
+    /// are read once at startup — app setting changes restart the container.
     /// </summary>
     public static WebApplication MapCraftPrmEndpoint(
         this WebApplication app, CraftSettings settings, ILogger logger)
@@ -32,74 +35,82 @@ public static class PrmEndpoint
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(logger);
 
-        var template = ResolveTemplate(settings.Prm, Environment.GetEnvironmentVariable, logger);
-        if (template is null) return app;
-
-        IResult Serve(HttpRequest request)
+        if (!settings.Prm.Enabled)
         {
-            // App Service terminates TLS upstream; the container sees http. The public origin is
-            // always https, and Host survives the front end (custom domains included).
-            return Results.Content(
-                Render(template, $"https://{request.Host.Value}"),
-                "application/json");
+            logger.LogInformation("[Prm] Protected resource metadata: disabled");
+            return app;
         }
 
-        // CORS: the document is public by design and some clients fetch it from browser contexts.
-        void Cors(HttpResponse response)
+        var getEnv = (Func<string, string?>)Environment.GetEnvironmentVariable;
+
+        var prmTemplate = ResolveTemplate(settings.Prm.SettingName, getEnv, logger);
+        if (prmTemplate is not null)
+            MapDocument(app, PrmSettings.WellKnownPath, prmTemplate);
+
+        var asTemplate = ResolveTemplate(settings.Prm.AuthServerSettingName, getEnv, logger);
+        if (asTemplate is not null)
         {
-            response.Headers.AccessControlAllowOrigin = "*";
-            response.Headers.AccessControlAllowMethods = "GET, OPTIONS";
+            // MCP clients are required to try RFC 8414 first and OIDC discovery second; both must
+            // answer with the same document for either probe order to succeed.
+            MapDocument(app, PrmSettings.AuthServerWellKnownPath, asTemplate);
+            MapDocument(app, PrmSettings.OidcWellKnownPath, asTemplate);
         }
 
-        app.MapMethods(PrmSettings.WellKnownPath, ["GET", "OPTIONS"], (HttpContext context) =>
+        if (prmTemplate is null && asTemplate is null)
         {
-            Cors(context.Response);
-            return HttpMethods.IsOptions(context.Request.Method)
-                ? Results.NoContent()
-                : Serve(context.Request);
-        });
-
-        // Suffixed variants (RFC 9728 path insertion) serve the same document. A client probing a
-        // path the document's resource does not name will reject the mismatch itself — which is the
-        // correct outcome, and keeps Craft free of any per-path knowledge.
-        app.MapMethods(PrmSettings.WellKnownPath + "/{**suffix}", ["GET", "OPTIONS"],
-            (HttpContext context, string suffix) =>
-        {
-            Cors(context.Response);
-            return HttpMethods.IsOptions(context.Request.Method)
-                ? Results.NoContent()
-                : Serve(context.Request);
-        });
+            logger.LogInformation(
+                "[Prm] Enabled but neither app setting '{Prm}' nor '{As}' is set — nothing served",
+                settings.Prm.SettingName, settings.Prm.AuthServerSettingName);
+            return app;
+        }
 
         logger.LogInformation(
-            "[Prm] Protected resource metadata: serving document from app setting '{Setting}' at {Path}",
-            settings.Prm.SettingName, PrmSettings.WellKnownPath);
+            "[Prm] Discovery documents: PRM={Prm}, authorization server metadata={As}",
+            prmTemplate is not null ? "serving" : "absent",
+            asTemplate is not null ? "serving" : "absent");
 
         return app;
     }
 
     /// <summary>
-    /// The document template from the configured app setting, or null (with the reason logged) when
-    /// PRM is disabled, the setting is absent, or its content is not valid JSON. Internal and
-    /// env-injectable for tests.
+    /// Maps one document at its well-known path and any suffixed variant (RFC 8414/9728 path
+    /// insertion), GET + OPTIONS, CORS-open. Suffixes all serve the same document: a client probing
+    /// a path the document does not describe will reject the mismatch itself, which is the correct
+    /// outcome and keeps Craft free of per-path knowledge.
     /// </summary>
-    internal static string? ResolveTemplate(
-        PrmSettings prm, Func<string, string?> getEnv, ILogger logger)
+    private static void MapDocument(WebApplication app, string path, string template)
     {
-        if (!prm.Enabled)
+        IResult Handle(HttpContext context)
         {
-            logger.LogInformation("[Prm] Protected resource metadata: disabled");
-            return null;
+            context.Response.Headers.AccessControlAllowOrigin = "*";
+            context.Response.Headers.AccessControlAllowMethods = "GET, OPTIONS";
+
+            if (HttpMethods.IsOptions(context.Request.Method)) return Results.NoContent();
+
+            // App Service terminates TLS upstream; the container sees http. The public origin is
+            // always https, and Host survives the front end (custom domains included).
+            return Results.Content(
+                Render(template, $"https://{context.Request.Host.Value}"),
+                "application/json");
         }
 
-        var raw = string.IsNullOrWhiteSpace(prm.SettingName) ? null : getEnv(prm.SettingName);
+        app.MapMethods(path, ["GET", "OPTIONS"], Handle);
+        app.MapMethods(path + "/{**suffix}", ["GET", "OPTIONS"], Handle);
+    }
+
+    /// <summary>
+    /// The document template from the named app setting, or null (with the reason logged) when the
+    /// setting is absent or its content is not valid JSON. Internal and env-injectable for tests.
+    /// </summary>
+    internal static string? ResolveTemplate(
+        string settingName, Func<string, string?> getEnv, ILogger logger)
+    {
+        var raw = string.IsNullOrWhiteSpace(settingName) ? null : getEnv(settingName);
         if (string.IsNullOrWhiteSpace(raw))
         {
-            // Enabled in config but this instance has no OAuth resource provisioned — the hosted
-            // app writes the document when one exists and clears it when it goes away.
-            logger.LogInformation(
-                "[Prm] Protected resource metadata: enabled but app setting '{Setting}' is not set — not serving",
-                prm.SettingName);
+            // Not an error: the hosted app writes the setting when the OAuth resource exists and
+            // clears it when it goes away.
+            logger.LogInformation("[Prm] App setting '{Setting}' is not set — document not served", settingName);
             return null;
         }
 
@@ -113,8 +124,7 @@ public static class PrmEndpoint
         catch (JsonException ex)
         {
             logger.LogError(ex,
-                "[Prm] App setting '{Setting}' is not valid JSON — protected resource metadata not served",
-                prm.SettingName);
+                "[Prm] App setting '{Setting}' is not valid JSON — document not served", settingName);
             return null;
         }
 
