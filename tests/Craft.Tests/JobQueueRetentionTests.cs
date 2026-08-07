@@ -1,7 +1,7 @@
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -44,10 +44,10 @@ public class JobQueueRetentionTests
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = bgPoolSize;
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, settings, new StartupProgressService(),
+            new Lazy<WorkerMetricsService>(() => null!));
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, settings, pool);
         return new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
     }
 

@@ -71,6 +71,7 @@ public class ConfigurationReferenceTests
             { "App:Scheduler:ConfigFile",              settings.Scheduler.ConfigFile },
             { "App:Scheduler:CheckIntervalSeconds",    settings.Scheduler.CheckIntervalSeconds },
             { "App:Scheduler:ApplyTZOffset",           settings.Scheduler.ApplyTZOffset },
+            { "App:Scheduler:Timezone",                settings.Scheduler.Timezone },
             { "App:Orchestrator:TablePrefix",          settings.Orchestrator.TablePrefix },
             { "App:Orchestrator:MaxRetries",           settings.Orchestrator.MaxRetries },
             { "App:Cache:MaxEntries",                  settings.Cache.MaxEntries },
@@ -98,8 +99,35 @@ public class ConfigurationReferenceTests
     }
 
     /// <summary>
+    /// Every uncommented leaf under <c>App</c> in the example must appear in
+    /// <see cref="DocumentedDefaults"/>. Without this, a new key can be uncommented in the example
+    /// and never checked against the C# default.
+    /// </summary>
+    [Fact]
+    public void EveryUncommentedAppLeaf_IsCoveredByDocumentedDefaults()
+    {
+        var covered = DocumentedDefaults().Select(row => (string)row[0]!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Keys with a non-null Value are leaves; intermediate sections have null Value.
+        var leaves = LoadExample()
+            .GetSection("App")
+            .AsEnumerable(makePathsRelative: false)
+            .Where(kv => kv.Value is not null)
+            .Select(kv => kv.Key)
+            .ToList();
+
+        Assert.NotEmpty(leaves);
+
+        var missing = leaves.Where(k => !covered.Contains(k)).OrderBy(k => k, StringComparer.Ordinal).ToList();
+        Assert.True(missing.Count == 0,
+            "Uncommented App keys in appsettings.example.jsonc are missing from DocumentedDefaults(): " +
+            string.Join(", ", missing) +
+            ". Add each to DocumentedDefaults() so its value is checked against the C# default.");
+    }
+
+    /// <summary>
     /// The example must never become load-bearing. Craft ships no appsettings.json, so a deployment
-    /// that sets nothing gets the C# defaults — this asserts a couple of representative ones directly,
+    /// that sets nothing gets the C# defaults — this asserts representative ones directly,
     /// independent of any file.
     /// </summary>
     [Fact]
@@ -107,11 +135,34 @@ public class ConfigurationReferenceTests
     {
         var settings = new CraftSettings();
 
+        Assert.Equal("Craft", settings.Name);
+        Assert.Equal("Immediate", settings.ReadinessMode);
+
         Assert.Equal(2, settings.Worker.HttpPoolSize);
         Assert.Equal(4, settings.Worker.BgPoolSize);
+        Assert.Equal("AfterReady", settings.Worker.WarmupMode);
+        Assert.True(settings.Worker.ReuseRunspaceThread);
+
         Assert.Equal("craft-session", settings.Auth.CookieName);
         Assert.False(settings.Realtime.Enabled);
         Assert.False(settings.Setup.Enabled);
+
         Assert.True(settings.Health.Enabled);
+        Assert.Equal("/healthz", settings.Health.Path);
+
+        Assert.True(settings.RateLimit.Enabled);
+        Assert.Equal(300, settings.RateLimit.PermitPerWindow);
+        Assert.Equal(10, settings.RateLimit.WindowSeconds);
+
+        Assert.True(settings.Orchestrator.BatchStatusWrites);
+        Assert.Equal("Orchestrator", settings.Orchestrator.TablePrefix);
+        Assert.Equal(3, settings.Orchestrator.MaxRetries);
+
+        Assert.True(settings.Frontend.Compression);
+        Assert.Equal(30, settings.Storage.MaxConnectionsPerServer);
+        Assert.Equal(15, settings.BackgroundLimiter.ScaleUpAfterSeconds);
+
+        Assert.Equal(1000, settings.Cache.MaxEntries);
+        Assert.Equal(600, settings.Cache.DefaultTtlSeconds);
     }
 }

@@ -5,30 +5,30 @@
 #   - dev builds pass --build-arg BUILD_CONFIGURATION=Debug (default: Release)
 #   - distroless = no shell, no package manager, non-root (APP_UID=1654)
 #   - no SSH server; layer one on downstream if a deployment needs it
-# The SDK / build stage stays on Debian; only the runtime is Azure Linux.
+# The SDK / build stage stays on Ubuntu Noble (glibc); only the runtime is Azure Linux.
+# .NET 10 dropped Debian bookworm images — noble is the supported full SDK/aspnet base.
 #
-# Default the .NET base images to the GHCR mirror (CyberDrain/Containers) so
-# builds survive an mcr.microsoft.com / Azure Container Registry outage. Build
-# against upstream until the mirror carries the azurelinux tags:
-#   docker build -f build/Dockerfile --build-arg DOTNET_REGISTRY=mcr.microsoft.com -t craft:local .
+# Default to upstream MCR for .NET 10 — the GHCR CyberDrain mirror does not yet carry the
+# 10.0-noble / 10.0-azurelinux3.0-* tags. Flip back to ghcr.io/cyberdrain once the mirror is updated:
+#   docker build -f build/Dockerfile --build-arg DOTNET_REGISTRY=ghcr.io/cyberdrain -t craft:local .
 #
 # ── Base image patching ──────────────────────────────────────────────────
-# The tags below deliberately float on the `8.0-*` minor, so .NET runtime security patches are picked
+# The tags below deliberately float on the `10.0-*` minor, so .NET runtime security patches are picked
 # up automatically. That only works if the tag is actually re-resolved on each build:
 #
 #   docker build --pull -f build/Dockerfile -t craft:local .
 #
-# WITHOUT --pull, Docker reuses whatever `8.0-...` it already has locally, potentially for months. The
+# WITHOUT --pull, Docker reuses whatever `10.0-...` it already has locally, potentially for months. The
 # CVEs this matters for live in /usr/share/dotnet/shared/Microsoft.NETCore.App/ — the shared runtime
 # shipped by the base image, NOT anything referenced from Craft.csproj. No package bump can fix them
 # and `dotnet list package --vulnerable` will never report them; only rebuilding on a newer base does.
 # CI passes `pull: true` for the same reason (.github/workflows/*-container.yml).
 #
-# Do NOT pin these to an exact patch (e.g. 8.0.29) unless you also own the job that bumps the pin —
+# Do NOT pin these to an exact patch (e.g. 10.0.10) unless you also own the job that bumps the pin —
 # a stale pin is strictly worse than a floating tag, because it looks deliberate.
-ARG DOTNET_REGISTRY=ghcr.io/cyberdrain
+ARG DOTNET_REGISTRY=mcr.microsoft.com
 
-FROM ${DOTNET_REGISTRY}/dotnet/sdk:8.0-bookworm-slim AS build
+FROM ${DOTNET_REGISTRY}/dotnet/sdk:10.0-noble AS build
 ARG BUILD_CONFIGURATION=Release
 # Supplied automatically by buildx (amd64 / arm64). Mapped to a .NET RID below.
 ARG TARGETARCH
@@ -45,14 +45,19 @@ RUN case "${TARGETARCH:-amd64}" in \
 # Restore inputs only, so the restore layer caches across source-only changes. Directory.Build.props
 # and global.json must land BEFORE restore: the props file sets properties restore evaluates, and
 # global.json pins the SDK — omit either and restore and publish disagree about what they're building.
-COPY Craft.csproj Directory.Build.props global.json ./
-RUN dotnet restore -r "$(cat /tmp/rid)"
+# The host lives under src/Craft/ and references sibling module projects; COPY their csproj files
+# into the restore layer so ProjectReference restore caches across source-only changes.
+COPY Directory.Build.props global.json ./
+COPY src/Craft/Craft.csproj ./src/Craft/
+COPY src/Craft.Configuration/Craft.Configuration.csproj ./src/Craft.Configuration/
+COPY src/Craft.Contracts/Craft.Contracts.csproj ./src/Craft.Contracts/
+RUN dotnet restore src/Craft/Craft.csproj -r "$(cat /tmp/rid)"
 
 COPY . .
 # Two things are load-bearing here:
 #
-#   Craft.csproj, named explicitly — with no argument `dotnet publish` resolves Craft.sln, which
-#   includes tests/Craft.Tests and publishes xunit, testhost and coverlet into the runtime image.
+#   src/Craft/Craft.csproj, named explicitly — with no argument `dotnet publish` resolves Craft.sln,
+#   which includes tests/Craft.Tests and publishes xunit, testhost and coverlet into the runtime image.
 #
 #   -r <rid> --self-contained false — WITHOUT a RuntimeIdentifier, publish keeps the RID-agnostic
 #   layout and copies EVERY platform's assets out of the NuGet packages: runtimes/win (17 MB), plus
@@ -79,7 +84,7 @@ COPY . .
 # runtime exception inside a hosted app's script, and dropping only the compiler produces a different
 # exception for the same root problem. The satellite locale folders below ARE safe to delete; these
 # two are not.
-RUN dotnet publish Craft.csproj -c ${BUILD_CONFIGURATION} \
+RUN dotnet publish src/Craft/Craft.csproj -c ${BUILD_CONFIGURATION} \
   -r "$(cat /tmp/rid)" --self-contained false \
   -o /app/publish && \
   rm -f /app/publish/Craft.xml && \
@@ -89,9 +94,9 @@ RUN dotnet publish Craft.csproj -c ${BUILD_CONFIGURATION} \
   /app/publish/pt-BR /app/publish/ru /app/publish/tr \
   /app/publish/zh-Hans /app/publish/zh-Hant
 
-# mimalloc staged from Debian (glibc) — not reliably packaged in Azure Linux's
+# mimalloc staged from Ubuntu Noble (glibc) — not reliably packaged in Azure Linux's
 # tdnf repos, and glibc→glibc so it loads cleanly on the Azure Linux runtime.
-FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-bookworm-slim AS mimalloc-src
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:10.0-noble AS mimalloc-src
 ARG TARGETARCH
 RUN set -eux; \
   apt-get update && apt-get install -y --no-install-recommends libmimalloc2.0; \
@@ -104,7 +109,7 @@ RUN set -eux; \
 
 # distroless-extra = distroless + icu/tzdata. PowerShell needs globalization, so
 # the plain -distroless tag (no ICU) would break it — the -extra tag is required.
-FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runtime
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:10.0-azurelinux3.0-distroless-extra AS runtime
 # IMPORTANT: the app lives in /app, NOT under /home. Azure App Service mounts persistent storage over
 # /home when WEBSITES_ENABLE_APP_SERVICE_STORAGE=true, which shadows anything the image ships there —
 # an app under /home/app loses its binaries at runtime ("Craft.dll does not exist"). So we keep the app
@@ -140,7 +145,7 @@ ENV CRAFT_VERBOSE="false"
 
 # Writable state needs no path envs: /app is app-owned (chowned COPY above), so runtime _cache/_data
 # land there fine; logs + restart-tracker default to the app user's home (RuntimePaths in
-# CraftSettings.cs). App-owned content such as API/Config/function-permissions.json is writable in
+# Craft.Configuration/Infrastructure/RuntimePaths.cs). App-owned content such as API/Config/function-permissions.json is writable in
 # place — downstream images that COPY additional files as root should still --chown them to APP_UID.
 
 # ── Memory & runtime tuning ──

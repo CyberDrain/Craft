@@ -1,11 +1,12 @@
 <Project>
 
   <!--
-    Shared build settings for every project in the repo (Craft.csproj and anything under tests/).
+    Shared build settings for every project in the repo (src/Craft*, tests/).
     Per-project settings stay in the .csproj; anything that should be true everywhere lives here.
 
-    NOTE for build/Dockerfile: this file must be COPYied alongside Craft.csproj *before* `dotnet restore`,
-    otherwise restore and build evaluate different properties.
+    NOTE for build/Dockerfile: this file must be COPYied *before* `dotnet restore` of
+    src/Craft/Craft.csproj (and its ProjectReferences), otherwise restore and build evaluate
+    different properties.
   -->
 
   <PropertyGroup>

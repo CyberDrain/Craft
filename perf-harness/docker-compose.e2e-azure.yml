@@ -14,7 +14,9 @@ services:
 
   sut:
     image: ${SUT_IMAGE:-craft:ci}
-    platform: linux/amd64
+    # Native host arch (CI amd64 / local arm64). For cross-arch: build with --platform and add
+    #   platform: linux/amd64
+    # under this service, or use docker compose run --platform.
     container_name: craft-e2e-az-sut
     cpus: 2
     ports:

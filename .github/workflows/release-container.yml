@@ -45,9 +45,9 @@ jobs:
           context: .
           file: build/Dockerfile
           # Always re-resolve the base image instead of reusing whatever the runner or the GHA layer
-          # cache already has. The Dockerfile intentionally floats on the `8.0-*` tag so .NET runtime
+          # cache already has. The Dockerfile intentionally floats on the `10.0-*` tag so .NET runtime
           # patches are picked up automatically — but that only works if the tag is actually
-          # re-resolved. Without this, a patched runtime (e.g. 8.0.28 -> 8.0.29, six High CVEs) can sit
+          # re-resolved. Without this, a patched runtime (e.g. 10.0.9 -> 10.0.10) can sit
           # unapplied in published images while every project-level dependency scans clean.
           pull: true
           push: true
@@ -57,7 +57,7 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.app_version }}
             COMMIT_SHA=${{ github.sha }}
             IMAGE_TAG=latest
-            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'ghcr.io/cyberdrain' }}
+            DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'mcr.microsoft.com' }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ steps.version.outputs.app_version }}

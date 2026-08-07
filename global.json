@@ -7,7 +7,7 @@
     "Bump this in lockstep with setup-dotnet in the workflows and the sdk tag in build/Dockerfile."
   ],
   "sdk": {
-    "version": "8.0.400",
+    "version": "10.0.100",
     "rollForward": "latestFeature",
     "allowPrerelease": false
   }

@@ -1,0 +1,86 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings live in Directory.Build.props. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Craft</RootNamespace>
+    <AssemblyName>Craft</AssemblyName>
+    <!--
+      Local `dotnet run` secrets (storage connection strings, AUTH_SECRET, …) live in the .NET
+      user-secrets store — never in a tracked or gitignored appsettings.json. CreateBuilder loads
+      them automatically when ASPNETCORE_ENVIRONMENT=Development (see Properties/launchSettings.json).
+    -->
+    <UserSecretsId>CyberDrain.Craft</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Craft.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Craft.Configuration\Craft.Configuration.csproj" />
+    <ProjectReference Include="..\Craft.Contracts\Craft.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Microsoft.PowerShell.SDK MUST stay on the matching TFM line: 7.4 is PowerShell on .NET 8,
+      7.5 is .NET 9, 7.6 is .NET 10. Moving the SDK version means moving TargetFramework with it.
+    -->
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.6.4" />
+    <PackageReference Include="Cronos" Version="0.8.4" />
+    <PackageReference Include="Azure.Data.Tables" Version="12.11.0" />
+  </ItemGroup>
+
+  <!--
+    Transitive security pins. These arrive several levels down from the packages above, so the only
+    way to move them is to reference them directly — a direct PackageReference wins over any transitive
+    version. Review whenever the parent packages are bumped: once the parent pulls a version at or
+    above the pin, delete the pin rather than leave it to rot.
+
+      System.Security.Cryptography.Xml  10.0.6 -> 10.0.10
+        via Microsoft.PowerShell.SDK -> Microsoft.Windows.Compatibility.
+        GHSA-g8r8-53c2-pm3f, GHSA-8q5v-6pqq-x66h, GHSA-cvvh-rhrc-wg4q, GHSA-23rf-6693-g89p,
+        GHSA-mmjf-rqrv-855v (all High).
+
+    NU1510 is suppressed on this reference: on net10.0 the package is part of the shared framework,
+    so NuGet wants to prune a direct PackageReference as "unnecessary". We keep the reference solely
+    to force the patched version over the vulnerable 10.0.6 PowerShell still pulls transitively —
+    without it, restore fails NU1903 (TreatWarningsAsErrors) on the same advisories.
+  -->
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.10" NoWarn="NU1510" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <EnableDefaultContentItems>false</EnableDefaultContentItems>
+  </PropertyGroup>
+
+  <!-- Include runtime content in published output -->
+  <ItemGroup>
+    <!--
+      CRAFT ships NO appsettings.json of its own. Every setting's default lives on the C# property in
+      Craft.Configuration (CraftSettings.cs), so a shipped file could only ever restate them — and a
+      stale restatement that silently overrides a changed default is worse than no file at all. The
+      annotated reference lives in appsettings.example.jsonc at the repo root (documentation,
+      deliberately not matched by this glob and deliberately not valid strict JSON — it has comments).
+
+      This glob still fires for a non-secret appsettings.json a *downstream app* image COPYs in.
+      Local developers configure secrets with `dotnet user-secrets` (see docs/configuration.md), not
+      by dropping an appsettings.json next to this project.
+    -->
+    <Content Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Runtime\**\*.ps1" CopyToOutputDirectory="PreserveNewest" LinkBase="Runtime" />
+  </ItemGroup>
+
+  <!--
+    First-run setup wizard pages. Kept as real .html files so tooling can parse them, compiled into
+    Craft.dll so they travel with the runtime and cannot be replaced by a downstream image.
+    LogicalName is explicit so the lookup key in Services/Setup/SetupPages.cs does not depend on folder
+    layout — moving these files is then a rename, not a silent runtime break.
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="Services\Setup\*.html" LogicalName="Craft.Setup.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

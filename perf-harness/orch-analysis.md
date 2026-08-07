@@ -84,9 +84,9 @@ fan-out is gated by **Azure Table write throughput, not worker throughput**. Thi
 
 ## Applied: #1 burst-to-ceiling (win) + over-subscription dial (marginal — confirms the real bottleneck)
 
-Both are configurable (default off/0, preserving today's conservative behavior):
-`BackgroundBurstToCeiling` (bool) and `BackgroundOverSubscribe` (int), alongside the existing
-`BackgroundBaseConcurrency` / `BackgroundScaleUpAfterSeconds` / `BackgroundMaxConcurrency`.
+Both are configurable (default off/0, preserving today's conservative behavior) under
+`App:BackgroundLimiter`: `BurstToCeiling` (bool) and `OverSubscribe` (int), alongside
+`BaseConcurrency` / `ScaleUpAfterSeconds` / `MaxConcurrency`.
 
 **#1 Burst-to-ceiling — clear 2.7× win.** Jumps `_currentMax` straight to the ceiling the moment tasks queue,
 instead of the 15 s ramp. 1000 tasks / pool 8: **12.5 s → 4.6 s**, identical to pinning baseline=ceiling, but

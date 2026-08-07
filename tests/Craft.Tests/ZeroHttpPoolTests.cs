@@ -1,6 +1,6 @@
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.PowerShellHost;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -22,9 +22,13 @@ public class ZeroHttpPoolTests
         settings.Worker.HttpPoolSize = httpPoolSize;
         settings.Worker.BgPoolSize = 4;
 
-        var config = new ConfigurationBuilder().Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        return new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        return new PowerShellWorkerPool(
+            repo,
+            NullLogger<PowerShellWorkerPool>.Instance,
+            settings,
+            new StartupProgressService(),
+            new Lazy<WorkerMetricsService>(() => throw new InvalidOperationException("metrics unused")));
     }
 
     [Fact]

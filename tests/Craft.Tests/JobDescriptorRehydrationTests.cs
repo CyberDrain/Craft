@@ -1,9 +1,9 @@
 using System.Runtime.CompilerServices;
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Storage;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -88,15 +88,16 @@ public class JobDescriptorRehydrationTests
         }
     }
 
-    private static (JobManager Jobs, CountingStore Store, OrchestratorTableStore Orch) NewHarness()
+    private static (JobManager Jobs, CountingStore Store, OrchestratorTableStore Orch) NewHarness(
+        Lazy<JobWorkResolver>? workResolver = null)
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = 8;
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
-        var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, settings, new StartupProgressService(),
+            new Lazy<WorkerMetricsService>(() => null!));
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, settings, pool);
+        var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter, workResolver: workResolver);
         var store = new CountingStore();
         var orch = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, store);
         return (jobs, store, orch);
@@ -104,38 +105,27 @@ public class JobDescriptorRehydrationTests
 
     private static Task Pump(JobManager jobs) => Task.Run(() => jobs.StartAsync(CancellationToken.None));
 
-    private static async Task<bool> WaitUntil(Func<bool> condition, int timeoutMs = 5000)
-    {
-        var deadline = Environment.TickCount64 + timeoutMs;
-        while (Environment.TickCount64 < deadline)
-        {
-            if (condition()) return true;
-            await Task.Delay(10);
-        }
-        return condition();
-    }
-
     /// <summary>The descriptor reaches the resolver intact — that is the whole contract of the queue.</summary>
     [Fact]
     public async Task Dispatch_HandsTheDescriptorToTheResolver()
     {
-        var (jobs, _, _) = NewHarness();
         var seen = new List<JobDescriptor>();
         var done = 0;
-
-        jobs.SetWorkResolver((d, _) =>
+        JobWorkResolver? resolver = null;
+        var (jobs, _, _) = NewHarness(new Lazy<JobWorkResolver>(() => resolver!));
+        resolver = (d, _) =>
         {
             lock (seen) seen.Add(d);
             return Task.FromResult<Func<CancellationToken, Task>?>(
                 _ => { Interlocked.Increment(ref done); return Task.CompletedTask; });
-        });
+        };
 
         for (var i = 0; i < 25; i++)
             jobs.Enqueue(new JobDescriptor("CIPPDBCacheRun", $"Graph_tenant{i:D3}", 5), $"CIPPDBCacheRun-Graph_tenant{i:D3}");
 
         _ = Pump(jobs);
-        Assert.True(await WaitUntil(() => Volatile.Read(ref done) == 25), $"only {done}/25 ran");
-        await Task.WhenAny(jobs.StopAsync(CancellationToken.None), Task.Delay(5000));
+        Assert.True(await TestWait.WaitUntil(() => Volatile.Read(ref done) == 25), $"only {done}/25 ran");
+        await TestWait.StopWithin(jobs.StopAsync(CancellationToken.None));
 
         lock (seen)
         {
@@ -152,23 +142,23 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public async Task StaleDescriptor_IsSkipped_AndDispatchContinues()
     {
-        var (jobs, _, _) = NewHarness();
         var ran = 0;
-
-        jobs.SetWorkResolver((d, _) => Task.FromResult<Func<CancellationToken, Task>?>(
+        JobWorkResolver? resolver = null;
+        var (jobs, _, _) = NewHarness(new Lazy<JobWorkResolver>(() => resolver!));
+        resolver = (d, _) => Task.FromResult<Func<CancellationToken, Task>?>(
             d.TaskId == "gone"
                 ? null                                            // stale — resolver declines
-                : _ => { Interlocked.Increment(ref ran); return Task.CompletedTask; }));
+                : _ => { Interlocked.Increment(ref ran); return Task.CompletedTask; });
 
         jobs.Enqueue(new JobDescriptor("run", "gone", 0), "run-gone");
         for (var i = 0; i < 10; i++)
             jobs.Enqueue(new JobDescriptor("run", $"live{i}", 5), $"run-live{i}");
 
         _ = Pump(jobs);
-        Assert.True(await WaitUntil(() => Volatile.Read(ref ran) == 10), $"only {ran}/10 ran after a stale descriptor");
+        Assert.True(await TestWait.WaitUntil(() => Volatile.Read(ref ran) == 10), $"only {ran}/10 ran after a stale descriptor");
 
         var stale = jobs.GetJobs(status: "Skipped");
-        await Task.WhenAny(jobs.StopAsync(CancellationToken.None), Task.Delay(5000));
+        await TestWait.StopWithin(jobs.StopAsync(CancellationToken.None));
 
         Assert.Single(stale);
         Assert.Equal("run-gone", stale[0].Name);
@@ -182,10 +172,10 @@ public class JobDescriptorRehydrationTests
         jobs.Enqueue(new JobDescriptor("run", "task", 0), "run-task");
 
         _ = Pump(jobs);
-        Assert.True(await WaitUntil(() => jobs.GetJobs(status: "Failed").Count == 1));
+        Assert.True(await TestWait.WaitUntil(() => jobs.GetJobs(status: "Failed").Count == 1));
 
         var failed = jobs.GetJobs(status: "Failed").Single();
-        await Task.WhenAny(jobs.StopAsync(CancellationToken.None), Task.Delay(5000));
+        await TestWait.StopWithin(jobs.StopAsync(CancellationToken.None));
 
         Assert.Contains("resolver", failed.LastError, StringComparison.OrdinalIgnoreCase);
     }
@@ -264,7 +254,7 @@ public class JobDescriptorRehydrationTests
             work: _ => { ran.TrySetResult(); return Task.CompletedTask; });
 
         await ran.Task;
-        Assert.True(await WaitUntil(() => !jobs.IsQueuedOrRunning("run-b-task-1")),
+        Assert.True(await TestWait.WaitUntil(() => !jobs.IsQueuedOrRunning("run-b-task-1")),
             "a completed job still reports as queued/running — the re-drive would never fire");
     }
 

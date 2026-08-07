@@ -39,13 +39,13 @@ services:
       - App__ReadinessMode=Immediate
       - App__Setup__Enabled=false
       - App__Orchestrator__TablePrefix=PerfBgOrch
-      # BackgroundTaskLimiter tuning (top-level config keys). run-orch.ps1 A/Bs the ramp behavior.
+      # BackgroundTaskLimiter tuning. Prefer App__BackgroundLimiter__*; root Background* keys still work via post-bind.
       # Defaults reproduce the app defaults on a small box (base 2, scale-up after 15s, ceiling = BG pool).
-      - BackgroundBaseConcurrency=${BG_BASE:-2}
-      - BackgroundScaleUpAfterSeconds=${BG_SCALEUP:-15}
-      - BackgroundMaxConcurrency=${BG_CEILING:-8}
-      - BackgroundBurstToCeiling=${BG_BURST:-false}
-      - BackgroundOverSubscribe=${BG_OVERSUB:-0}
+      - App__BackgroundLimiter__BaseConcurrency=${BG_BASE:-2}
+      - App__BackgroundLimiter__ScaleUpAfterSeconds=${BG_SCALEUP:-15}
+      - App__BackgroundLimiter__MaxConcurrency=${BG_CEILING:-8}
+      - App__BackgroundLimiter__BurstToCeiling=${BG_BURST:-false}
+      - App__BackgroundLimiter__OverSubscribe=${BG_OVERSUB:-0}
       # Batched status writer (#3). run-orch.ps1 -NoBatch sets false to A/B the per-task-write "before".
       - App__Orchestrator__BatchStatusWrites=${BATCH_WRITES:-true}
       - App__Orchestrator__DurableRunningBarrier=${DURABLE_BARRIER:-true}

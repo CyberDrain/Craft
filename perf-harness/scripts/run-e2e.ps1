@@ -60,7 +60,12 @@ function Fetch($url, $extra = @()) {
 
 if ($Build) {
   Info "building $SutImage ..."
-  docker build -f (Join-Path $repoRoot 'build/Dockerfile') -t $SutImage $repoRoot | Out-Host
+  # Prefer upstream MCR until the GHCR CyberDrain mirror carries .NET 10 tags. --pull re-resolves
+  # floating 10.0-* bases so runtime CVEs aren't baked from a stale local cache.
+  $registry = if ($env:DOTNET_REGISTRY) { $env:DOTNET_REGISTRY } else { 'mcr.microsoft.com' }
+  docker build --pull -f (Join-Path $repoRoot 'build/Dockerfile') `
+    --build-arg "DOTNET_REGISTRY=$registry" `
+    -t $SutImage $repoRoot | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "docker build failed" }
 }
 
