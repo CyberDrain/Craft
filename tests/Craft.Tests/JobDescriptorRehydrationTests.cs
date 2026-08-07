@@ -229,4 +229,51 @@ public class JobDescriptorRehydrationTests
         Assert.Equal(1, counting.PointReads);        // the run row
         Assert.Equal(1, counting.PartitionScans);    // all 200 task rows in one partition query
     }
+
+    // ── OWNERSHIP, as used by the Pending re-drive ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// The re-drive re-queues tasks that are Pending with nothing owning them, and decides ownership from
+    /// this. A queued job must report owned, or the re-drive would double-dispatch every task in the queue
+    /// on its next 60s tick.
+    /// </summary>
+    [Fact]
+    public void IsQueuedOrRunning_True_ForAQueuedJob()
+    {
+        var (jobs, _, _) = NewHarness();
+
+        jobs.Enqueue(new JobDescriptor("run-a", "task-1", 4), name: "run-a-task-1");
+
+        Assert.True(jobs.IsQueuedOrRunning("run-a-task-1"));
+    }
+
+    /// <summary>
+    /// THE trap. Terminal records stay in the tracking dictionary up to MaxTrackedJobs so the status API
+    /// can report them, so a presence-only check would answer true for a job that finished long ago — and
+    /// a task left Pending by an exhausted deferral would then look owned forever and never be re-driven.
+    /// That is precisely the three-day outage this guards.
+    /// </summary>
+    [Fact]
+    public async Task IsQueuedOrRunning_False_OnceTheJobHasCompleted()
+    {
+        var (jobs, _, _) = NewHarness();
+        _ = Pump(jobs);
+
+        var ran = new TaskCompletionSource();
+        jobs.Enqueue(name: "run-b-task-1", priority: 4, runName: "run-b",
+            work: _ => { ran.TrySetResult(); return Task.CompletedTask; });
+
+        await ran.Task;
+        Assert.True(await WaitUntil(() => !jobs.IsQueuedOrRunning("run-b-task-1")),
+            "a completed job still reports as queued/running — the re-drive would never fire");
+    }
+
+    /// <summary>A job id nothing knows about is not owned. This is the state a deferred task is left in.</summary>
+    [Fact]
+    public void IsQueuedOrRunning_False_ForAnUnknownJob()
+    {
+        var (jobs, _, _) = NewHarness();
+
+        Assert.False(jobs.IsQueuedOrRunning("run-c-task-never-enqueued"));
+    }
 }

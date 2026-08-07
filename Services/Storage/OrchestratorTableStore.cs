@@ -52,26 +52,74 @@ public class OrchestratorTableStore
     /// <summary>Upsert run metadata (without tasks — tasks are separate rows).</summary>
     public async Task UpsertRunAsync(OrchestratorRun run)
     {
-        var row = new StoreRow("Run", run.Name)
-        {
-            Properties =
-            {
-                ["Status"] = run.Status,
-                ["Priority"] = run.Priority,
-                ["StartedUtc"] = run.StartedUtc,
-                ["CompletedUtc"] = run.CompletedUtc,
-                ["TaskScriptName"] = run.TaskScriptName,
-                ["PostExecFunctionName"] = run.PostExecFunctionName,
-                ["PostExecParametersJson"] = run.PostExecParametersJson,
-                ["PostExecStatus"] = run.PostExecStatus,
-                ["Reference"] = run.Reference,
-                ["ParentRunName"] = run.ParentRunName,
-                ["TaskCount"] = run.Tasks.Count
-            }
-        };
-
-        await _store.UpsertAsync(_runsTable, row);
+        await _store.UpsertAsync(_runsTable, BuildRunRow(run));
     }
+
+    /// <summary>
+    /// Persist many run rows in as few round-trips as possible.
+    ///
+    /// Every run row shares the constant "Run" partition key, so N of them cost ceil(N/100)
+    /// transactions rather than N. Writing them one at a time inside a flush bounded by
+    /// StatusFlushTimeoutSeconds is what pushed real flushes past 30s and then past the 90s durable
+    /// barrier: every task waiting on its "Running" marker deferred, and after MaxDeferrals was
+    /// abandoned as Pending with nothing left to retry it.
+    ///
+    /// Returns the names of runs that did not persist, so the caller can requeue exactly those.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> WriteRunStatusBatchAsync(IReadOnlyList<OrchestratorRun> runs,
+        CancellationToken ct = default)
+    {
+        if (runs.Count == 0) return [];
+
+        var failed = new List<string>();
+
+        // 100 is the Azure Table transaction ceiling.
+        foreach (var chunk in runs.Chunk(100))
+        {
+            try
+            {
+                await _store.UpsertBatchAsync(_runsTable, "Run", chunk.Select(BuildRunRow).ToList(), ct);
+            }
+            catch (Exception ex)
+            {
+                // A transaction fails atomically, so one rejected row would discard the other 99. Retry
+                // the chunk row by row: the poison row is isolated and the rest still land.
+                _logger.LogWarning(ex,
+                    "[OrchestratorStore] Run status batch of {Count} failed — retrying individually", chunk.Length);
+
+                foreach (var run in chunk)
+                {
+                    try { await _store.UpsertAsync(_runsTable, BuildRunRow(run), ct); }
+                    catch (Exception single)
+                    {
+                        failed.Add(run.Name);
+                        _logger.LogWarning(single,
+                            "[OrchestratorStore] Run status write failed for {Run} — will retry", run.Name);
+                    }
+                }
+            }
+        }
+
+        return failed;
+    }
+
+    private static StoreRow BuildRunRow(OrchestratorRun run) => new("Run", run.Name)
+    {
+        Properties =
+        {
+            ["Status"] = run.Status,
+            ["Priority"] = run.Priority,
+            ["StartedUtc"] = run.StartedUtc,
+            ["CompletedUtc"] = run.CompletedUtc,
+            ["TaskScriptName"] = run.TaskScriptName,
+            ["PostExecFunctionName"] = run.PostExecFunctionName,
+            ["PostExecParametersJson"] = run.PostExecParametersJson,
+            ["PostExecStatus"] = run.PostExecStatus,
+            ["Reference"] = run.Reference,
+            ["ParentRunName"] = run.ParentRunName,
+            ["TaskCount"] = run.Tasks.Count
+        }
+    };
 
     /// <summary>Load a run and all its tasks. Returns null if the run does not exist.</summary>
     public async Task<OrchestratorRun?> GetRunAsync(string name)

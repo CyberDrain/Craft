@@ -232,15 +232,13 @@ public sealed class OrchestratorStatusWriter : IDisposable
             if (tasks.Count > 0)
                 unwritten.AddRange(await _store.WriteTaskStatusBatchAsync(tasks.Values.ToList(), _flushConcurrency, cts.Token));
 
-            foreach (var run in runs.Values)
-            {
-                try { await _store.UpsertRunAsync(run); }
-                catch (Exception ex)
-                {
-                    unwritten.Add(run.Name);
-                    _logger.LogWarning(ex, "[Orchestrator] Run status write failed for {Run} — will retry", run.Name);
-                }
-            }
+            // Batched, not one await per run. Run rows all share the "Run" partition key, so N of them
+            // cost ceil(N/100) transactions; the previous per-run loop cost N round-trips inside a flush
+            // bounded by _flushTimeout, which is how a busy instance (100+ live runs) blew the flush
+            // budget and then the durable barrier. The store isolates a poison row by retrying a failed
+            // chunk individually, so a single bad run no longer discards the other 99.
+            if (runs.Count > 0)
+                unwritten.AddRange(await _store.WriteRunStatusBatchAsync(runs.Values.ToList(), cts.Token));
         }
         catch (Exception ex)
         {
