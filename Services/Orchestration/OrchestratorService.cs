@@ -494,7 +494,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // Start periodic status timer (every 60s) for this run
         if (!_runStatusTimers.ContainsKey(run.Name))
         {
-            var timer = new Timer(_ => LogRunStatus(run), null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+            var timer = new Timer(_ => { LogRunStatus(run); RedrivePendingTasks(run); },
+                null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
             _runStatusTimers.TryAdd(run.Name, timer);
         }
 
@@ -711,9 +712,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _writer.QueueRun(run);
     }
 
+    /// <summary>How many times a task has been deferred, and when it last was. The timestamp is what lets
+    /// the re-drive tell an exhausted task that has been sitting for minutes from one that deferred a
+    /// moment ago and is still legitimately retrying.</summary>
+    private sealed record DeferralState(int Count, DateTime LastUtc);
+
     /// <summary>Deferrals per task while storage is unable to accept the durable marker. In-memory and
     /// intentionally so — it bounds retries within one process life, nothing more.</summary>
-    private readonly ConcurrentDictionary<string, int> _deferrals = new();
+    private readonly ConcurrentDictionary<string, DeferralState> _deferrals = new();
 
     /// <summary>Cap on in-process retries before a task is left for the next recovery pass to pick up.</summary>
     private const int MaxDeferrals = 3;
@@ -727,12 +733,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     private void DeferTask(OrchestratorRun run, OrchestratorTaskItem task, Exception cause)
     {
-        var count = _deferrals.AddOrUpdate(DeferralKey(run.Name, task.Id), 1, (_, c) => c + 1);
+        var state = _deferrals.AddOrUpdate(DeferralKey(run.Name, task.Id),
+            _ => new DeferralState(1, DateTime.UtcNow),
+            (_, s) => new DeferralState(s.Count + 1, DateTime.UtcNow));
+        var count = state.Count;
 
         if (count > MaxDeferrals)
         {
+            // Left Pending on purpose — storage already says Pending, so nothing is lost. It is no longer
+            // terminal though: RedrivePendingTasks picks it up once it has aged, so recovery is not
+            // gated on a restart the way it used to be.
             _logger.LogError(cause,
-                "[Scheduler] Task {TaskId} in {Run} deferred {Count} times — leaving it Pending for the next recovery",
+                "[Scheduler] Task {TaskId} in {Run} deferred {Count} times — left Pending for the re-drive",
                 task.Id, run.Name, count);
             return;
         }
@@ -743,6 +755,58 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
         _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
             name: $"{run.Name}-{task.Id}");
+    }
+
+    /// <summary>
+    /// How long a task must have sat Pending-and-unowned before the re-drive claims it. Long enough that a
+    /// task mid-deferral (each attempt can take up to the barrier timeout) is not stolen out from under the
+    /// attempt already in progress.
+    /// </summary>
+    private static readonly TimeSpan RedriveAge = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Re-queue tasks that are Pending in memory but that nothing owns — no queued job, no running job.
+    ///
+    /// This is the safety net for the state a deferral leaves behind. A task whose durable "Running" marker
+    /// could not be written is rolled back to Pending and retried, but only <see cref="MaxDeferrals"/>
+    /// times; after that it used to sit Pending with nothing to pick it up, because the only other retry
+    /// path was startup recovery. A healthy instance never restarts, so in production that meant 658 tasks
+    /// pending and 0 running for three days, with "Run X already active, skipping" preventing a fresh run
+    /// from doing the work instead.
+    ///
+    /// Ownership is decided by <see cref="JobManager.IsQueuedOrRunning"/> rather than by a timestamp on the
+    /// task, so a task queued normally is never double-dispatched. The age gate only applies to tasks with
+    /// a deferral history — anything Pending and unowned with no deferral record was lost some other way
+    /// and there is nothing to wait for.
+    /// </summary>
+    private void RedrivePendingTasks(OrchestratorRun run)
+    {
+        var now = DateTime.UtcNow;
+        List<OrchestratorTaskItem> orphaned;
+
+        lock (_lock)
+        {
+            orphaned = run.Tasks
+                .Where(t => t.Status == "Pending")
+                .Where(t => !_jobManager.IsQueuedOrRunning($"{run.Name}-{t.Id}"))
+                .Where(t => !_deferrals.TryGetValue(DeferralKey(run.Name, t.Id), out var s)
+                            || now - s.LastUtc >= RedriveAge)
+                .ToList();
+        }
+
+        if (orphaned.Count == 0) return;
+
+        foreach (var task in orphaned)
+        {
+            // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
+            _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
+            _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
+                name: $"{run.Name}-{task.Id}");
+        }
+
+        _logger.LogWarning(
+            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — none were queued or running",
+            orphaned.Count, run.Name);
     }
 
     private void LogRunStatus(OrchestratorRun run)

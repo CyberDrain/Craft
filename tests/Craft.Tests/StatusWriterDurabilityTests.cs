@@ -37,6 +37,11 @@ public class StatusWriterDurabilityTests
         public int MaxConcurrentBatches;
         private int _inFlight;
 
+        /// <summary>Single-row upserts. Counted separately from batches because a flush that writes N rows
+        /// one at a time costs N round-trips no matter how fast each one is — the cost the batch path exists
+        /// to avoid.</summary>
+        public int SingleUpsertCalls;
+
         public List<StoreRow> Rows(string table)
         {
             lock (_sync) return _tables.TryGetValue(table, out var t) ? t.Values.ToList() : new List<StoreRow>();
@@ -50,14 +55,17 @@ public class StatusWriterDurabilityTests
             return Task.CompletedTask;
         }
 
-        public Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
+        public async Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
         {
+            Interlocked.Increment(ref SingleUpsertCalls);
+            // Same simulated round-trip as the batch path: without it a sequential loop of N writes
+            // completes in microseconds and the test cannot distinguish it from a single batch.
+            if (BatchDelayMs > 0) await Task.Delay(BatchDelayMs, ct);
             lock (_sync)
             {
                 if (!_tables.ContainsKey(table)) _tables[table] = new();
                 _tables[table][(row.PartitionKey, row.RowKey)] = row;
             }
-            return Task.CompletedTask;
         }
 
         public async Task UpsertBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
@@ -369,6 +377,58 @@ public class StatusWriterDurabilityTests
 
         public Task DeleteAsync(string t, string p, string r, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeletePartitionAsync(string t, string p, CancellationToken ct = default) => Task.CompletedTask;
+    }
+
+    // ── RUN-ROW WRITE COST ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Run rows all share the constant "Run" partition key, so a flush carrying N of them can persist
+    /// them in ceil(N/100) transactions. Writing them one at a time instead costs N round-trips inside a
+    /// flush that is bounded by StatusFlushTimeoutSeconds — the cost that pushed real flushes past 30s,
+    /// then past the 90s barrier, deferring every waiting task until it was abandoned as Pending.
+    ///
+    /// Guards the write SHAPE, not wall-clock: a timing assertion here would be flaky on a loaded agent.
+    /// </summary>
+    [Fact]
+    public async Task RunRows_ArePersistedInBatches_NotOnePerRoundTrip()
+    {
+        var (writer, backing) = NewWriter(barrierTimeoutSec: 30, flushTimeoutSec: 20);
+        using var _ = writer;
+
+        const int runCount = 150;
+        for (var i = 0; i < runCount; i++)
+            writer.QueueRun(new OrchestratorRun { Name = $"run-{i:D3}", Status = "Running" });
+
+        await writer.FlushAsync();
+
+        Assert.Equal(runCount, backing.Rows("OrchestratorRuns").Count);
+
+        // 150 rows in one partition = 2 transactions of 100 + 50. Allow generous headroom for the
+        // warmup row and flush-cycle boundaries, but nothing close to one call per row.
+        Assert.True(backing.SingleUpsertCalls <= 10,
+            $"run rows were written with {backing.SingleUpsertCalls} single upserts for {runCount} runs — " +
+            "they share one partition key and should be batched");
+    }
+
+    /// <summary>
+    /// A batch transaction fails atomically, so one bad row would take out the other 99. The write path
+    /// must fall back to per-row writes for that chunk rather than reporting all of them unwritten.
+    /// </summary>
+    [Fact]
+    public async Task RunRows_FallBackToIndividualWrites_WhenABatchFails()
+    {
+        var (writer, backing) = NewWriter(barrierTimeoutSec: 30, flushTimeoutSec: 20);
+        using var _ = writer;
+
+        backing.FailBatches = true;              // every batch transaction rejects
+
+        for (var i = 0; i < 5; i++)
+            writer.QueueRun(new OrchestratorRun { Name = $"run-{i}", Status = "Running" });
+
+        await writer.FlushAsync();
+
+        // Batching failed, so each row must still have reached storage individually.
+        Assert.Equal(5, backing.Rows("OrchestratorRuns").Count);
     }
 }
 

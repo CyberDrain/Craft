@@ -78,6 +78,16 @@ public class JobManager : BackgroundService
     public int ActiveCount => _activeCount;
     public int QueuedCount { get { lock (_queueLock) return _pendingQueue.Count; } }
 
+    /// <summary>
+    /// Is this job still in flight — queued or running?
+    ///
+    /// Presence in <see cref="_jobs"/> is NOT enough: terminal records are retained there up to
+    /// <see cref="MaxTrackedJobs"/> for the status API, so a completed job would answer true and a caller
+    /// checking "does anything still own this work" would wrongly conclude yes. Status is the answer.
+    /// </summary>
+    public bool IsQueuedOrRunning(string jobId) =>
+        _jobs.TryGetValue(jobId, out var record) && record.Status is "Queued" or "Running";
+
     public JobManager(ILogger<JobManager> logger, CraftSettings settings, BackgroundTaskLimiter limiter)
     {
         _logger = logger;
