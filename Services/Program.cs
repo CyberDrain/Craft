@@ -359,6 +359,11 @@ app.MapCraftPrmEndpoint(CraftSettings, logger);
 if (capHttp)
 {
 
+    // Answer CORS preflights for the deployment's declared-public (EasyAuth-excluded) paths —
+    // browser-based OAuth/MCP clients preflight their registration POST and the PowerShell
+    // dispatcher maps no OPTIONS verb. See Services/Hosting/CorsPreflightMiddleware.cs.
+    app.UseCraftPublicCorsPreflight(CraftSettings, logger);
+
     // Normalise the EasyAuth principal into the SWA shape the hosted PS app expects, then map the two
     // auth-adjacent routes. See Services/Hosting/CraftAuthMiddleware.cs and Endpoints/AuthEndpoints.cs.
     app.UseCraftAuth(CraftSettings, authService, logger);
