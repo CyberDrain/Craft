@@ -2,7 +2,7 @@
 
   <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings come from Directory.Build.props. -->
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -25,7 +25,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\Craft.csproj" />
+    <ProjectReference Include="..\..\src\Craft\Craft.csproj" />
   </ItemGroup>
 
   <!--
@@ -44,7 +44,7 @@
     without standing up a server, so the source itself is the thing under test.
   -->
   <ItemGroup>
-    <None Include="..\..\Services\Hosting\Endpoints\*.cs" CopyToOutputDirectory="PreserveNewest" LinkBase="EndpointSources" />
+    <None Include="..\..\src\Craft\Services\Hosting\Endpoints\*.cs" CopyToOutputDirectory="PreserveNewest" LinkBase="EndpointSources" />
   </ItemGroup>
 
 </Project>

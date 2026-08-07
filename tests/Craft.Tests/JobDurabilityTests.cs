@@ -1,9 +1,9 @@
 using Craft.Auth;
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Storage;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -15,7 +15,7 @@ namespace Craft.Tests;
 /// </summary>
 public class JobDurabilityTests
 {
-    private sealed class FakeStore : ICraftTableStore
+    private sealed class FakeStore : IUserTableStore
     {
         private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
 
@@ -84,15 +84,15 @@ public class JobDurabilityTests
         return new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, new CraftSettings(), backing);
     }
 
-    private static JobManager NewJobManager()
+    private static JobManager NewJobManager(Lazy<IJobDescriptorStateWriter>? stateWriter = null)
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = 8;
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
-        return new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, settings, new StartupProgressService(),
+            new Lazy<WorkerMetricsService>(() => null!));
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, settings, pool);
+        return new JobManager(NullLogger<JobManager>.Instance, settings, limiter, stateWriter: stateWriter);
     }
 
     /// <summary>Records what the JobManager reports, standing in for OrchestratorService.</summary>
@@ -173,9 +173,8 @@ public class JobDurabilityTests
     [Fact]
     public void ChangePriority_ReportsTheDescriptor_ForDurablePersistence()
     {
-        var jobs = NewJobManager();
         var sink = new RecordingSink();
-        jobs.SetDescriptorStateWriter(sink);
+        var jobs = NewJobManager(new Lazy<IJobDescriptorStateWriter>(() => sink));
 
         var id = jobs.Enqueue(new JobDescriptor("run", "task1", 5), "run-task1");
         Assert.True(jobs.ChangePriority(id, 0));
@@ -189,9 +188,8 @@ public class JobDurabilityTests
     [Fact]
     public void CancelJob_ReportsTheDescriptor_SoRecoveryDoesNotReQueueIt()
     {
-        var jobs = NewJobManager();
         var sink = new RecordingSink();
-        jobs.SetDescriptorStateWriter(sink);
+        var jobs = NewJobManager(new Lazy<IJobDescriptorStateWriter>(() => sink));
 
         var id = jobs.Enqueue(new JobDescriptor("run", "task1", 5), "run-task1");
         Assert.True(jobs.CancelJob(id));
@@ -203,9 +201,8 @@ public class JobDurabilityTests
     [Fact]
     public void CancelRun_ReportsEveryQueuedDescriptor()
     {
-        var jobs = NewJobManager();
         var sink = new RecordingSink();
-        jobs.SetDescriptorStateWriter(sink);
+        var jobs = NewJobManager(new Lazy<IJobDescriptorStateWriter>(() => sink));
 
         for (var i = 0; i < 25; i++)
             jobs.Enqueue(new JobDescriptor("run", $"task{i}", 5), $"run-task{i}");
@@ -224,9 +221,8 @@ public class JobDurabilityTests
     [Fact]
     public void ClosureJobs_AreNotReported_HavingNothingToPersist()
     {
-        var jobs = NewJobManager();
         var sink = new RecordingSink();
-        jobs.SetDescriptorStateWriter(sink);
+        var jobs = NewJobManager(new Lazy<IJobDescriptorStateWriter>(() => sink));
 
         var id = jobs.Enqueue("Start-CIPPDBCache", 5, _ => Task.CompletedTask);
         Assert.True(jobs.ChangePriority(id, 0));
@@ -240,8 +236,7 @@ public class JobDurabilityTests
     [Fact]
     public void SinkFailure_DoesNotFailTheOperatorAction()
     {
-        var jobs = NewJobManager();
-        jobs.SetDescriptorStateWriter(new ThrowingSink());
+        var jobs = NewJobManager(new Lazy<IJobDescriptorStateWriter>(() => new ThrowingSink()));
 
         var id = jobs.Enqueue(new JobDescriptor("run", "task1", 5), "run-task1");
 
@@ -266,8 +261,7 @@ public class JobDurabilityTests
     [Fact]
     public void AuthService_Dispose_DoesNotThrow()
     {
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
-        var auth = new AuthService(NullLogger<AuthService>.Instance, config, new CraftSettings(), new FakeStore());
+        var auth = new AuthService(NullLogger<AuthService>.Instance, new CraftSettings(), new FakeStore());
 
         auth.Dispose();          // must not throw — this is what broke host shutdown
         auth.Dispose();          // and must stay safe if the container disposes twice

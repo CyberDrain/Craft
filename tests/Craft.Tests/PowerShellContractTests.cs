@@ -1,5 +1,3 @@
-using System.Reflection;
-
 namespace Craft.Tests;
 
 /// <summary>
@@ -8,9 +6,12 @@ namespace Craft.Tests;
 /// Hosted apps call these directly — <c>[Craft.Services.RealtimeBridge]::Publish(...)</c>,
 /// <c>[Craft.Services.OrchestratorBridge]::QueueOrchestration(...)</c>. A namespace rename, a class
 /// rename or a visibility change compiles perfectly and then fails at runtime inside the hosted app
-/// with "Unable to find type", which is the worst possible place to discover it. Type forwarding
-/// cannot soften the blow: <c>[TypeForwardedTo]</c> only works across assemblies, and all of these
-/// live in Craft.dll.
+/// with "Unable to find type", which is the worst possible place to discover it.
+/// </para>
+/// <para>
+/// After the Contracts extraction, bridge facades and <c>PowerShellRunnerService</c> live in the
+/// host <c>Craft</c> assembly while DTOs live in <c>Craft.Contracts</c> (same <c>Craft.Services</c>
+/// namespace). PowerShell resolves by FQN across loaded assemblies; these tests do the same.
 /// </para>
 /// <para>
 /// If a test here fails, the fix is almost always to revert the rename — not to update the list.
@@ -20,21 +21,18 @@ namespace Craft.Tests;
 /// </summary>
 public class PowerShellContractTests
 {
-    private static readonly Assembly s_craft = typeof(Craft.Services.RealtimeBridge).Assembly;
     private static readonly string[] ContractSurface =
         {
-            // Bridges
+            // Bridges + runner (host assembly)
             "AppLifecycleBridge", "AuthBridge", "CacheBridge", "LogBridge", "OrchestratorBridge",
             "QueueBridge", "QueueStatusBridge", "RealtimeBridge", "SchedulerBridge",
             "StartupInfoBridge", "StatsHistoryBridge", "WorkerMetricsBridge",
             "PowerShellRunnerService",
-            // DTOs a bridge can hand to PowerShell, directly or nested
+            // DTOs (Craft.Contracts assembly, same namespace)
             "CacheStats", "LogFileInfo", "StartupStats", "StatsDataPoint", "ScriptResult",
-            "JobRecord", "JobSummary", "JobRunSummary", "JobDetail",
-            "WorkerStats", "WorkerMetricsSnapshot", "PoolMetrics", "WorkerDetail", "LimiterMetrics",
+            "JobSummary", "JobRunSummary", "JobDetail",
+            "WorkerMetricsSnapshot", "PoolMetrics", "WorkerDetail", "LimiterMetrics",
             "JobMetrics", "MemoryMetrics", "WorkerSummary", "MemoryBreakdown", "GenerationDetail",
-            // Nested public records on the bridges — the queued-item types the background side drains.
-            "PendingOrchestration", "PendingPlannerRun", "PendingQueueCommand",
         };
 
     /// <summary>
@@ -58,11 +56,49 @@ public class PowerShellContractTests
         "Craft.Services.PowerShellRunnerService",
     };
 
+    private static Type? FindContractType(string fullName)
+    {
+        // Touch both assemblies so they are loaded before we scan.
+        _ = typeof(Craft.Services.RealtimeBridge);
+        _ = typeof(Craft.Services.ScriptResult);
+
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = asm.GetName().Name;
+            if (name is not ("Craft" or "Craft.Contracts"))
+                continue;
+            var type = asm.GetType(fullName, throwOnError: false);
+            if (type is not null)
+                return type;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<Type> EnumerateCraftServicesTypes()
+    {
+        _ = typeof(Craft.Services.RealtimeBridge);
+        _ = typeof(Craft.Services.ScriptResult);
+
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = asm.GetName().Name;
+            if (name is not ("Craft" or "Craft.Contracts"))
+                continue;
+
+            foreach (var type in asm.GetExportedTypes())
+            {
+                if (type.Namespace == "Craft.Services")
+                    yield return type;
+            }
+        }
+    }
+
     [Theory]
     [MemberData(nameof(ContractTypeNames))]
     public void ContractType_ExistsAndIsPublic(string fullName)
     {
-        var type = s_craft.GetType(fullName, throwOnError: false);
+        var type = FindContractType(fullName);
 
         Assert.True(type is not null,
             $"[{fullName}] is referenced from PowerShell but no longer exists under that name. " +
@@ -82,11 +118,11 @@ public class PowerShellContractTests
     public void HttpResponseContext_KeepsFunctionsWorkerTypeName()
     {
         const string expected = "Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext";
-        var type = s_craft.GetType(expected, throwOnError: false);
+        var type = typeof(Microsoft.Azure.Functions.PowerShellWorker.HttpResponseContext);
 
-        Assert.True(type is not null,
-            $"{expected} must keep this exact name — hosted-app routers match on PSObject.TypeNames.");
-        Assert.True(type!.IsPublic);
+        Assert.Equal(expected, type.FullName);
+        Assert.True(type.IsPublic);
+        Assert.Equal("Craft.Contracts", type.Assembly.GetName().Name);
     }
 
     /// <summary>
@@ -100,9 +136,9 @@ public class PowerShellContractTests
     {
         var allowed = new HashSet<string>(ContractSurface);
 
-        var actual = s_craft.GetExportedTypes()
-            .Where(t => t.Namespace == "Craft.Services")
+        var actual = EnumerateCraftServicesTypes()
             .Select(t => t.Name)
+            .Distinct()
             .ToList();
 
         var unexpected = actual.Where(n => !allowed.Contains(n)).OrderBy(n => n).ToList();

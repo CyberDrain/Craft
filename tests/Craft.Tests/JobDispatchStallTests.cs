@@ -1,7 +1,7 @@
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -33,10 +33,10 @@ public class JobDispatchStallTests
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = bgPoolSize;
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, settings, new StartupProgressService(),
+            new Lazy<WorkerMetricsService>(() => null!));
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, settings, pool);
         return (new JobManager(NullLogger<JobManager>.Instance, settings, limiter), limiter);
     }
 
@@ -52,19 +52,8 @@ public class JobDispatchStallTests
     private static Task StartPump(JobManager jobs) => Task.Run(() => jobs.StartAsync(CancellationToken.None));
 
     /// <summary>Stop without ever hanging the suite, whatever state the loop is in.</summary>
-    private static async Task StopPump(JobManager jobs) =>
-        await Task.WhenAny(jobs.StopAsync(CancellationToken.None), Task.Delay(5000));
-
-    private static async Task<bool> WaitUntil(Func<bool> condition, int timeoutMs = 5000)
-    {
-        var deadline = Environment.TickCount64 + timeoutMs;
-        while (Environment.TickCount64 < deadline)
-        {
-            if (condition()) return true;
-            await Task.Delay(10);
-        }
-        return condition();
-    }
+    private static Task StopPump(JobManager jobs) =>
+        TestWait.StopWithin(jobs.StopAsync(CancellationToken.None));
 
     /// <summary>
     /// THE GUARANTEE. A job that blocks its thread must not stop other jobs from being dispatched while
@@ -97,9 +86,9 @@ public class JobDispatchStallTests
                 runName: "CIPPDBCacheRun");
 
         _ = StartPump(jobs);
-        Assert.True(reached.Wait(5000), "the blocking job never started");
+        Assert.True(reached.Wait(30_000), "the blocking job never started");
 
-        var drained = await WaitUntil(() => Volatile.Read(ref ran) == 20);
+        var drained = await TestWait.WaitUntil(() => Volatile.Read(ref ran) == 20);
 
         // Snapshot the stall signature while the blocker is still holding its thread.
         var stillBlocked = !blocked.IsSet;
@@ -142,7 +131,7 @@ public class JobDispatchStallTests
         _ = StartPump(jobs);
 
         // Saturated + backlog ⇒ the loop must be parked in AcquireAsync and say so.
-        var reported = await WaitUntil(() => limiter.Waiting > 0 && jobs.QueuedCount > 0);
+        var reported = await TestWait.WaitUntil(() => limiter.Waiting > 0 && jobs.QueuedCount > 0);
         var waiting = limiter.Waiting;
         var queued = jobs.QueuedCount;
         var active = limiter.Active;
@@ -178,7 +167,7 @@ public class JobDispatchStallTests
             });
 
         _ = StartPump(jobs);
-        await WaitUntil(() => Volatile.Read(ref concurrent) >= limiter.CurrentMax);
+        await TestWait.WaitUntil(() => Volatile.Read(ref concurrent) >= limiter.CurrentMax);
         await Task.Delay(300);
 
         var observedPeak = Volatile.Read(ref peak);

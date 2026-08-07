@@ -14,8 +14,8 @@ namespace Craft.Tests;
 /// </summary>
 public class SetupWizardStatusTests
 {
-    private static SetupService NewService(ICraftTableStore store, CraftSettings? settings = null) =>
-        new(NullLogger<SetupService>.Instance, settings ?? new CraftSettings(), store);
+    private static SetupUserBootstrap NewService(IUserTableStore store, CraftSettings? settings = null) =>
+        new(NullLogger<SetupUserBootstrap>.Instance, settings ?? new CraftSettings(), store);
 
     // ── The probe ───────────────────────────────────────────────────────────────────────────────
 
@@ -231,11 +231,11 @@ public class SetupWizardStatusTests
     // ── Fake ────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// In-memory <see cref="ICraftTableStore"/>. Only the four members the setup path touches do
+    /// In-memory <see cref="IUserTableStore"/>. Only the four members the setup path touches do
     /// anything; the rest throw so an accidental new dependency shows up as a failing test rather
     /// than a silent no-op.
     /// </summary>
-    private sealed class FakeStore : ICraftTableStore
+    private sealed class FakeStore : IUserTableStore
     {
         public List<StoreRow> Rows { get; } = [];
         public List<string> EnsuredTables { get; } = [];

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings live in Directory.Build.props. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Craft.Services</RootNamespace>
+    <AssemblyName>Craft.Contracts</AssemblyName>
+    <Description>Pinned Craft.Services DTOs and HttpResponseContext for PowerShell interop.</Description>
+  </PropertyGroup>
+
+  <!-- StartupStats (and similar) use internal setters mutated by the host. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Craft" />
+    <InternalsVisibleTo Include="Craft.Tests" />
+  </ItemGroup>
+
+</Project>

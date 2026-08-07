@@ -9,9 +9,9 @@ on:
     paths:
       - 'build/**'
       - 'docker/**'
-      - 'Runtime/**'
-      - 'Services/**'
-      - 'Craft.csproj'
+      - 'src/Craft/**'
+      - 'src/Craft.Configuration/**'
+      - 'src/Craft.Contracts/**'
       - 'Craft.sln'
       - 'tests/**'
       - 'Directory.Build.props'
@@ -22,9 +22,9 @@ on:
     paths:
       - 'build/**'
       - 'docker/**'
-      - 'Runtime/**'
-      - 'Services/**'
-      - 'Craft.csproj'
+      - 'src/Craft/**'
+      - 'src/Craft.Configuration/**'
+      - 'src/Craft.Contracts/**'
       - 'Craft.sln'
       - 'tests/**'
       - 'Directory.Build.props'
@@ -105,8 +105,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # Build the AzureTables image the E2E stack runs (compose references it as craft:ci).
+      # --pull re-resolves floating 10.0-* bases; DOTNET_REGISTRY defaults to MCR until the GHCR
+      # CyberDrain mirror publishes .NET 10 tags (override via repo variable).
       - name: Build image
-        run: docker build -f build/Dockerfile -t craft:ci .
+        run: >
+          docker build --pull -f build/Dockerfile
+          --build-arg DOTNET_REGISTRY=${{ vars.DOTNET_REGISTRY || 'mcr.microsoft.com' }}
+          -t craft:ci .
 
       # Brings up Azurite + the SUT (combined role), asserts every subsystem PASS/FAIL, and exits
       # non-zero on any failure. pwsh, docker, and docker compose are preinstalled on ubuntu-latest.

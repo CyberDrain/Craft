@@ -22,11 +22,11 @@ Thumbs.db
 # Logs
 *.log
 
-# Local settings (contains secrets)
-# CRAFT ships no appsettings.json — appsettings.example.jsonc is the annotated reference, and real
-# config comes from App__* env vars or a file the downstream app supplies. Anything matching
-# appsettings*.json here is therefore somebody's local override, which is exactly the file most likely
-# to hold a storage connection string. Keep it out of the repo.
+# Local settings
+# CRAFT ships no appsettings.json — appsettings.example.jsonc is the annotated reference.
+# Local secrets belong in `dotnet user-secrets` (UserSecretsId on Craft.csproj), not in a JSON file.
+# Anything matching appsettings*.json here is therefore a non-secret override (or a mistake); keep it
+# out of the repo either way.
 appsettings.json
 appsettings.*.json
 local.settings.json

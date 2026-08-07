@@ -10,16 +10,19 @@
 // JSON per the spec, and a file named `.json` that no generic tool, schema validator or linter can read
 // is a trap. The extension now matches the contents.
 //
-// TO CONFIGURE A DEPLOYMENT, pick one:
+// TO CONFIGURE A DEPLOYMENT, pick the right channel:
 //   1. Environment variables — App__Worker__HttpPoolSize=4, App__Auth__CookieName=..., and the CRAFT_*
 //      shorthands. This is what the E2E harness and most deployments use. Highest precedence.
-//   2. Your own appsettings.json, supplied by the downstream app image (COPY it to /app) or dropped in
-//      the project root for local `dotnet run`.
+//   2. Local `dotnet run` secrets — `dotnet user-secrets set "AzureWebJobsStorage" "..."` (and other
+//      secret keys). User secrets load in Development only; see docs/configuration.md. Do NOT put
+//      connection strings or AUTH_SECRET in an appsettings.json for local work.
+//   3. A downstream appsettings.json — optional non-secret structural defaults COPYed into a
+//      container image. Prefer env / Key Vault for credentials even there.
 //
 // EVERY VALUE BELOW IS ALREADY THE BUILT-IN DEFAULT. The defaults are the C# property initialisers in
-// Services/CraftSettings.cs — that file is the single source of truth. Copy out only the keys you are
-// actually changing; restating a default here just creates something that silently goes stale when the
-// default moves.
+// src/Craft.Configuration/CraftSettings.cs — that file is the single source of truth.
+// Copy out only the keys you are actually changing; restating a default here just creates something
+// that silently goes stale when the default moves.
 //
 // Full prose documentation: docs/configuration.md
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -131,7 +134,7 @@
 
       // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
       // Default true — the biggest per-request dispatch win (~50% of PS-invoke cost; see
-      // docs/dispatch-analysis.md). Set false only to A/B or if a module misbehaves on a long-lived thread.
+      // perf-harness/dispatch-analysis.md). Set false only to A/B or if a module misbehaves on a long-lived thread.
       // "ReuseRunspaceThread": true,
 
       // Host-tier pool sizing. When set, the first matching entry overrides
@@ -237,10 +240,14 @@
     },
 
     // ── Storage backend (Azure Tables) ──
-    // The allowedUsers table (Auth) and orchestrator state resolve their connection as an explicit
-    // per-feature setting (e.g. Auth:UserStorageConnection) → the AzureWebJobsStorage env var. If
-    // neither is set the host FAILS TO START rather than silently falling back to the local emulator.
+    // Resolve order: Auth:UserStorageConnection (etc.) → AzureWebJobsStorage env var →
+    // App:Storage:ConnectionString (config / user secrets) → Development emulator fallback.
+    // Outside Development, missing config FAILS TO START rather than silently using the emulator.
     // "Storage": {
+    //   // Shared connection string (same role as AzureWebJobsStorage). Local: prefer
+    //   //   dotnet user-secrets set "AzureWebJobsStorage" "…"
+    //   // or set this key. Containers keep using the AzureWebJobsStorage env var.
+    //   "ConnectionString": "",
     //   // Allow the local storage emulator fallback when no connection string is configured.
     //   // Default false (fail closed). Also enabled by CRAFT_ALLOW_DEV_STORAGE=true or
     //   // ASPNETCORE_ENVIRONMENT=Development.
@@ -373,6 +380,17 @@
       "Timezone": ""
     },
 
+    // Background concurrency limiter (on top of Worker.BgPoolSize). Null Base/Max use runtime defaults.
+    // "BackgroundLimiter": {
+    //   "BaseConcurrency": 2,
+    //   "MaxConcurrency": 8,
+    //   "ScaleUpAfterSeconds": 15,
+    //   "BurstToCeiling": false,
+    //   "OverSubscribe": 0,
+    //   "HttpPressureThreshold": null,
+    //   "HttpPressureAfterSeconds": 10
+    // },
+
     "Orchestrator": {
       // Prefix for Azure Tables: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results
       "TablePrefix": "Orchestrator",
@@ -380,7 +398,7 @@
       "MaxRetries": 3,
       // Batch + coalesce per-task/run status writes off the fan-out critical path (results are never batched).
       // Default true. Removes the per-task Azure Table write that gates worker throughput — see
-      // docs/orch-analysis.md. Set false for the original per-task writes.
+      // perf-harness/orch-analysis.md. Set false for the original per-task writes.
       // "BatchStatusWrites": true,
       // Write the pre-invoke "Running" marker under a durable barrier (persisted before the task runs, so
       // AttemptCount/MaxRetries still bounds poison tasks). Default true. False = eventual (max throughput —
@@ -413,7 +431,7 @@
 
       // Bytes budget for keeping cached response bodies in memory (LRU tier over the disk cache) so a HIT
       // returns from RAM instead of re-reading the file. Default 64 MiB; 0 = disk-only. Big win for large
-      // List* responses (+157% throughput at ~150KB — see docs/cache-analysis.md).
+      // List* responses (+157% throughput at ~150KB — see perf-harness/cache-analysis.md).
       // "MaxMemoryBytes": 67108864,
 
       // Maximum cached responses held in memory

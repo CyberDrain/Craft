@@ -245,9 +245,8 @@ public class StatusWriterDurabilityTests
 
         backing.FailBatches = false;                             // storage recovers
 
-        var deadline = Environment.TickCount64 + 5000;
-        while (Environment.TickCount64 < deadline && backing.Rows("OrchestratorTasks").Count == 0)
-            await Task.Delay(20);
+        Assert.True(await TestWait.WaitUntil(() => backing.Rows("OrchestratorTasks").Count > 0),
+            "retried write never landed after storage recovered");
 
         var rows = backing.Rows("OrchestratorTasks");
         Assert.Single(rows);
@@ -268,9 +267,8 @@ public class StatusWriterDurabilityTests
         writer.QueueTask("run", new OrchestratorTaskItem { Id = "t1", Status = "Completed" });
         backing.FailBatches = false;
 
-        var deadline = Environment.TickCount64 + 5000;
-        while (Environment.TickCount64 < deadline && backing.Rows("OrchestratorTasks").Count == 0)
-            await Task.Delay(20);
+        Assert.True(await TestWait.WaitUntil(() => backing.Rows("OrchestratorTasks").Count > 0),
+            "newer Completed state never landed after storage recovered");
 
         var rows = backing.Rows("OrchestratorTasks");
         Assert.Single(rows);

@@ -5,12 +5,12 @@ Craft (CyberDrain Runtime for Apps, Functions, Tasks) is configured through ASP.
 ## Where defaults come from
 
 **Craft ships no `appsettings.json`.** Every setting's default is the C# property initialiser in
-[`Services/CraftSettings.cs`](../Services/CraftSettings.cs) — that file is the single source of truth, and a
+[`src/Craft.Configuration/CraftSettings.cs`](../src/Craft.Configuration/CraftSettings.cs) — that file is the single source of truth, and a
 deployment that sets nothing at all gets exactly those values.
 
 [`appsettings.example.jsonc`](../appsettings.example.jsonc) is an annotated reference listing every key
 alongside its default. It is **documentation only**: the `.jsonc` extension keeps it out of the
-`appsettings*.json` content glob in `Craft.csproj`, so it is never copied to the published output or the
+`appsettings*.json` content glob in `src/Craft/Craft.csproj`, so it is never copied to the published output or the
 container image. It carries comments, which strict JSON does not allow — hence the extension.
 
 Copy out of it only the keys you are actually changing. Restating a default in your own config creates a
@@ -20,16 +20,44 @@ value that silently goes stale the day the default moves.
 
 Settings are merged in priority order (highest wins):
 
-1. **Environment variables** — `App__Worker__BgPoolSize=8`
-2. **`Properties/launchSettings.json`** — profile env vars injected by `dotnet run` / Visual Studio (local dev only, ignored in Docker/production)
-3. **`appsettings.{Environment}.json`** — e.g. `appsettings.Development.json` (loaded when `ASPNETCORE_ENVIRONMENT=Development`)
-4. **`appsettings.json`** — supplied by *your* app, if you supply one (always loaded, all environments)
-5. **C# property defaults** in `Services/CraftSettings.cs` — the floor; always present
+1. **Environment variables** — `App__Worker__BgPoolSize=8` (containers / CI / production)
+2. **`src/Craft/Properties/launchSettings.json`** — profile env vars injected by `dotnet run` / Visual Studio (local only; sets `ASPNETCORE_ENVIRONMENT=Development`)
+3. **.NET user secrets** — local `dotnet run` only (Development). Connection strings and other secrets go here — **not** in an `appsettings.json` on disk
+4. **`appsettings.{Environment}.json` / `appsettings.json`** — optional non-secret overlays a *downstream app* may ship in its image. Do not use these for local secrets
+5. **C# property defaults** in `src/Craft.Configuration/CraftSettings.cs` — the floor; always present
 
-Both appsettings files are optional. When both are present the environment-specific file overlays onto the
-base — it doesn't replace it — and values in the environment file win for the same key. Note that both are
-gitignored in this repo, since a local `appsettings.json` is the file most likely to hold a storage
-connection string.
+The host registers settings with `AddOptions<CraftSettings>().BindConfiguration("App")`, applies SKU /
+`AzureWebJobsStorage` post-configure, and `ValidateOnStart` for readiness mode and pool sizes. Nested
+section objects use `= new()` so defaults apply when a section is absent from config.
+
+### Local development (user secrets only)
+
+For `dotnet run`, put every secret and connection string in the user-secrets store. Secrets never leave your
+machine and are never a file in the repo (gitignored or otherwise).
+
+```bash
+# from the repo root (src/Craft/Craft.csproj has UserSecretsId=CyberDrain.Craft)
+# Azurite: Development already allows the emulator fallback — only set a connection when you need a
+# real storage account (or want to be explicit):
+dotnet user-secrets set "AzureWebJobsStorage" "UseDevelopmentStorage=true" --project src/Craft/Craft.csproj
+# Optional App-section secrets use ":" (JSON shape), not "__":
+dotnet user-secrets set "App:Auth:UserStorageConnection" "UseDevelopmentStorage=true" --project src/Craft/Craft.csproj
+# EasyAuth client secret — only needed when exercising real AAD login / setup flows locally:
+dotnet user-secrets set "AUTH_SECRET" "local-dev-only-change-me" --project src/Craft/Craft.csproj
+dotnet user-secrets list --project src/Craft/Craft.csproj
+dotnet run --project src/Craft/Craft.csproj
+```
+
+`WebApplication.CreateBuilder` loads user secrets only when the environment is **Development**. The checked-in
+[`src/Craft/Properties/launchSettings.json`](../src/Craft/Properties/launchSettings.json) sets that for the default `dotnet run`
+profile. If you override the environment to Production locally, secrets will not load — and storage will
+fail closed unless `AzureWebJobsStorage` / `App:Storage:ConnectionString` is set another way.
+
+With `ASPNETCORE_ENVIRONMENT=Development` and no connection string at all, Craft already falls back to
+`UseDevelopmentStorage=true` (Azurite). User secrets are for when you need a real account or other secrets.
+
+Containers and App Service keep using environment variables / Key Vault references — user secrets are a
+local-dev mechanism, not a deployment one.
 
 Environment variables use `__` (double underscore) as the section separator:
 
@@ -174,7 +202,7 @@ Controls the PowerShell runspace pools that execute all scripts.
 
   // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
   // Default true — the biggest single per-request dispatch win (~50% of the PS-invoke cost, +68% throughput
-  // on dispatch-bound load; see docs/dispatch-analysis.md), and matches the Azure Functions PS worker's
+  // on dispatch-bound load; see ../perf-harness/dispatch-analysis.md), and matches the Azure Functions PS worker's
   // persistent runspace. Safe: each worker owns one runspace and serves one request at a time. Set false
   // only to A/B or if a module misbehaves on a long-lived pipeline thread.
   "ReuseRunspaceThread": true,
@@ -346,24 +374,27 @@ at load with an error naming the timer.
 
 ### Background concurrency limiter
 
-Gates how many background/orchestrator tasks run at once, on top of the `Worker.BgPoolSize` runspaces. These
-are **root-level** config keys (set at the top of `appsettings.json` or as env vars, not under `App:`).
+Gates how many background/orchestrator tasks run at once, on top of the `Worker.BgPoolSize` runspaces.
+Bound under `App:BackgroundLimiter` (env: `App__BackgroundLimiter__*`). Legacy root-level keys
+(`BackgroundBaseConcurrency`, etc.) are still accepted via post-bind for older harness compose files.
+
 By default it starts narrow and ramps slowly, to keep idle memory low; tune it for bursty fan-out.
 
 | Key | Default | Effect |
 |---|---|---|
-| `BackgroundBaseConcurrency` | `clamp(cores, 2, 4)` | starting width when idle |
-| `BackgroundScaleUpAfterSeconds` | `15` | how long the queue must be backed up before ramping (doubles per 10s tick) |
-| `BackgroundMaxConcurrency` | `BgPoolSize` | ceiling |
-| `BackgroundBurstToCeiling` | `false` | jump straight to the ceiling the moment tasks queue, skipping the ramp — **~2.7× faster fan-out** for bursts shorter than the ramp dwell (see docs/orch-analysis.md) |
-| `BackgroundOverSubscribe` | `0` | admit this many tasks *above* the ceiling so they can do their pre-invoke table write and queue at the worker checkout while the pool stays full (helps only up to Azure Table write throughput) |
-| `BackgroundHttpPressureThreshold` | `HttpPoolSize/2` | busy-HTTP-worker count that throttles BG to 2; `0` disables |
-| `BackgroundHttpPressureAfterSeconds` | `10` | how long HTTP pressure must persist before throttling |
+| `App:BackgroundLimiter:BaseConcurrency` | `clamp(cores, 2, 4)` | starting width when idle |
+| `App:BackgroundLimiter:ScaleUpAfterSeconds` | `15` | how long the queue must be backed up before ramping (doubles per 10s tick) |
+| `App:BackgroundLimiter:MaxConcurrency` | `BgPoolSize` | ceiling |
+| `App:BackgroundLimiter:BurstToCeiling` | `false` | jump straight to the ceiling the moment tasks queue, skipping the ramp — **~2.7× faster fan-out** for bursts shorter than the ramp dwell (see ../perf-harness/orch-analysis.md) |
+| `App:BackgroundLimiter:OverSubscribe` | `0` | admit this many tasks *above* the ceiling so they can do their pre-invoke table write and queue at the worker checkout while the pool stays full (helps only up to Azure Table write throughput) |
+| `App:BackgroundLimiter:HttpPressureThreshold` | `HttpPoolSize/2` | busy-HTTP-worker count that throttles BG to 2; `0` disables |
+| `App:BackgroundLimiter:HttpPressureAfterSeconds` | `10` | how long HTTP pressure must persist before throttling |
 
 ```jsonc
-// top level of appsettings.json (NOT under "App"):
-"BackgroundBurstToCeiling": true,     // fill the pool immediately on a fan-out burst
-"BackgroundScaleUpAfterSeconds": 5    // or: ramp sooner without going straight to ceiling
+"BackgroundLimiter": {
+  "BurstToCeiling": true,     // fill the pool immediately on a fan-out burst
+  "ScaleUpAfterSeconds": 5    // or: ramp sooner without going straight to ceiling
+}
 ```
 
 ---
@@ -379,7 +410,7 @@ Fan-out/fan-in task execution with crash recovery.
 
   // Batch + coalesce per-task/run STATUS writes off the fan-out critical path, in ≤100-entity byte-budgeted
   // Azure Table transactions. Default true. This is the throughput fix for large fan-outs — the per-task
-  // table write was the ceiling (see docs/orch-analysis.md). Results are NEVER batched (their chunking /
+  // table write was the ceiling (see ../perf-harness/orch-analysis.md). Results are NEVER batched (their chunking /
   // multi-row large-payload path is untouched). Set false to fall back to per-task writes.
   "BatchStatusWrites": true,
   // Write the pre-invoke "Running" marker under a durable barrier (persisted BEFORE the task runs, batched
@@ -451,7 +482,7 @@ In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET en
 
   // Bytes budget for the in-memory body tier (LRU over the disk cache) — a HIT returns the body from RAM
   // instead of re-reading + re-decoding the file. Default 64 MiB; 0 = disk-only. Gain scales with response
-  // size (+44% throughput for small List* responses, +157% at ~150KB; see docs/cache-analysis.md).
+  // size (+44% throughput for small List* responses, +157% at ~150KB; see ../perf-harness/cache-analysis.md).
   "MaxMemoryBytes": 67108864,
 
   // Maximum cached responses held in memory
@@ -646,7 +677,7 @@ runs on.
 ### Realtime (SSE)
 
 Identity-gated Server-Sent Events channel at `/.craft/events`, fed in-process by
-`[Craft.Services.RealtimeBridge]::Publish(...)` from PowerShell. See [realtime-bridge-plan.md](realtime-bridge-plan.md).
+`[Craft.Services.RealtimeBridge]::Publish(...)` from PowerShell.
 
 **Off by default — opt in.** Set `Enabled: true` (or `CRAFT_REALTIME_ENABLED=true`, which wins over config).
 While off the endpoint is not mapped, `Publish` calls are no-ops, and no state or timer is held. When on, the
@@ -735,7 +766,12 @@ The `allowedUsers` table works the same way as Azure Static Web Apps user invita
 
 By default, the table lives in the same storage account as the rest of the app (`AzureWebJobsStorage`). To isolate it — for example, to share a single user table across multiple Craft instances, or to keep user data in a separate storage account from operational data — set `Auth.UserStorageConnection` to a different connection string.
 
-In `appsettings.json`:
+Locally (user secrets):
+```bash
+dotnet user-secrets set "App:Auth:UserStorageConnection" "UseDevelopmentStorage=true"
+```
+
+In a downstream non-secret `appsettings.json` (prefer Key Vault / env for real credentials):
 ```jsonc
 "Auth": {
   "UserStorageConnection": "DefaultEndpointsProtocol=https;AccountName=myuserstorage;AccountKey=..."
@@ -889,8 +925,8 @@ Craft separates its own built-in scripts from application content:
 
 1. **Place compiled PS modules** in `API/Modules/`
 2. **Place frontend build** in `Frontend/` (static files served automatically)
-3. **Configure `App:` settings** — either `App__*` environment variables (preferred for containers) or your own `appsettings.json`, using [`appsettings.example.jsonc`](../appsettings.example.jsonc) as the reference. Set only what you're changing; everything else falls back to the defaults in `Services/CraftSettings.cs`.
-4. **Set `AzureWebJobsStorage`** to a valid Azure Storage connection string (or `UseDevelopmentStorage=true` for Azurite)
+3. **Configure `App:` settings** — `App__*` environment variables for containers; for local `dotnet run`, use `dotnet user-secrets` for secrets/connection strings (see [Local development](#local-development-user-secrets-only)). Non-secret structural defaults may live in a downstream `appsettings.json`. Use [`appsettings.example.jsonc`](../appsettings.example.jsonc) as the key reference; only set what you're changing.
+4. **Set storage** — locally, Development already allows Azurite (`UseDevelopmentStorage=true`); put a real connection string in user secrets as `AzureWebJobsStorage` when needed. Deployed environments use env / Key Vault.
 5. **Run:** `dotnet run` or `docker compose up`
 
 The host auto-discovers modules, builds route tables from HTTP endpoint functions, starts the scheduler, and serves both API and frontend from a single process.
