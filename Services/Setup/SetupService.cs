@@ -737,8 +737,13 @@ public class SetupService
         ];
         foreach (var prefix in wellKnown)
         {
-            if (!paths.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
-                paths.Add(prefix + "*");
+            if (paths.Any(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))) continue;
+
+            // Exact path + segment wildcard, NOT "{prefix}*": EasyAuth's excludedPaths matching
+            // only supports exact paths and a trailing "/*" segment wildcard — a suffix glob glued
+            // to text silently matches nothing (verified live on App Service, Aug 2026).
+            paths.Add(prefix);
+            paths.Add(prefix + "/*");
         }
         return paths;
 

@@ -78,6 +78,8 @@ public static class PrmEndpoint
         {
             context.Response.Headers.AccessControlAllowOrigin = "*";
             context.Response.Headers.AccessControlAllowMethods = "GET, OPTIONS";
+            context.Response.Headers.AccessControlAllowHeaders = "*";
+            context.Response.Headers.AccessControlMaxAge = "86400";
 
             if (HttpMethods.IsOptions(context.Request.Method)) return Results.NoContent();
 
