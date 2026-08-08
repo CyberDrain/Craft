@@ -188,7 +188,7 @@ public class PowerShellWorkerPool : IDisposable
         // ── HTTP first-worker (cloned base + HTTP-only modules) ────────────
         var httpISS = BuildClonedISSWithModules(baseState, httpOnlyModules);
         var firstHttpWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
-        firstHttpWorker.Initialize(_repo, _apiBasePath, _settings);
+        InitializeClonedWorker(firstHttpWorker, baseState);
         var httpState = firstHttpWorker.ExportModuleState();
 
         _httpClonedState = httpState.MergeWith(baseState);
@@ -215,7 +215,7 @@ public class PowerShellWorkerPool : IDisposable
             for (int i = 1; i < _httpPoolSize; i++)
                 httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
 
-            Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            Parallel.ForEach(httpRemaining, w => InitializeClonedWorker(w, _httpClonedState!));
             foreach (var w in httpRemaining)
                 AddToHttpPool(w);
 
@@ -227,7 +227,7 @@ public class PowerShellWorkerPool : IDisposable
         // ── BG first-worker (cloned base + BG-only modules) ────────────────
         var bgISS = BuildClonedISSWithModules(baseState, bgOnlyModules);
         var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger);
-        firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
+        InitializeClonedWorker(firstBgWorker, baseState);
         var bgState = firstBgWorker.ExportModuleState();
 
         _bgClonedState = bgState.MergeWith(baseState);
@@ -250,7 +250,7 @@ public class PowerShellWorkerPool : IDisposable
             for (int i = 1; i < _bgPoolSize; i++)
                 bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
 
-            Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+            Parallel.ForEach(bgRemaining, w => InitializeClonedWorker(w, _bgClonedState!));
             foreach (var w in bgRemaining)
                 AddToBgPool(w);
         }
@@ -307,7 +307,7 @@ public class PowerShellWorkerPool : IDisposable
                 for (int i = 1; i < _httpPoolSize; i++)
                     httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
 
-                Parallel.ForEach(httpRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                Parallel.ForEach(httpRemaining, w => InitializeClonedWorker(w, _httpClonedState!));
                 foreach (var w in httpRemaining)
                     AddToHttpPool(w);
 
@@ -358,7 +358,7 @@ public class PowerShellWorkerPool : IDisposable
 
             if (bgRemaining.Count > 0)
             {
-                Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                Parallel.ForEach(bgRemaining, w => InitializeClonedWorker(w, _bgClonedState!));
                 foreach (var w in bgRemaining)
                     AddToBgPool(w);
             }
@@ -387,7 +387,7 @@ public class PowerShellWorkerPool : IDisposable
                 for (int i = 1; i < _bgPoolSize; i++)
                     bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
 
-                Parallel.ForEach(bgRemaining, w => w.Initialize(_repo, _apiBasePath, _settings));
+                Parallel.ForEach(bgRemaining, w => InitializeClonedWorker(w, _bgClonedState!));
                 foreach (var w in bgRemaining)
                     AddToBgPool(w);
             }
@@ -547,7 +547,10 @@ public class PowerShellWorkerPool : IDisposable
                     var cloned = ish ? _httpClonedState : _bgClonedState;
                     var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: ish);
                     var fresh = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
-                    fresh.Initialize(_repo, _apiBasePath, _settings);
+                    if (cloned != null)
+                        InitializeClonedWorker(fresh, cloned);
+                    else
+                        fresh.Initialize(_repo, _apiBasePath, _settings);
                     WorkerMetricsBridge.RegisterWorker(fresh.Id, ish);
                     if (ish) _httpPool.Add(fresh); else _bgPool.Add(fresh);
                     _logger.LogInformation("[Pool] Replaced W{OldId} → W{NewId} ({Type}) (background recycle)",
@@ -569,6 +572,16 @@ public class PowerShellWorkerPool : IDisposable
     {
         var allowList = isHttp ? _settings.Worker.HttpModules : _settings.Worker.BgModules;
         return BuildISSForModules(allowList.Count > 0 ? allowList : null);
+    }
+
+    /// <summary>
+    /// Initialize a worker whose ISS was built via <see cref="BuildClonedISS"/> /
+    /// <see cref="BuildClonedISSWithModules"/>, then restore ModuleName metadata lost by SSFE injection.
+    /// </summary>
+    private void InitializeClonedWorker(PowerShellWorker worker, ExportedModuleState state)
+    {
+        worker.Initialize(_repo, _apiBasePath, _settings);
+        worker.RestoreExportedModuleNames(state);
     }
 
     /// <summary>
@@ -660,6 +673,7 @@ public class PowerShellWorkerPool : IDisposable
     /// Build an ISS from a cloned base state plus additional modules via ImportPSModule.
     /// The base functions are injected as SessionStateFunctionEntry (no re-parsing),
     /// then the additional modules are imported normally (only they get parsed).
+    /// SSFE drops module association — <see cref="InitializeClonedWorker"/> restores ModuleName after open.
     /// </summary>
     private InitialSessionState BuildClonedISSWithModules(ExportedModuleState baseState, List<string> additionalModules)
     {
@@ -683,7 +697,8 @@ public class PowerShellWorkerPool : IDisposable
         var nativeModules = new HashSet<string>(baseState.NativeImportModulePaths.Select(Path.GetFileNameWithoutExtension)!,
             StringComparer.OrdinalIgnoreCase);
 
-        // Inject pre-parsed functions from the base state (skip natively-imported modules)
+        // Inject pre-parsed functions from the base state (skip natively-imported modules).
+        // SSFE cannot preserve ModuleName — restored post-open by RestoreExportedModuleNames.
         foreach (var (name, definition, module) in baseState.Functions)
         {
             if (nativeModules.Contains(module))
@@ -728,6 +743,7 @@ public class PowerShellWorkerPool : IDisposable
     /// Build an ISS using pre-parsed function definitions from an existing worker.
     /// Skips file I/O and AST parsing for script modules — functions are injected directly.
     /// Binary modules and modules with private functions still need native import.
+    /// SSFE drops module association — <see cref="InitializeClonedWorker"/> restores ModuleName after open.
     /// </summary>
     private InitialSessionState BuildClonedISS(ExportedModuleState state)
     {
@@ -747,6 +763,7 @@ public class PowerShellWorkerPool : IDisposable
 
         // Inject pre-parsed functions — this is the big win, no .psm1 parsing needed.
         // Skip functions from modules that will be natively imported (they bring their own).
+        // SSFE cannot preserve ModuleName — restored post-open by RestoreExportedModuleNames.
         foreach (var (name, definition, module) in state.Functions)
         {
             if (nativeModules.Contains(module))
