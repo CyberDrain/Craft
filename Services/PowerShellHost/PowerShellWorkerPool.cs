@@ -745,7 +745,7 @@ public class PowerShellWorkerPool : IDisposable
     /// Binary modules and modules with private functions still need native import.
     /// SSFE drops module association — <see cref="InitializeClonedWorker"/> restores ModuleName after open.
     /// </summary>
-    private InitialSessionState BuildClonedISS(ExportedModuleState state)
+    internal InitialSessionState BuildClonedISS(ExportedModuleState state)
     {
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
