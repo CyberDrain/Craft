@@ -683,6 +683,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     {
                         // Capture output so C# can store results for PostExecution
                         var output = await _psRunner.ExecuteScriptWithOutput(taskPath, parameters);
+
+                        // Sizing the result payload. This string is the whole task result held in one
+                        // piece, and BgPoolSize of them can be live at once - each a Large Object Heap
+                        // allocation, at roughly two bytes per char since it is UTF-16. That transient
+                        // peak is invisible to the run graph and lands in the native/LOH gap, so it is
+                        // the number worth having before deciding whether to bound concurrency or stream
+                        // the result instead of materializing it. Debug, so it costs nothing until trace
+                        // logging is turned on for the container.
+                        _logger.LogDebug(
+                            "[Scheduler] Task {TaskId} in {Run} returned {Chars} chars (~{ApproxMB:F1} MB in memory)",
+                            task.Id, run.Name, output?.Length ?? 0, (output?.Length ?? 0) * 2 / (1024.0 * 1024.0));
+
                         if (!string.IsNullOrEmpty(output))
                             await _store.StoreResultAsync(run.Name, task.Id, output);
                     }
