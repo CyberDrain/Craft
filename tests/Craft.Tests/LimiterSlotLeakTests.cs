@@ -1,10 +1,10 @@
+using System.Globalization;
 using Craft.Configuration;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using System.Globalization;
 
 namespace Craft.Tests;
 
