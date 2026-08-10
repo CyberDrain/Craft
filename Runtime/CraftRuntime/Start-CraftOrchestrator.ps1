@@ -62,8 +62,6 @@ function Start-CraftOrchestrator {
         return "Craft-$OrchestratorName-NoTasks"
     }
 
-    $BatchJson = ConvertTo-Json -InputObject @($InputObject.Batch) -Depth 10 -Compress
-
     $PostExecFunctionName = $null
     $PostExecParametersJson = $null
     if ($InputObject.PostExecution) {
@@ -73,10 +71,36 @@ function Start-CraftOrchestrator {
         }
     }
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($($InputObject.Batch.Count) tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
-    [Craft.Services.OrchestratorBridge]::QueueOrchestration(
+    # Write the batch as JSON Lines — one task per line — and hand the orchestrator the path rather
+    # than the content. Serialising the whole array into one string makes the peak allocation scale
+    # with the size of the fan-out, which is exactly the case that hurts: a run big enough to be worth
+    # fanning out is a run whose batch string is big. One task at a time costs one task, at any size.
+    # ConvertTo-Json -Compress escapes newlines, so a task is always exactly one line.
+    $BatchPath = Join-Path ([System.IO.Path]::GetTempPath()) "craft-batch-$([guid]::NewGuid().ToString('N')).jsonl"
+    $TaskCount = 0
+    try {
+        $Writer = [System.IO.StreamWriter]::new($BatchPath, $false, [System.Text.Encoding]::UTF8)
+        try {
+            foreach ($BatchItem in @($InputObject.Batch)) {
+                if ($null -eq $BatchItem) { continue }
+                $Writer.WriteLine((ConvertTo-Json -InputObject $BatchItem -Depth 10 -Compress))
+                $TaskCount++
+            }
+        } finally {
+            $Writer.Dispose()
+        }
+    } catch {
+        # Queue nothing on a partial write — a half-written batch would start a run silently missing
+        # tasks. Drop the file and surface the failure instead.
+        Remove-Item -LiteralPath $BatchPath -Force -ErrorAction SilentlyContinue
+        Write-Error "Failed to write batch file for '$OrchestratorName': $($_.Exception.Message)"
+        throw
+    }
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
+    [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
-        $BatchJson,
+        $BatchPath,
         4,
         $PostExecFunctionName,
         $PostExecParametersJson,

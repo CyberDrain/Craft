@@ -218,4 +218,61 @@ public class JobQueueStore
                 await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
         }
     }
+
+    /// <summary>
+    /// Hand back every claim on a run's rows, making them immediately claimable again. Returns how many
+    /// were released.
+    ///
+    /// For crash recovery only, where "this run was interrupted" already means the process that held
+    /// these claims is gone. Without it a crash strands the run for up to the full lease: the rows are
+    /// owned with a live LeaseUntil, so nothing can claim them, while re-dispatch correctly declines to
+    /// write duplicates for tasks that already have rows. Seen on a killed 140-task fanout — 12 tasks sat
+    /// Pending with 0 running for the remainder of a 30 minute lease.
+    ///
+    /// Rows are updated in place (same PartitionKey/RowKey), so this frees the existing row rather than
+    /// adding another one.
+    /// </summary>
+    public async Task<int> ReleaseRunClaimsAsync(string runName, CancellationToken ct = default)
+    {
+        var released = 0;
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        {
+            if (row.GetString("RunName") != runName) continue;
+            if (string.IsNullOrEmpty(row.GetString("Owner"))) continue;   // already free
+
+            row["Owner"] = "";
+            row["LeaseUntil"] = (DateTimeOffset?)null;
+            await _store.UpsertAsync(_queueTable, row, ct);
+            released++;
+        }
+
+        return released;
+    }
+
+    /// <summary>
+    /// The task ids this run still has rows for, claimed or not.
+    ///
+    /// This is what tells a re-drive the difference between a task that is merely WAITING — Pending in
+    /// the run graph, sitting in this queue, not yet claimed by the pump — and one whose row is
+    /// genuinely gone. Under the pump, waiting is the normal state of a backlog: a 124-task run against
+    /// eight workers has most of its tasks Pending and absent from the JobManager for minutes at a time.
+    /// Treating that as orphaned re-queues the whole backlog on a timer, and because a RowKey is
+    /// prefixed with the enqueue timestamp, each pass adds a SECOND row for the same task rather than
+    /// updating the first — so the task is claimed and executed once per copy.
+    /// </summary>
+    public async Task<HashSet<string>> GetQueuedTaskIdsAsync(string runName, CancellationToken ct = default)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        {
+            if (row.GetString("RunName") != runName) continue;
+
+            var taskId = row.GetString("TaskId");
+            if (!string.IsNullOrEmpty(taskId)) ids.Add(taskId);
+        }
+
+        return ids;
+    }
 }

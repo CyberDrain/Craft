@@ -189,7 +189,18 @@ public class JobManager : BackgroundService
             QueuedUtc = DateTime.UtcNow
         };
 
-        _jobs.TryAdd(jobId, record);
+        // Assign, do not TryAdd. Descriptor job ids are STABLE — "{runName}-{taskId}" — so re-enqueueing
+        // a task collides with its own previous record, and TryAdd resolves that by keeping the OLD one
+        // and discarding this one. The work still runs (it goes on the queue below, and the dispatcher
+        // writes status onto the queue item's own record), so the TRACKED record sat frozen at the
+        // previous outing's "Completed" while a live copy of the job was queued or running.
+        //
+        // IsQueuedOrRunning reads this dictionary, and JobQueuePump.ReleaseFinishedAsync treats a "no"
+        // as permission to DELETE that task's durable queue row. A stale record therefore had the pump
+        // dropping rows out from under running work — observed live releasing 7-9 "finished" jobs per
+        // second against 8 slots. RedrivePendingTasks consults the same predicate, so it was misreading
+        // task state for the same reason.
+        _jobs[jobId] = record;
 
         lock (_queueLock)
         {

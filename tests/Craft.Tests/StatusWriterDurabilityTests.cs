@@ -34,10 +34,6 @@ public class StatusWriterDurabilityTests
         public ManualResetEventSlim BatchGate { get; } = new(initialState: true);
         public volatile bool FailBatches;
 
-        /// <summary>Simulated round-trip latency. Without it a batch finishes inside its own
-        /// continuation and no two ever overlap, which measures the thread pool rather than the code.</summary>
-        public int BatchDelayMs;
-
         public int BatchCalls;
         public int MaxConcurrentBatches;
         private int _inFlight;
@@ -60,17 +56,17 @@ public class StatusWriterDurabilityTests
             return Task.CompletedTask;
         }
 
-        public async Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
+        public Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
         {
+            // Counted, not timed: the single-vs-batch distinction the tests assert on is the NUMBER of
+            // round-trips, so this needs no simulated latency.
             Interlocked.Increment(ref SingleUpsertCalls);
-            // Same simulated round-trip as the batch path: without it a sequential loop of N writes
-            // completes in microseconds and the test cannot distinguish it from a single batch.
-            if (BatchDelayMs > 0) await Task.Delay(BatchDelayMs, ct);
             lock (_sync)
             {
                 if (!_tables.ContainsKey(table)) _tables[table] = new();
                 _tables[table][(row.PartitionKey, row.RowKey)] = row;
             }
+            return Task.CompletedTask;
         }
 
         public async Task UpsertBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
@@ -88,7 +84,6 @@ public class StatusWriterDurabilityTests
                     ct.ThrowIfCancellationRequested();
                     await Task.Delay(5, ct);
                 }
-                if (BatchDelayMs > 0) await Task.Delay(BatchDelayMs, ct);
                 if (FailBatches) throw new InvalidOperationException("storage unavailable");
 
                 lock (_sync)
@@ -306,7 +301,7 @@ public class StatusWriterDurabilityTests
     public async Task ManySingleTaskRuns_AreWrittenConcurrently_NotOneAtATime()
     {
         var settings = new CraftSettings();
-        var backing = new ControllableStore { BatchDelayMs = 15 };   // stand in for storage latency
+        var backing = new ControllableStore();
         var store = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, backing);
 
         // The shape that broke production: one run per tenant, one task each.
@@ -314,19 +309,34 @@ public class StatusWriterDurabilityTests
             .Select(i => new TaskStatusWrite($"AuditLogIngestV2-tenant{i:D3}.dk", "t1", "Completed", "{}", 0, null, null, null))
             .ToList();
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var failed = await store.WriteTaskStatusBatchAsync(writes, maxConcurrency: 8);
-        sw.Stop();
+        // Hold every batch inside the store, so overlap is FORCED rather than raced for.
+        //
+        // Two earlier versions of this assertion measured the machine instead of the code. It first
+        // asserted the whole thing finished inside two seconds — that failed on a box running a 124-task
+        // orchestration and passed on the same commit once idle. Replacing it with "peak concurrency
+        // reaches the cap of 8" was no better: under a fully saturated CPU the observed peak was 3,
+        // because starvation delays the continuations ENTERING the counted region, so it narrows the
+        // window rather than widening it.
+        //
+        // With the gate closed every batch blocks after being counted, so the first 8 occupy the
+        // semaphore and stay there no matter how slow the scheduler is. The only thing left to wait for
+        // is progress, and the bound below is generous enough that a slow machine takes longer rather
+        // than failing.
+        backing.BatchGate.Reset();
+        var pending = store.WriteTaskStatusBatchAsync(writes, maxConcurrency: 8);
+
+        for (var i = 0; i < 400 && Volatile.Read(ref backing.MaxConcurrentBatches) < 8; i++)
+            await Task.Delay(25);
+
+        // Exactly 8: fewer means the per-run writes are not overlapping as designed, more means the
+        // requested cap is not being honoured.
+        Assert.Equal(8, Volatile.Read(ref backing.MaxConcurrentBatches));
+
+        backing.BatchGate.Set();
+        var failed = await pending;
 
         Assert.Empty(failed);
         Assert.Equal(200, backing.BatchCalls);
-        Assert.True(backing.MaxConcurrentBatches > 1,
-            $"peak concurrent batch writes was {backing.MaxConcurrentBatches} — per-run writes are still serialized");
-        Assert.True(backing.MaxConcurrentBatches <= 8,
-            $"peak concurrency {backing.MaxConcurrentBatches} exceeded the requested cap of 8");
-        // Serialized, 200 x 15ms would be >= 3s. Bounded parallelism must beat that comfortably.
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2),
-            $"200 single-task runs took {sw.Elapsed.TotalSeconds:F1}s — still effectively sequential");
     }
 
     /// <summary>One run's failure must not discard the other 199.</summary>

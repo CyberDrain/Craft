@@ -110,6 +110,54 @@ public class OrchestratorRunPersistenceTests
         Assert.Equal("ParentRun", recovered.ParentRunName);
     }
 
+    /// <summary>
+    /// PostExecAttemptCount is what bounds the retry of a failed post-execution across restarts. If it
+    /// did not survive the restart it would read back as 0 every time, and the bound would never be
+    /// reached — a post-execution that crashes the host would be retried on every start forever.
+    /// </summary>
+    [Fact]
+    public async Task PostExecAttemptCount_SurvivesARestart()
+    {
+        var store = NewStore();
+        await store.InitializeAsync();
+
+        await store.UpsertRunAsync(new OrchestratorRun
+        {
+            Name = "AggregatedRun",
+            Status = "Completed",
+            PostExecFunctionName = "StoreMailboxPermissions",
+            PostExecStatus = "Failed",
+            PostExecAttemptCount = 2,
+            StartedUtc = DateTime.UtcNow,
+        });
+
+        var recovered = await store.GetRunAsync("AggregatedRun");
+
+        Assert.Equal("Failed", recovered!.PostExecStatus);
+        Assert.Equal(2, recovered.PostExecAttemptCount);
+    }
+
+    /// <summary>
+    /// Rows written before the counter existed have no such property. They must read as 0 — an
+    /// already-exhausted reading would abandon in-flight aggregations on the upgrade restart.
+    /// </summary>
+    [Fact]
+    public async Task RunWrittenWithoutTheCounter_ReadsAsZeroAttempts()
+    {
+        var store = NewStore();
+        await store.InitializeAsync();
+
+        await store.UpsertRunAsync(new OrchestratorRun
+        {
+            Name = "Legacy",
+            Status = "Completed",
+            PostExecStatus = "Pending",
+            StartedUtc = DateTime.UtcNow,
+        });
+
+        Assert.Equal(0, (await store.GetRunAsync("Legacy"))!.PostExecAttemptCount);
+    }
+
     /// <summary>Runs without either field keep round-tripping as null — no backfill required.</summary>
     [Fact]
     public async Task RunsWithoutReferenceOrParent_RoundTripAsNull()

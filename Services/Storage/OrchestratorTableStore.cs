@@ -115,6 +115,7 @@ public class OrchestratorTableStore
             ["PostExecFunctionName"] = run.PostExecFunctionName,
             ["PostExecParametersJson"] = run.PostExecParametersJson,
             ["PostExecStatus"] = run.PostExecStatus,
+            ["PostExecAttemptCount"] = run.PostExecAttemptCount,
             ["Reference"] = run.Reference,
             ["ParentRunName"] = run.ParentRunName,
             ["TaskCount"] = run.Tasks.Count
@@ -138,6 +139,8 @@ public class OrchestratorTableStore
             PostExecFunctionName = runRow.GetString("PostExecFunctionName"),
             PostExecParametersJson = runRow.GetString("PostExecParametersJson"),
             PostExecStatus = runRow.GetString("PostExecStatus"),
+            // Absent on rows written before this existed — 0 is the right reading of "never retried".
+            PostExecAttemptCount = runRow.GetInt32("PostExecAttemptCount") ?? 0,
             // Both were in-memory only until now: a resumed run came back with a null Reference
             // (so FindRunByReference could not see it) and a null ParentRunName (so its finalize
             // never re-checked the parent). Absent on rows written before this existed.
@@ -481,7 +484,7 @@ public class OrchestratorTableStore
     /// Get all result JSON strings for a run, reassembling any chunked/multi-row results.
     ///
     /// Buffers every result by signature — prefer <see cref="StreamResultsAsync"/> or
-    /// <see cref="StreamResultsToFileAsync"/> for run-sized payloads.
+    /// <see cref="StreamResultsToJsonLinesAsync"/> for run-sized payloads.
     /// </summary>
     public async Task<string[]> GetResultsAsync(string runName, CancellationToken ct = default)
     {
@@ -506,34 +509,72 @@ public class OrchestratorTableStore
 
     /// <summary>
     /// Stream all result JSON strings for a run directly to a file, reassembling any chunked/multi-row
-    /// results on the fly. Writes a JSON array.
+    /// results on the fly. Writes JSON Lines (NDJSON): one result per line, no enclosing array.
     ///
     /// Chunks are written individually, so the largest allocation this makes is one chunk
     /// (<see cref="MaxPropertyChars"/>) — the reassembled result is never built as a string.
+    ///
+    /// JSON Lines rather than a JSON array because the consumer is PowerShell. A JSON array forces the
+    /// reader to hold the whole document to find where each element ends; one result per line lets
+    /// Invoke-CraftPostExecution walk the file with File.ReadLines and hold ONE result at a time. That
+    /// is the difference between a 50-150MB Large Object Heap allocation per post-execution and none.
+    /// It also isolates failure: a malformed result costs that result, not the entire aggregate.
+    ///
+    /// Returns the number of results written.
     /// </summary>
-    public async Task StreamResultsToFileAsync(string runName, string filePath, CancellationToken ct = default)
+    public async Task<int> StreamResultsToJsonLinesAsync(string runName, string filePath,
+        CancellationToken ct = default)
     {
         var count = 0;
 
         await using (var writer = new StreamWriter(filePath, append: false, Encoding.UTF8, bufferSize: 65536))
         {
-            await writer.WriteAsync('[');
-            var first = true;
-
             await foreach (var chunks in StreamResultChunkGroupsAsync(runName, ct))
             {
-                if (!first) await writer.WriteAsync(',');
                 foreach (var chunk in chunks)
-                    await writer.WriteAsync(chunk);
-                first = false;
+                    await WriteSingleLineAsync(writer, chunk);
+                await writer.WriteAsync('\n');
                 count++;
             }
-
-            await writer.WriteAsync(']');
         }
 
         _logger.LogInformation("[OrchestratorStore] Streamed {Count} results to {Path} for run {Name}",
             count, filePath, runName);
+
+        return count;
+    }
+
+    /// <summary>
+    /// Write a chunk with any raw CR/LF removed, so one result stays on one line.
+    ///
+    /// Results are expected to be compact JSON on a single line — that is what Invoke-CraftTask's
+    /// `ConvertTo-Json -Compress` produces, and JSON escapes newlines inside strings as \n rather than
+    /// emitting them raw. A raw newline can therefore only appear as inter-token whitespace, which
+    /// carries no meaning, or in a result that was not valid JSON to begin with (a task script that
+    /// wrote several objects to the output stream — the runner joins those with "\n"). Dropping the
+    /// character is right in the first case and no worse than today's behaviour in the second, where
+    /// the malformed result currently takes the whole aggregate's parse down with it.
+    ///
+    /// The scan is the common-case fast path: no newline means the chunk is written untouched, with
+    /// no copy and no per-character work beyond the search itself.
+    /// </summary>
+    private static async Task WriteSingleLineAsync(StreamWriter writer, string chunk)
+    {
+        var start = 0;
+        int idx;
+
+        while ((idx = chunk.AsSpan(start).IndexOfAny('\r', '\n')) >= 0)
+        {
+            var abs = start + idx;
+            if (abs > start)
+                await writer.WriteAsync(chunk.AsMemory(start, abs - start));
+            start = abs + 1;
+        }
+
+        if (start == 0)
+            await writer.WriteAsync(chunk);
+        else if (start < chunk.Length)
+            await writer.WriteAsync(chunk.AsMemory(start));
     }
 
     /// <summary>

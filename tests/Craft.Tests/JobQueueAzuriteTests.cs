@@ -124,19 +124,28 @@ public class JobQueueAzuriteTests
 
         await queue.EnqueueAsync("run", "task-0", 4, At(0));
 
-        var held = await queue.ClaimBatchAsync("worker-a", 1, TimeSpan.FromSeconds(2));
+        // Long lease for the "still held" assertions. They only need the lease to outlive a storage
+        // round-trip, and a short one makes that a race: this test used to claim for 2 seconds and
+        // then assert liveness through two more round-trips, so a loaded backend expired the lease
+        // before the assertion ran and the test failed claiming exclusivity was broken. Nothing here
+        // is waiting out this lease, so minutes cost nothing.
+        var held = await queue.ClaimBatchAsync("worker-a", 1, TimeSpan.FromMinutes(5));
         Assert.Single(held);
 
         // Live lease: nobody else may take it.
         Assert.Empty(await queue.ClaimBatchAsync("worker-b", 1, TimeSpan.FromMinutes(20)));
 
-        // Renewal extends it against the real clock.
-        Assert.True(await queue.RenewAsync(held, "worker-a", TimeSpan.FromSeconds(3)));
-        await Task.Delay(TimeSpan.FromSeconds(2.5));
+        // Renewal keeps ownership rather than releasing it — the long-running-task path.
+        Assert.True(await queue.RenewAsync(held, "worker-a", TimeSpan.FromMinutes(5)));
         Assert.Empty(await queue.ClaimBatchAsync("worker-b", 1, TimeSpan.FromMinutes(20)));
 
+        // Renewal sets the deadline against the real clock, so renewing SHORT lets it lapse. This is
+        // the one deliberately time-bound step; the wait is several times the lease so a slow
+        // backend makes it later, not flakier.
+        Assert.True(await queue.RenewAsync(held, "worker-a", TimeSpan.FromSeconds(1)));
+        await Task.Delay(TimeSpan.FromSeconds(4));
+
         // Lapsed: reclaimable, with no intervention from the holder. This is the crash-recovery path.
-        await Task.Delay(TimeSpan.FromSeconds(1.5));
         var reclaimed = await queue.ClaimBatchAsync("worker-b", 1, TimeSpan.FromMinutes(20));
         Assert.Equal("task-0", Assert.Single(reclaimed).TaskId);
     }
