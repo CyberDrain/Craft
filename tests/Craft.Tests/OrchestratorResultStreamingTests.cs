@@ -25,6 +25,11 @@ public class OrchestratorResultStreamingTests
     /// </summary>
     private sealed class LazyProbeStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
 
         /// <summary>Rows handed out by <see cref="QueryPartitionAsync"/> so far.</summary>
@@ -149,7 +154,7 @@ public class OrchestratorResultStreamingTests
     }
 
     [Fact]
-    public async Task StreamResultsToFile_WritesWhileReading_NotAfterDrainingTheRun()
+    public async Task StreamResultsToJsonLines_WritesWhileReading_NotAfterDrainingTheRun()
     {
         var (store, backing) = NewStore();
         await store.InitializeAsync();
@@ -160,7 +165,7 @@ public class OrchestratorResultStreamingTests
         for (var i = 0; i < Results; i++)
             await store.StoreResultAsync("run", $"task{i:D3}", BigJson(4_000));
 
-        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.json");
+        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
         long fileLengthAtLastRow = -1;
 
         backing.RowsYielded = 0;
@@ -175,10 +180,10 @@ public class OrchestratorResultStreamingTests
 
         try
         {
-            await store.StreamResultsToFileAsync("run", path);
-            var parsed = JsonSerializer.Deserialize<List<JsonElement>>(await File.ReadAllTextAsync(path));
+            var count = await store.StreamResultsToJsonLinesAsync("run", path);
 
-            Assert.Equal(Results, parsed!.Count);
+            Assert.Equal(Results, count);
+            Assert.Equal(Results, ReadJsonLines(path).Count);
             Assert.Equal(Results, backing.RowsYielded);
             Assert.True(fileLengthAtLastRow > 0,
                 "nothing had been written to the file by the time the last row was read — " +
@@ -234,23 +239,36 @@ public class OrchestratorResultStreamingTests
         Assert.Contains(spilled, results);
     }
 
+    // ── JSON Lines: one result per line, whatever the result's storage shape ────────────────────────
+
+    /// <summary>Read the file the way Invoke-CraftPostExecution does — line by line, parsing each.</summary>
+    private static List<JsonElement> ReadJsonLines(string path) =>
+        File.ReadLines(path)
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .Select(l => JsonSerializer.Deserialize<JsonElement>(l))
+            .ToList();
+
     [Fact]
-    public async Task StreamedFile_IsValidJson_ForAMixOfResultShapes()
+    public async Task EachResult_IsExactlyOneLine_ForAMixOfResultShapes()
     {
         var (store, _) = NewStore();
         await store.InitializeAsync();
 
+        // One property, chunked-within-a-row, and spilled-across-rows. The reader must not be able to
+        // tell which is which: a result's storage shape is not allowed to change its line count.
         await store.StoreResultAsync("run", "a", """{"i":1}""");
         await store.StoreResultAsync("run", "b", BigJson(90_000));
         await store.StoreResultAsync("run", "c", BigJson(1_200_000));
         await store.StoreResultAsync("run", "d", """{"i":4}""");
 
-        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.json");
+        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
         try
         {
-            await store.StreamResultsToFileAsync("run", path);
-            var parsed = JsonSerializer.Deserialize<List<JsonElement>>(await File.ReadAllTextAsync(path));
-            Assert.Equal(4, parsed!.Count);
+            var count = await store.StreamResultsToJsonLinesAsync("run", path);
+
+            Assert.Equal(4, count);
+            Assert.Equal(4, File.ReadAllLines(path).Count(l => !string.IsNullOrWhiteSpace(l)));
+            Assert.Equal(4, ReadJsonLines(path).Count);
         }
         finally
         {
@@ -259,16 +277,75 @@ public class OrchestratorResultStreamingTests
     }
 
     [Fact]
-    public async Task EmptyRun_WritesAnEmptyJsonArray()
+    public async Task ResultContainingRawNewlines_StillOccupiesOneLine()
     {
         var (store, _) = NewStore();
         await store.InitializeAsync();
 
-        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.json");
+        // A task script that wrote several objects to the output stream gets them joined with "\n"
+        // by the runner. That must not become several lines here, or one broken result would be
+        // silently read back as several results.
+        await store.StoreResultAsync("run", "a", "{\"i\":1}");
+        await store.StoreResultAsync("run", "b", "{\"x\":1}\n{\"x\":2}\r\n{\"x\":3}");
+        await store.StoreResultAsync("run", "c", "{\"i\":3}");
+
+        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
         try
         {
-            await store.StreamResultsToFileAsync("run", path);
-            Assert.Equal("[]", (await File.ReadAllTextAsync(path)).Trim());
+            var count = await store.StreamResultsToJsonLinesAsync("run", path);
+
+            Assert.Equal(3, count);
+            Assert.Equal(3, File.ReadAllLines(path).Count(l => !string.IsNullOrWhiteSpace(l)));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task RawNewlinesSpanningAChunkBoundary_StillOccupyOneLine()
+    {
+        var (store, _) = NewStore();
+        await store.InitializeAsync();
+
+        // The writer emits chunk by chunk, so a newline landing at a chunk edge is the case a
+        // per-chunk scan could miss. Build a result long enough to chunk with newlines throughout.
+        var noisy = string.Concat(Enumerable.Repeat("{\"x\":1}\n", 20_000));
+        await store.StoreResultAsync("run", "noisy", noisy);
+
+        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var count = await store.StreamResultsToJsonLinesAsync("run", path);
+
+            Assert.Equal(1, count);
+            Assert.Equal(1, File.ReadAllLines(path).Count(l => !string.IsNullOrWhiteSpace(l)));
+
+            // And nothing was lost but the newlines themselves.
+            Assert.Equal(noisy.Replace("\n", ""), File.ReadAllText(path).TrimEnd('\n'));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task EmptyRun_WritesAnEmptyFile()
+    {
+        var (store, _) = NewStore();
+        await store.InitializeAsync();
+
+        var path = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var count = await store.StreamResultsToJsonLinesAsync("run", path);
+
+            // Empty, not "[]" — JSON Lines has no enclosing token, and the reader's loop over zero
+            // lines yields zero results without needing to special-case it.
+            Assert.Equal(0, count);
+            Assert.Equal("", await File.ReadAllTextAsync(path));
             Assert.Empty(await store.GetResultsAsync("run"));
         }
         finally

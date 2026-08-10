@@ -47,4 +47,16 @@
     <None Include="..\..\Services\Hosting\Endpoints\*.cs" CopyToOutputDirectory="PreserveNewest" LinkBase="EndpointSources" />
   </ItemGroup>
 
+  <!--
+    A one-function PowerShell module laid out exactly where the pool looks for them
+    (<base>/API/Modules/<Name>/<Name>.psd1). ClonedWorkerModuleIdentityTests warms a real pool against
+    it, which is the only way to assert that cloned workers get their ModuleName repaired *through the
+    pool's own code path* — asserting on RestoreExportedModuleNames alone would still pass if a
+    refactor stopped calling it.
+  -->
+  <ItemGroup>
+    <None Include="TestApi\Modules\CraftPoolFixture\CraftPoolFixture.psd1" CopyToOutputDirectory="PreserveNewest" Link="API\Modules\CraftPoolFixture\CraftPoolFixture.psd1" />
+    <None Include="TestApi\Modules\CraftPoolFixture\CraftPoolFixture.psm1" CopyToOutputDirectory="PreserveNewest" Link="API\Modules\CraftPoolFixture\CraftPoolFixture.psm1" />
+  </ItemGroup>
+
 </Project>

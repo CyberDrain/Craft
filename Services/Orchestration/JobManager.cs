@@ -189,7 +189,18 @@ public class JobManager : BackgroundService
             QueuedUtc = DateTime.UtcNow
         };
 
-        _jobs.TryAdd(jobId, record);
+        // Assign, do not TryAdd. Descriptor job ids are STABLE — "{runName}-{taskId}" — so re-enqueueing
+        // a task collides with its own previous record, and TryAdd resolves that by keeping the OLD one
+        // and discarding this one. The work still runs (it goes on the queue below, and the dispatcher
+        // writes status onto the queue item's own record), so the TRACKED record sat frozen at the
+        // previous outing's "Completed" while a live copy of the job was queued or running.
+        //
+        // IsQueuedOrRunning reads this dictionary, and JobQueuePump.ReleaseFinishedAsync treats a "no"
+        // as permission to DELETE that task's durable queue row. A stale record therefore had the pump
+        // dropping rows out from under running work — observed live releasing 7-9 "finished" jobs per
+        // second against 8 slots. RedrivePendingTasks consults the same predicate, so it was misreading
+        // task state for the same reason.
+        _jobs[jobId] = record;
 
         lock (_queueLock)
         {
@@ -212,6 +223,11 @@ public class JobManager : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Ownership of this iteration's limiter slot: set when AcquireAsync returns, cleared once the
+            // slot is released or handed to RunJobAsync's finally. Lets the handlers below tell "never
+            // acquired" from "acquired and now orphaned".
+            var slotHeld = false;
+
             try
             {
                 // 1. Wait for at least one item in the queue
@@ -228,6 +244,7 @@ public class JobManager : BackgroundService
                     peekName = peeked?.Record.Name ?? "unknown";
                 }
                 await _limiter.AcquireAsync(peekName, stoppingToken);
+                slotHeld = true;
 
                 // 3. Dequeue highest priority item (lowest int wins)
                 QueuedJob? job;
@@ -239,6 +256,7 @@ public class JobManager : BackgroundService
                 if (job == null)
                 {
                     _limiter.ReleaseSlot();
+                    slotHeld = false;
                     continue;
                 }
 
@@ -246,6 +264,7 @@ public class JobManager : BackgroundService
                 if (_reprioritized.TryGetValue(job.Record.Id, out var liveEpoch) && job.Epoch != liveEpoch)
                 {
                     _limiter.ReleaseSlot();
+                    slotHeld = false;
                     continue;
                 }
 
@@ -257,6 +276,7 @@ public class JobManager : BackgroundService
                 {
                     _pendingWork.TryRemove(job.Record.Id, out _);
                     _limiter.ReleaseSlot();
+                    slotHeld = false;
                     continue;
                 }
 
@@ -268,11 +288,39 @@ public class JobManager : BackgroundService
                 // 4. Hand the job to the thread pool — see invariant 1 on the class. This loop must get
                 //    straight back to _itemAvailable/AcquireAsync; running RunJobAsync inline lets any
                 //    synchronous block inside the job stop dispatch for the whole process.
-                _ = Task.Run(() => RunJobAsync(job, stoppingToken), CancellationToken.None);
+                //
+                //    RunJobAsync's finally owns the slot from here. If the handoff itself fails that
+                //    finally never runs, so this iteration's finally has to return the slot.
+                try
+                {
+                    _ = Task.Run(() => RunJobAsync(job, stoppingToken), CancellationToken.None);
+                    slotHeld = false; // RunJobAsync's finally owns the slot from here.
+                }
+                catch (Exception ex)
+                {
+                    // slotHeld stays set — the finally below returns it.
+                    Interlocked.Decrement(ref _activeCount);
+                    job.Record.Status = "Failed";
+                    job.Record.LastError = ex.Message;
+                    job.Record.CompletedUtc = DateTime.UtcNow;
+                    _logger.LogError(ex, "[JobManager] Could not dispatch: {Name}", job.Record.Name);
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
+            }
+            catch (Exception ex)
+            {
+                // Anything else — a throw out of the queue lock, the limiter or the semaphore — used to
+                // escape ExecuteAsync and silently end dispatch for the life of the process. One bad
+                // iteration must not stop every future job.
+                _logger.LogError(ex, "[JobManager] Dispatch iteration failed; continuing");
+            }
+            finally
+            {
+                // Acquired but never handed over: release rather than carry an untracked slot forward.
+                if (slotHeld) _limiter.ReleaseSlot();
             }
         }
 
@@ -282,16 +330,22 @@ public class JobManager : BackgroundService
 
     private async Task RunJobAsync(QueuedJob job, CancellationToken ct)
     {
-        // Set operation context for traceability — ExecuteScript reads RunName from this
-        var parentInvocation = new OperationContext.Invocation(job.Record.Name)
-        {
-            RunName = job.Record.RunName,
-            Category = "Job"
-        };
-        using var opScope = OperationContext.Set(parentInvocation);
+        // The operation-context setup below used to sit ABOVE the try. The dispatch loop acquires the slot
+        // and this method's finally releases it, so a throw up there orphaned the slot permanently — and
+        // silently, because the caller discards this task. Setup that cannot run is a failed job, not a
+        // lost slot.
+        IDisposable? opScope = null;
 
         try
         {
+            // Set operation context for traceability — ExecuteScript reads RunName from this
+            var parentInvocation = new OperationContext.Invocation(job.Record.Name)
+            {
+                RunName = job.Record.RunName,
+                Category = "Job"
+            };
+            opScope = OperationContext.Set(parentInvocation);
+
             job.Record.Status = "Running";
             job.Record.StartedUtc = DateTime.UtcNow;
 
@@ -336,9 +390,11 @@ public class JobManager : BackgroundService
         }
         finally
         {
+            // Accounting first, context teardown second: ReleaseSlot cannot throw, Dispose can.
             Interlocked.Decrement(ref _activeCount);
             Interlocked.Increment(ref _totalProcessed);
             _limiter.ReleaseSlot();
+            opScope?.Dispose();
         }
     }
 

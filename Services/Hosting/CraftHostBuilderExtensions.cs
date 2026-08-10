@@ -207,6 +207,9 @@ public static class CraftHostBuilderExtensions
         services.AddSingleton<BackgroundTaskLimiter>();
         services.AddSingleton<JobManager>();
         services.AddSingleton<OrchestratorTableStore>();
+        // The durable job queue. Registered alongside the orchestrator store because it shares the
+        // same ICraftTableStore and therefore the same bounded connection pool.
+        services.AddSingleton<JobQueueStore>();
         services.AddSingleton<OrchestratorStatusWriter>();
         services.AddSingleton<OrchestratorService>();
         services.AddSingleton<AuthService>();
@@ -221,6 +224,10 @@ public static class CraftHostBuilderExtensions
         if (roles.Background)
         {
             services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
+            // Feeds the JobManager from the durable queue a batch at a time, so the backlog lives
+            // in storage rather than in this process.
+            services.AddSingleton<JobQueuePump>();
+            services.AddHostedService(sp => sp.GetRequiredService<JobQueuePump>());
             services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
             services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
         }

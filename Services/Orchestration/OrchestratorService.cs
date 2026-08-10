@@ -31,6 +31,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private readonly BackgroundTaskLimiter _limiter;
     private readonly JobManager _jobManager;
     private readonly OrchestratorTableStore _store;
+
+    /// <summary>The durable job queue. Its table is created alongside the orchestrator's; nothing
+    /// dispatches from it yet, so an existing deployment gains an empty table and nothing else.</summary>
+    private readonly JobQueueStore _queue;
     private readonly OrchestratorStatusWriter _writer;
     private readonly CraftSettings _settings;
     private readonly object _lock = new();
@@ -53,6 +57,21 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// one string reference instead of 738 captured ones. Populated at dispatch, dropped at finalize.
     /// </summary>
     private readonly ConcurrentDictionary<string, string> _taskScriptPaths = new();
+
+    /// <summary>
+    /// How many times a run's post-execution may be attempted before it is abandoned. Matches the
+    /// per-task cap so recovery behaves the same at both levels: retry a few times across restarts,
+    /// then stop and release the storage rather than retrying forever.
+    /// </summary>
+    private const int MaxPostExecAttempts = 3;
+
+    /// <summary>
+    /// Runs whose finalize has been claimed, so it happens once. Claimed in CheckRunCompletion,
+    /// released on the deferral/failure paths there, and cleared in DispatchPendingTasksAsync when a
+    /// run becomes live again. In-memory only: after a restart nothing has been finalized yet, so an
+    /// empty set is the correct starting state.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _finalizingRuns = new();
 
     /// <summary>
     /// Get the Reference for a given run name, or null if not found/no reference set.
@@ -85,6 +104,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         BackgroundTaskLimiter limiter,
         JobManager jobManager,
         OrchestratorTableStore store,
+        JobQueueStore queue,
         OrchestratorStatusWriter writer,
         CraftSettings settings)
     {
@@ -93,6 +113,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _limiter = limiter;
         _jobManager = jobManager;
         _store = store;
+        _queue = queue;
         _writer = writer;
         _settings = settings;
 
@@ -169,6 +190,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
+            await _queue.InitializeAsync();
             var run = await _store.GetRunAsync(name);
 
             if (run != null && run.Status == "Running")
@@ -216,7 +238,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     }
                     _logger.LogInformation("[Scheduler] Resuming run {Name}: {Pending}/{Total} pending",
                         name, pendingCount, run.Tasks.Count);
-                    DispatchPendingTasks(run, taskPath, run.Priority, ct);
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
                     return;
                 }
 
@@ -260,8 +282,11 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
             await _store.UpsertRunAsync(run);
             await _store.UpsertTaskBatchAsync(name, tasks);
+            // Seed the durable outstanding-task count alongside the tasks themselves, so completion
+            // is answerable from storage instead of by walking this run graph.
+            await _store.InitRemainingAsync(name, tasks.Count, ct);
             _logger.LogInformation("[Scheduler] Run {Name} created with {Count} tasks at P{Priority}", name, tasks.Count, priority);
-            DispatchPendingTasks(run, taskPath, priority, ct);
+            await DispatchPendingTasksAsync(run, taskPath, priority, ct);
         }
         finally
         {
@@ -302,6 +327,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task ResumeInterruptedRunsAsync(CancellationToken ct)
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
 
         // Rebuild parent→child links BEFORE processing anything. _childRuns is in-memory, so without
         // this a resumed parent has no registered children, AllChildRunsComplete answers true, and the
@@ -327,12 +353,33 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 var run = await _store.GetRunAsync(runName);
                 if (run == null) continue;
 
-                // Check for runs where PostExec was pending or running when we crashed
+                // Check for runs whose PostExec was pending/running when we crashed, or failed outright.
+                //
+                // "Failed" belongs here: post-execution IS the aggregation, so a failed one means the
+                // run's whole point never happened (no cached permissions, no applied standards) and its
+                // Results rows were never cleaned up, because CleanupRunAsync only runs on success. This
+                // used to be excluded, which quietly contradicted the catch block's own comment that a
+                // failure "will be retried on next startup".
                 if (run.Status is "Completed" or "CompletedWithErrors"
-                    && run.PostExecStatus is "Pending" or "Running")
+                    && run.PostExecStatus is "Pending" or "Running" or "Failed")
                 {
-                    _logger.LogInformation("[Scheduler] Resuming interrupted PostExecution for run: {Name} (PostExecStatus={Status})",
-                        run.Name, run.PostExecStatus);
+                    if (run.PostExecAttemptCount >= MaxPostExecAttempts)
+                    {
+                        // Out of retries. Say so once and release the storage, rather than re-reading
+                        // this run's rows on every start for the life of the deployment.
+                        _logger.LogError(
+                            "[Scheduler] PostExecution for {Name} failed {Count} times — giving up and cleaning up results",
+                            run.Name, run.PostExecAttemptCount);
+                        run.PostExecStatus = "Abandoned";
+                        await _store.UpsertRunAsync(run);
+                        await _store.CleanupRunAsync(run.Name);
+                        await _queue.RemoveRunAsync(run.Name, ct);
+                        continue;
+                    }
+
+                    _logger.LogInformation(
+                        "[Scheduler] Resuming interrupted PostExecution for run: {Name} (PostExecStatus={Status}, attempt {Attempt}/{Max})",
+                        run.Name, run.PostExecStatus, run.PostExecAttemptCount + 1, MaxPostExecAttempts);
                     DispatchPostExecution(run);
                     continue;
                 }
@@ -379,8 +426,29 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 var pending = run.Tasks.Count(t => t.Status == "Pending");
                 if (pending > 0)
                 {
+                    // Hand back the claims the dead process was holding. Reaching here means this run was
+                    // interrupted, so every lease on its rows belongs to a process that no longer exists —
+                    // but the lease itself is still live as far as storage is concerned, so nothing can
+                    // claim those rows until it lapses. Re-dispatch below deliberately does not paper over
+                    // that by writing duplicate rows, which is what used to hide it, so without this the
+                    // run stalls for the remainder of the lease: measured as 12 tasks Pending with nothing
+                    // running for the balance of a 30 minute lease after a kill.
+                    try
+                    {
+                        var released = await _queue.ReleaseRunClaimsAsync(run.Name, ct);
+                        if (released > 0)
+                            _logger.LogInformation(
+                                "[Scheduler] Released {Count} stale claim(s) held by the previous process for {Name}",
+                                released, run.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Not fatal: the leases still lapse on their own, just slowly.
+                        _logger.LogWarning(ex, "[Scheduler] Could not release stale claims for {Name}", run.Name);
+                    }
+
                     _logger.LogInformation("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
-                    DispatchPendingTasks(run, taskPath, run.Priority, ct);
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
                 }
                 else
                 {
@@ -412,13 +480,46 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
-    /// Start an orchestrator run from a pre-built batch JSON array.
+    /// Start an orchestrator run from a pre-built batch.
     /// Called by OrchestratorBridge.DrainPending() when PowerShell's Start-CIPPOrchestrator
     /// queues a run on CIPPNG (bypassing the planner script phase).
+    ///
+    /// The batch arrives one of two ways. <paramref name="batchFilePath"/>, when set, is a JSON Lines
+    /// file with one task object per line and is the preferred form: the caller writes it a task at a
+    /// time and this reads it a line at a time, so no single string ever holds the whole batch.
+    /// <paramref name="batchJson"/> is the original whole-array-in-one-string form, kept for callers
+    /// that still use it — it costs the full batch as a string here AND again as a JsonDocument.
+    /// A file path wins when both are given; the file is deleted once parsed.
     /// </summary>
     public async Task StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
-        string? parentRunName = null, string? reference = null)
+        string? parentRunName = null, string? reference = null, string? batchFilePath = null)
+    {
+        // The batch file is this method's to dispose of, on EVERY path — including the two
+        // "already running, skipping" returns below, which never look at it. Those are the common
+        // case for a duplicate enqueue, so leaving cleanup at the parse site would quietly fill the
+        // container's temp directory with the batches of runs that were skipped rather than started.
+        try
+        {
+            await StartFromBatchCoreAsync(name, batchJson, priority, postExecFunctionName,
+                postExecParametersJson, parentRunName, reference, batchFilePath, ct);
+        }
+        finally
+        {
+            if (!string.IsNullOrEmpty(batchFilePath))
+            {
+                try { if (File.Exists(batchFilePath)) File.Delete(batchFilePath); }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "[Orchestrator] Failed to delete batch file {Path}", batchFilePath);
+                }
+            }
+        }
+    }
+
+    private async Task StartFromBatchCoreAsync(string name, string batchJson, int priority,
+        string? postExecFunctionName, string? postExecParametersJson,
+        string? parentRunName, string? reference, string? batchFilePath, CancellationToken ct)
     {
         if (!_activePlanners.TryAdd(name, true))
         {
@@ -429,6 +530,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
+            await _queue.InitializeAsync();
 
             var existing = await _store.GetRunAsync(name);
             if (existing != null && existing.Status == "Running" && _activeRuns.ContainsKey(name))
@@ -437,7 +539,28 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 return;
             }
 
-            var tasks = ParseTasksFromJson(batchJson, name);
+            List<OrchestratorTaskItem> tasks;
+            if (!string.IsNullOrEmpty(batchFilePath))
+            {
+                var batchBytes = File.Exists(batchFilePath) ? new FileInfo(batchFilePath).Length : 0;
+                _logger.LogDebug(
+                    "[Orchestrator] Batch for {Name} streamed from {Path} ({KB:F1} KB on disk, never held whole)",
+                    name, batchFilePath, batchBytes / 1024.0);
+
+                tasks = ParseTasksFromJsonLinesFile(batchFilePath, name);
+            }
+            else
+            {
+                // Sizing the legacy inbound batch: the whole run's task list as ONE string, built by
+                // ConvertTo-Json in the calling PowerShell, held in the bridge queue, and parsed here
+                // into a JsonDocument that holds it a second time.
+                _logger.LogDebug(
+                    "[Orchestrator] Batch for {Name} is {Chars} chars (~{ApproxKB:F1} KB in memory)",
+                    name, batchJson.Length, batchJson.Length * 2 / 1024.0);
+
+                tasks = ParseTasksFromJson(batchJson, name);
+            }
+
             if (tasks.Count == 0)
             {
                 _logger.LogWarning("[Orchestrator] Batch for {Name} produced 0 tasks", name);
@@ -473,11 +596,20 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
             await _store.UpsertRunAsync(run);
             await _store.UpsertTaskBatchAsync(name, tasks);
+            // Seed the durable outstanding-task count alongside the tasks themselves, so completion
+            // is answerable from storage instead of by walking this run graph.
+            await _store.InitRemainingAsync(name, tasks.Count, ct);
+            // IsNullOrEmpty, not != null: PowerShell marshals a $null argument to an empty string, so a
+            // run with no post-execution arrives here with "" and a null check logs the meaningless
+            // "(PostExec: Push-)". Everything that acts on this field already uses IsNullOrEmpty —
+            // only the log disagreed.
+            var postExecSuffix = !string.IsNullOrEmpty(postExecFunctionName)
+                ? $" (PostExec: Push-{postExecFunctionName})"
+                : "";
             _logger.LogInformation(
                 "[Orchestrator] Run {Name} created from batch: {Count} tasks P{Priority}{PostExec}",
-                name, tasks.Count, priority,
-                postExecFunctionName != null ? $" (PostExec: Push-{postExecFunctionName})" : "");
-            DispatchPendingTasks(run, taskPath, priority, ct);
+                name, tasks.Count, priority, postExecSuffix);
+            await DispatchPendingTasksAsync(run, taskPath, priority, ct);
         }
         finally
         {
@@ -485,29 +617,84 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
     }
 
-    private void DispatchPendingTasks(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
+    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
     {
         _activeRuns.TryAdd(run.Name, run);
         // Registered before anything is enqueued — the resolver reads it on the dispatch side.
         _taskScriptPaths[run.Name] = taskPath;
 
+        // This run is live again, so it is allowed to finalize again. Matters for the stable run names
+        // (CIPPDBCacheOrchestrator, ProcessDeltaQueries) that recur within one process lifetime — without
+        // this, the finalize claim from their previous outing would strand the next one forever.
+        _finalizingRuns.TryRemove(run.Name, out _);
+
         // Start periodic status timer (every 60s) for this run
         if (!_runStatusTimers.ContainsKey(run.Name))
         {
-            var timer = new Timer(_ => { LogRunStatus(run); RedrivePendingTasks(run); },
+            // CheckRunCompletion is re-run here on purpose. It is normally driven by task transitions,
+            // but a run whose finalize was deferred because storage still showed work outstanding has no
+            // transitions left to retrigger it - without this periodic re-check that deferral would be
+            // permanent, which is a worse failure than the premature finalize it exists to prevent.
+            var timer = new Timer(_ =>
+                {
+                    LogRunStatus(run);
+                    RedrivePendingTasks(run);
+                    lock (_lock) { CheckRunCompletion(run); }
+                },
                 null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
             _runStatusTimers.TryAdd(run.Name, timer);
         }
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
 
-        foreach (var task in pending)
+        // Skip anything that already has a queue row.
+        //
+        // A queue RowKey is BuildRowKey(queuedUtc, run, task), so it is idempotent only for a GIVEN
+        // timestamp — re-dispatching the same task later writes a SECOND row rather than updating the
+        // first. That is exactly what crash recovery does: ResumeInterruptedRunsAsync flips interrupted
+        // tasks back to Pending and calls this, while every pre-crash row for those tasks is still in the
+        // queue. Measured on a killed 140-task fanout: 102 tasks re-dispatched on top of 102 survivors.
+        //
+        // Most duplicates are harmless — the second row resolves to a task that has since finished and is
+        // dropped as a stale descriptor. But if both rows are claimed while the task is still RUNNING,
+        // the resolver's terminal-status guard does not apply and the task runs twice. That happened:
+        // Intune_dev.mspadvisors.com was claimed again 5 minutes into its own execution and ran a second
+        // time. Not writing the duplicate is the fix; the resolver check below is the backstop.
+        //
+        // A read of the run's rows costs one table scan per dispatch, against a write per task avoided.
+        HashSet<string> alreadyQueued;
+        try
         {
-            DispatchSingleTask(run, task, priority);
+            alreadyQueued = await _queue.GetQueuedTaskIdsAsync(run.Name, ct);
+        }
+        catch (Exception ex)
+        {
+            // Enqueuing a duplicate is recoverable; enqueuing nothing strands the run. Prefer the former.
+            _logger.LogWarning(ex,
+                "[Scheduler] Could not read existing queue rows for {Run} — dispatching without de-duplication",
+                run.Name);
+            alreadyQueued = [];
         }
 
-        _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
-            pending.Count, run.Name, priority);
+        var toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+
+        // One batched write per priority bucket rather than one per task. The queue is the backlog now;
+        // the JobManager only ever sees the batch JobQueuePump claims from it.
+        await _queue.EnqueueBatchAsync(run.Name,
+            toQueue.Select(t => (t.Id, t.Priority ?? priority)).ToList(),
+            DateTime.UtcNow, ct);
+
+        if (toQueue.Count == pending.Count)
+        {
+            _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
+                toQueue.Count, run.Name, priority);
+        }
+        else
+        {
+            _logger.LogInformation(
+                "[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority} ({Existing} already queued)",
+                toQueue.Count, run.Name, priority, pending.Count - toQueue.Count);
+        }
     }
 
     /// <summary>
@@ -515,14 +702,23 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// graph, no task, no script path, no service reference — and calls back into
     /// <see cref="ResolveTaskWorkAsync"/> at dispatch time to rebuild the work.
     /// </summary>
-    private void DispatchSingleTask(OrchestratorRun run, OrchestratorTaskItem task, int priority)
+    /// <summary>
+    /// Put one task back on the durable queue. Fire-and-forget because every caller is on a lock or a
+    /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
+    /// re-drive finds it again.
+    /// </summary>
+    private void RequeueToTable(OrchestratorRun run, OrchestratorTaskItem task)
     {
-        // A per-task override (set by an operator reprioritizing this job) wins over the run's
-        // priority; null — the normal case — inherits. Because the override is persisted, this holds
-        // across a restart rather than reverting when the run is re-queued from storage.
-        _jobManager.Enqueue(
-            new JobDescriptor(run.Name, task.Id, task.Priority ?? priority),
-            name: $"{run.Name}-{task.Id}");
+        var priority = task.Priority ?? run.Priority;
+        _ = Task.Run(async () =>
+        {
+            try { await _queue.EnqueueAsync(run.Name, task.Id, priority, DateTime.UtcNow); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[Scheduler] Could not re-queue {Task} in {Run} — the re-drive will retry",
+                    task.Id, run.Name);
+            }
+        });
     }
 
     /// <summary>
@@ -565,6 +761,21 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // Run is no longer in memory — rehydrate it. This is the same read the crash-recovery path
             // already performs (ResumeInterruptedRunsAsync), which resumed 421 runs in seconds.
             run = await _store.GetRunAsync(descriptor.RunName);
+
+            // A run absent from _activeRuns because it FINISHED must not be resurrected. Rehydrating it
+            // put a finalized run back into the live graph, where the next completion re-finalized it
+            // and re-dispatched its post-execution; and because terminal task writes are coalesced, the
+            // rehydrated task could still read Pending and be run a second time. Storage is authoritative
+            // here — FinalizeRunAsync flushes the run's terminal status before it removes the run from
+            // _activeRuns, so a terminal Status seen here is not a race.
+            if (run != null && run.Status is "Completed" or "CompletedWithErrors")
+            {
+                _logger.LogDebug(
+                    "[Orchestrator] Descriptor {Run}/{Task} belongs to a run that already finished ({Status}) — dropping",
+                    descriptor.RunName, descriptor.TaskId, run.Status);
+                return null;
+            }
+
             task = run?.Tasks.FirstOrDefault(t => t.Id == descriptor.TaskId);
             if (run != null && task != null)
             {
@@ -582,10 +793,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
             return null;
         }
 
-        // Already terminal (e.g. cancelled, or completed by a previous attempt while queued).
+        // Already terminal (e.g. cancelled, or completed by a previous attempt while queued), or already
+        // executing.
+        //
+        // "Running" belongs here as well as the terminal states. A duplicate queue row claimed while its
+        // task is mid-flight used to pass this check and start a SECOND copy — seen with a five-minute
+        // Intune collection that was re-claimed four minutes in and ran twice. This does not block crash
+        // recovery: ResumeInterruptedRunsAsync flips interrupted tasks from Running back to Pending
+        // before re-dispatching them, so a task that genuinely needs re-running never reaches here as
+        // Running. Within a live process, Running means a worker has it.
         lock (_lock)
         {
-            if (task.Status is "Completed" or "Failed" or "Cancelled")
+            if (task.Status is "Completed" or "Failed" or "Cancelled" or "Running")
                 return null;
         }
 
@@ -649,6 +868,22 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     {
                         // Capture output so C# can store results for PostExecution
                         var output = await _psRunner.ExecuteScriptWithOutput(taskPath, parameters);
+
+                        // Sizing the result payload. This string is the whole task result held in one
+                        // piece, and BgPoolSize of them can be live at once — each at roughly two bytes
+                        // per char since it is UTF-16.
+                        //
+                        // Measured on a 16-tenant instance across 92 real task results (mailbox and
+                        // calendar permission batches, the widest fan-out CIPP has): median 5.9K chars,
+                        // p95 42.5K, max 43.3K — 0.08 MB in memory for the largest. Eight of those
+                        // concurrently is under 1 MB against a 2398 MB heap cap, so this site is not
+                        // where the memory goes; the aggregate built from these at post-execution is
+                        // (see DispatchPostExecution). Reported in KB because MB rounds every real
+                        // result to 0.0 and hides exactly that conclusion.
+                        _logger.LogDebug(
+                            "[Scheduler] Task {TaskId} in {Run} returned {Chars} chars (~{ApproxKB:F1} KB in memory)",
+                            task.Id, run.Name, output?.Length ?? 0, (output?.Length ?? 0) * 2 / 1024.0);
+
                         if (!string.IsNullOrEmpty(output))
                             await _store.StoreResultAsync(run.Name, task.Id, output);
                     }
@@ -753,8 +988,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
             "[Scheduler] Task {TaskId} in {Run} could not be marked Running (attempt {Count}/{Max}) — re-queued, slot released",
             task.Id, run.Name, count, MaxDeferrals);
 
-        _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
-            name: $"{run.Name}-{task.Id}");
+        // Back to the QUEUE, not to memory. The pump drops a claimed row once the JobManager is done with
+        // the job, so an in-memory re-queue here would leave the retry with no durable row behind it — and
+        // nothing to pick it up again if this instance went away.
+        RequeueToTable(run, task);
     }
 
     /// <summary>
@@ -779,14 +1016,32 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// a deferral history — anything Pending and unowned with no deferral record was lost some other way
     /// and there is nothing to wait for.
     /// </summary>
-    private void RedrivePendingTasks(OrchestratorRun run)
+    private void RedrivePendingTasks(OrchestratorRun run) => _ = RedrivePendingTasksAsync(run);
+
+    /// <summary>
+    /// Re-queue tasks whose durable queue row went missing — a task Pending forever with nothing left to
+    /// dispatch it. Runs off the 60s status timer.
+    ///
+    /// "Orphaned" has to mean "storage has no row for it". It used to mean "the JobManager does not have
+    /// it queued or running", which was true in the world where dispatch enqueued every task into the
+    /// JobManager immediately. Under the pump that is simply what a BACKLOG looks like: the pump holds a
+    /// worker-pool-sized buffer and leaves the rest in storage, so a 124-task run against eight workers
+    /// has most of its tasks Pending and absent from the JobManager for minutes.
+    ///
+    /// The consequence was severe and silent. Every 60 seconds this re-queued the entire un-started
+    /// backlog — measured live at 92, then 60, 60, 52, 44, 36 tasks on consecutive ticks — and because
+    /// RequeueToTable stamps UtcNow into the RowKey, each pass created an ADDITIONAL row for the same
+    /// task instead of updating the existing one. Every copy was independently claimable, so tasks ran
+    /// once per copy: one Intune collection executed six times, from six rows exactly 60s apart.
+    /// </summary>
+    private async Task RedrivePendingTasksAsync(OrchestratorRun run)
     {
         var now = DateTime.UtcNow;
-        List<OrchestratorTaskItem> orphaned;
+        List<OrchestratorTaskItem> candidates;
 
         lock (_lock)
         {
-            orphaned = run.Tasks
+            candidates = run.Tasks
                 .Where(t => t.Status == "Pending")
                 .Where(t => !_jobManager.IsQueuedOrRunning($"{run.Name}-{t.Id}"))
                 .Where(t => !_deferrals.TryGetValue(DeferralKey(run.Name, t.Id), out var s)
@@ -794,18 +1049,34 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 .ToList();
         }
 
+        if (candidates.Count == 0) return;
+
+        // Storage decides. A Pending task that still has a row is waiting its turn, not orphaned.
+        HashSet<string> stillQueued;
+        try
+        {
+            stillQueued = await _queue.GetQueuedTaskIdsAsync(run.Name);
+        }
+        catch (Exception ex)
+        {
+            // Without this answer every candidate looks orphaned, which is the failure being fixed.
+            // Skip this tick; the timer comes back in 60s.
+            _logger.LogWarning(ex, "[Scheduler] Could not read queued tasks for {Run} — skipping re-drive", run.Name);
+            return;
+        }
+
+        var orphaned = candidates.Where(t => !stillQueued.Contains(t.Id)).ToList();
         if (orphaned.Count == 0) return;
 
         foreach (var task in orphaned)
         {
             // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
             _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
-            _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
-                name: $"{run.Name}-{task.Id}");
+            RequeueToTable(run, task);
         }
 
         _logger.LogWarning(
-            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — none were queued or running",
+            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no queue row and not queued or running",
             orphaned.Count, run.Name);
     }
 
@@ -845,7 +1116,23 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // Cannot await inside lock — schedule finalization
             _ = Task.Run(async () =>
             {
-                try { await FinalizeRunAsync(run); }
+                try
+                {
+                    // The in-memory graph proposes, storage disposes. Finalizing is irreversible - it
+                    // writes the aggregate and cleans the run up - so it must not run while storage still
+                    // shows work outstanding, which is exactly the case when terminal writes have not yet
+                    // flushed. A null count means the run predates the counter and cannot veto anything.
+                    var remaining = await _store.GetRemainingAsync(run.Name);
+                    if (remaining is > 0)
+                    {
+                        _logger.LogInformation(
+                            "[Scheduler] Run {Name} complete in memory but storage shows {Remaining} outstanding - deferring finalize",
+                            run.Name, remaining);
+                        return;
+                    }
+
+                    await FinalizeRunAsync(run);
+                }
                 catch (Exception ex) { _logger.LogError(ex, "[Scheduler] FinalizeRun failed for {Name}", run.Name); }
             });
         }
@@ -874,7 +1161,41 @@ public class OrchestratorService : IJobDescriptorStateWriter
             _activeRuns.ContainsKey(childName) || _recoveringChildren.ContainsKey(childName));
     }
 
+    /// <summary>
+    /// Declare a run finished: write its terminal status, drop it from the live graph, and hand off to
+    /// post-execution. Runs at most once per run — see the claim below.
+    /// </summary>
     private async Task FinalizeRunAsync(OrchestratorRun run)
+    {
+        // Finalize once. This is not an idempotent method: it re-arms PostExecStatus and dispatches the
+        // post-execution again, so entering it twice runs the run's aggregation twice. Observed live
+        // before this guard: one 13-task run finalized 7 times and dispatched Push-StoreMailboxRules 7
+        // times. Idempotent consumers hid it; Push-ScheduledTaskPostExecution did not, because it
+        // advances a recurring task by one interval per invocation.
+        //
+        // The claim lives here rather than at the call sites because there are four of them — normal
+        // completion, two resume paths, and cancellation — and cancellation can race a completion.
+        // DispatchPendingTasksAsync releases it when a run becomes live again, so a recurring run name
+        // can finalize on its next outing.
+        if (!_finalizingRuns.TryAdd(run.Name, true))
+        {
+            _logger.LogDebug("[Scheduler] Run {Name} has already been finalized — ignoring duplicate", run.Name);
+            return;
+        }
+
+        try
+        {
+            await FinalizeRunCoreAsync(run);
+        }
+        catch
+        {
+            // Still needs finalizing, so it must stay claimable — the 60s status timer retriggers it.
+            _finalizingRuns.TryRemove(run.Name, out _);
+            throw;
+        }
+    }
+
+    private async Task FinalizeRunCoreAsync(OrchestratorRun run)
     {
         var failed = run.Tasks.Count(t => t.Status == "Failed");
         var cancelled = run.Tasks.Count(t => t.Status == "Cancelled");
@@ -919,6 +1240,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // Cleanup child run tracking for this run
         _childRuns.TryRemove(run.Name, out _);
 
+        // Anything of this run's still queued is now moot; leaving rows behind has the pump claim work
+        // for a run that is already finished. That applies to EVERY finalized run — this used to sit in
+        // the else below, so a run WITH post-execution kept its queue rows from finalize until
+        // post-execution succeeded, and the pump spent that window re-claiming them. Observed live: one
+        // 13-task run finalized 7 times, dispatched its Push-* aggregation 7 times, and re-ran
+        // individual tasks up to 4 times each. The durable queue only ever carries TASKS — the
+        // post-execution job is enqueued in-memory on the JobManager and, after a crash, is re-derived
+        // from PostExecStatus — so dropping these rows here cannot cost the post-execution its retry.
+        _ = _queue.RemoveRunAsync(run.Name);
+
         // Dispatch PostExecution if configured
         if (!string.IsNullOrEmpty(run.PostExecFunctionName))
         {
@@ -952,43 +1283,42 @@ public class OrchestratorService : IJobDescriptorStateWriter
             runName: run.Name,
             work: async (jobCt) =>
             {
-                // Mark PostExec as Running
+                // Mark PostExec as Running, and count the attempt. Incremented BEFORE the work so a
+                // crash mid-post-execution still burns an attempt — otherwise a post-execution that
+                // kills the host would be retried forever, which is precisely what the bound is for.
                 run.PostExecStatus = "Running";
+                run.PostExecAttemptCount++;
                 await _store.UpsertRunAsync(run);
 
                 // Stream results to a temp file rather than building the aggregate in memory. For large
-                // runs (738+ tasks) that aggregate is 50-150 MB, and StreamResultsToFileAsync now holds
+                // runs (738+ tasks) that aggregate is 50-150 MB, and StreamResultsToJsonLinesAsync holds
                 // one chunk at a time rather than the whole entity set (it used to buffer every result
                 // row into a dictionary before writing a byte, so "streaming" still peaked at the full
                 // payload in UTF-16 — roughly 2x the stored size — before this ran).
                 //
-                // The remaining copy is ResultsJson below: the PS contract takes the aggregate as a
-                // string, so it is read back as one Large Object Heap allocation and PowerShell copies
-                // it again on ConvertFrom-Json. Removing THAT needs a contract change with the
-                // configured PostExecFunction (App:Orchestrator:PostExecFunction), whose downstream
-                // Push-* consumers live outside this repo.
-                var tempFile = Path.Combine(Path.GetTempPath(), $"craft-postexec-{Guid.NewGuid():N}.json");
+                // The path — not the content — is what goes to PowerShell. This used to read the file
+                // back with File.ReadAllTextAsync and pass it as a ResultsJson string, which put the
+                // whole aggregate on the Large Object Heap and had PowerShell copy it a second time on
+                // ConvertFrom-Json. Handing over the path instead lets Invoke-CraftPostExecution walk
+                // the file one line at a time, so neither copy is ever made. The file is JSON Lines for
+                // exactly that reason; see StreamResultsToJsonLinesAsync.
+                //
+                // Consequence for the file's lifetime: it must now survive until PowerShell has read
+                // it, so it is deleted in the finally below rather than immediately after streaming.
+                var tempFile = Path.Combine(Path.GetTempPath(), $"craft-postexec-{Guid.NewGuid():N}.jsonl");
                 try
                 {
-                    await _store.StreamResultsToFileAsync(run.Name, tempFile, jobCt);
+                    var resultCount = await _store.StreamResultsToJsonLinesAsync(run.Name, tempFile, jobCt);
                     var fileSize = new FileInfo(tempFile).Length;
                     var fileSizeMB = fileSize / (1024.0 * 1024.0);
                     _logger.LogInformation(
-                        "[Orchestrator] PostExec results for {Name}: {SizeMB:F1}MB streamed to temp file {Memory}",
-                        run.Name, fileSizeMB, BackgroundTaskLimiter.GetMemorySnapshot());
-
-                    // Read the file content and pass as ResultsJson — this keeps the PS interface
-                    // unchanged so no consumer (Push-*) code needs modification.
-                    var resultsJson = await File.ReadAllTextAsync(tempFile, jobCt);
-
-                    // Delete the temp file immediately to free disk — we have the string now
-                    try { File.Delete(tempFile); tempFile = null; }
-                    catch { /* will retry in finally */ }
+                        "[Orchestrator] PostExec results for {Name}: {Count} results, {SizeMB:F1}MB streamed to temp file {Memory}",
+                        run.Name, resultCount, fileSizeMB, BackgroundTaskLimiter.GetMemorySnapshot());
 
                     var parameters = new Dictionary<string, object>
                     {
                         { "FunctionName", run.PostExecFunctionName! },
-                        { "ResultsJson", resultsJson }
+                        { "ResultsPath", tempFile }
                     };
                     if (!string.IsNullOrEmpty(run.PostExecParametersJson))
                         parameters["ParametersJson"] = run.PostExecParametersJson;
@@ -1007,10 +1337,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
                     // Cleanup after successful PostExec
                     await _store.CleanupRunAsync(run.Name);
+                    await _queue.RemoveRunAsync(run.Name, jobCt);
                 }
                 catch (Exception ex)
                 {
-                    // Mark PostExec as Failed — will be retried on next startup via ResumeInterruptedRunsAsync
+                    // Mark PostExec as Failed. ResumeInterruptedRunsAsync picks "Failed" back up on the
+                    // next startup, up to MaxPostExecAttempts; the run's Results rows stay in storage
+                    // until it either succeeds or is abandoned, because they are the retry's input.
                     run.PostExecStatus = "Failed";
                     try { await _store.UpsertRunAsync(run); } catch { /* best effort */ }
                     _logger.LogError(ex, "[Orchestrator] PostExecution Push-{Function} failed for run {Name}",
@@ -1019,12 +1352,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 }
                 finally
                 {
-                    // Clean up temp file if it still exists (early delete may have succeeded)
-                    if (tempFile != null)
-                    {
-                        try { if (File.Exists(tempFile)) File.Delete(tempFile); }
-                        catch (Exception ex) { _logger.LogDebug(ex, "[Orchestrator] Failed to delete temp file {Path}", tempFile); }
-                    }
+                    // The only delete. PowerShell reads the file during ExecuteScript above, so it
+                    // cannot be freed any earlier — and it must still be freed when that throws.
+                    try { if (File.Exists(tempFile)) File.Delete(tempFile); }
+                    catch (Exception ex) { _logger.LogDebug(ex, "[Orchestrator] Failed to delete temp file {Path}", tempFile); }
                 }
             }
         );
@@ -1047,126 +1378,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
             var usedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var element in root.EnumerateArray())
-            {
-                // Skip null or non-object elements (planner returned $null for a tenant)
-                if (element.ValueKind != JsonValueKind.Object)
-                    continue;
-
-                var parameters = new Dictionary<string, object>();
-                string? collectionType = null;
-                string? name = null;
-                string? tenantFilter = null;
-                string? functionName = null;
-                string? suiteName = null;
-                string? batchNumber = null;
-                string? queueName = null;
-                string? customerId = null;
-                string? standardName = null;
-                string? templateId = null;
-                string? templateListValue = null;
-
-                foreach (var prop in element.EnumerateObject())
-                {
-                    var value = prop.Value.ValueKind switch
-                    {
-                        JsonValueKind.String => (object)prop.Value.GetString()!,
-                        JsonValueKind.Number => prop.Value.TryGetInt64(out var l) ? l : (object)prop.Value.GetDouble(),
-                        JsonValueKind.True => true,
-                        JsonValueKind.False => false,
-                        _ => prop.Value.Clone()
-                    };
-                    parameters[prop.Name] = value;
-
-                    if (prop.Name.Equals("CollectionType", StringComparison.OrdinalIgnoreCase))
-                        collectionType = prop.Value.GetString();
-                    if (prop.Name.Equals("Name", StringComparison.OrdinalIgnoreCase))
-                        name = prop.Value.GetString();
-                    if (prop.Name.Equals("TenantFilter", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.String)
-                        tenantFilter = prop.Value.GetString();
-                    if (prop.Name.Equals("FunctionName", StringComparison.OrdinalIgnoreCase))
-                        functionName = prop.Value.GetString();
-                    if (prop.Name.Equals("SuiteName", StringComparison.OrdinalIgnoreCase))
-                        suiteName = prop.Value.GetString();
-                    if (prop.Name.Equals("Standard", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.String)
-                        standardName = prop.Value.GetString();
-                    if (prop.Name.Equals("TemplateId", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.String)
-                        templateId = prop.Value.GetString();
-
-                    // Template-backed standards (Intune / Conditional Access) expand one standards
-                    // template into several items that all carry the same TemplateId — only
-                    // Settings.TemplateList.value separates them.
-                    if (prop.Name.Equals("Settings", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.Object
-                        && prop.Value.TryGetProperty("TemplateList", out var tmplList)
-                        && tmplList.ValueKind == JsonValueKind.Object
-                        && tmplList.TryGetProperty("value", out var tmplValue)
-                        && tmplValue.ValueKind == JsonValueKind.String)
-                    {
-                        templateListValue = tmplValue.GetString();
-                    }
-                    if (prop.Name.Equals("BatchNumber", StringComparison.OrdinalIgnoreCase))
-                        batchNumber = prop.Value.ToString();
-                    if (prop.Name.Equals("QueueName", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.String)
-                        queueName = prop.Value.GetString();
-                    if (prop.Name.Equals("customerId", StringComparison.OrdinalIgnoreCase)
-                        && prop.Value.ValueKind == JsonValueKind.String)
-                        customerId = prop.Value.GetString();
-
-                    // Tenant is either a plain domain string (e.g. standards batch items) or a
-                    // nested tenant object (e.g. audit log batch items). TenantFilter still wins.
-                    if (tenantFilter == null && prop.Name.Equals("Tenant", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (prop.Value.ValueKind == JsonValueKind.String)
-                        {
-                            tenantFilter = prop.Value.GetString();
-                        }
-                        else if (prop.Value.ValueKind == JsonValueKind.Object
-                            && prop.Value.TryGetProperty("defaultDomainName", out var ddn)
-                            && ddn.ValueKind == JsonValueKind.String)
-                        {
-                            tenantFilter = ddn.GetString();
-                        }
-                    }
-                }
-
-                // Build a unique task ID from available distinguishing properties. Standards batch
-                // items all share FunctionName = 'CIPPStandard', so fold in the Standard name.
-                var label = collectionType ?? suiteName ?? name
-                    ?? (functionName != null && standardName != null
-                        ? $"{functionName}_{standardName}"
-                        : functionName)
-                    ?? standardName ?? "unknown";
-
-                // Standards items sharing a Standard name are separated by their template identity.
-                // Mirrors the API key CIPP itself uses for rerun detection (Push-CIPPStandard).
-                if (standardName != null)
-                {
-                    if (templateId != null) label = $"{label}_{templateId}";
-                    if (templateListValue != null) label = $"{label}_{templateListValue}";
-                }
-
-                var tenant = tenantFilter ?? queueName ?? customerId ?? "unknown";
-                var taskId = batchNumber != null ? $"{label}_{tenant}_b{batchNumber}" : $"{label}_{tenant}";
-
-                // Ensure uniqueness — append index if collision
-                if (!usedIds.Add(taskId))
-                {
-                    var idx = 2;
-                    while (!usedIds.Add($"{taskId}_{idx}")) idx++;
-                    taskId = $"{taskId}_{idx}";
-                }
-
-                tasks.Add(new OrchestratorTaskItem
-                {
-                    Id = taskId,
-                    Parameters = parameters,
-                    Status = "Pending"
-                });
-            }
+                AddTaskFromElement(tasks, usedIds, element);
         }
         catch (Exception ex)
         {
@@ -1175,6 +1387,186 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
 
         return tasks;
+    }
+
+    /// <summary>
+    /// Parse a batch written as JSON Lines — one task object per line — holding only one line at a
+    /// time. This is the counterpart to the caller writing the batch a task at a time: between them,
+    /// a batch of any size costs one task's worth of string on each side instead of the whole array.
+    ///
+    /// Task IDs are de-duplicated across the whole file, exactly as the array parser does across the
+    /// whole array, so the two forms produce identical task lists for identical input.
+    ///
+    /// A malformed line costs that task, not the run — the same failure isolation the results path
+    /// gets. The array form cannot do this: one bad element fails the whole document.
+    /// </summary>
+    private List<OrchestratorTaskItem> ParseTasksFromJsonLinesFile(string path, string runName)
+    {
+        var tasks = new List<OrchestratorTaskItem>();
+        var usedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var lineNumber = 0;
+        var failed = 0;
+
+        try
+        {
+            // ReadLines is lazy — the file is never read into memory as a whole.
+            foreach (var line in File.ReadLines(path))
+            {
+                lineNumber++;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    AddTaskFromElement(tasks, usedIds, doc.RootElement);
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    if (failed <= 3)
+                        _logger.LogWarning(ex, "[Orchestrator] Batch line {Line} for run {Name} is not valid JSON",
+                            lineNumber, runName);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[Orchestrator] Failed to read batch file {Path} for run {Name}", path, runName);
+        }
+
+        if (failed > 0)
+            _logger.LogWarning("[Orchestrator] {Failed} of {Total} batch lines for run {Name} could not be parsed",
+                failed, lineNumber, runName);
+
+        return tasks;
+    }
+
+    /// <summary>
+    /// Convert one batch element into a task and append it, deriving the task ID from whichever
+    /// distinguishing properties the element carries. <paramref name="usedIds"/> is threaded through
+    /// by the caller so IDs stay unique across the whole batch however it was delivered.
+    /// </summary>
+    private static void AddTaskFromElement(List<OrchestratorTaskItem> tasks, HashSet<string> usedIds,
+        JsonElement element)
+    {
+        // Skip null or non-object elements (planner returned $null for a tenant)
+        if (element.ValueKind != JsonValueKind.Object)
+            return;
+
+        var parameters = new Dictionary<string, object>();
+        string? collectionType = null;
+        string? name = null;
+        string? tenantFilter = null;
+        string? functionName = null;
+        string? suiteName = null;
+        string? batchNumber = null;
+        string? queueName = null;
+        string? customerId = null;
+        string? standardName = null;
+        string? templateId = null;
+        string? templateListValue = null;
+
+        foreach (var prop in element.EnumerateObject())
+        {
+            var value = prop.Value.ValueKind switch
+            {
+                JsonValueKind.String => (object)prop.Value.GetString()!,
+                JsonValueKind.Number => prop.Value.TryGetInt64(out var l) ? l : (object)prop.Value.GetDouble(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => prop.Value.Clone()
+            };
+            parameters[prop.Name] = value;
+
+            if (prop.Name.Equals("CollectionType", StringComparison.OrdinalIgnoreCase))
+                collectionType = prop.Value.GetString();
+            if (prop.Name.Equals("Name", StringComparison.OrdinalIgnoreCase))
+                name = prop.Value.GetString();
+            if (prop.Name.Equals("TenantFilter", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.String)
+                tenantFilter = prop.Value.GetString();
+            if (prop.Name.Equals("FunctionName", StringComparison.OrdinalIgnoreCase))
+                functionName = prop.Value.GetString();
+            if (prop.Name.Equals("SuiteName", StringComparison.OrdinalIgnoreCase))
+                suiteName = prop.Value.GetString();
+            if (prop.Name.Equals("Standard", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.String)
+                standardName = prop.Value.GetString();
+            if (prop.Name.Equals("TemplateId", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.String)
+                templateId = prop.Value.GetString();
+
+            // Template-backed standards (Intune / Conditional Access) expand one standards
+            // template into several items that all carry the same TemplateId — only
+            // Settings.TemplateList.value separates them.
+            if (prop.Name.Equals("Settings", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.Object
+                && prop.Value.TryGetProperty("TemplateList", out var tmplList)
+                && tmplList.ValueKind == JsonValueKind.Object
+                && tmplList.TryGetProperty("value", out var tmplValue)
+                && tmplValue.ValueKind == JsonValueKind.String)
+            {
+                templateListValue = tmplValue.GetString();
+            }
+            if (prop.Name.Equals("BatchNumber", StringComparison.OrdinalIgnoreCase))
+                batchNumber = prop.Value.ToString();
+            if (prop.Name.Equals("QueueName", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.String)
+                queueName = prop.Value.GetString();
+            if (prop.Name.Equals("customerId", StringComparison.OrdinalIgnoreCase)
+                && prop.Value.ValueKind == JsonValueKind.String)
+                customerId = prop.Value.GetString();
+
+            // Tenant is either a plain domain string (e.g. standards batch items) or a
+            // nested tenant object (e.g. audit log batch items). TenantFilter still wins.
+            if (tenantFilter == null && prop.Name.Equals("Tenant", StringComparison.OrdinalIgnoreCase))
+            {
+                if (prop.Value.ValueKind == JsonValueKind.String)
+                {
+                    tenantFilter = prop.Value.GetString();
+                }
+                else if (prop.Value.ValueKind == JsonValueKind.Object
+                    && prop.Value.TryGetProperty("defaultDomainName", out var ddn)
+                    && ddn.ValueKind == JsonValueKind.String)
+                {
+                    tenantFilter = ddn.GetString();
+                }
+            }
+        }
+
+        // Build a unique task ID from available distinguishing properties. Standards batch
+        // items all share FunctionName = 'CIPPStandard', so fold in the Standard name.
+        var label = collectionType ?? suiteName ?? name
+            ?? (functionName != null && standardName != null
+                ? $"{functionName}_{standardName}"
+                : functionName)
+            ?? standardName ?? "unknown";
+
+        // Standards items sharing a Standard name are separated by their template identity.
+        // Mirrors the API key CIPP itself uses for rerun detection (Push-CIPPStandard).
+        if (standardName != null)
+        {
+            if (templateId != null) label = $"{label}_{templateId}";
+            if (templateListValue != null) label = $"{label}_{templateListValue}";
+        }
+
+        var tenant = tenantFilter ?? queueName ?? customerId ?? "unknown";
+        var taskId = batchNumber != null ? $"{label}_{tenant}_b{batchNumber}" : $"{label}_{tenant}";
+
+        // Ensure uniqueness — append index if collision
+        if (!usedIds.Add(taskId))
+        {
+            var idx = 2;
+            while (!usedIds.Add($"{taskId}_{idx}")) idx++;
+            taskId = $"{taskId}_{idx}";
+        }
+
+        tasks.Add(new OrchestratorTaskItem
+        {
+            Id = taskId,
+            Parameters = parameters,
+            Status = "Pending"
+        });
     }
 
     private string? FindTaskScript(string runName)
@@ -1247,6 +1639,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task<OrchestratorRun?> GetRunStatusAsync(string name)
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
         return await _store.GetRunAsync(name);
     }
 
@@ -1256,6 +1649,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task<List<string>> ListRunsAsync()
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
         return await _store.ListRunsAsync();
     }
 }

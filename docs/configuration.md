@@ -399,7 +399,11 @@ Fan-out/fan-in task execution with crash recovery.
   // Default: "Invoke-CraftQueueTask" (provided in CraftRuntime/)
   "QueueTaskFunction": "Invoke-CraftQueueTask",
 
-  // PS function for post-execution aggregation. Receives FunctionName + ResultsJson.
+  // PS function for post-execution aggregation. Receives FunctionName + ResultsPath, where
+  // ResultsPath is a JSON Lines file (one task result per line) that the host writes before
+  // the call and deletes after it. Read it a line at a time: it holds the whole run's results,
+  // 50-150MB on large runs, and not materialising that as a string is the point of passing a
+  // path. A replacement must declare -ResultsPath; the former -ResultsJson parameter is gone.
   // Default: "Invoke-CraftPostExecution" (provided in CraftRuntime/)
   "PostExecFunction": "Invoke-CraftPostExecution",
 

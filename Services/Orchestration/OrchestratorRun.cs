@@ -12,6 +12,18 @@ public class OrchestratorRun
     public string? TaskScriptName { get; set; }
     public string? PostExecFunctionName { get; set; }
     public string? PostExecParametersJson { get; set; }
-    public string? PostExecStatus { get; set; }  // null | "Pending" | "Running" | "Completed" | "Failed"
+    // null | "Pending" | "Running" | "Completed" | "Failed" | "Abandoned"
+    // "Failed" is retryable — recovery picks it back up on the next host start. "Abandoned" is the
+    // terminal one: retries are spent, and the run's result rows have been cleaned up.
+    public string? PostExecStatus { get; set; }
+
+    /// <summary>
+    /// How many times post-execution has been attempted. Bounds the retry that
+    /// ResumeInterruptedRunsAsync performs for a "Failed" post-execution, the same way
+    /// <see cref="OrchestratorTaskItem.AttemptCount"/> bounds task recovery — without it a
+    /// permanently-failing aggregation would be retried on every host start forever.
+    /// </summary>
+    public int PostExecAttemptCount { get; set; }
+
     public string? ParentRunName { get; set; }
 }

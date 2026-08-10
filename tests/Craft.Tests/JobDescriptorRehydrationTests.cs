@@ -22,6 +22,11 @@ public class JobDescriptorRehydrationTests
     /// <summary>An in-memory <see cref="ICraftTableStore"/> that counts point reads.</summary>
     private sealed class CountingStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
         public int PointReads;
         public int PartitionScans;

@@ -18,11 +18,20 @@ public class PowerShellWorker : IDisposable
         new[] { typeof(Cmdlet), typeof(bool), typeof(bool), typeof(string[]) },
         null);
     private static readonly object[] s_getJobsArgs = { null!, false, false, null! };
+    // PSModuleInfo.SetName + CommandInfo.Module setter — internal APIs used to reattach ModuleName
+    // after SSFE clone (SessionStateFunctionEntry cannot preserve module association).
+    private static readonly MethodInfo? s_psModuleInfoSetName = typeof(PSModuleInfo).GetMethod(
+        "SetName", NonPublicInstance, null, new[] { typeof(string) }, null);
+    private static readonly MethodInfo? s_commandInfoModuleSetter = typeof(CommandInfo)
+        .GetProperty(nameof(CommandInfo.Module), BindingFlags.Public | BindingFlags.Instance)
+        ?.GetSetMethod(nonPublic: true);
     private static HashSet<string>? s_builtinGlobalVars;
 
     private readonly PowerShell _pwsh;
     private readonly ILogger _logger;
     private bool _initialized;
+    private readonly Dictionary<string, PSModuleInfo> _moduleNameShells =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public int Id { get; }
 
@@ -206,6 +215,81 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
 
         _initialized = true;
         _logger.LogInformation("Worker{Id}: {Count} functions deployed", Id, deployed);
+    }
+
+    /// <summary>
+    /// Reattach <see cref="CommandInfo.ModuleName"/> on SSFE-injected functions using names captured
+    /// at export time. <see cref="SessionStateFunctionEntry"/> cannot preserve module association, so
+    /// cloned workers otherwise report empty ModuleName (e.g. <c>\Push-ExecOnboardTenantQueue</c>),
+    /// which breaks downstream allowlists that key off module identity.
+    /// <para>
+    /// Metadata only — does not restore <c>Get-Module</c>, module scope, or private functions.
+    /// Skips commands that already have a ModuleName (native ImportPSModule / binary modules).
+    /// </para>
+    /// </summary>
+    public void RestoreExportedModuleNames(ExportedModuleState state)
+    {
+        if (s_psModuleInfoSetName == null || s_commandInfoModuleSetter == null)
+        {
+            _logger.LogWarning(
+                "Worker{Id}: cannot restore module names — PSModuleInfo.SetName / CommandInfo.Module reflection unavailable",
+                Id);
+            return;
+        }
+
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (name, _, module) in state.Functions)
+        {
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(module))
+                continue;
+            map[name] = module;
+        }
+
+        if (map.Count == 0)
+            return;
+
+        var prevDefault = Runspace.DefaultRunspace;
+        var stamped = 0;
+        try
+        {
+            Runspace.DefaultRunspace = _pwsh.Runspace;
+
+            foreach (var (name, moduleName) in map)
+            {
+                try
+                {
+                    var cmd = _pwsh.Runspace.SessionStateProxy.InvokeCommand.GetCommand(
+                        name, CommandTypes.Function);
+                    if (cmd == null || !string.IsNullOrEmpty(cmd.ModuleName))
+                        continue;
+
+                    if (!_moduleNameShells.TryGetValue(moduleName, out var shell))
+                    {
+                        shell = new PSModuleInfo(linkToGlobal: true);
+                        s_psModuleInfoSetName.Invoke(shell, new object[] { moduleName });
+                        _moduleNameShells[moduleName] = shell;
+                    }
+
+                    s_commandInfoModuleSetter.Invoke(cmd, new object[] { shell });
+                    stamped++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Worker{Id}: failed to restore ModuleName for {Function}", Id, name);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Worker{Id}: RestoreExportedModuleNames failed", Id);
+        }
+        finally
+        {
+            Runspace.DefaultRunspace = prevDefault;
+        }
+
+        if (stamped > 0)
+            _logger.LogDebug("Worker{Id}: restored ModuleName on {Count} SSFE-injected functions", Id, stamped);
     }
 
     /// <summary>
