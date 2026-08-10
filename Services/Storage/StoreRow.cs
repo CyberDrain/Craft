@@ -16,6 +16,17 @@ public sealed class StoreRow
     public string PartitionKey { get; init; } = "";
     public string RowKey { get; init; } = "";
     public DateTimeOffset? Timestamp { get; init; }
+
+    /// <summary>
+    /// The backend's concurrency token for this row as it was read, or null for a row built locally.
+    ///
+    /// Carried so a caller can read a row, mutate <see cref="Properties"/>, and write it back guarded by
+    /// this value. That is what makes storage — not a process's memory — the source of truth: if anything
+    /// else changed the row in between, the token no longer matches and the conditional write is rejected
+    /// rather than silently overwriting the newer state.
+    /// </summary>
+    public string? ETag { get; init; }
+
     public Dictionary<string, object?> Properties { get; init; } = new();
 
     public StoreRow() { }

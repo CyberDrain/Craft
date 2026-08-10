@@ -114,6 +114,43 @@ public sealed class AzureTableStore : ICraftTableStore
             await SubmitAsync(client, batch, ct);
     }
 
+    public async Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+        CancellationToken ct = default)
+    {
+        if (rows.Count == 0) return true;
+
+        // One transaction, so one round-trip and one atomic outcome. A caller claiming more than a
+        // transaction can hold would silently get partial application, which for a claim means rows
+        // marked as owned by a worker that never receives them.
+        if (rows.Count > MaxBatch)
+            throw new ArgumentException($"Conditional batch is limited to {MaxBatch} rows, got {rows.Count}.", nameof(rows));
+
+        var actions = new List<TableTransactionAction>(rows.Count);
+        foreach (var row in rows)
+        {
+            // A row with no ETag was never read from storage, so there is nothing to guard against and
+            // "replace whatever is there" is not a claim. Refuse rather than race.
+            if (string.IsNullOrEmpty(row.ETag))
+                throw new ArgumentException($"Row {row.PartitionKey}/{row.RowKey} has no ETag to guard the write.", nameof(rows));
+
+            actions.Add(new TableTransactionAction(
+                TableTransactionActionType.UpdateReplace, ToEntity(row), new ETag(row.ETag)));
+        }
+
+        try
+        {
+            await Client(table).SubmitTransactionAsync(actions, ct);
+            return true;
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 404 or 409)
+        {
+            // 412 precondition failed / 409 conflict — someone else changed or claimed a row.
+            // 404 — a row was deleted underneath us. All three mean "not ours", not "retry harder".
+            // Deliberately NO fallback to unconditional upserts: that is what would steal the row.
+            return false;
+        }
+    }
+
     private static async Task SubmitAsync(TableClient client, List<TableTransactionAction> batch, CancellationToken ct)
     {
         try
@@ -212,7 +249,13 @@ public sealed class AzureTableStore : ICraftTableStore
 
     private static StoreRow ToRow(TableEntity entity)
     {
-        var row = new StoreRow(entity.PartitionKey, entity.RowKey) { Timestamp = entity.Timestamp };
+        // ETag is surfaced as a field rather than a property, so it survives the round-trip a conditional
+        // write needs without polluting the caller's property bag (s_systemKeys drops it below).
+        var row = new StoreRow(entity.PartitionKey, entity.RowKey)
+        {
+            Timestamp = entity.Timestamp,
+            ETag = entity.ETag.ToString(),
+        };
         foreach (var (key, value) in entity)
         {
             if (s_systemKeys.Contains(key)) continue;

@@ -237,6 +237,11 @@ public class SetupWizardStatusTests
     /// </summary>
     private sealed class FakeStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         public List<StoreRow> Rows { get; } = [];
         public List<string> EnsuredTables { get; } = [];
         public List<string> UpsertedTo { get; } = [];

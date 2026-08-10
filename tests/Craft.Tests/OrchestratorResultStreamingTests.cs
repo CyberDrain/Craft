@@ -25,6 +25,11 @@ public class OrchestratorResultStreamingTests
     /// </summary>
     private sealed class LazyProbeStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
 
         /// <summary>Rows handed out by <see cref="QueryPartitionAsync"/> so far.</summary>

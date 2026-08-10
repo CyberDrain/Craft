@@ -148,6 +148,11 @@ public class OrchestratorTableStore
         var tasks = new List<OrchestratorTaskItem>();
         await foreach (var taskRow in _store.QueryPartitionAsync(_tasksTable, name))
         {
+            // The remaining-count row shares this partition so it can be updated in the same transaction
+            // as a task completion. It is bookkeeping, not work — materializing it would give every run a
+            // phantom task that never completes, and no run would ever finalize.
+            if (taskRow.RowKey == CounterRowKey) continue;
+
             var parametersJson = taskRow.GetString("ParametersJson");
             Dictionary<string, object> parameters;
             try
@@ -207,6 +212,109 @@ public class OrchestratorTableStore
         return summaries;
     }
 
+    // ── Remaining-task counter ────────────────────────────────────────────────
+    //
+    // How many of a run's tasks are not yet terminal, kept in storage rather than derived from the
+    // in-memory run graph, so finalization stops depending on one process holding the whole graph.
+    // Scanning instead is not an option: Azure Table cannot count server-side, so "is this run done"
+    // would be a 7,000-row read per check.
+    //
+    // The row lives in the TASKS table, in the run's own partition, and that placement is the whole
+    // design. A counter decremented separately from the task's terminal write is not idempotent — the
+    // status writer retries failed runs, so a replayed batch would decrement twice and strand a run that
+    // had actually finished. Sharing the partition lets CompleteTaskAsync mark the task terminal AND
+    // decrement the counter in ONE conditional transaction: exactly-once by construction, because a
+    // replay finds the task's ETag already moved on and the whole transaction is rejected.
+    //
+    // The reserved row key cannot collide with a task id — task ids are caller-supplied names like
+    // "CIPPStandard_IntuneTemplate_<guid>_<tenant>", never a control character.
+    private const string CounterRowKey = "!!run-counter";
+    private const int CounterAttempts = 8;
+
+    /// <summary>The three statuses that mean a task will not run again, and so has been counted.</summary>
+    private static bool IsTerminal(string? status) =>
+        status is "Completed" or "Failed" or "Cancelled";
+
+    /// <summary>Seed the counter when a run is created. Idempotent, so re-seeding a resumed run is safe.</summary>
+    public Task InitRemainingAsync(string runName, int total, CancellationToken ct = default) =>
+        _store.UpsertAsync(_tasksTable, new StoreRow(runName, CounterRowKey)
+        {
+            Properties = { ["Remaining"] = total, ["Total"] = total }
+        }, ct);
+
+    /// <summary>How many tasks the STORE believes are outstanding, or null if the run has no counter row.</summary>
+    public async Task<int?> GetRemainingAsync(string runName, CancellationToken ct = default)
+        => (await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct))?.GetInt32("Remaining");
+
+    /// <summary>
+    /// Subtract <paramref name="by"/> from a run's outstanding count, for the batch path.
+    ///
+    /// Exactly-once here rests on the caller: the coalescing status writer holds one pending write per
+    /// task and re-queues only the runs whose batch did NOT land, so a group that applied is never
+    /// re-sent. Call this only after a group has been written successfully, counting the terminal rows
+    /// in that group. Retries on a lost race so a concurrent decrement cannot swallow this one.
+    /// </summary>
+    public async Task<int?> DecrementRemainingAsync(string runName, int by, CancellationToken ct = default)
+    {
+        if (by <= 0) return await GetRemainingAsync(runName, ct);
+
+        for (var attempt = 0; attempt < CounterAttempts; attempt++)
+        {
+            var counter = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
+            if (counter == null) return null;
+
+            counter["Remaining"] = Math.Max(0, (counter.GetInt32("Remaining") ?? 0) - by);
+
+            if (await _store.TryReplaceBatchAsync(_tasksTable, runName, [counter], ct))
+                return (int)counter["Remaining"]!;
+        }
+
+        _logger.LogWarning("[OrchestratorStore] Could not decrement remaining for {Run} by {By} after {Attempts} attempts",
+            runName, by, CounterAttempts);
+        return null;
+    }
+
+    /// <summary>
+    /// Mark one task terminal and decrement its run's outstanding count, atomically.
+    ///
+    /// Both rows share the run's partition, so this is a single conditional transaction guarded by both
+    /// ETags. That is what makes it exactly-once: a replay of the same completion finds the task row's
+    /// ETag already advanced, the transaction is rejected, and the counter is not decremented a second
+    /// time. A caller seeing false should re-read — either someone else completed this task, or the
+    /// counter moved under it and the decrement needs re-applying.
+    /// </summary>
+    /// <returns>The new outstanding count, or null if the transaction was rejected or rows are missing.</returns>
+    public async Task<int?> CompleteTaskAsync(string runName, OrchestratorTaskItem task,
+        CancellationToken ct = default)
+    {
+        for (var attempt = 0; attempt < CounterAttempts; attempt++)
+        {
+            var counter = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
+            var existing = await _store.GetAsync(_tasksTable, runName, task.Id, ct);
+            if (counter == null || existing == null) return null;
+
+            // Already terminal in storage — this is a replay. The ETag guard alone does not catch it,
+            // because each attempt re-reads the CURRENT row and would happily guard against the
+            // post-completion version and decrement a second time. Completing a completed task is a
+            // no-op, not another decrement: report the count and leave it alone.
+            if (IsTerminal(existing.GetString("Status")))
+                return counter.GetInt32("Remaining") ?? 0;
+
+            var taskRow = BuildTaskRow(runName, task);
+            // Guard on the row as it stands now; a concurrent writer invalidates this and we re-read.
+            var guarded = new StoreRow(runName, task.Id) { ETag = existing.ETag, Properties = taskRow.Properties };
+
+            counter["Remaining"] = Math.Max(0, (counter.GetInt32("Remaining") ?? 0) - 1);
+
+            if (await _store.TryReplaceBatchAsync(_tasksTable, runName, [guarded, counter], ct))
+                return (int)counter["Remaining"]!;
+        }
+
+        _logger.LogWarning("[OrchestratorStore] Could not complete {Task} in {Run} after {Attempts} attempts",
+            task.Id, runName, CounterAttempts);
+        return null;
+    }
+
     /// <summary>Upsert a single task row.</summary>
     public Task UpsertTaskAsync(string runName, OrchestratorTaskItem task) =>
         _store.UpsertAsync(_tasksTable, BuildTaskRow(runName, task));
@@ -246,6 +354,13 @@ public class OrchestratorTableStore
             try
             {
                 await _store.UpsertBatchAsync(_tasksTable, group.Key, group.Select(BuildTaskRow).ToList(), ct);
+
+                // The group landed, so the tasks it just moved to a terminal state are now durably
+                // finished. Decrement once for them here rather than per task: this is the only place
+                // that knows a terminal write actually applied, and the writer never re-sends a group
+                // that did, which is what keeps the count honest.
+                var terminal = group.Count(w => IsTerminal(w.Status));
+                if (terminal > 0) await DecrementRemainingAsync(group.Key, terminal, ct);
             }
             catch (Exception ex)
             {

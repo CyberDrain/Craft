@@ -31,6 +31,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private readonly BackgroundTaskLimiter _limiter;
     private readonly JobManager _jobManager;
     private readonly OrchestratorTableStore _store;
+
+    /// <summary>The durable job queue. Its table is created alongside the orchestrator's; nothing
+    /// dispatches from it yet, so an existing deployment gains an empty table and nothing else.</summary>
+    private readonly JobQueueStore _queue;
     private readonly OrchestratorStatusWriter _writer;
     private readonly CraftSettings _settings;
     private readonly object _lock = new();
@@ -85,6 +89,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         BackgroundTaskLimiter limiter,
         JobManager jobManager,
         OrchestratorTableStore store,
+        JobQueueStore queue,
         OrchestratorStatusWriter writer,
         CraftSettings settings)
     {
@@ -93,6 +98,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _limiter = limiter;
         _jobManager = jobManager;
         _store = store;
+        _queue = queue;
         _writer = writer;
         _settings = settings;
 
@@ -169,6 +175,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
+            await _queue.InitializeAsync();
             var run = await _store.GetRunAsync(name);
 
             if (run != null && run.Status == "Running")
@@ -216,7 +223,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     }
                     _logger.LogInformation("[Scheduler] Resuming run {Name}: {Pending}/{Total} pending",
                         name, pendingCount, run.Tasks.Count);
-                    DispatchPendingTasks(run, taskPath, run.Priority, ct);
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
                     return;
                 }
 
@@ -260,8 +267,11 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
             await _store.UpsertRunAsync(run);
             await _store.UpsertTaskBatchAsync(name, tasks);
+            // Seed the durable outstanding-task count alongside the tasks themselves, so completion
+            // is answerable from storage instead of by walking this run graph.
+            await _store.InitRemainingAsync(name, tasks.Count, ct);
             _logger.LogInformation("[Scheduler] Run {Name} created with {Count} tasks at P{Priority}", name, tasks.Count, priority);
-            DispatchPendingTasks(run, taskPath, priority, ct);
+            await DispatchPendingTasksAsync(run, taskPath, priority, ct);
         }
         finally
         {
@@ -302,6 +312,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task ResumeInterruptedRunsAsync(CancellationToken ct)
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
 
         // Rebuild parent→child links BEFORE processing anything. _childRuns is in-memory, so without
         // this a resumed parent has no registered children, AllChildRunsComplete answers true, and the
@@ -380,7 +391,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 if (pending > 0)
                 {
                     _logger.LogInformation("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
-                    DispatchPendingTasks(run, taskPath, run.Priority, ct);
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
                 }
                 else
                 {
@@ -429,6 +440,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
+            await _queue.InitializeAsync();
 
             var existing = await _store.GetRunAsync(name);
             if (existing != null && existing.Status == "Running" && _activeRuns.ContainsKey(name))
@@ -473,11 +485,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
             await _store.UpsertRunAsync(run);
             await _store.UpsertTaskBatchAsync(name, tasks);
+            // Seed the durable outstanding-task count alongside the tasks themselves, so completion
+            // is answerable from storage instead of by walking this run graph.
+            await _store.InitRemainingAsync(name, tasks.Count, ct);
             _logger.LogInformation(
                 "[Orchestrator] Run {Name} created from batch: {Count} tasks P{Priority}{PostExec}",
                 name, tasks.Count, priority,
                 postExecFunctionName != null ? $" (PostExec: Push-{postExecFunctionName})" : "");
-            DispatchPendingTasks(run, taskPath, priority, ct);
+            await DispatchPendingTasksAsync(run, taskPath, priority, ct);
         }
         finally
         {
@@ -485,7 +500,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
     }
 
-    private void DispatchPendingTasks(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
+    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
     {
         _activeRuns.TryAdd(run.Name, run);
         // Registered before anything is enqueued — the resolver reads it on the dispatch side.
@@ -494,17 +509,27 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // Start periodic status timer (every 60s) for this run
         if (!_runStatusTimers.ContainsKey(run.Name))
         {
-            var timer = new Timer(_ => { LogRunStatus(run); RedrivePendingTasks(run); },
+            // CheckRunCompletion is re-run here on purpose. It is normally driven by task transitions,
+            // but a run whose finalize was deferred because storage still showed work outstanding has no
+            // transitions left to retrigger it - without this periodic re-check that deferral would be
+            // permanent, which is a worse failure than the premature finalize it exists to prevent.
+            var timer = new Timer(_ =>
+                {
+                    LogRunStatus(run);
+                    RedrivePendingTasks(run);
+                    lock (_lock) { CheckRunCompletion(run); }
+                },
                 null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
             _runStatusTimers.TryAdd(run.Name, timer);
         }
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
 
-        foreach (var task in pending)
-        {
-            DispatchSingleTask(run, task, priority);
-        }
+        // One batched write per priority bucket rather than one per task. The queue is the backlog now;
+        // the JobManager only ever sees the batch JobQueuePump claims from it.
+        await _queue.EnqueueBatchAsync(run.Name,
+            pending.Select(t => (t.Id, t.Priority ?? priority)).ToList(),
+            DateTime.UtcNow, ct);
 
         _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
             pending.Count, run.Name, priority);
@@ -515,14 +540,23 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// graph, no task, no script path, no service reference — and calls back into
     /// <see cref="ResolveTaskWorkAsync"/> at dispatch time to rebuild the work.
     /// </summary>
-    private void DispatchSingleTask(OrchestratorRun run, OrchestratorTaskItem task, int priority)
+    /// <summary>
+    /// Put one task back on the durable queue. Fire-and-forget because every caller is on a lock or a
+    /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
+    /// re-drive finds it again.
+    /// </summary>
+    private void RequeueToTable(OrchestratorRun run, OrchestratorTaskItem task)
     {
-        // A per-task override (set by an operator reprioritizing this job) wins over the run's
-        // priority; null — the normal case — inherits. Because the override is persisted, this holds
-        // across a restart rather than reverting when the run is re-queued from storage.
-        _jobManager.Enqueue(
-            new JobDescriptor(run.Name, task.Id, task.Priority ?? priority),
-            name: $"{run.Name}-{task.Id}");
+        var priority = task.Priority ?? run.Priority;
+        _ = Task.Run(async () =>
+        {
+            try { await _queue.EnqueueAsync(run.Name, task.Id, priority, DateTime.UtcNow); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[Scheduler] Could not re-queue {Task} in {Run} — the re-drive will retry",
+                    task.Id, run.Name);
+            }
+        });
     }
 
     /// <summary>
@@ -753,8 +787,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
             "[Scheduler] Task {TaskId} in {Run} could not be marked Running (attempt {Count}/{Max}) — re-queued, slot released",
             task.Id, run.Name, count, MaxDeferrals);
 
-        _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
-            name: $"{run.Name}-{task.Id}");
+        // Back to the QUEUE, not to memory. The pump drops a claimed row once the JobManager is done with
+        // the job, so an in-memory re-queue here would leave the retry with no durable row behind it — and
+        // nothing to pick it up again if this instance went away.
+        RequeueToTable(run, task);
     }
 
     /// <summary>
@@ -800,8 +836,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         {
             // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
             _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
-            _jobManager.Enqueue(new JobDescriptor(run.Name, task.Id, task.Priority ?? run.Priority),
-                name: $"{run.Name}-{task.Id}");
+            RequeueToTable(run, task);
         }
 
         _logger.LogWarning(
@@ -845,7 +880,23 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // Cannot await inside lock — schedule finalization
             _ = Task.Run(async () =>
             {
-                try { await FinalizeRunAsync(run); }
+                try
+                {
+                    // The in-memory graph proposes, storage disposes. Finalizing is irreversible - it
+                    // writes the aggregate and cleans the run up - so it must not run while storage still
+                    // shows work outstanding, which is exactly the case when terminal writes have not yet
+                    // flushed. A null count means the run predates the counter and cannot veto anything.
+                    var remaining = await _store.GetRemainingAsync(run.Name);
+                    if (remaining is > 0)
+                    {
+                        _logger.LogInformation(
+                            "[Scheduler] Run {Name} complete in memory but storage shows {Remaining} outstanding - deferring finalize",
+                            run.Name, remaining);
+                        return;
+                    }
+
+                    await FinalizeRunAsync(run);
+                }
                 catch (Exception ex) { _logger.LogError(ex, "[Scheduler] FinalizeRun failed for {Name}", run.Name); }
             });
         }
@@ -928,6 +979,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
         {
             // No PostExec — cleanup results table (if any stray entries exist)
             _ = _store.CleanupRunAsync(run.Name);
+            // Anything of this run's still queued is now moot; leaving rows behind would have the
+            // pump claim work for a run that no longer exists.
+            _ = _queue.RemoveRunAsync(run.Name);
         }
     }
 
@@ -1007,6 +1061,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
                     // Cleanup after successful PostExec
                     await _store.CleanupRunAsync(run.Name);
+                    await _queue.RemoveRunAsync(run.Name, jobCt);
                 }
                 catch (Exception ex)
                 {
@@ -1247,6 +1302,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task<OrchestratorRun?> GetRunStatusAsync(string name)
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
         return await _store.GetRunAsync(name);
     }
 
@@ -1256,6 +1312,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task<List<string>> ListRunsAsync()
     {
         await _store.InitializeAsync();
+        await _queue.InitializeAsync();
         return await _store.ListRunsAsync();
     }
 }

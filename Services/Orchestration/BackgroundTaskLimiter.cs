@@ -28,6 +28,21 @@ namespace Craft.Orchestration;
 ///   instead of SemaphoreSlim. This eliminates permit-leak bugs that occur when
 ///   scaling down while tasks are running — there are no permits to leak, just a
 ///   threshold comparison under a single lock.
+///
+/// Slot accounting — THE INVARIANT, learned from a 28-hour production deadlock:
+///   A slot the gate believes is in use but that nobody can release is unrecoverable, and once every
+///   slot is lost the dispatch loop parks here forever. The process stays up and the scheduler keeps
+///   logging; no job ever starts again. So:
+///
+///     - once <see cref="AcquireAsync"/> has committed a slot to a caller, or enqueued a waiter, it
+///       must not throw — the caller is the only thing that can give the slot back, and an exception
+///       leaves it holding one it never learned about, or abandons a waiter that will later swallow a
+///       grant meant for someone real;
+///     - <see cref="ReleaseSlot"/> must not throw and must not skip its decrement;
+///     - <see cref="ReconcileSlots"/> is the backstop for when both of those are wrong anyway.
+///
+///   In practice that means every log call past the point of commitment is wrapped. Logging is never
+///   worth a slot.
 /// </summary>
 public class BackgroundTaskLimiter : IDisposable
 {
@@ -45,6 +60,22 @@ public class BackgroundTaskLimiter : IDisposable
     private bool _httpThrottled;
     private readonly bool _burstToCeiling;
     private readonly int _overSubscribe;
+
+    /// <summary>Releases whose decrement could not land because the release path threw. Drained by the
+    /// monitor, so a failed release costs a tick rather than the slot.</summary>
+    private int _unreconciledReleases;
+
+    /// <summary>Bumped on every grant and every release. The monitor watches it to tell "saturated and
+    /// working" (churn rising) from "saturated and wedged" (churn frozen with waiters queued).</summary>
+    private long _churn;
+    private long _lastChurnSeen;
+    private int _stalledTicks;
+
+    /// <summary>Monitor ticks with waiters queued and zero churn before the limiter concludes it has lost
+    /// slots and resets its own accounting. 10s per tick, so the default 180 is 30 minutes. It has to clear
+    /// the 1200s task timeout with room to spare: a single legitimately long job holds its slot without any
+    /// churn, and reclaiming that slot early would over-admit against a pool that is genuinely full.</summary>
+    private readonly int _stalledTicksBeforeReconcile;
 
     public int BaseConcurrency { get; }
     public int CeilingConcurrency { get; }
@@ -116,6 +147,11 @@ public class BackgroundTaskLimiter : IDisposable
         // Over-subscription: admit this many tasks ABOVE the worker target so they can do their pre-invoke
         // table writes and queue at the worker checkout while the pool stays full. 0 = off (strict pool cap).
         _overSubscribe = Math.Max(0, configuration.GetValue("BackgroundOverSubscribe", 0));
+
+        // How long the gate may sit with waiters queued and zero slot churn before it treats its own
+        // accounting as wrong and resets. See the field docs for why this must clear the task timeout.
+        _stalledTicksBeforeReconcile = Math.Max(1,
+            configuration.GetValue("BackgroundStalledTicksBeforeReconcile", 180));
 
         // Clamp to the ceiling. BaseConcurrency derives from ProcessorCount while CeilingConcurrency
         // derives from BgPoolSize, so a small pool on a big host (e.g. BgPoolSize=2 on 4 cores) started
@@ -198,8 +234,15 @@ public class BackgroundTaskLimiter : IDisposable
             {
                 // Slot available — grant immediately
                 _active++;
-                _logger.LogDebug("Limiter slot granted immediately: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
-                    taskName, _active, _waiting, _currentMax);
+
+                // Committed: the slot is the caller's from here. See the accounting invariant on the class.
+                try
+                {
+                    _logger.LogDebug("Limiter slot granted immediately: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
+                        taskName, _active, _waiting, _currentMax);
+                }
+                catch { /* logging is never worth a slot */ }
+
                 return;
             }
 
@@ -209,8 +252,14 @@ public class BackgroundTaskLimiter : IDisposable
             node = _waiters.AddLast(tcs);
         }
 
-        _logger.LogDebug("Limiter slot requested: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
-            taskName, _active, _waiting, _currentMax);
+        // Committed: a waiter is enqueued. Throwing here abandons it, and the next release grants a slot
+        // to a TaskCompletionSource nobody awaits — gone for good. See the accounting invariant.
+        try
+        {
+            _logger.LogDebug("Limiter slot requested: {Task} ({Active} active, {Waiting} waiting, {Max} max)",
+                taskName, _active, _waiting, _currentMax);
+        }
+        catch { /* logging is never worth a slot */ }
 
         // Register cancellation to remove from queue without granting
         using var ctr = ct.Register(() =>
@@ -231,12 +280,18 @@ public class BackgroundTaskLimiter : IDisposable
         await node.Value.Task; // completes when granted or throws if cancelled
         sw.Stop();
 
-        // Slot was granted — _active incremented and _waiting decremented by granter
-        if (sw.ElapsedMilliseconds > 500)
+        // Slot was granted — _active incremented and _waiting decremented by the granter, so we are
+        // committed. This log is the likeliest culprit for the production wedge: the last line that
+        // instance ever wrote of this kind was at 02:37:23, and dispatch never started another job.
+        try
         {
-            _logger.LogInformation("Limiter slot acquired after {WaitMs}ms: {Task} ({Active} active, {Waiting} waiting)",
-                sw.ElapsedMilliseconds, taskName, _active, _waiting);
+            if (sw.ElapsedMilliseconds > 500)
+            {
+                _logger.LogInformation("Limiter slot acquired after {WaitMs}ms: {Task} ({Active} active, {Waiting} waiting)",
+                    sw.ElapsedMilliseconds, taskName, _active, _waiting);
+            }
         }
+        catch { /* logging is never worth a slot */ }
     }
 
     /// <summary>
@@ -244,10 +299,32 @@ public class BackgroundTaskLimiter : IDisposable
     /// </summary>
     public void ReleaseSlot()
     {
-        lock (_gateLock)
+        // Called from a finally that also owns the job's bookkeeping, under memory pressure. Nothing here
+        // may throw back into it, and the decrement may not be skipped because the lock or the grant path
+        // failed. See the accounting invariant on the class.
+        var released = false;
+        try
         {
-            _active--;
-            GrantWaiters();
+            lock (_gateLock)
+            {
+                // Clamped: a double release must not drive the count negative and hand out phantom slots.
+                if (_active > 0) _active--;
+                released = true;
+                Interlocked.Increment(ref _churn);
+                GrantWaiters();
+            }
+        }
+        catch (Exception ex)
+        {
+            // Only the decrement matters for correctness; if it never happened, hand the debt to the monitor.
+            if (!released) Interlocked.Increment(ref _unreconciledReleases);
+
+            try
+            {
+                _logger.LogError(ex, "[System] Limiter release failed (decrement {State}); slot queued for reconciliation",
+                    released ? "applied" : "NOT applied");
+            }
+            catch { /* logging is never worth a slot */ }
         }
     }
 
@@ -266,6 +343,7 @@ public class BackgroundTaskLimiter : IDisposable
                 // Successfully granted — transfer from waiting to active
                 _active++;
                 _waiting--;
+                Interlocked.Increment(ref _churn);
             }
             // If TrySetResult failed, the waiter was cancelled — its cancellation
             // handler already decremented _waiting and removed it from the list.
@@ -275,6 +353,8 @@ public class BackgroundTaskLimiter : IDisposable
 
     private void MonitorCallback(object? state)
     {
+        ReconcileSlots();
+
         var waiting = _waiting;
         var active = _active;
 
@@ -306,6 +386,63 @@ public class BackgroundTaskLimiter : IDisposable
             {
                 _queuePressureSince = null;
             }
+        }
+    }
+
+    /// <summary>
+    /// Repair the slot accounting, on every monitor tick:
+    ///
+    ///   1. Apply releases that could not land because <see cref="ReleaseSlot"/> threw.
+    ///   2. Grant waiters unconditionally, so a grant skipped by a throw is served next tick rather than
+    ///      parking the queue forever.
+    ///   3. Break a wedge: with callers queued and no slot granted or released in
+    ///      <see cref="_stalledTicksBeforeReconcile"/> ticks, the held slots belong to work that will
+    ///      never report back. Reset and let the queue drain.
+    ///
+    /// (3) is a backstop, not a design — reaching it means a slot leaked and the leak still wants finding,
+    /// hence the Error log. Releasing is still right: worker concurrency is capped by the pool anyway, so
+    /// the cost is brief over-admission against the certainty of a dead dispatch loop.
+    /// </summary>
+    internal void ReconcileSlots()
+    {
+        var pending = Interlocked.Exchange(ref _unreconciledReleases, 0);
+        var churn = Interlocked.Read(ref _churn);
+
+        lock (_gateLock)
+        {
+            if (pending > 0)
+            {
+                var before = _active;
+                _active = Math.Max(0, _active - pending);
+                _logger.LogWarning("[System] Limiter reconciled {Count} failed release(s): {Before} -> {After} active",
+                    pending, before, _active);
+            }
+
+            if (_waiting > 0 && churn == _lastChurnSeen)
+            {
+                _stalledTicks++;
+
+                if (_stalledTicks >= _stalledTicksBeforeReconcile && _active > 0)
+                {
+                    _logger.LogError(
+                        "[System] Limiter wedged: {Active} slot(s) held with {Waiting} waiting and no grant or " +
+                        "release for {Seconds}s. Releasing them — a slot was leaked and dispatch would never resume.",
+                        _active, _waiting, _stalledTicks * 10);
+
+                    _active = 0;
+                    _stalledTicks = 0;
+                }
+            }
+            else
+            {
+                _stalledTicks = 0;
+            }
+
+            // Sample before granting: any grant below is progress, so the next tick sees churn move and
+            // starts the stall count over.
+            _lastChurnSeen = churn;
+
+            GrantWaiters();
         }
     }
 

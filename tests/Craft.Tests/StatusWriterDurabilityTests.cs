@@ -23,6 +23,11 @@ public class StatusWriterDurabilityTests
     /// <summary>An in-memory store whose writes can be made to hang or fail on demand.</summary>
     private sealed class ControllableStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
         private readonly object _sync = new();
 
@@ -344,6 +349,11 @@ public class StatusWriterDurabilityTests
 
     private sealed class FlakyStore : ICraftTableStore
     {
+
+        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
+        // a silent 'true' here would look exactly like a successful claim.
+        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+            CancellationToken ct = default) => throw new NotSupportedException();
         private readonly string _failFor;
         public int Written;
         public FlakyStore(string failFor) => _failFor = failFor;

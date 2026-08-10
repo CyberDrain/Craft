@@ -29,6 +29,22 @@ public interface ICraftTableStore
     /// </summary>
     Task UpsertBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows, CancellationToken ct = default);
 
+    /// <summary>
+    /// Replace rows that share a partition key, each guarded by the <see cref="StoreRow.ETag"/> it was
+    /// read with. All-or-nothing and never partially applied: if any row has changed since it was read,
+    /// nothing is written and this returns false.
+    ///
+    /// This is the claim primitive. Unlike <see cref="UpsertBatchAsync"/> it must NOT fall back to
+    /// unconditional writes when the transaction fails — a rejected conditional write means something
+    /// else owns those rows now, and forcing it through would take work another worker is already doing.
+    ///
+    /// Implementations may cap the batch at the backend's transaction limit; callers are expected to
+    /// stay well under it (a claim is worker-pool sized, not run sized).
+    /// </summary>
+    /// <returns>True if every row was replaced; false if the guard failed and nothing was written.</returns>
+    Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
+        CancellationToken ct = default);
+
     /// <summary>Fetch a single row, or null if it does not exist.</summary>
     Task<StoreRow?> GetAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 
