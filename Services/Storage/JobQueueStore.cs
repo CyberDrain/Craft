@@ -119,7 +119,12 @@ public class JobQueueStore
         string? bucket = null;
 
         // Ordered partition-then-row, so this walks highest priority first, oldest first within it.
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        //
+        // The filter is the same predicate as IsClaimable, pushed to the service so a backlog is not
+        // paged to the client on every pump tick just to find the few free rows at its head. It is an
+        // optimisation ONLY — a store that ignores it still returns everything — so IsClaimable below
+        // stays as the authority. Nothing here may assume the filter was applied.
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ClaimableFilter(now), ct))
         {
             if (!IsClaimable(row, now)) continue;
 
@@ -169,6 +174,22 @@ public class JobQueueStore
         var lease = row.GetDateTimeOffset("LeaseUntil");
         return lease == null || lease <= now;
     }
+
+    /// <summary>
+    /// The server-side half of <see cref="IsClaimable"/>: free rows, plus rows whose lease has run out.
+    ///
+    /// Enqueue writes Owner as an empty string and LeaseUntil as null, and a null property is simply
+    /// absent from an Azure Tables entity — so a free row is matched by the Owner clause rather than by
+    /// anything about LeaseUntil, which is why this does not try to express "LeaseUntil is null".
+    ///
+    /// One case is deliberately narrower than IsClaimable: a row with an Owner but NO LeaseUntil, which
+    /// IsClaimable treats as claimable, is not matched here. No write path produces one — Owner and
+    /// LeaseUntil are always set together, by the claim, the renewal and the release alike — so this
+    /// costs nothing in practice, and IsClaimable keeps the defensive reading for anything that
+    /// arrives through the unfiltered path.
+    /// </summary>
+    private static string ClaimableFilter(DateTimeOffset now) =>
+        $"Owner eq '' or LeaseUntil lt datetime'{now.UtcDateTime:yyyy-MM-ddTHH:mm:ss.fffffffZ}'";
 
     /// <summary>Remove a finished task from the queue. A missing row is not an error — it is the normal
     /// result of a retry after the removal already landed.</summary>
