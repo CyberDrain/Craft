@@ -233,12 +233,28 @@ public class JobQueueStore
     /// <summary>Drop every queued row for a run — used when a run is cancelled or cleaned up.</summary>
     public async Task RemoveRunAsync(string runName, CancellationToken ct = default)
     {
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
         {
             if (row.GetString("RunName") == runName)
                 await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
         }
     }
+
+    /// <summary>
+    /// Server-side narrowing for the run-scoped reads, matching the client-side RunName check each of
+    /// them already applies.
+    ///
+    /// Unfiltered, every one of these pages the ENTIRE queue table to the client to find one run's rows,
+    /// and they run on hot paths — once per finalize, once per resumed run, once per dispatch. A
+    /// production log showed 19,339 unfiltered scans of this table in an hour, peaking at 1,028 in a
+    /// single minute, with individual scans taking up to 200 seconds once the storage account began
+    /// throttling them. The claim path is the one that starves when that happens, but these reads are
+    /// what generate much of the volume.
+    ///
+    /// Narrowing only, on the same terms as ClaimableFilter: the callers keep their own RunName checks,
+    /// so a store that ignores the filter still behaves correctly.
+    /// </summary>
+    private static string RunFilter(string runName) => $"RunName eq '{runName.Replace("'", "''")}'";
 
     /// <summary>
     /// Hand back every claim on a run's rows, making them immediately claimable again. Returns how many
@@ -257,7 +273,7 @@ public class JobQueueStore
     {
         var released = 0;
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
         {
             if (row.GetString("RunName") != runName) continue;
             if (string.IsNullOrEmpty(row.GetString("Owner"))) continue;   // already free
@@ -286,7 +302,7 @@ public class JobQueueStore
     {
         var ids = new HashSet<string>(StringComparer.Ordinal);
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
         {
             if (row.GetString("RunName") != runName) continue;
 

@@ -94,6 +94,46 @@ public class JobQueueAzuriteTests
         Assert.DoesNotContain(first[0].TaskId, ids);     // lease live   -> hidden
     }
 
+    /// <summary>
+    /// The run-scoped reads (remove, release, queued-ids) narrow on RunName server-side. Every
+    /// in-memory fake ignores the filter and returns everything, so this is the only place the
+    /// predicate is actually evaluated — and getting it wrong is silent: a filter that matches nothing
+    /// makes cleanup delete nothing and de-duplication see nothing, both of which look like success.
+    /// </summary>
+    [Fact]
+    public async Task ServerSideRunFilter_ScopesToOneRun()
+    {
+        var queue = await TryConnectAsync();
+        if (queue == null) return;
+
+        await queue.EnqueueBatchAsync("run-a", [("a1", 4), ("a2", 4)], At(0));
+        await queue.EnqueueBatchAsync("run-b", [("b1", 4)], At(0));
+
+        Assert.Equal(["a1", "a2"],
+            (await queue.GetQueuedTaskIdsAsync("run-a")).OrderBy(x => x, StringComparer.Ordinal));
+
+        // Removing one run must not touch the other.
+        await queue.RemoveRunAsync("run-a");
+
+        Assert.Empty(await queue.GetQueuedTaskIdsAsync("run-a"));
+        Assert.Equal(["b1"], await queue.GetQueuedTaskIdsAsync("run-b"));
+    }
+
+    /// <summary>A run name containing a quote must not break the filter or leak into it.</summary>
+    [Fact]
+    public async Task ServerSideRunFilter_HandlesAQuoteInTheRunName()
+    {
+        var queue = await TryConnectAsync();
+        if (queue == null) return;
+
+        const string Odd = "run-o'brien";
+        await queue.EnqueueBatchAsync(Odd, [("t1", 4)], At(0));
+        await queue.EnqueueBatchAsync("run-plain", [("t2", 4)], At(0));
+
+        Assert.Equal(["t1"], await queue.GetQueuedTaskIdsAsync(Odd));
+        Assert.Equal(["t2"], await queue.GetQueuedTaskIdsAsync("run-plain"));
+    }
+
     [Fact]
     public async Task BackendReturnsWorkPriorityFirstThenOldestFirst()
     {
