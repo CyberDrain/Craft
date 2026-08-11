@@ -1446,7 +1446,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// distinguishing properties the element carries. <paramref name="usedIds"/> is threaded through
     /// by the caller so IDs stay unique across the whole batch however it was delivered.
     /// </summary>
-    private static void AddTaskFromElement(List<OrchestratorTaskItem> tasks, HashSet<string> usedIds,
+    // internal rather than private so the id it mints — which becomes a RowKey — is directly testable.
+    internal static void AddTaskFromElement(List<OrchestratorTaskItem> tasks, HashSet<string> usedIds,
         JsonElement element)
     {
         // Skip null or non-object elements (planner returned $null for a tenant)
@@ -1552,6 +1553,17 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
         var tenant = tenantFilter ?? queueName ?? customerId ?? "unknown";
         var taskId = batchNumber != null ? $"{label}_{tenant}_b{batchNumber}" : $"{label}_{tenant}";
+
+        // The id becomes a RowKey in three tables — the job queue, the tasks table and the results
+        // table — so it has to be a legal key before anything downstream tries to write it. Batch items
+        // are labelled from caller-supplied names, and a name is free to contain a character the backend
+        // refuses: a CIPP template-library task is named after its GitHub repo ("CIPP Template
+        // Owner/Repo"), so its id carries a '/'. Enqueue then 400s identically on every attempt, the
+        // task never leaves Pending, and the orphan re-drive retries it for the life of the process.
+        //
+        // Sanitize BEFORE the uniqueness check below, not after: folding is lossy, so two ids can
+        // collapse onto one, and this is the check that already knows how to separate them.
+        taskId = TableKeys.Sanitize(taskId);
 
         // Ensure uniqueness — append index if collision
         if (!usedIds.Add(taskId))

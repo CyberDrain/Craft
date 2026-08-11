@@ -54,6 +54,22 @@ public interface ICraftTableStore
     /// <summary>Stream every row in the table (all partitions).</summary>
     IAsyncEnumerable<StoreRow> QueryTableAsync(string table, CancellationToken ct = default);
 
+    /// <summary>
+    /// Stream rows matching a backend-native filter expression — an OData <c>$filter</c> for Azure
+    /// Tables — so the narrowing happens server-side instead of over the wire.
+    ///
+    /// Purely an optimisation, and deliberately so: this default implementation IGNORES the filter and
+    /// returns everything, which keeps a backend that cannot push predicates down correct without
+    /// implementing anything. Callers must therefore re-apply the same predicate to whatever comes
+    /// back, and must never depend on the filter having been honoured.
+    ///
+    /// It exists for the job queue's claim path, which runs once per pump tick against the whole queue
+    /// table. Unfiltered, a large backlog is paged to the client on every poll just to find the handful
+    /// of rows that are actually free.
+    /// </summary>
+    IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, CancellationToken ct = default)
+        => QueryTableAsync(table, ct);
+
     /// <summary>Delete a single row. A missing row is not an error.</summary>
     Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 

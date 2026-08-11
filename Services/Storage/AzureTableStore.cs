@@ -197,6 +197,18 @@ public sealed class AzureTableStore : ICraftTableStore
             yield return ToRow(entity);
     }
 
+    /// <summary>
+    /// The same scan, narrowed by an OData <c>$filter</c> the service evaluates. Rows that cannot match
+    /// are never put on the wire, which is the difference between paging a whole backlog to the client
+    /// on every pump tick and fetching only the rows that are actually claimable.
+    /// </summary>
+    public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var entity in Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct))
+            yield return ToRow(entity);
+    }
+
     public async Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
     {
         try
