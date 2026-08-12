@@ -395,9 +395,11 @@ OrchestratorBridge.Initialize(orchestrator);
 AuthBridge.Initialize(authService);
 var jobManager = app.Services.GetRequiredService<JobManager>();
 QueueBridge.Initialize(psRunner, jobManager, CraftSettings.Orchestrator.QueueTaskFunction);
-QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>());
+QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<OrchestratorService>(),
+    app.Services.GetRequiredService<JobQueueStatusReader>());
 WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundTaskLimiter>(), jobManager,
-    app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Craft.Services.WorkerMetricsBridge"));
+    app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Craft.Services.WorkerMetricsBridge"),
+    app.Services.GetRequiredService<JobQueueStatusReader>(), orchestrator);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());

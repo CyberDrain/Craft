@@ -287,6 +287,114 @@ public class JobQueueStore
         return released;
     }
 
+    /// <summary>A queued row as the status APIs see it: identity, priority, age and claim state.</summary>
+    public sealed record QueuedRow(string RunName, string TaskId, int Priority, DateTime QueuedUtc,
+        bool Claimed, string Owner, string Bucket, string RowKey);
+
+    /// <summary>
+    /// The enqueue timestamp a row key was built from, or null for a key that predates the format.
+    /// The inverse of <see cref="BuildRowKey"/>'s D19 tick prefix.
+    /// </summary>
+    internal static DateTime? ParseQueuedUtc(string rowKey)
+    {
+        if (rowKey.Length < 20 || rowKey[19] != '-') return null;
+        if (!long.TryParse(rowKey.AsSpan(0, 19), NumberStyles.None, CultureInfo.InvariantCulture, out var ticks))
+            return null;
+        if (ticks <= 0 || ticks > DateTime.MaxValue.Ticks) return null;
+        return new DateTime(ticks, DateTimeKind.Utc);
+    }
+
+    /// <summary>
+    /// Every row currently in the queue, in storage order (highest priority bucket first, oldest first
+    /// within it). This is the durable backlog the status APIs report — the in-memory JobManager only
+    /// ever holds a worker-pool-sized buffer of it.
+    ///
+    /// Claimed means owned under a live lease, i.e. buffered or running on some instance; everything
+    /// else is waiting for a pump to take it. One unfiltered scan, so the cost is proportional to the
+    /// backlog — callers are expected to cache the result rather than call this per poll.
+    /// </summary>
+    public async Task<IReadOnlyList<QueuedRow>> ListQueuedAsync(CancellationToken ct = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rows = new List<QueuedRow>();
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        {
+            rows.Add(new QueuedRow(
+                row.GetString("RunName") ?? "",
+                row.GetString("TaskId") ?? "",
+                row.GetInt32("Priority") ?? 0,
+                ParseQueuedUtc(row.RowKey) ?? DateTime.UtcNow,
+                !IsClaimable(row, now),
+                row.GetString("Owner") ?? "",
+                row.PartitionKey,
+                row.RowKey));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// Remove every queue row for one task, regardless of claim state. Returns how many were removed.
+    /// Used by the durable cancel path — the caller must have already marked the task terminal in the
+    /// run graph, or the orphan re-drive sees a Pending task with no row and puts one straight back.
+    /// </summary>
+    public async Task<int> RemoveTaskAsync(string runName, string taskId, CancellationToken ct = default)
+    {
+        var removed = 0;
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        {
+            if (row.GetString("RunName") != runName) continue;
+            if (row.GetString("TaskId") != taskId) continue;
+
+            await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
+            removed++;
+        }
+
+        return removed;
+    }
+
+    /// <summary>
+    /// Move a task's queue rows to a new priority bucket, keeping their enqueue timestamp so the task
+    /// keeps its place in line within the new priority. Returns how many rows moved.
+    ///
+    /// Delete-then-add, in that order: a crash in between loses the row, which the orphan re-drive
+    /// repairs by re-queueing the task. The other order leaves TWO claimable rows for one task, and a
+    /// duplicated row is executed once per copy — that is the failure mode this queue exists to prevent.
+    /// </summary>
+    public async Task<int> ReprioritizeTaskAsync(string runName, string taskId, int newPriority,
+        CancellationToken ct = default)
+    {
+        var moved = 0;
+        var now = DateTimeOffset.UtcNow;
+        var toMove = new List<StoreRow>();
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        {
+            if (row.GetString("RunName") != runName) continue;
+            if (row.GetString("TaskId") != taskId) continue;
+            if (row.PartitionKey == Bucket(newPriority)) continue;   // already there
+
+            // A claimed row is already buffered on some instance and about to run — re-adding it
+            // unclaimed would create a second runnable copy of the task. Leave it be.
+            if (!IsClaimable(row, now)) continue;
+
+            toMove.Add(row);
+        }
+
+        foreach (var row in toMove)
+        {
+            await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
+
+            var queuedUtc = ParseQueuedUtc(row.RowKey) ?? DateTime.UtcNow;
+            await EnqueueAsync(runName, taskId, newPriority, queuedUtc, ct);
+            moved++;
+        }
+
+        return moved;
+    }
+
     /// <summary>
     /// The task ids this run still has rows for, claimed or not.
     ///

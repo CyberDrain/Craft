@@ -28,6 +28,8 @@ public static class WorkerMetricsBridge
     private static PowerShellWorkerPool? s_pool;
     private static BackgroundTaskLimiter? s_limiter;
     private static JobManager? s_jobManager;
+    private static JobQueueStatusReader? s_queueReader;
+    private static OrchestratorService? s_orchestrator;
     private static ILogger? s_logger;
 
     // Per-worker tracking: workerId → stats
@@ -46,11 +48,14 @@ public static class WorkerMetricsBridge
     private static long s_retiredBgBusyMs;
     private static long s_retiredBgFaults;
 
-    public static void Initialize(PowerShellWorkerPool pool, BackgroundTaskLimiter limiter, JobManager jobManager, ILogger? logger = null)
+    public static void Initialize(PowerShellWorkerPool pool, BackgroundTaskLimiter limiter, JobManager jobManager,
+        ILogger? logger = null, JobQueueStatusReader? queueReader = null, OrchestratorService? orchestrator = null)
     {
         s_pool = pool;
         s_limiter = limiter;
         s_jobManager = jobManager;
+        s_queueReader = queueReader;
+        s_orchestrator = orchestrator;
         s_logger = logger;
     }
 
@@ -213,9 +218,17 @@ public static class WorkerMetricsBridge
         if (s_jobManager != null)
         {
             var summary = s_jobManager.GetSummary();
+
+            // The JobManager only buffers a worker-pool-sized slice of the backlog — the rest lives in
+            // the durable queue table. GetCached never blocks: a stale/missing snapshot kicks off a
+            // background refresh and this poll reports what is known now.
+            var durable = s_queueReader?.GetCached();
+
             snapshot.Jobs = new JobMetrics
             {
-                Queued = summary.Queued,
+                Queued = summary.Queued + (durable?.Unclaimed ?? 0),
+                QueuedLocal = summary.Queued,
+                QueuedDurable = durable?.Unclaimed ?? 0,
                 Running = summary.Running,
                 Completed = summary.Completed,
                 Failed = summary.Failed,
@@ -576,6 +589,9 @@ public static class WorkerMetricsBridge
     /// <summary>Get a summary of just the busy/available counts.</summary>
     public static WorkerSummary GetSummary()
     {
+        var durable = s_queueReader?.GetCached();
+        var localQueued = s_jobManager?.QueuedCount ?? 0;
+
         return new WorkerSummary
         {
             HttpBusy = s_pool != null ? s_pool.HttpPoolSize - s_pool.HttpAvailable : 0,
@@ -588,36 +604,138 @@ public static class WorkerMetricsBridge
             LimiterWaiting = s_limiter?.Waiting ?? 0,
             LimiterMax = s_limiter?.CurrentMax ?? 0,
             IsHttpThrottled = s_limiter?.IsHttpThrottled ?? false,
-            JobsQueued = s_jobManager?.QueuedCount ?? 0,
+            JobsQueued = localQueued + (durable?.Unclaimed ?? 0),
+            JobsQueuedLocal = localQueued,
+            JobsQueuedDurable = durable?.Unclaimed ?? 0,
             JobsActive = s_jobManager?.ActiveCount ?? 0,
         };
     }
 
     // ── Job management (exposed to PowerShell) ──
+    //
+    // The listing/summary methods prefer the table-merged view (JobQueueStatusReader) and fall back to
+    // the in-memory JobManager, which only ever holds a worker-pool-sized buffer of the real backlog.
+    // The mutating methods try the local buffer first, then the durable queue — an unclaimed task is
+    // invisible to the JobManager but very much cancellable.
+    //
+    // These bridge calls run on a PowerShell worker thread with no synchronization context, so blocking
+    // on the async read model is safe; the timeout keeps a storage stall from wedging the worker.
 
-    /// <summary>Get detailed job list with wait/duration times.</summary>
+    /// <summary>Get detailed job list with wait/duration times, including the unclaimed durable backlog.</summary>
     public static List<JobDetail> GetJobDetails(string? runName = null, string? status = null, int limit = 100)
-        => s_jobManager?.GetJobDetails(runName, status, limit) ?? new();
+    {
+        if (s_queueReader is { } reader)
+        {
+            var merged = RunBridged(ct => reader.GetJobDetailsAsync(runName, status, limit, ct));
+            if (merged != null) return merged;
+        }
+        return s_jobManager?.GetJobDetails(runName, status, limit) ?? new();
+    }
 
-    /// <summary>Get run group summaries.</summary>
+    /// <summary>Get run group summaries, sized by the durable run counters rather than local records.</summary>
     public static List<JobRunSummary> GetRunSummaries()
-        => s_jobManager?.GetRunSummaries() ?? new();
+    {
+        if (s_queueReader is { } reader)
+        {
+            var merged = RunBridged(ct => reader.GetRunSummariesAsync(ct));
+            if (merged != null) return merged;
+        }
+        return s_jobManager?.GetRunSummaries() ?? new();
+    }
 
-    /// <summary>Cancel a single queued job by ID.</summary>
+    /// <summary>
+    /// Cancel a single queued job by ID. Tries this instance's buffer first (the state writer persists
+    /// that path), then the durable queue for a task no instance has claimed yet — the majority of any
+    /// backlog under the pump.
+    /// </summary>
     public static bool CancelJob(string jobId)
-        => s_jobManager?.CancelJob(jobId) ?? false;
+    {
+        if (s_jobManager?.CancelJob(jobId) == true) return true;
+        if (s_queueReader == null || s_orchestrator == null) return false;
 
-    /// <summary>Cancel all queued jobs in a run group.</summary>
+        return RunBridged(async ct =>
+        {
+            var snap = await s_queueReader.GetAsync(TimeSpan.FromSeconds(2), ct);
+            var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
+            if (row == null) return false;
+
+            return await s_orchestrator.TryCancelQueuedTaskAsync(row.RunName, row.TaskId);
+        });
+    }
+
+    /// <summary>
+    /// Cancel all queued jobs in a run group: the local buffer immediately, then the run's durable
+    /// state through the orchestrator, which is what stops the table backlog from being claimed and
+    /// run afterwards.
+    /// </summary>
     public static int CancelRun(string runName)
-        => s_jobManager?.CancelRun(runName) ?? 0;
+    {
+        var local = s_jobManager?.CancelRun(runName) ?? 0;
+
+        if (s_orchestrator is { } orchestrator)
+        {
+            var durable = RunBridged(async _ =>
+            {
+                var (found, cancelled) = await orchestrator.CancelRunAsync(runName);
+                return found ? cancelled : 0;
+            });
+            // Overlapping counts, not additive: the buffered jobs cancelled above were still Pending in
+            // storage when the durable cancel swept the run, so the larger number is the honest one.
+            return Math.Max(local, durable);
+        }
+
+        return local;
+    }
 
     /// <summary>Delete a completed/failed/cancelled job from tracking.</summary>
     public static bool DeleteJob(string jobId)
         => s_jobManager?.DeleteJob(jobId) ?? false;
 
-    /// <summary>Change a queued job's priority (re-enqueues with new priority).</summary>
+    /// <summary>
+    /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for an
+    /// unclaimed durable row it moves the row to the new priority bucket (keeping its age) and records
+    /// the override on the task so a restart re-queues it at the operator's priority.
+    /// </summary>
     public static bool ChangePriority(string jobId, int newPriority)
-        => s_jobManager?.ChangePriority(jobId, newPriority) ?? false;
+    {
+        if (s_jobManager?.ChangePriority(jobId, newPriority) == true) return true;
+        if (s_queueReader == null) return false;
+
+        return RunBridged(async ct =>
+        {
+            var snap = await s_queueReader.GetAsync(TimeSpan.FromSeconds(2), ct);
+            var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
+            if (row == null) return false;
+
+            var moved = await s_queueReader.Queue.ReprioritizeTaskAsync(row.RunName, row.TaskId, newPriority, ct);
+            if (moved == 0) return false;
+
+            // Best-effort durability of the override itself: only effective where the run is live,
+            // which on the dispatching node it is. The row move above is what changes dispatch order.
+            s_orchestrator?.PriorityChanged(new JobDescriptor(row.RunName, row.TaskId, row.Priority), newPriority);
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Run an async table-backed operation from this synchronous bridge. Bridge calls arrive on
+    /// PowerShell worker threads with no synchronization context, so blocking here cannot deadlock;
+    /// the timeout keeps a storage stall from wedging the worker, and any failure falls back to the
+    /// caller's in-memory answer.
+    /// </summary>
+    private static T? RunBridged<T>(Func<CancellationToken, Task<T>> work, int timeoutSeconds = 15)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            return Task.Run(() => work(cts.Token)).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            s_logger?.LogWarning(ex, "[WorkerMetrics] Table-backed queue operation failed — using in-memory view");
+            return default;
+        }
+    }
 
     // ── Private helpers ──
 

@@ -19,5 +19,7 @@ public class WorkerSummary
     public int LimiterMax { get; set; }
     public bool IsHttpThrottled { get; set; }
     public int JobsQueued { get; set; }
+    public int JobsQueuedLocal { get; set; }
+    public int JobsQueuedDurable { get; set; }
     public int JobsActive { get; set; }
 }

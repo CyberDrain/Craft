@@ -145,10 +145,22 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public void Cancelled(JobDescriptor descriptor)
     {
         if (!TryFindLive(descriptor, out var run, out var task)) return;
+        CancelLiveTask(run, task);
+    }
 
+    /// <summary>
+    /// Mark a live task Cancelled in the run graph and queue the durable write. Returns false when the
+    /// task is already terminal — nothing to cancel, nothing to persist. With
+    /// <paramref name="requirePending"/>, a Running task is also refused: the callers that pass it
+    /// found the task via a queue snapshot that may be seconds old, and cancelling a task that has
+    /// since dispatched would race its own completion write.
+    /// </summary>
+    private bool CancelLiveTask(OrchestratorRun run, OrchestratorTaskItem task, bool requirePending = false)
+    {
         lock (_lock)
         {
-            if (task.Status is "Completed" or "Failed" or "Cancelled") return;
+            if (task.Status is "Completed" or "Failed" or "Cancelled") return false;
+            if (requirePending && task.Status != "Pending") return false;
             task.Status = "Cancelled";
             task.LastError = "Cancelled by user";
             task.CompletedUtc = DateTime.UtcNow;
@@ -156,7 +168,40 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // Cancelling the last outstanding task can complete the run.
             CheckRunCompletion(run);
         }
-        _writer.QueueTask(descriptor.RunName, task);
+        _writer.QueueTask(run.Name, task);
+        return true;
+    }
+
+    /// <summary>
+    /// Cancel a task that exists only as a durable queue row — queued in the table, not (yet) claimed
+    /// into this instance's JobManager, which is where the worker-health page now sees most of a
+    /// backlog.
+    ///
+    /// Order is load-bearing: the run graph is marked terminal and the write queued BEFORE the queue
+    /// row is removed, because the orphan re-drive reads "Pending with no row" as work to re-queue —
+    /// remove the row first and the cancel un-does itself within a minute. The row removal itself is
+    /// best-effort: a row left behind is claimed, found terminal at rehydration, skipped and released.
+    ///
+    /// Returns false when the run is not live on this node or the task is already terminal; callers
+    /// should treat that as "nothing cancellable here".
+    /// </summary>
+    public async Task<bool> TryCancelQueuedTaskAsync(string runName, string taskId)
+    {
+        if (!TryFindLive(new JobDescriptor(runName, taskId, 0), out var run, out var task)) return false;
+        if (!CancelLiveTask(run, task, requirePending: true)) return false;
+
+        try
+        {
+            await _queue.RemoveTaskAsync(runName, taskId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "[Scheduler] Cancelled {Run}/{Task} but could not remove its queue row — it will be skipped at claim",
+                runName, taskId);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1618,9 +1663,26 @@ public class OrchestratorService : IJobDescriptorStateWriter
             }
         }
 
-        // Persist cancelled task states
+        // Persist cancelled task states through the status-guarded cancel, not a plain upsert. Two
+        // things ride on that. Cancelled is terminal, so the write must decrement the run counter —
+        // skip it and CheckRunCompletion's finalize veto reads "{cancelled count} still outstanding"
+        // forever once the running tasks drain. And the write must only land while storage still shows
+        // Pending: dispatch can move a task to Running between our read above and this write, and
+        // clobbering that would have the task's real completion decrement a second time. A task that
+        // moved on is un-cancelled in our copy and left to finish.
         foreach (var t in tasksToUpdate)
-            await _store.UpsertTaskAsync(run.Name, t);
+        {
+            var result = await _store.CancelPendingTaskAsync(run.Name, t);
+            if (result.Cancelled) continue;
+
+            cancelled--;
+            lock (_lock)
+            {
+                t.Status = result.CurrentStatus ?? "Running";
+                t.LastError = null;
+                t.CompletedUtc = null;
+            }
+        }
 
         // Check if the run is now fully done (Running tasks will finalize themselves)
         var remaining = run.Tasks.Count(t => t.Status is "Running");

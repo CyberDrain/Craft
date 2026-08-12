@@ -250,6 +250,18 @@ public class OrchestratorTableStore
         => (await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct))?.GetInt32("Remaining");
 
     /// <summary>
+    /// The run's counter row as (Remaining, Total), or null if the run has no counter. This is what the
+    /// status APIs use for a run's true size and durable progress — the in-memory JobManager only ever
+    /// sees the slice of a run that has been claimed onto this instance.
+    /// </summary>
+    public async Task<(int Remaining, int Total)?> GetCounterAsync(string runName, CancellationToken ct = default)
+    {
+        var row = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
+        if (row == null) return null;
+        return (row.GetInt32("Remaining") ?? 0, row.GetInt32("Total") ?? 0);
+    }
+
+    /// <summary>
     /// Subtract <paramref name="by"/> from a run's outstanding count, for the batch path.
     ///
     /// Exactly-once here rests on the caller: the coalescing status writer holds one pending write per
@@ -316,6 +328,56 @@ public class OrchestratorTableStore
         _logger.LogWarning("[OrchestratorStore] Could not complete {Task} in {Run} after {Attempts} attempts",
             task.Id, runName, CounterAttempts);
         return null;
+    }
+
+    /// <summary>What a status-guarded cancel actually did, so the caller can keep its view honest.</summary>
+    public sealed record CancelWriteResult(bool Cancelled, string? CurrentStatus);
+
+    /// <summary>
+    /// Write a task as Cancelled and decrement the run counter, but ONLY while storage still shows the
+    /// task Pending. This is the cancel-a-run primitive, and the guard is the point: between the
+    /// caller's read and this write, dispatch can move a task to Running — an unguarded terminal write
+    /// would clobber that, and the task's real completion would then decrement the counter a SECOND
+    /// time, letting the run finalize while work is still outstanding.
+    ///
+    /// A run without a counter row (pre-counter) gets the same status guard with a task-ETag-only write.
+    /// </summary>
+    /// <returns>
+    /// Whether the cancel landed, plus the status storage showed when it did not — so the caller can
+    /// correct its in-memory copy rather than believing a cancel that never happened.
+    /// </returns>
+    public async Task<CancelWriteResult> CancelPendingTaskAsync(string runName, OrchestratorTaskItem task,
+        CancellationToken ct = default)
+    {
+        for (var attempt = 0; attempt < CounterAttempts; attempt++)
+        {
+            var existing = await _store.GetAsync(_tasksTable, runName, task.Id, ct);
+            var currentStatus = existing?.GetString("Status");
+            if (existing == null || currentStatus != "Pending")
+                return new CancelWriteResult(false, currentStatus);
+
+            var guarded = new StoreRow(runName, task.Id)
+            {
+                ETag = existing.ETag,
+                Properties = BuildTaskRow(runName, task).Properties,
+            };
+
+            var counter = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
+            if (counter == null)
+            {
+                if (await _store.TryReplaceBatchAsync(_tasksTable, runName, [guarded], ct))
+                    return new CancelWriteResult(true, null);
+                continue;
+            }
+
+            counter["Remaining"] = Math.Max(0, (counter.GetInt32("Remaining") ?? 0) - 1);
+            if (await _store.TryReplaceBatchAsync(_tasksTable, runName, [guarded, counter], ct))
+                return new CancelWriteResult(true, null);
+        }
+
+        _logger.LogWarning("[OrchestratorStore] Could not cancel {Task} in {Run} after {Attempts} attempts",
+            task.Id, runName, CounterAttempts);
+        return new CancelWriteResult(false, null);
     }
 
     /// <summary>Upsert a single task row.</summary>

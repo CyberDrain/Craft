@@ -35,6 +35,9 @@ public class RunRemainingCounterTests
         /// <summary>Set to run just before a conditional write lands — lets a test interleave a competitor.</summary>
         public Action? OnBeforeConditionalWrite { get; set; }
 
+        /// <summary>Set to run at the start of any table query — lets a test model unreachable storage.</summary>
+        public Action? OnBeforeQuery { get; set; }
+
         private Dictionary<(string, string), StoreRow> Table(string t) =>
             _tables.TryGetValue(t, out var x) ? x : _tables[t] = new();
 
@@ -123,6 +126,7 @@ public class RunRemainingCounterTests
         public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
+            OnBeforeQuery?.Invoke();
             foreach (var r in Ordered(table)) { yield return r; await Task.Yield(); }
         }
 
@@ -281,5 +285,56 @@ public class RunRemainingCounterTests
 
         Assert.Null(await store.GetRemainingAsync("never-seeded"));
         Assert.Null(await store.CompleteTaskAsync("never-seeded", Task_("task-0")));
+    }
+
+    // ─── Status-guarded cancel (the cancel-a-run write) ───
+
+    [Fact]
+    public async Task CancellingAPendingTaskDecrementsTheCounter()
+    {
+        var backing = new ConditionalStore();
+        var store = await SeededAsync(backing, 3);
+        await store.UpsertRunAsync(new OrchestratorRun { Name = Run, Priority = 4 });
+
+        var result = await store.CancelPendingTaskAsync(Run, Task_("task-0", "Cancelled"));
+
+        Assert.True(result.Cancelled);
+        Assert.Equal(2, await store.GetRemainingAsync(Run));
+        Assert.Equal("Cancelled", (await store.GetRunAsync(Run))?.Tasks.Single(t => t.Id == "task-0").Status);
+    }
+
+    /// <summary>
+    /// The guard that makes cancel safe against dispatch. A task that moved Pending → Running between
+    /// the caller's read and this write must be left alone: clobbering it would have the task's real
+    /// completion decrement the counter a second time, and the run would finalize with work
+    /// outstanding.
+    /// </summary>
+    [Fact]
+    public async Task CancellingATaskThatStartedRunningIsRefused()
+    {
+        var backing = new ConditionalStore();
+        var store = await SeededAsync(backing, 3);
+        await store.UpsertRunAsync(new OrchestratorRun { Name = Run, Priority = 4 });
+        await store.UpsertTaskAsync(Run, Task_("task-0", "Running"));
+
+        var result = await store.CancelPendingTaskAsync(Run, Task_("task-0", "Cancelled"));
+
+        Assert.False(result.Cancelled);
+        Assert.Equal("Running", result.CurrentStatus);
+        Assert.Equal(3, await store.GetRemainingAsync(Run));
+        Assert.Equal("Running", (await store.GetRunAsync(Run))?.Tasks.Single(t => t.Id == "task-0").Status);
+    }
+
+    [Fact]
+    public async Task CancellingOnAPreCounterRunStillWritesTheStatus()
+    {
+        var (store, _) = NewStore();
+        await store.InitializeAsync();
+        await store.UpsertTaskBatchAsync("old-run", [Task_("task-0", "Pending")]);
+
+        var result = await store.CancelPendingTaskAsync("old-run", Task_("task-0", "Cancelled"));
+
+        Assert.True(result.Cancelled);
+        Assert.Null(await store.GetRemainingAsync("old-run"));
     }
 }

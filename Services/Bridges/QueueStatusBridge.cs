@@ -19,6 +19,7 @@ public static class QueueStatusBridge
 {
     private static JobManager? s_jobManager;
     private static OrchestratorService? s_orchestratorService;
+    private static JobQueueStatusReader? s_queueReader;
 
     /// <summary>
     /// Maps QueueId (GUID) or Reference to friendly display metadata (Name, Link).
@@ -26,10 +27,12 @@ public static class QueueStatusBridge
     /// </summary>
     private static readonly ConcurrentDictionary<string, QueueMetadata> s_queueMetadata = new(StringComparer.OrdinalIgnoreCase);
 
-    public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null)
+    public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null,
+        JobQueueStatusReader? queueReader = null)
     {
         s_jobManager = jobManager;
         s_orchestratorService = orchestratorService;
+        s_queueReader = queueReader;
     }
 
     /// <summary>
@@ -62,7 +65,7 @@ public static class QueueStatusBridge
         var effectiveQueueId = string.IsNullOrEmpty(queueId) ? null : queueId;
         var effectiveReference = string.IsNullOrEmpty(reference) ? null : reference;
         var lookup = effectiveQueueId ?? effectiveReference;
-        var summaries = s_jobManager.GetRunSummaries();
+        var summaries = GetMergedRunSummaries();
 
         if (!string.IsNullOrEmpty(lookup))
         {
@@ -142,6 +145,32 @@ public static class QueueStatusBridge
         }).ToList();
 
         return JsonSerializer.Serialize(result, s_jsonOptions);
+    }
+
+    /// <summary>
+    /// Run summaries sized by the durable tables where possible. The in-memory JobManager only holds
+    /// the claimed slice of a run, so on its own a 7,000-task fan-out reports a Total in the dozens —
+    /// and DeriveStatus reads an empty local buffer as "Completed" while thousands of rows wait
+    /// unclaimed. Falls back to the local view when storage does not answer.
+    /// </summary>
+    private static List<JobRunSummary> GetMergedRunSummaries()
+    {
+        if (s_queueReader is { } reader)
+        {
+            try
+            {
+                // PS worker thread, no synchronization context — blocking is safe; the timeout keeps a
+                // storage stall from wedging the worker.
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                return Task.Run(() => reader.GetRunSummariesAsync(cts.Token)).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                // Fall through to the local view.
+            }
+        }
+
+        return s_jobManager?.GetRunSummaries() ?? [];
     }
 
     private static string DeriveStatus(JobRunSummary s)
