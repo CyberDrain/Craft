@@ -19,59 +19,72 @@ public static class JobEndpoints
         var orchestrator = app.Services.GetRequiredService<OrchestratorService>();
         var bgLimiter = app.Services.GetRequiredService<BackgroundTaskLimiter>();
         var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
+        var queueStatus = app.Services.GetRequiredService<JobQueueStatusReader>();
 
-        app.MapGet("/API/jobs/summary", (HttpContext context) =>
+        app.MapGet("/API/jobs/summary", async (HttpContext context, CancellationToken ct) =>
         {
             context.Response.ContentType = "application/json";
-            return Results.Ok(jobManager.GetSummary());
+            return Results.Ok(await queueStatus.GetSummaryAsync(ct));
         });
 
         // Worker-allocation snapshot: JobManager queue/active, the concurrency limiter's live gate, and
         // the BG pool's busy/idle workers. Poll it during a fan-out to watch the ramp, worker
-        // utilisation and I/O idle over time.
-        app.MapGet("/API/jobs/allocation", () => Results.Json(new
+        // utilisation and I/O idle over time. Polled at 4 Hz by the perf harness, so the durable-queue
+        // numbers come from the cached snapshot (GetCached never blocks on storage).
+        app.MapGet("/API/jobs/allocation", () =>
         {
-            jm = new
+            var durable = queueStatus.GetCached();
+            return Results.Json(new
             {
-                active = jobManager.ActiveCount,
-                queued = jobManager.QueuedCount,
-                maxConcurrency = jobManager.MaxConcurrency,
-            },
-            limiter = new
-            {
-                currentMax = bgLimiter.CurrentMax,
-                effectiveMax = bgLimiter.EffectiveMax,
-                overSubscribe = bgLimiter.OverSubscribe,
-                burst = bgLimiter.BurstToCeiling,
-                active = bgLimiter.Active,
-                waiting = bgLimiter.Waiting,
-                httpThrottled = bgLimiter.IsHttpThrottled,
-            },
-            pool = new
-            {
-                bgBusy = pool.BgPoolSize - pool.BgAvailable,
-                bgTotal = pool.BgPoolSize,
-                bgAvail = pool.BgAvailable,
-                httpAvail = pool.HttpAvailable,
-            },
-        }));
-
-        app.MapGet("/API/jobs/runs", (HttpContext context) =>
-        {
-            context.Response.ContentType = "application/json";
-            return Results.Ok(jobManager.GetRunSummaries());
+                jm = new
+                {
+                    active = jobManager.ActiveCount,
+                    queued = jobManager.QueuedCount,
+                    maxConcurrency = jobManager.MaxConcurrency,
+                },
+                queue = new
+                {
+                    unclaimed = durable?.Unclaimed ?? 0,
+                    claimed = durable?.Claimed ?? 0,
+                    total = durable?.Total ?? 0,
+                    ageSeconds = durable?.AgeSeconds,
+                },
+                limiter = new
+                {
+                    currentMax = bgLimiter.CurrentMax,
+                    effectiveMax = bgLimiter.EffectiveMax,
+                    overSubscribe = bgLimiter.OverSubscribe,
+                    burst = bgLimiter.BurstToCeiling,
+                    active = bgLimiter.Active,
+                    waiting = bgLimiter.Waiting,
+                    httpThrottled = bgLimiter.IsHttpThrottled,
+                },
+                pool = new
+                {
+                    bgBusy = pool.BgPoolSize - pool.BgAvailable,
+                    bgTotal = pool.BgPoolSize,
+                    bgAvail = pool.BgAvailable,
+                    httpAvail = pool.HttpAvailable,
+                },
+            });
         });
 
-        app.MapGet("/API/jobs/list", (HttpContext context) =>
+        app.MapGet("/API/jobs/runs", async (HttpContext context, CancellationToken ct) =>
+        {
+            context.Response.ContentType = "application/json";
+            return Results.Ok(await queueStatus.GetRunSummariesAsync(ct));
+        });
+
+        app.MapGet("/API/jobs/list", async (HttpContext context, CancellationToken ct) =>
         {
             var runName = context.Request.Query["runName"].ToString();
             var status = context.Request.Query["status"].ToString();
-            int? limit = int.TryParse(context.Request.Query["limit"].ToString(), out var l) ? l : null;
+            var limit = int.TryParse(context.Request.Query["limit"].ToString(), out var l) ? l : 100;
 
-            var jobs = jobManager.GetJobs(
+            var jobs = await queueStatus.GetJobDetailsAsync(
                 string.IsNullOrEmpty(runName) ? null : runName,
                 string.IsNullOrEmpty(status) ? null : status,
-                limit);
+                limit, ct);
 
             context.Response.ContentType = "application/json";
             return Results.Ok(jobs);

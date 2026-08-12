@@ -210,6 +210,10 @@ public static class CraftHostBuilderExtensions
         // The durable job queue. Registered alongside the orchestrator store because it shares the
         // same ICraftTableStore and therefore the same bounded connection pool.
         services.AddSingleton<JobQueueStore>();
+        // Table-backed queue view for the status APIs — the JobManager only buffers a worker-pool-sized
+        // slice of the backlog, so status must read the tables. All roles: an HTTP-only node serves the
+        // worker-health endpoint for work that runs elsewhere.
+        services.AddSingleton<JobQueueStatusReader>();
         services.AddSingleton<OrchestratorStatusWriter>();
         services.AddSingleton<OrchestratorService>();
         services.AddSingleton<AuthService>();

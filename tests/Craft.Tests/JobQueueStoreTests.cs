@@ -204,4 +204,106 @@ public class JobQueueStoreTests
 
         Assert.Empty(await queue.ClaimBatchAsync("worker-a", 8, Lease));
     }
+
+    // ─── Status/maintenance surface (the table-backed worker-health view) ───
+
+    [Fact]
+    public void ParseQueuedUtcInvertsBuildRowKey()
+    {
+        var queuedUtc = new DateTime(2026, 8, 12, 3, 4, 5, DateTimeKind.Utc);
+        var rowKey = JobQueueStore.BuildRowKey(queuedUtc, "run", "task");
+
+        Assert.Equal(queuedUtc, JobQueueStore.ParseQueuedUtc(rowKey));
+        Assert.Null(JobQueueStore.ParseQueuedUtc("not-a-tick-prefixed-key"));
+    }
+
+    [Fact]
+    public async Task ListQueuedReportsIdentityAgeAndClaimState()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueAsync("run", "waiting", 4, At(2));
+        await queue.EnqueueAsync("run", "taken", 0, At(1));
+        await queue.ClaimBatchAsync("worker-a", 1, Lease);
+
+        var rows = await queue.ListQueuedAsync();
+
+        Assert.Equal(2, rows.Count);
+
+        var taken = Assert.Single(rows, r => r.TaskId == "taken");
+        Assert.True(taken.Claimed);
+        Assert.Equal("worker-a", taken.Owner);
+        Assert.Equal(0, taken.Priority);
+        Assert.Equal(At(1), taken.QueuedUtc);
+
+        var waiting = Assert.Single(rows, r => r.TaskId == "waiting");
+        Assert.False(waiting.Claimed);
+        Assert.Equal(At(2), waiting.QueuedUtc);
+    }
+
+    [Fact]
+    public async Task ListQueuedTreatsALapsedLeaseAsUnclaimed()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueAsync("run", "task-0", 4, At(0));
+        await queue.ClaimBatchAsync("worker-a", 1, TimeSpan.FromMilliseconds(40));
+
+        await Task.Delay(120);
+
+        Assert.False(Assert.Single(await queue.ListQueuedAsync()).Claimed);
+    }
+
+    [Fact]
+    public async Task RemoveTaskRemovesOnlyThatTasksRows()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueAsync("run", "doomed", 4, At(0));
+        await queue.EnqueueAsync("run", "survivor", 4, At(0));
+        await queue.EnqueueAsync("other-run", "doomed", 4, At(0));
+
+        Assert.Equal(1, await queue.RemoveTaskAsync("run", "doomed"));
+
+        var left = await queue.ListQueuedAsync();
+        Assert.Equal(2, left.Count);
+        Assert.DoesNotContain(left, r => r.RunName == "run" && r.TaskId == "doomed");
+    }
+
+    [Fact]
+    public async Task ReprioritizeMovesTheRowKeepingItsPlaceInLine()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueAsync("run", "older", 4, At(0));
+        await queue.EnqueueAsync("run", "boosted", 4, At(1));
+        await queue.EnqueueAsync("run", "urgent", 0, At(2));
+
+        Assert.Equal(1, await queue.ReprioritizeTaskAsync("run", "boosted", 0));
+
+        // The moved row keeps its enqueue time, so within P0 the earlier "boosted" outranks "urgent".
+        var claimed = await queue.ClaimBatchAsync("worker-a", 2, Lease);
+        Assert.Equal(["boosted", "urgent"], claimed.Select(j => j.TaskId).ToArray());
+        Assert.All(claimed, j => Assert.Equal(0, j.Priority));
+    }
+
+    /// <summary>
+    /// A claimed row is already buffered inside some instance — re-adding it unclaimed at a new
+    /// priority would create a second runnable copy of the task, the exact failure this queue's
+    /// claim semantics exist to prevent.
+    /// </summary>
+    [Fact]
+    public async Task ReprioritizeLeavesClaimedRowsAlone()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueAsync("run", "task-0", 4, At(0));
+        await queue.ClaimBatchAsync("worker-a", 1, Lease);
+
+        Assert.Equal(0, await queue.ReprioritizeTaskAsync("run", "task-0", 0));
+
+        var row = Assert.Single(await queue.ListQueuedAsync());
+        Assert.Equal(4, row.Priority);
+        Assert.True(row.Claimed);
+    }
 }

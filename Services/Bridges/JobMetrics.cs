@@ -8,7 +8,15 @@ namespace Craft.Services;
 
 public class JobMetrics
 {
+    /// <summary>Everything waiting to run: this instance's buffer plus the unclaimed durable backlog.</summary>
     public int Queued { get; set; }
+
+    /// <summary>Jobs buffered in this instance's JobManager (claimed rows plus closure jobs).</summary>
+    public int QueuedLocal { get; set; }
+
+    /// <summary>Unclaimed rows in the durable queue table — the backlog no instance has taken yet.</summary>
+    public int QueuedDurable { get; set; }
+
     public int Running { get; set; }
     public int Completed { get; set; }
     public int Failed { get; set; }
