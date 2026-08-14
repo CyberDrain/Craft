@@ -24,28 +24,76 @@ namespace Craft.Storage;
 /// A claim is one conditional transaction over rows sharing a bucket: one round-trip per BATCH, not per
 /// task. Guarded by each row's ETag, so an external edit — or another instance claiming first — makes
 /// the claim fail rather than silently overwrite, and the caller re-reads.
+///
+/// THE RUN INDEX, and why the queue table alone is not enough:
+///
+/// The key design above is right for the claim path and wrong for everything else. RunName is not part
+/// of the key, so every run-scoped read — "which tasks does this run still have queued", "release this
+/// run's claims", "drop this run's rows" — can only be answered by scanning every partition. Those run
+/// on hot paths: once per finalize, once per resumed run, once per orphan re-drive.
+///
+/// Measured on a production instance whose queue reached ~743,000 rows: 61,939 such scans in ten
+/// minutes, p50 80 seconds, p95 100 seconds, then TaskCanceledException. The timeouts fell on the task
+/// status writes, so tasks never reached a terminal state, so runs never finalized, so their rows were
+/// never deleted — and the table that made the scans slow could only grow. 65% of the log file was the
+/// resulting HTTP-SLOW warnings; 0.3% was actual task execution.
+///
+/// A server-side $filter does not fix this and previously appeared to: filtering on a non-key property
+/// narrows what crosses the wire, not what the backend reads. The scan is the cost.
+///
+/// So run-scoped access gets its own index table, keyed the way those reads actually ask:
+///
+///   PartitionKey  the run name, escaped for the key charset
+///   RowKey        "{bucket}|{queue row key}" — enough to address the queue row directly
+///
+/// Every run-scoped method below is now a single-partition read followed by point operations, and the
+/// claim path is untouched. The index is maintained by the enqueue/remove paths, and built once for a
+/// pre-existing queue by <see cref="BackfillIndexAsync"/>.
 /// </summary>
 public class JobQueueStore
 {
     private readonly ILogger<JobQueueStore> _logger;
     private readonly ICraftTableStore _store;
     private readonly string _queueTable;
+    private readonly string _indexTable;
     private bool _initialized;
 
     /// <summary>Priorities above this share the lowest bucket. Callers use 0-6; the cap only bounds the key.</summary>
     private const int MaxPriorityBucket = 99;
+
+    /// <summary>Width of the zero-padded bucket key ("P04"), so the index row key splits at a fixed offset.</summary>
+    private const int BucketKeyLength = 3;
+
+    /// <summary>
+    /// Where the backfill marker lives. '$' is legal in a key and no run name starts with it — run names
+    /// are "{OrchestratorName}-{tenant}-{guid}" or "{OrchestratorName}_{...}".
+    /// </summary>
+    private const string SchemaPartition = "$schema";
+    private const string SchemaRowKey = "queue-index";
+    private const int SchemaVersion = 1;
+
+    /// <summary>
+    /// Rows buffered before the backfill flushes. Bounds peak memory on a very large queue — the
+    /// instance that motivated this was at 85% of a 2398MB heap cap before the backfill even started,
+    /// and buffering 743,000 rows to group them perfectly would have been the thing that OOMed it.
+    /// Rows for one run are written adjacently, so a window this size still groups them in practice.
+    /// </summary>
+    private const int BackfillFlushThreshold = 5_000;
 
     public JobQueueStore(ILogger<JobQueueStore> logger, CraftSettings settings, ICraftTableStore store)
     {
         _logger = logger;
         _store = store;
         _queueTable = $"{settings.Orchestrator.TablePrefix}Queue";
+        _indexTable = $"{settings.Orchestrator.TablePrefix}QueueIndex";
     }
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(CancellationToken ct = default)
     {
         if (_initialized) return;
-        await _store.EnsureTableAsync(_queueTable);
+        await _store.EnsureTableAsync(_queueTable, ct);
+        await _store.EnsureTableAsync(_indexTable, ct);
+        await BackfillIndexAsync(ct);
         _initialized = true;
     }
 
@@ -57,10 +105,67 @@ public class JobQueueStore
         // straddles a tick-digit boundary would silently reorder.
         $"{queuedUtc.Ticks.ToString("D19", CultureInfo.InvariantCulture)}-{runName}-{taskId}";
 
+    /// <summary>
+    /// A run name as an index partition key. Azure Tables rejects '/', '\', '#', '?' and control
+    /// characters in a key, and a run name carries a user-supplied scheduled-task name — "Alert on
+    /// Huntress Rogue Apps detected" is a real one, and nothing stops the next one containing a slash
+    /// or a question mark. Percent-escaping is reversible and leaves ordinary names untouched, so the
+    /// table stays readable in the portal, which is where anyone debugging this will be looking.
+    /// </summary>
+    internal static string IndexPartition(string runName)
+    {
+        var needsEscape = false;
+        foreach (var c in runName)
+        {
+            if (c is '/' or '\\' or '#' or '?' or '%' || char.IsControl(c)) { needsEscape = true; break; }
+        }
+        if (!needsEscape) return runName;
+
+        var sb = new System.Text.StringBuilder(runName.Length + 8);
+        foreach (var c in runName)
+        {
+            // '%' first, or the escape sequences themselves would be ambiguous.
+            if (c is '/' or '\\' or '#' or '?' or '%' || char.IsControl(c))
+                sb.Append('%').Append(((int)c).ToString("X2", CultureInfo.InvariantCulture));
+            else
+                sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>Index row key: the bucket (fixed width) plus the queue row key it points at.</summary>
+    internal static string IndexRowKey(string bucket, string queueRowKey) => $"{bucket}|{queueRowKey}";
+
+    /// <summary>The inverse of <see cref="IndexRowKey"/>. Split at a fixed offset — the bucket is always
+    /// three characters, so a '|' inside the queue row key cannot confuse this.</summary>
+    internal static (string Bucket, string QueueRowKey)? SplitIndexRowKey(string indexRowKey)
+    {
+        if (indexRowKey.Length < BucketKeyLength + 2 || indexRowKey[BucketKeyLength] != '|') return null;
+        return (indexRowKey[..BucketKeyLength], indexRowKey[(BucketKeyLength + 1)..]);
+    }
+
+    private static StoreRow IndexRow(string runName, string taskId, string bucket, string queueRowKey) =>
+        new(IndexPartition(runName), IndexRowKey(bucket, queueRowKey))
+        {
+            Properties = { ["TaskId"] = taskId, ["RunName"] = runName }
+        };
+
     /// <summary>Add one task to the queue. Idempotent for a given (queuedUtc, run, task).</summary>
-    public Task EnqueueAsync(string runName, string taskId, int priority, DateTime queuedUtc,
-        CancellationToken ct = default) =>
-        _store.UpsertAsync(_queueTable, new StoreRow(Bucket(priority), BuildRowKey(queuedUtc, runName, taskId))
+    /// <remarks>
+    /// Queue row first, index row second. The queue row is what makes the task actually run; the index
+    /// only accelerates lookups. If the process dies between the two the task still executes, and the
+    /// missing index entry is repaired by the next enqueue of the same (queuedUtc, run, task), which
+    /// rewrites both keys unchanged. The other order would leave the index claiming a task is queued
+    /// when no row exists — the orphan re-drive trusts the index, would decline to re-queue, and the
+    /// run would sit Pending with nothing running.
+    /// </remarks>
+    public async Task EnqueueAsync(string runName, string taskId, int priority, DateTime queuedUtc,
+        CancellationToken ct = default)
+    {
+        var bucket = Bucket(priority);
+        var rowKey = BuildRowKey(queuedUtc, runName, taskId);
+
+        await _store.UpsertAsync(_queueTable, new StoreRow(bucket, rowKey)
         {
             Properties =
             {
@@ -72,10 +177,19 @@ public class JobQueueStore
             }
         }, ct);
 
+        await _store.UpsertAsync(_indexTable, IndexRow(runName, taskId, bucket, rowKey), ct);
+    }
+
     /// <summary>Queue many tasks for one run. Chunked by the caller's priority into per-bucket batches.</summary>
+    /// <remarks>
+    /// The index rows for one run all share a partition, so however many buckets the tasks span the
+    /// index costs exactly one transaction. Ordering is as <see cref="EnqueueAsync"/>.
+    /// </remarks>
     public async Task EnqueueBatchAsync(string runName, IReadOnlyList<(string TaskId, int Priority)> tasks,
         DateTime queuedUtc, CancellationToken ct = default)
     {
+        var indexRows = new List<StoreRow>(tasks.Count);
+
         foreach (var byBucket in tasks.GroupBy(t => Bucket(t.Priority)))
         {
             var rows = byBucket.Select(t => new StoreRow(byBucket.Key, BuildRowKey(queuedUtc, runName, t.TaskId))
@@ -91,7 +205,13 @@ public class JobQueueStore
             }).ToList();
 
             await _store.UpsertBatchAsync(_queueTable, byBucket.Key, rows, ct);
+
+            indexRows.AddRange(byBucket.Select(t =>
+                IndexRow(runName, t.TaskId, byBucket.Key, BuildRowKey(queuedUtc, runName, t.TaskId))));
         }
+
+        if (indexRows.Count > 0)
+            await _store.UpsertBatchAsync(_indexTable, IndexPartition(runName), indexRows, ct);
     }
 
     /// <summary>A queued task this worker now owns, with the row key needed to release it.</summary>
@@ -193,8 +313,40 @@ public class JobQueueStore
 
     /// <summary>Remove a finished task from the queue. A missing row is not an error — it is the normal
     /// result of a retry after the removal already landed.</summary>
-    public Task RemoveAsync(ClaimedJob job, CancellationToken ct = default) =>
-        _store.DeleteAsync(_queueTable, job.Bucket, job.RowKey, ct);
+    /// <remarks>
+    /// Index row first, mirroring the enqueue rationale from the other side. A crash between the two
+    /// leaves a queue row for a task that has finished; it gets claimed once more and the resolver drops
+    /// it as a stale descriptor, which is already a handled path. Deleting the queue row first would
+    /// instead leave the index advertising queued work that does not exist, which stalls the run.
+    /// </remarks>
+    public async Task RemoveAsync(ClaimedJob job, CancellationToken ct = default)
+    {
+        await _store.DeleteAsync(_indexTable, IndexPartition(job.RunName), IndexRowKey(job.Bucket, job.RowKey), ct);
+        await _store.DeleteAsync(_queueTable, job.Bucket, job.RowKey, ct);
+    }
+
+    /// <summary>
+    /// This run's index rows. One single-partition read — the operation every run-scoped method below
+    /// used to perform as a full-table scan.
+    /// </summary>
+    private async Task<List<(string TaskId, string Bucket, string QueueRowKey, string IndexRowKey)>>
+        ReadIndexAsync(string runName, CancellationToken ct)
+    {
+        var entries = new List<(string, string, string, string)>();
+
+        await foreach (var row in _store.QueryPartitionAsync(_indexTable, IndexPartition(runName), ct))
+        {
+            var split = SplitIndexRowKey(row.RowKey);
+            if (split == null) continue;
+
+            var taskId = row.GetString("TaskId");
+            if (string.IsNullOrEmpty(taskId)) continue;
+
+            entries.Add((taskId, split.Value.Bucket, split.Value.QueueRowKey, row.RowKey));
+        }
+
+        return entries;
+    }
 
     /// <summary>
     /// Extend the lease on jobs still in flight. One transaction per bucket, so a full buffer costs one
@@ -233,28 +385,12 @@ public class JobQueueStore
     /// <summary>Drop every queued row for a run — used when a run is cancelled or cleaned up.</summary>
     public async Task RemoveRunAsync(string runName, CancellationToken ct = default)
     {
-        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
-        {
-            if (row.GetString("RunName") == runName)
-                await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
-        }
-    }
+        foreach (var e in await ReadIndexAsync(runName, ct))
+            await _store.DeleteAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
 
-    /// <summary>
-    /// Server-side narrowing for the run-scoped reads, matching the client-side RunName check each of
-    /// them already applies.
-    ///
-    /// Unfiltered, every one of these pages the ENTIRE queue table to the client to find one run's rows,
-    /// and they run on hot paths — once per finalize, once per resumed run, once per dispatch. A
-    /// production log showed 19,339 unfiltered scans of this table in an hour, peaking at 1,028 in a
-    /// single minute, with individual scans taking up to 200 seconds once the storage account began
-    /// throttling them. The claim path is the one that starves when that happens, but these reads are
-    /// what generate much of the volume.
-    ///
-    /// Narrowing only, on the same terms as ClaimableFilter: the callers keep their own RunName checks,
-    /// so a store that ignores the filter still behaves correctly.
-    /// </summary>
-    private static string RunFilter(string runName) => $"RunName eq '{runName.Replace("'", "''")}'";
+        // One call, and it also takes any entry whose queue row was already gone.
+        await _store.DeletePartitionAsync(_indexTable, IndexPartition(runName), ct);
+    }
 
     /// <summary>
     /// Hand back every claim on a run's rows, making them immediately claimable again. Returns how many
@@ -273,10 +409,11 @@ public class JobQueueStore
     {
         var released = 0;
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        foreach (var e in await ReadIndexAsync(runName, ct))
         {
-            if (row.GetString("RunName") != runName) continue;
-            if (string.IsNullOrEmpty(row.GetString("Owner"))) continue;   // already free
+            var row = await _store.GetAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
+            if (row == null) continue;                                     // finished and removed
+            if (string.IsNullOrEmpty(row.GetString("Owner"))) continue;    // already free
 
             row["Owner"] = "";
             row["LeaseUntil"] = (DateTimeOffset?)null;
@@ -342,13 +479,14 @@ public class JobQueueStore
     public async Task<int> RemoveTaskAsync(string runName, string taskId, CancellationToken ct = default)
     {
         var removed = 0;
+        var partition = IndexPartition(runName);
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        foreach (var e in await ReadIndexAsync(runName, ct))
         {
-            if (row.GetString("RunName") != runName) continue;
-            if (row.GetString("TaskId") != taskId) continue;
+            if (e.TaskId != taskId) continue;
 
-            await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
+            await _store.DeleteAsync(_indexTable, partition, e.IndexRowKey, ct);
+            await _store.DeleteAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
             removed++;
         }
 
@@ -368,13 +506,16 @@ public class JobQueueStore
     {
         var moved = 0;
         var now = DateTimeOffset.UtcNow;
+        var partition = IndexPartition(runName);
         var toMove = new List<StoreRow>();
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        foreach (var e in await ReadIndexAsync(runName, ct))
         {
-            if (row.GetString("RunName") != runName) continue;
-            if (row.GetString("TaskId") != taskId) continue;
-            if (row.PartitionKey == Bucket(newPriority)) continue;   // already there
+            if (e.TaskId != taskId) continue;
+            if (e.Bucket == Bucket(newPriority)) continue;   // already there
+
+            var row = await _store.GetAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
+            if (row == null) continue;
 
             // A claimed row is already buffered on some instance and about to run — re-adding it
             // unclaimed would create a second runnable copy of the task. Leave it be.
@@ -385,6 +526,7 @@ public class JobQueueStore
 
         foreach (var row in toMove)
         {
+            await _store.DeleteAsync(_indexTable, partition, IndexRowKey(row.PartitionKey, row.RowKey), ct);
             await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
 
             var queuedUtc = ParseQueuedUtc(row.RowKey) ?? DateTime.UtcNow;
@@ -410,14 +552,88 @@ public class JobQueueStore
     {
         var ids = new HashSet<string>(StringComparer.Ordinal);
 
-        await foreach (var row in _store.QueryTableAsync(_queueTable, RunFilter(runName), ct))
+        // Index only — this never touches the queue table. It is the hottest of the run-scoped reads
+        // (once per run per re-drive) and was the single largest source of the scan volume.
+        await foreach (var row in _store.QueryPartitionAsync(_indexTable, IndexPartition(runName), ct))
         {
-            if (row.GetString("RunName") != runName) continue;
-
             var taskId = row.GetString("TaskId");
             if (!string.IsNullOrEmpty(taskId)) ids.Add(taskId);
         }
 
         return ids;
+    }
+
+    /// <summary>
+    /// Build the run index for a queue that predates it. Runs at most once per storage account, ever:
+    /// the marker row written at the end is checked first, so every later start is a single point read.
+    ///
+    /// Awaited by <see cref="InitializeAsync"/> rather than backgrounded, because the run-scoped reads
+    /// are only correct once it has finished. A half-built index under-reports, the orphan re-drive
+    /// reads that as "this task has no queue row", and re-queueing a task that already has one is how
+    /// the same task gets executed twice — the failure this queue exists to prevent.
+    ///
+    /// Concurrency needs no lock. Two instances starting together both scan and both write the same
+    /// deterministic rows, so the duplicated work is wasted but not wrong, and neither serves traffic
+    /// until its own scan completed. Rows enqueued during the scan are indexed by the enqueue path.
+    /// </summary>
+    private async Task BackfillIndexAsync(CancellationToken ct)
+    {
+        var marker = await _store.GetAsync(_indexTable, SchemaPartition, SchemaRowKey, ct);
+        if ((marker?.GetInt32("Version") ?? 0) >= SchemaVersion) return;
+
+        var started = DateTime.UtcNow;
+        _logger.LogInformation("[JobQueue] Building the run index for the first time — one full pass over {Table}", _queueTable);
+
+        var pending = new Dictionary<string, List<StoreRow>>(StringComparer.Ordinal);
+        var buffered = 0;
+        var indexed = 0;
+        var skipped = 0;
+
+        async Task FlushAsync()
+        {
+            foreach (var (partition, rows) in pending)
+                await _store.UpsertBatchAsync(_indexTable, partition, rows, ct);
+
+            indexed += buffered;
+            pending.Clear();
+            buffered = 0;
+        }
+
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        {
+            var runName = row.GetString("RunName");
+            var taskId = row.GetString("TaskId");
+            if (string.IsNullOrEmpty(runName) || string.IsNullOrEmpty(taskId)) { skipped++; continue; }
+
+            var partition = IndexPartition(runName);
+            if (!pending.TryGetValue(partition, out var rows))
+                pending[partition] = rows = [];
+
+            rows.Add(IndexRow(runName, taskId, row.PartitionKey, row.RowKey));
+            buffered++;
+
+            if (buffered >= BackfillFlushThreshold)
+            {
+                await FlushAsync();
+                _logger.LogInformation("[JobQueue] Run index backfill: {Indexed:N0} rows so far", indexed);
+            }
+        }
+
+        await FlushAsync();
+
+        await _store.UpsertAsync(_indexTable, new StoreRow(SchemaPartition, SchemaRowKey)
+        {
+            Properties =
+            {
+                ["Version"] = SchemaVersion,
+                ["BuiltUtc"] = new DateTimeOffset(started, TimeSpan.Zero),
+                ["RowsIndexed"] = indexed,
+            }
+        }, ct);
+
+        _logger.LogInformation(
+            "[JobQueue] Run index built: {Indexed:N0} rows in {Seconds:N0}s{Skipped} — this will not run again",
+            indexed, (DateTime.UtcNow - started).TotalSeconds,
+            skipped > 0 ? $", {skipped:N0} malformed row(s) skipped" : "");
     }
 }
