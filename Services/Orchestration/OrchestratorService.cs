@@ -235,7 +235,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
-            await _queue.InitializeAsync();
+            await _queue.InitializeAsync(ct);
             var run = await _store.GetRunAsync(name);
 
             if (run != null && run.Status == "Running")
@@ -372,7 +372,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public async Task ResumeInterruptedRunsAsync(CancellationToken ct)
     {
         await _store.InitializeAsync();
-        await _queue.InitializeAsync();
+        await _queue.InitializeAsync(ct);
 
         // Rebuild parent→child links BEFORE processing anything. _childRuns is in-memory, so without
         // this a resumed parent has no registered children, AllChildRunsComplete answers true, and the
@@ -575,7 +575,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await _store.InitializeAsync();
-            await _queue.InitializeAsync();
+            await _queue.InitializeAsync(ct);
 
             var existing = await _store.GetRunAsync(name);
             if (existing != null && existing.Status == "Running" && _activeRuns.ContainsKey(name))

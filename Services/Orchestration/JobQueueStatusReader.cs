@@ -18,6 +18,18 @@ namespace Craft.Orchestration;
 /// dashboard at a few hertz, the perf harness at 4 Hz. One scan per TTL window serves all of them.
 /// A refresh failure keeps the previous snapshot: stale numbers with an honest timestamp beat an
 /// exception on a health endpoint.
+///
+/// THE TTL ADAPTS TO WHAT THE SCAN ACTUALLY COSTS, and that is not a refinement. The snapshot used to
+/// be stamped with the time the refresh STARTED, so on a large backlog an 80-second scan produced a
+/// snapshot already 80 seconds past a 5-second TTL the moment it was stored. The next poll — the
+/// worker-health page sits at a few hertz — saw it stale and started another. The single-flight gate
+/// kept it to one at a time, but they ran back to back, permanently, against the largest table in the
+/// account, on the instance least able to afford it. Measured on the instance that motivated this:
+/// full scans of a 743,000-row queue looping continuously, alongside 12,028 per-run counter reads
+/// each (see BuildSnapshotAsync). A customer reporting sluggishness had "kept the Worker Health page
+/// open" — which is what was driving it.
+///
+/// So: stamp on completion, and never re-scan more often than the last scan took.
 /// </summary>
 public class JobQueueStatusReader : IDisposable
 {
@@ -28,8 +40,23 @@ public class JobQueueStatusReader : IDisposable
 
     private static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How many runs <see cref="GetRunSummariesAsync"/> will resolve counter rows for. Each is a point
+    /// read, cheap alone and not in the thousands. A run without one falls back to local numbers, which
+    /// is the same graceful path a pre-counter run already takes — so this degrades detail, not
+    /// correctness. Truncation is logged rather than silent.
+    /// </summary>
+    private const int MaxCounterLookups = 200;
+
     private volatile QueueSnapshot? _cached;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+
+    /// <summary>
+    /// How long the last successful snapshot took to build. The floor under the effective TTL, so a
+    /// scan that costs 80s is not re-run 5s later. Volatile read/write of a long via Interlocked —
+    /// ticks rather than TimeSpan so it stays atomic.
+    /// </summary>
+    private long _lastBuildTicks;
 
     public JobQueueStatusReader(ILogger<JobQueueStatusReader> logger, JobManager jobs,
         JobQueueStore queue, OrchestratorTableStore store)
@@ -43,9 +70,17 @@ public class JobQueueStatusReader : IDisposable
     /// <summary>The underlying durable queue, for callers that need its maintenance operations.</summary>
     public JobQueueStore Queue => _queue;
 
-    /// <summary>Per-run slice of the durable queue plus that run's counter row, when it has one.</summary>
+    /// <summary>
+    /// Per-run slice of the durable queue, derived entirely from the rows the scan already returned.
+    ///
+    /// Deliberately carries no counter data. The counter lives in a different table, partitioned per
+    /// run, so folding it in here meant one point read per distinct run on EVERY refresh — 12,028 of
+    /// them on the instance that motivated this — even though only <see cref="GetRunSummariesAsync"/>
+    /// ever read those fields. The two paths that poll hardest, <see cref="GetSummaryAsync"/> and
+    /// <see cref="GetJobDetailsAsync"/>, never used them at all.
+    /// </summary>
     public sealed record RunQueueInfo(int Unclaimed, int Claimed, int MinPriority,
-        DateTime? OldestQueuedUtc, int? Remaining, int? Total);
+        DateTime? OldestQueuedUtc);
 
     /// <summary>One scan of the queue table, aggregated the way the status APIs consume it.</summary>
     public sealed record QueueSnapshot(DateTime TakenUtc, IReadOnlyList<JobQueueStore.QueuedRow> Rows,
@@ -62,10 +97,22 @@ public class JobQueueStatusReader : IDisposable
     /// A stale or missing snapshot kicks off a background refresh and returns what exists NOW; the
     /// refreshed data is simply what the next call sees.
     /// </summary>
+    /// <summary>
+    /// The shortest interval we will re-scan at: never less than the requested age, and never less than
+    /// the last scan took. On a healthy instance the scan is milliseconds and this is just the 5s TTL;
+    /// on a degraded one it is what stops the refresh loop from consuming the storage account.
+    /// </summary>
+    private TimeSpan EffectiveTtl(TimeSpan? maxAge)
+    {
+        var requested = maxAge ?? DefaultTtl;
+        var lastBuild = TimeSpan.FromTicks(Interlocked.Read(ref _lastBuildTicks));
+        return lastBuild > requested ? lastBuild : requested;
+    }
+
     public QueueSnapshot? GetCached(TimeSpan? maxAge = null)
     {
         var cached = _cached;
-        if (cached == null || DateTime.UtcNow - cached.TakenUtc > (maxAge ?? DefaultTtl))
+        if (cached == null || DateTime.UtcNow - cached.TakenUtc > EffectiveTtl(maxAge))
         {
             _ = Task.Run(() => GetAsync(maxAge, CancellationToken.None));
         }
@@ -78,18 +125,22 @@ public class JobQueueStatusReader : IDisposable
     /// </summary>
     public async Task<QueueSnapshot?> GetAsync(TimeSpan? maxAge = null, CancellationToken ct = default)
     {
-        var ttl = maxAge ?? DefaultTtl;
+        var ttl = EffectiveTtl(maxAge);
         var cached = _cached;
         if (cached != null && DateTime.UtcNow - cached.TakenUtc <= ttl) return cached;
 
         await _refreshGate.WaitAsync(ct);
         try
         {
-            // Re-check under the gate: a concurrent caller may have refreshed while we waited.
+            // Re-check under the gate, against a TTL recomputed AFTER the wait: whoever held the gate
+            // may also have just told us how expensive this scan is now.
             cached = _cached;
-            if (cached != null && DateTime.UtcNow - cached.TakenUtc <= ttl) return cached;
+            if (cached != null && DateTime.UtcNow - cached.TakenUtc <= EffectiveTtl(maxAge)) return cached;
 
-            _cached = await BuildSnapshotAsync(ct);
+            var startedUtc = DateTime.UtcNow;
+            var snapshot = await BuildSnapshotAsync(ct);
+            Interlocked.Exchange(ref _lastBuildTicks, (DateTime.UtcNow - startedUtc).Ticks);
+            _cached = snapshot;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -107,9 +158,13 @@ public class JobQueueStatusReader : IDisposable
         return _cached;
     }
 
+    /// <summary>
+    /// One scan of the queue table, aggregated. No per-run storage reads: everything here comes from
+    /// the rows the scan already returned, so the cost is one scan regardless of how many runs the
+    /// backlog spans.
+    /// </summary>
     private async Task<QueueSnapshot> BuildSnapshotAsync(CancellationToken ct)
     {
-        var takenUtc = DateTime.UtcNow;
         var rows = await _queue.ListQueuedAsync(ct);
 
         var unclaimed = 0;
@@ -138,22 +193,14 @@ public class JobQueueStatusReader : IDisposable
             if (oldest != null && (oldestUnclaimed == null || oldest < oldestUnclaimed))
                 oldestUnclaimed = oldest;
 
-            // The counter row is the run's true size and durable progress — the queue rows alone only
-            // say what has not been claimed yet. Best-effort per run: a missing counter (pre-counter
-            // run) simply leaves those fields null and the consumer falls back to local numbers.
-            (int Remaining, int Total)? counter = null;
-            try { counter = await _store.GetCounterAsync(group.Key, ct); }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "[JobQueueStatus] Counter read failed for {Run}", group.Key);
-            }
-
             byRun[group.Key] = new RunQueueInfo(runUnclaimed, runClaimed,
-                minPriority == int.MaxValue ? 0 : minPriority, oldest,
-                counter?.Remaining, counter?.Total);
+                minPriority == int.MaxValue ? 0 : minPriority, oldest);
         }
 
-        return new QueueSnapshot(takenUtc, rows, unclaimed, rows.Count - unclaimed, oldestUnclaimed, byRun);
+        // Stamped on COMPLETION, not on entry. A scan that took longer than the TTL would otherwise
+        // return a snapshot that is already expired, and the next poll would start another immediately.
+        return new QueueSnapshot(DateTime.UtcNow, rows, unclaimed, rows.Count - unclaimed,
+            oldestUnclaimed, byRun);
     }
 
     // ─── Merged views ───
@@ -254,7 +301,6 @@ public class JobQueueStatusReader : IDisposable
             if (byName.TryGetValue(run, out var summary))
             {
                 summary.Queued += info.Unclaimed;
-                Overlay(summary, info.Remaining, info.Total);
             }
             else
             {
@@ -267,34 +313,50 @@ public class JobQueueStatusReader : IDisposable
                     Queued = info.Unclaimed + info.Claimed,
                     Total = info.Unclaimed + info.Claimed,
                 };
-                Overlay(synthesized, info.Remaining, info.Total);
                 summaries.Add(synthesized);
+                byName[run] = synthesized;
             }
         }
 
-        // A run whose backlog is fully claimed has no queue rows, but its counter still knows the true
-        // size — a restart or a multi-instance claim pattern otherwise shrinks Total to whatever this
-        // node happened to process. Only active runs; finished ones are locally complete records.
-        foreach (var summary in summaries)
-        {
-            if (summary.Queued + summary.Running == 0) continue;
-            if (snap.ByRun.ContainsKey(summary.Name)) continue;
-
-            try
-            {
-                if (await _store.GetCounterAsync(summary.Name, ct) is { } counter)
-                    Overlay(summary, counter.Remaining, counter.Total);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "[JobQueueStatus] Counter read failed for {Run}", summary.Name);
-            }
-        }
-
-        return summaries
+        // Counter rows, resolved HERE rather than in the snapshot, because this is the only caller that
+        // reads them. Each is a point read on the run's own task partition.
+        //
+        // The counter is a run's true size and durable progress — a restart or a multi-instance claim
+        // pattern otherwise shrinks Total to whatever this node happened to process. It covers runs with
+        // queue rows and runs whose backlog is fully claimed alike, which is why this is one pass over
+        // the active summaries rather than two loops keyed off the snapshot.
+        var ordered = summaries
             .OrderBy(r => r.Priority)
             .ThenByDescending(r => r.StartedUtc)
             .ToList();
+
+        var active = ordered.Where(s => s.Queued + s.Running > 0).ToList();
+        var lookups = Math.Min(active.Count, MaxCounterLookups);
+
+        for (var i = 0; i < lookups; i++)
+        {
+            try
+            {
+                if (await _store.GetCounterAsync(active[i].Name, ct) is { } counter)
+                    Overlay(active[i], counter.Remaining, counter.Total);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[JobQueueStatus] Counter read failed for {Run}", active[i].Name);
+            }
+        }
+
+        if (active.Count > lookups)
+        {
+            // Said out loud: a silent cap here would read as "these runs have no durable progress"
+            // rather than "we did not look", and the two are indistinguishable in the UI.
+            _logger.LogDebug(
+                "[JobQueueStatus] Resolved counters for {Looked} of {Active} active runs (cap {Cap}) — " +
+                "the remainder report local numbers only",
+                lookups, active.Count, MaxCounterLookups);
+        }
+
+        return ordered;
     }
 
     public void Dispose()
