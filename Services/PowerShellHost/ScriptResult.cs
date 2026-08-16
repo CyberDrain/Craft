@@ -12,6 +12,14 @@ public class ScriptResult
     public string Body { get; set; } = "{}";
 
     /// <summary>
+    /// Raw response bytes for a handler that returned a <c>byte[]</c> body (e.g. an image).
+    /// When set, <see cref="Body"/> is empty and the response writer must send these bytes
+    /// unserialized — pushing them through the JSON path is how images came back as
+    /// integer arrays.
+    /// </summary>
+    public byte[]? BodyBytes { get; set; }
+
+    /// <summary>
     /// Response headers the handler asked for, already normalised by
     /// <see cref="Craft.Hosting.HandlerHeaders.FromPowerShell"/>. Null when the handler set none,
     /// which is the overwhelmingly common case — a redirect's <c>Location</c> is the reason this
