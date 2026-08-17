@@ -383,6 +383,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
         foreach (var child in summaries)
         {
             if (string.IsNullOrEmpty(child.ParentRunName)) continue;
+            // Rows written before the self-parent guard can record a run as its own parent;
+            // reattaching one would rebuild the self-wait this fix removes.
+            if (child.ParentRunName == child.Name) continue;
             if (child.Status is not "Running") continue;   // terminal children cannot block a parent
             _childRuns.GetOrAdd(child.ParentRunName, _ => new ConcurrentBag<string>()).Add(child.Name);
             _recoveringChildren.TryAdd(child.Name, true);
@@ -566,6 +569,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         string? postExecFunctionName, string? postExecParametersJson,
         string? parentRunName, string? reference, string? batchFilePath, CancellationToken ct)
     {
+        // A run cannot be its own parent. The ambient RunName rides along when a run is re-queued
+        // from inside its own context; persisting it would feed the reattach loop a self-link on the
+        // next start and show circular lineage in the status APIs.
+        if (parentRunName == name)
+            parentRunName = null;
+
         if (!_activePlanners.TryAdd(name, true))
         {
             _logger.LogInformation("[Orchestrator] Run {Name} already in progress, skipping", name);
@@ -1189,6 +1198,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// </summary>
     internal void TryRegisterChildRun(string parentRunName, string childRunName)
     {
+        // A run re-queued from inside its own context arrives with itself as parent — the bridge
+        // captures the ambient RunName, and a duplicate enqueue of an already-active run still lands
+        // here. Linking it would deadlock finalization: the run stays in _activeRuns until it
+        // finalizes, so AllChildRunsComplete would wait on the run itself forever. Observed live as
+        // runs stuck "Running" for days with every task terminal and Remaining=0.
+        if (parentRunName == childRunName)
+            return;
+
         if (!_activeRuns.ContainsKey(parentRunName))
             return; // Parent no longer active (e.g. called from PostExec context)
 
@@ -1202,8 +1219,11 @@ public class OrchestratorService : IJobDescriptorStateWriter
     {
         if (!_childRuns.TryGetValue(runName, out var children))
             return true;
+        // A run is never its own blocker. TryRegisterChildRun refuses self-links, but ones registered
+        // before that guard existed can still be sitting in the bag of a long-lived process.
         return !children.Any(childName =>
-            _activeRuns.ContainsKey(childName) || _recoveringChildren.ContainsKey(childName));
+            childName != runName &&
+            (_activeRuns.ContainsKey(childName) || _recoveringChildren.ContainsKey(childName)));
     }
 
     /// <summary>
