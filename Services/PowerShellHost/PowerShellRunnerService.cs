@@ -817,7 +817,9 @@ public class PowerShellRunnerService : IDisposable
         }
     }
 
-    private static ScriptResult ExtractResponse(Collection<PSObject>? results)
+    // internal for Craft.Tests - this is the single point deciding how a handler's body
+    // reaches the wire, and the binary/content-type branches need direct coverage.
+    internal static ScriptResult ExtractResponse(Collection<PSObject>? results)
     {
         if (results == null || results.Count == 0)
         {
@@ -860,6 +862,41 @@ public class PowerShellRunnerService : IDisposable
 
             if (found)
             {
+                var unwrappedBody = Unwrap(body);
+                var declaredType = Unwrap(contentType) as string;
+
+                // A byte[] body is written to the wire verbatim - serializing it is how
+                // images came back as JSON integer arrays. octet-stream fallback keeps
+                // ResolveContentType from stamping application/json on binary data.
+                if (unwrappedBody is byte[] bodyBytes)
+                {
+                    return new ScriptResult
+                    {
+                        StatusCode = statusCode ?? 200,
+                        Body = string.Empty,
+                        BodyBytes = bodyBytes,
+                        Headers = HandlerHeaders.FromPowerShell(AsDictionary(headers)),
+                        ContentType = string.IsNullOrWhiteSpace(declaredType)
+                            ? "application/octet-stream"
+                            : declaredType,
+                    };
+                }
+
+                // HttpResponseContext defaults ContentType to application/json, so only an
+                // explicitly non-JSON declaration takes this path: the string body passes
+                // through untouched instead of being JSON-validated and re-quoted.
+                if (unwrappedBody is string rawBody && declaredType is not null &&
+                    !declaredType.Contains("json", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new ScriptResult
+                    {
+                        StatusCode = statusCode ?? 200,
+                        Body = rawBody,
+                        Headers = HandlerHeaders.FromPowerShell(AsDictionary(headers)),
+                        ContentType = declaredType,
+                    };
+                }
+
                 string jsonBody;
                 if (body is string strBody)
                 {

@@ -639,11 +639,14 @@ public class PowerShellWorkerPool : IDisposable
 
         // Set PowerShell preference variables based on configured log level.
         // This controls which PS streams actually produce records for CRAFT to capture.
+        // The value must be the ActionPreference enum: a string entry replaces the
+        // type-constrained built-in with a raw string, and module code that re-binds it
+        // (e.g. -Verbose:$VerbosePreference) then fails parameter binding.
         var logLevel = _settings.FileLogging.ParsedLogLevel;
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
-            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", System.Management.Automation.ActionPreference.Continue, "Set by CRAFT log level"));
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
-            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", System.Management.Automation.ActionPreference.Continue, "Set by CRAFT log level"));
 
         var hasAllowList = moduleList != null && moduleList.Count > 0;
 
@@ -686,12 +689,13 @@ public class PowerShellWorkerPool : IDisposable
         foreach (System.Collections.DictionaryEntry env in Environment.GetEnvironmentVariables())
             iss.EnvironmentVariables.Add(new SessionStateVariableEntry((string)env.Key, env.Value, null));
 
-        // Set PowerShell preference variables based on configured log level
+        // Set PowerShell preference variables based on configured log level.
+        // Must be the ActionPreference enum, not a string - see BuildISSForModules.
         var logLevel = _settings.FileLogging.ParsedLogLevel;
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
-            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", "Continue", "Set by CRAFT log level"));
+            iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", System.Management.Automation.ActionPreference.Continue, "Set by CRAFT log level"));
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)
-            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", "Continue", "Set by CRAFT log level"));
+            iss.Variables.Add(new SessionStateVariableEntry("DebugPreference", System.Management.Automation.ActionPreference.Continue, "Set by CRAFT log level"));
 
         // Determine which modules need native import (they have private functions)
         var nativeModules = new HashSet<string>(baseState.NativeImportModulePaths.Select(Path.GetFileNameWithoutExtension)!,

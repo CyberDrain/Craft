@@ -123,7 +123,12 @@ public static class PowerShellDispatchEndpoint
                 }
 
                 if (HandlerHeaders.AllowsBody(result.StatusCode))
-                    await context.Response.WriteAsync(result.Body);
+                {
+                    if (result.BodyBytes is { } bodyBytes)
+                        await context.Response.Body.WriteAsync(bodyBytes);
+                    else
+                        await context.Response.WriteAsync(result.Body);
+                }
             }
             finally
             {
@@ -211,7 +216,12 @@ public static class PowerShellDispatchEndpoint
         context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
         if (HandlerHeaders.AllowsBody(cached.Result.StatusCode))
-            await context.Response.WriteAsync(cached.Result.Body);
+        {
+            if (cached.Result.BodyBytes is { } cachedBytes)
+                await context.Response.Body.WriteAsync(cachedBytes);
+            else
+                await context.Response.WriteAsync(cached.Result.Body);
+        }
 
         if (requestSnapshot is null) return;
 
