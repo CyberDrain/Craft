@@ -49,6 +49,9 @@ public class PowerShellWorker : IDisposable
         _pwsh.Runspace.Name = $"Worker{id}";
     }
 
+    /// <summary>This worker's runspace. Test-only access — production code goes through _pwsh.</summary>
+    internal Runspace Runspace => _pwsh.Runspace;
+
     public void Initialize(ScriptRepository repo, string apiBasePath, CraftSettings settings)
     {
         if (_initialized) return;
@@ -582,8 +585,15 @@ try {{
 
     public void Dispose()
     {
+        // PowerShell.Create(iss) ASSIGNS the runspace rather than creating it lazily, and an assigned
+        // runspace is caller-owned — _pwsh.Dispose() does not close it. Left open, the runspace keeps
+        // its ReuseThread pipeline thread alive, and a live thread roots the entire session state
+        // (every SSFE-injected function of every module) through any GC, however aggressive: measured
+        // at ~20 MB retained per recycled worker, for the process lifetime.
+        var runspace = _pwsh.Runspace;
         _pwsh.Dispose();
-        // Nothing here owns unmanaged resources directly, but suppressing finalization keeps a
+        runspace?.Dispose();
+        // Nothing else here owns unmanaged resources directly, but suppressing finalization keeps a
         // derived type that adds a finalizer from having to re-implement IDisposable to do it.
         GC.SuppressFinalize(this);
     }
