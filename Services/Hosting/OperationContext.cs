@@ -52,6 +52,15 @@ public static class OperationContext
         /// <summary>Parent orchestrator run name (null for HTTP requests).</summary>
         public string? RunName { get; init; }
 
+        /// <summary>
+        /// Queue priority of the enclosing run, exposed so nested enqueues can inherit it
+        /// (Start-CIPPOrchestrator reads this to default a child run to its parent's priority).
+        /// Set only for orchestrator activity jobs and post-execution jobs — plain closure jobs
+        /// (scheduler starters, queue starters) deliberately leave it null, because their own job
+        /// priority orders the starter script, not the work it goes on to enqueue.
+        /// </summary>
+        public int? Priority { get; init; }
+
         /// <summary>Category: "HTTP", "Job", "Planner".</summary>
         public string Category { get; init; } = "Job";
 
