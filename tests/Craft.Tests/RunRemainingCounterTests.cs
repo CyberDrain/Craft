@@ -287,6 +287,75 @@ public class RunRemainingCounterTests
         Assert.Null(await store.CompleteTaskAsync("never-seeded", Task_("task-0")));
     }
 
+    // ─── Reconciliation (the lost-decrement repair) ───
+
+    /// <summary>
+    /// A decrement that exhausts its retries is never re-sent — the terminal rows landed, the counter
+    /// didn't move, and from then on it overstates the run's outstanding work forever. Production
+    /// symptom: "complete in memory but storage shows N outstanding - deferring finalize" on every 60s
+    /// tick for the life of the process. Reconcile recounts the rows and repairs the counter.
+    /// </summary>
+    [Fact]
+    public async Task ReconcileRepairsALostDecrement()
+    {
+        var backing = new ConditionalStore();
+        var store = await SeededAsync(backing, 3);
+
+        // Terminal rows written WITHOUT the counter moving — exactly what a lost decrement leaves.
+        await store.UpsertTaskAsync(Run, Task_("task-0"));
+        await store.UpsertTaskAsync(Run, Task_("task-1", "Failed"));
+        Assert.Equal(3, await store.GetRemainingAsync(Run));
+
+        Assert.Equal(1, await store.ReconcileRemainingAsync(Run));
+        Assert.Equal(1, await store.GetRemainingAsync(Run));
+    }
+
+    [Fact]
+    public async Task ReconcileWithoutDriftChangesNothing()
+    {
+        var backing = new ConditionalStore();
+        var store = await SeededAsync(backing, 2);
+
+        var writesBefore = backing.ConditionalWrites;
+
+        Assert.Equal(2, await store.ReconcileRemainingAsync(Run));
+        Assert.Equal(writesBefore, backing.ConditionalWrites);
+    }
+
+    [Fact]
+    public async Task ReconcileWithoutACounterRowIsANoOp()
+    {
+        var (store, _) = NewStore();
+        await store.InitializeAsync();
+
+        Assert.Null(await store.ReconcileRemainingAsync("never-seeded"));
+    }
+
+    /// <summary>
+    /// A decrement landing between reconcile's recount and its write must win. The recount is stale the
+    /// moment a competitor moves the counter, so the ETag guard has to reject the repair — reporting
+    /// null sends the caller back around rather than letting an old count overwrite fresh progress.
+    /// </summary>
+    [Fact]
+    public async Task ReconcileLosingARaceDoesNotClobberTheCompetitor()
+    {
+        var backing = new ConditionalStore();
+        var store = await SeededAsync(backing, 3);
+
+        // Manufacture drift so reconcile attempts a write at all.
+        await store.UpsertTaskAsync(Run, Task_("task-0"));
+
+        backing.OnBeforeConditionalWrite = () =>
+        {
+            backing.OnBeforeConditionalWrite = null;
+            store.CompleteTaskAsync(Run, Task_("task-1")).GetAwaiter().GetResult();
+        };
+
+        Assert.Null(await store.ReconcileRemainingAsync(Run));
+        // The competitor's decrement survived: 3 seeded − 1 completed-by-competitor.
+        Assert.Equal(2, await store.GetRemainingAsync(Run));
+    }
+
     // ─── Status-guarded cancel (the cancel-a-run write) ───
 
     [Fact]

@@ -287,8 +287,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     return;
                 }
 
-                // All tasks finished — finalize
+                // All tasks finished — finalize, and STOP. Finalize dispatches post-execution
+                // asynchronously, and its success path deletes the run's partitions by name
+                // (CleanupRunAsync). Falling through to start a fresh same-named outing here raced
+                // that delete and lost the new run's rows mid-flight; the next scheduler tick starts
+                // the fresh outing cleanly instead.
                 await FinalizeRunAsync(run);
+                return;
             }
 
             // Start a new run
@@ -569,6 +574,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
         string? postExecFunctionName, string? postExecParametersJson,
         string? parentRunName, string? reference, string? batchFilePath, CancellationToken ct)
     {
+        // Run names become PartitionKeys verbatim, and batch names carry user-typed task names
+        // ("Alert on Entra ID P1/P2 …"). An illegal key character 400s every write for the run —
+        // run row, task rows, counter, queue rows — identically forever, so the run can neither
+        // start nor be re-driven. Sanitize at the boundary, like task ids at mint.
+        name = TableKeys.Sanitize(name);
+        if (!string.IsNullOrEmpty(parentRunName))
+            parentRunName = TableKeys.Sanitize(parentRunName);
+
         // A run cannot be its own parent. The ambient RunName rides along when a run is re-queued
         // from inside its own context; persisting it would feed the reattach loop a self-link on the
         // next start and show circular lineage in the status APIs.
@@ -696,7 +709,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     lock (_lock) { CheckRunCompletion(run); }
                 },
                 null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
-            _runStatusTimers.TryAdd(run.Name, timer);
+            if (!_runStatusTimers.TryAdd(run.Name, timer))
+            {
+                // Lost the ContainsKey→TryAdd race (concurrent dispatch of the same run — startup
+                // resume vs a scheduler tick). An active periodic Timer is rooted by the runtime's
+                // timer queue, so an undisposed loser would fire — and pin this run graph through its
+                // closure — for the process lifetime.
+                timer.Dispose();
+            }
         }
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
@@ -766,13 +786,53 @@ public class OrchestratorService : IJobDescriptorStateWriter
         var priority = task.Priority ?? run.Priority;
         _ = Task.Run(async () =>
         {
-            try { await _queue.EnqueueAsync(run.Name, task.Id, priority, DateTime.UtcNow); }
+            var key = DeferralKey(run.Name, task.Id);
+            try
+            {
+                await _queue.EnqueueAsync(run.Name, task.Id, priority, DateTime.UtcNow);
+                _requeueFailures.TryRemove(key, out _);
+            }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "[Scheduler] Could not re-queue {Task} in {Run} — the re-drive will retry",
-                    task.Id, run.Name);
+                // A row storage rejects is rejected identically forever (illegal key remnant,
+                // oversized property), and the re-drive resets the deferral counter on every pass —
+                // without this cap the retry loop is infinite and the run it belongs to can never
+                // finalize. Consecutive failures only: a success above clears the count.
+                var failures = _requeueFailures.AddOrUpdate(key, 1, (_, c) => c + 1);
+                if (failures >= MaxRequeueFailures)
+                {
+                    _requeueFailures.TryRemove(key, out _);
+                    FailTaskTerminally(run, task,
+                        $"Could not re-queue after {failures} consecutive attempts: {ex.Message}");
+                    return;
+                }
+                _logger.LogWarning(ex,
+                    "[Scheduler] Could not re-queue {Task} in {Run} (attempt {Count}/{Max}) — the re-drive will retry",
+                    task.Id, run.Name, failures, MaxRequeueFailures);
             }
         });
+    }
+
+    /// <summary>
+    /// Move a task that can never run to Failed and let its run finish without it. The terminal write
+    /// flows through the status writer like any other completion, so the remaining counter decrements
+    /// and finalize proceeds — the alternative is a Pending task retried for the process lifetime,
+    /// pinning the whole run graph with it.
+    /// </summary>
+    private void FailTaskTerminally(OrchestratorRun run, OrchestratorTaskItem task, string reason)
+    {
+        lock (_lock)
+        {
+            if (task.Status is "Completed" or "Failed" or "Cancelled") return;
+            task.Status = "Failed";
+            task.LastError = reason;
+            task.CompletedUtc = DateTime.UtcNow;
+            task.Parameters = null!;
+            CheckRunCompletion(run);
+        }
+        PersistTaskAndRunAsync(run, task);
+        _logger.LogError("[Scheduler] Task {TaskId} in {Run} permanently failed: {Reason}",
+            task.Id, run.Name, reason);
     }
 
     /// <summary>
@@ -1013,6 +1073,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// <summary>Cap on in-process retries before a task is left for the next recovery pass to pick up.</summary>
     private const int MaxDeferrals = 3;
 
+    /// <summary>Consecutive finalize checks where storage still reported outstanding work for a run whose
+    /// in-memory tasks are all terminal. At <see cref="ReconcileAfterDeferrals"/> the counter is recounted
+    /// from the task rows — a lost decrement otherwise defers finalize forever.</summary>
+    private readonly ConcurrentDictionary<string, int> _finalizeDeferrals = new();
+    private const int ReconcileAfterDeferrals = 3;
+
+    /// <summary>Consecutive re-queue failures per task. Storage rejecting the same entity is not
+    /// transient — the write fails identically forever (see <see cref="TableKeys"/>) — so past
+    /// <see cref="MaxRequeueFailures"/> the task is failed terminally instead of re-driven again.</summary>
+    private readonly ConcurrentDictionary<string, int> _requeueFailures = new();
+    private const int MaxRequeueFailures = 5;
+
     /// <summary>
     /// Re-queue a task whose durable marker could not be written, so it retries once storage recovers
     /// instead of waiting for a restart. Bounded: after <see cref="MaxDeferrals"/> the task is simply
@@ -1029,6 +1101,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
         if (count > MaxDeferrals)
         {
+            // One exhausted deferral cycle counts as one attempt on the task, mirroring startup
+            // recovery's 3-attempts rule. The re-drive resets the deferral counter when it re-queues,
+            // so without this the marker-fail → re-queue → marker-fail cycle repeats for the process
+            // lifetime and the run never finalizes. Exactly-once per cycle: only the call that
+            // crosses the cap increments (a duplicate queue row can push count past it again).
+            if (count == MaxDeferrals + 1 && ++task.AttemptCount >= 3)
+            {
+                FailTaskTerminally(run, task,
+                    $"Durable Running marker rejected across {task.AttemptCount} deferral cycles: {cause.Message}");
+                return;
+            }
+
             // Left Pending on purpose — storage already says Pending, so nothing is lost. It is no longer
             // terminal though: RedrivePendingTasks picks it up once it has aged, so recovery is not
             // gated on a restart the way it used to be.
@@ -1179,12 +1263,28 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     var remaining = await _store.GetRemainingAsync(run.Name);
                     if (remaining is > 0)
                     {
+                        // A counter that keeps contradicting a fully-terminal graph is drifted, not
+                        // busy — a decrement that exhausted its retries is never re-applied, and
+                        // without a recount this deferral repeats on every 60s tick for the process
+                        // lifetime, pinning the run graph with it. Give in-flight terminal writes a
+                        // few checks to land, then recount the partition the counter summarizes.
+                        var misses = _finalizeDeferrals.AddOrUpdate(run.Name, 1, (_, c) => c + 1);
+                        if (misses >= ReconcileAfterDeferrals)
+                        {
+                            _finalizeDeferrals.TryRemove(run.Name, out _);
+                            if (await _store.ReconcileRemainingAsync(run.Name) is 0)
+                            {
+                                await FinalizeRunAsync(run);
+                                return;
+                            }
+                        }
                         _logger.LogInformation(
                             "[Scheduler] Run {Name} complete in memory but storage shows {Remaining} outstanding - deferring finalize",
                             run.Name, remaining);
                         return;
                     }
 
+                    _finalizeDeferrals.TryRemove(run.Name, out _);
                     await FinalizeRunAsync(run);
                 }
                 catch (Exception ex) { _logger.LogError(ex, "[Scheduler] FinalizeRun failed for {Name}", run.Name); }
@@ -1284,6 +1384,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _taskScriptPaths.TryRemove(run.Name, out _);
         _runStatusTimers.TryRemove(run.Name, out var timer);
         timer?.Dispose();
+        _finalizeDeferrals.TryRemove(run.Name, out _);
+        // Deferral and re-queue tracking is keyed per task and nothing else removes entries for tasks
+        // that ended without passing through their happy-path cleanup — without this sweep the residue
+        // of every run that ever deferred outlives the run.
+        foreach (var t in run.Tasks)
+        {
+            var key = DeferralKey(run.Name, t.Id);
+            _deferrals.TryRemove(key, out _);
+            _requeueFailures.TryRemove(key, out _);
+        }
 
         var wallDisplay = wallClock.TotalSeconds < 60
             ? $"{wallClock.TotalSeconds:F1}s"

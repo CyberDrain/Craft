@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Craft.Hosting;
 using Craft.Orchestration;
+using Craft.Storage;
 
 // NAMESPACE PINNED — do not change.
 // Downstream PowerShell reaches these types by fully-qualified name, e.g.
@@ -26,6 +27,10 @@ public static class OrchestratorBridge
         string? postExecFunctionName = null, string? postExecParametersJson = null,
         string? reference = null)
     {
+        // Sanitized here as well as at run creation so the child-run registration in DrainPending
+        // records the SAME name the service ends up creating — a raw name with a table-illegal
+        // character would register a child link no live run ever matches.
+        name = TableKeys.Sanitize(name);
         var parentRunName = OperationContext.Current?.RunName;
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference));
@@ -46,6 +51,7 @@ public static class OrchestratorBridge
         string? postExecFunctionName = null, string? postExecParametersJson = null,
         string? reference = null)
     {
+        name = TableKeys.Sanitize(name);
         var parentRunName = OperationContext.Current?.RunName;
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath));
