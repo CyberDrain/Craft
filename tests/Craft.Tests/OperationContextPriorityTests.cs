@@ -2,12 +2,12 @@ using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using Craft.Configuration;
 using Craft.Hosting;
-using JobManager = Craft.Orchestration.JobManager;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using JobManager = Craft.Orchestration.JobManager;
 
 namespace Craft.Tests;
 
