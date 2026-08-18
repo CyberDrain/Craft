@@ -1,5 +1,8 @@
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
 using Craft.Configuration;
 using Craft.Hosting;
+using JobManager = Craft.Orchestration.JobManager;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Services;
@@ -143,5 +146,55 @@ public class OperationContextPriorityTests
         // Callers that predate priorities must keep landing at P5 — the 3-arg overload exists so
         // user-initiated starters can opt INTO a higher band, not to move everyone else.
         Assert.Equal(5, new QueueBridge.PendingQueueCommand("Start-Thing", "{}").Priority);
+    }
+
+    /// <summary>
+    /// PS code cannot read OperationContext.Current: the pipeline runs on the runspace's reused
+    /// thread (ReuseThread), whose ExecutionContext was frozen when the thread was created — at pool
+    /// warmup, before any operation context existed. The worker therefore stamps the invocation into
+    /// $global:CraftOperationContext from the calling thread, and that variable is the only carrier
+    /// Start-CIPPOrchestrator's priority resolution can rely on.
+    /// </summary>
+    [Fact]
+    public async Task InvokeStampsOperationContextIntoTheRunspace_AndCleanupRemovesIt()
+    {
+        var worker = new PowerShellWorker(97, InitialSessionState.CreateDefault2(), NullLogger.Instance);
+        try
+        {
+            if (worker.Runspace.RunspaceStateInfo.State == RunspaceState.BeforeOpen)
+                worker.Runspace.Open();
+
+            // Pin the reused pipeline thread's ExecutionContext to one with NO operation context,
+            // exactly like pool warmup does — anything the later invocation observes must have come
+            // through the stamped variable, not through thread-creation context flow.
+            await worker.InvokeScriptAsync(ScriptBlock.Create("$null"));
+
+            var invocation = new OperationContext.Invocation("Test-Function")
+            {
+                RunName = "StampTestRun",
+                Priority = 3,
+                Category = "Job"
+            };
+            OperationContext.Invocation? observed;
+            using (OperationContext.Set(invocation))
+            {
+                var results = await worker.InvokeScriptAsync(ScriptBlock.Create("$global:CraftOperationContext"));
+                observed = Assert.Single(results).BaseObject as OperationContext.Invocation;
+            }
+
+            Assert.NotNull(observed);
+            Assert.Equal("StampTestRun", observed.RunName);
+            Assert.Equal(3, observed.Priority);
+            Assert.Equal("Job", observed.Category);
+
+            // Context disposed: the next invocation stamps null (and the post-invoke global-variable
+            // sweep removed the previous value), so nothing stale leaks across checkouts.
+            var after = await worker.InvokeScriptAsync(ScriptBlock.Create("$null -eq $global:CraftOperationContext"));
+            Assert.True((bool)Assert.Single(after).BaseObject);
+        }
+        finally
+        {
+            worker.Dispose();
+        }
     }
 }

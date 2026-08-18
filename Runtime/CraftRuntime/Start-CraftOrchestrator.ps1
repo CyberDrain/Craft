@@ -101,16 +101,18 @@ function Start-CraftOrchestrator {
     }
 
     # Priority resolution: explicit on the InputObject wins; otherwise inherit the enclosing run's
-    # priority (ambient, set by JobManager for orchestrator activities and post-exec jobs); otherwise
-    # the default band. Guard the explicit value — the store clamps into 0-99 buckets, so a stray
-    # negative would silently land in the critical P00 bucket.
+    # priority (stamped into the global CraftOperationContext variable by the worker — the pipeline
+    # thread never sees OperationContext.Current directly); otherwise the default band. Guard the
+    # explicit value — the store clamps into 0-99 buckets, so a stray negative would silently land
+    # in the critical P00 bucket.
     $Priority = $InputObject.Priority
     if ($null -ne $Priority) {
         $Priority = [int]$Priority
         if ($Priority -lt 0 -or $Priority -gt 99) { $Priority = $null }
     }
     if ($null -eq $Priority) {
-        $Priority = [Craft.Hosting.OperationContext]::Current.Priority ?? 4
+        $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        $Priority = $OpContext.Priority ?? 4
     }
 
     Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"

@@ -311,6 +311,7 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         long buildTicks = 0, runTicks = 0, copyTicks = 0;
         try
         {
+            StampOperationContext();
             var bStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             _pwsh.AddCommand(functionName);
             foreach (var p in parameters)
@@ -358,6 +359,7 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         CancellationTokenRegistration? registration = null;
         try
         {
+            StampOperationContext();
             _pwsh.AddScript("& $args[0]").AddArgument(scriptBlock);
             if (parameters != null)
                 foreach (var p in parameters)
@@ -386,6 +388,31 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     }
 
     public PSDataStreams Streams => _pwsh.Streams;
+
+    /// <summary>
+    /// Make the caller's ambient <see cref="OperationContext"/> readable from PowerShell as
+    /// $global:CraftOperationContext.
+    ///
+    /// The pipeline runs on the runspace's reused thread (<c>PSThreadOptions.ReuseThread</c>, set at
+    /// worker creation), whose ExecutionContext was captured once when that thread was created — at
+    /// pool warmup, before any operation context existed. AsyncLocal values set per invocation never
+    /// reach it, so PS code (and .NET bridge calls made from the pipeline thread) reading
+    /// <c>OperationContext.Current</c> always sees null. Stamping the context into a global variable
+    /// from the calling thread — which does hold the AsyncLocal — is the reliable carrier. The
+    /// post-invocation <see cref="CleanupGlobalVariables"/> sweep removes it again, so it cannot go
+    /// stale across checkouts.
+    /// </summary>
+    private void StampOperationContext()
+    {
+        try
+        {
+            _pwsh.Runspace.SessionStateProxy.PSVariable.Set("CraftOperationContext", OperationContext.Current);
+        }
+        catch
+        {
+            // Diagnostics context is never worth failing the invocation; PS falls back to defaults.
+        }
+    }
 
     private void Cleanup()
     {
