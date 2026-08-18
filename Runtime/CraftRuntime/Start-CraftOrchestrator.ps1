@@ -6,14 +6,17 @@ function Start-CraftOrchestrator {
         Generic bridge function that serializes a batch of tasks and queues them
         for fan-out execution via the C# OrchestratorService.
 
-        This is the framework-provided default. Application-specific wrappers
-        (e.g. Start-CIPPOrchestrator) can override via Orchestrator.BridgeFunction
-        in appsettings.json if they need additional logic (queue routing, dual-boot, etc.)
+        This is the framework-provided default. Applications with additional logic
+        (queue routing, dual-boot, etc.) ship their own wrapper (e.g. Start-CIPPOrchestrator)
+        and simply call that instead of this function.
 
     .PARAMETER InputObject
         Orchestrator input with the following structure:
           - OrchestratorName  (string)  — unique run identifier
           - Batch             (array)   — task objects, each with at least FunctionName
+          - Priority          (int)     — optional; queue priority bucket for the run (lower = sooner).
+                                          Defaults to the parent run's priority when queued from inside
+                                          an orchestrator run, else 4.
           - QueueFunction     (object)  — optional; called first to generate the batch dynamically
             - FunctionName    (string)  — Push-{FunctionName} is called
             - Parameters      (object)  — passed as -Item to the queue function
@@ -97,11 +100,24 @@ function Start-CraftOrchestrator {
         throw
     }
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
+    # Priority resolution: explicit on the InputObject wins; otherwise inherit the enclosing run's
+    # priority (ambient, set by JobManager for orchestrator activities and post-exec jobs); otherwise
+    # the default band. Guard the explicit value — the store clamps into 0-99 buckets, so a stray
+    # negative would silently land in the critical P00 bucket.
+    $Priority = $InputObject.Priority
+    if ($null -ne $Priority) {
+        $Priority = [int]$Priority
+        if ($Priority -lt 0 -or $Priority -gt 99) { $Priority = $null }
+    }
+    if ($null -eq $Priority) {
+        $Priority = [Craft.Hosting.OperationContext]::Current.Priority ?? 4
+    }
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
         $BatchPath,
-        4,
+        $Priority,
         $PostExecFunctionName,
         $PostExecParametersJson,
         $InputObject.Reference

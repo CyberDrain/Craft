@@ -1455,6 +1455,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _jobManager.Enqueue(
             name: $"{run.Name}-PostExec",
             priority: run.Priority,
+            // Post-exec commonly starts follow-up runs (baseline → cache refresh); they should land
+            // at this run's priority, not the enqueue default.
+            inheritPriority: run.Priority,
             runName: run.Name,
             work: async (jobCt) =>
             {

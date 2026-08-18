@@ -28,10 +28,21 @@ public static class QueueBridge
         s_queueTaskFunction = queueTaskFunction;
     }
 
+    /// <summary>Default-priority enqueue. Kept for compatibility with callers that predate priorities.</summary>
     public static void Enqueue(string cmdlet, string parametersJson)
+        => Enqueue(cmdlet, parametersJson, DefaultPriority);
+
+    /// <summary>
+    /// Enqueue with an explicit job priority. User-initiated starters (run-now scheduled tasks) pass a
+    /// high band here so they are not claimed behind the background fan-out backlog — the queue claims
+    /// strictly by priority bucket, so a starter below the backlog's band cannot run until it drains.
+    /// </summary>
+    public static void Enqueue(string cmdlet, string parametersJson, int priority)
     {
-        s_pending.Enqueue(new PendingQueueCommand(cmdlet, parametersJson));
+        s_pending.Enqueue(new PendingQueueCommand(cmdlet, parametersJson, priority));
     }
+
+    private const int DefaultPriority = 5;
 
     public static void DrainPending()
     {
@@ -46,7 +57,7 @@ public static class QueueBridge
             var captured = cmd;
             s_jobManager.Enqueue(
                 name: $"Queue-{captured.Cmdlet}",
-                priority: 5,
+                priority: captured.Priority,
                 runName: $"Queue-{captured.Cmdlet}-{Guid.NewGuid():N}",
                 id: $"Queue-{Guid.NewGuid():N}",
                 work: async (ct) =>
@@ -65,5 +76,5 @@ public static class QueueBridge
         }
     }
 
-    public record PendingQueueCommand(string Cmdlet, string ParametersJson);
+    public record PendingQueueCommand(string Cmdlet, string ParametersJson, int Priority = DefaultPriority);
 }

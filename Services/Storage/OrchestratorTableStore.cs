@@ -132,7 +132,7 @@ public class OrchestratorTableStore
         {
             Name = name,
             Status = runRow.GetString("Status") ?? "Pending",
-            Priority = runRow.GetInt32("Priority") ?? 2,
+            Priority = runRow.GetInt32("Priority") ?? 4,
             StartedUtc = runRow.GetDateTimeOffset("StartedUtc")?.UtcDateTime ?? DateTime.UtcNow,
             CompletedUtc = runRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime,
             TaskScriptName = runRow.GetString("TaskScriptName"),
