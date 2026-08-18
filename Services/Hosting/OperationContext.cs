@@ -49,7 +49,13 @@ public static class OperationContext
         /// <summary>Worker identifier (e.g. "W3").</summary>
         public string? WorkerId { get; init; }
 
-        /// <summary>Parent orchestrator run name (null for HTTP requests).</summary>
+        /// <summary>
+        /// Parent orchestrator run name (null for HTTP requests).
+        /// Like <see cref="Priority"/>, PowerShell can only see this through the stamped
+        /// $global:CraftOperationContext — Start-CraftOrchestrator reads it there and passes it
+        /// back explicitly as the parent of runs it queues, because the bridge's own ambient read
+        /// is null on the pipeline thread.
+        /// </summary>
         public string? RunName { get; init; }
 
         /// <summary>

@@ -49,6 +49,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// Each name is cleared as its run is processed, whichever way that goes.
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _recoveringChildren = new();
+
+    /// <summary>
+    /// Child runs queued through the bridge but not yet started, keyed by child name with a count
+    /// of outstanding queue entries. They count as incomplete for the same reason recovering
+    /// children do: between a task's script enqueuing a sub-orchestration and DrainPending getting
+    /// it into <see cref="_activeRuns"/> there is otherwise nothing for the parent's completion
+    /// check to see — and that window contains the parent's own last-task completion, because the
+    /// drain runs in the background while the enqueuing task is marked terminal immediately.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, int> _pendingChildRuns = new();
     private readonly ConcurrentDictionary<string, Timer> _runStatusTimers = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledRuns = new();
 
@@ -384,6 +394,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // parent can finalize (and fire PostExecution) while its children are still running — exactly
         // what the child-run guard exists to prevent. One partition scan, no task rows.
         var summaries = await _store.ListRunSummariesAsync();
+        var runningRuns = summaries.Where(s => s.Status == "Running").Select(s => s.Name)
+            .ToHashSet(StringComparer.Ordinal);
         var reattached = 0;
         foreach (var child in summaries)
         {
@@ -392,6 +404,11 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // reattaching one would rebuild the self-wait this fix removes.
             if (child.ParentRunName == child.Name) continue;
             if (child.Status is not "Running") continue;   // terminal children cannot block a parent
+            // The parent must itself be resuming. Lineage can point at a run that already
+            // finalized — a run queued from PostExecution records its finished spawner as parent —
+            // and reattaching those would build bags no completion check consults, or worse, gate
+            // the NEXT outing of a recurring parent name on a leftover of the previous one.
+            if (!runningRuns.Contains(child.ParentRunName)) continue;
             _childRuns.GetOrAdd(child.ParentRunName, _ => new ConcurrentBag<string>()).Add(child.Name);
             _recoveringChildren.TryAdd(child.Name, true);
             reattached++;
@@ -1293,37 +1310,70 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
-    /// Register a child run under a parent run. The parent will not finalize
-    /// until all child runs complete. Only registers if the parent is still active.
+    /// Register a child run under a parent at ENQUEUE time — while the parent task's script is
+    /// still executing, so the parent cannot pass its completion check before the link exists. The
+    /// parent will not finalize while any child is pending dispatch, active, or recovering. Only
+    /// registers if the parent is still active; returns whether a pending gate was taken (the
+    /// bridge releases exactly what was taken via <see cref="ReleasePendingChildRun"/>).
     /// </summary>
-    internal void TryRegisterChildRun(string parentRunName, string childRunName)
+    internal bool TryRegisterPendingChildRun(string parentRunName, string childRunName)
     {
-        // A run re-queued from inside its own context arrives with itself as parent — the bridge
-        // captures the ambient RunName, and a duplicate enqueue of an already-active run still lands
-        // here. Linking it would deadlock finalization: the run stays in _activeRuns until it
-        // finalizes, so AllChildRunsComplete would wait on the run itself forever. Observed live as
-        // runs stuck "Running" for days with every task terminal and Remaining=0.
+        // A run re-queued from inside its own context arrives with itself as parent — the
+        // recurring-run pattern, or a duplicate enqueue of an already-active run. Linking it would
+        // deadlock finalization: the run stays in _activeRuns until it finalizes, so
+        // AllChildRunsComplete would wait on the run itself forever. Observed live as runs stuck
+        // "Running" for days with every task terminal and Remaining=0.
         if (parentRunName == childRunName)
-            return;
+            return false;
 
         if (!_activeRuns.ContainsKey(parentRunName))
-            return; // Parent no longer active (e.g. called from PostExec context)
+            return false; // Parent no longer active (e.g. queued from PostExec context)
 
-        var children = _childRuns.GetOrAdd(parentRunName, _ => new ConcurrentBag<string>());
-        children.Add(childRunName);
+        // Gate before link: the moment the link is visible to AllChildRunsComplete the pending
+        // mark must already hold, or a completion check could slip between the two writes.
+        _pendingChildRuns.AddOrUpdate(childRunName, 1, (_, n) => n + 1);
+        _childRuns.GetOrAdd(parentRunName, _ => new ConcurrentBag<string>()).Add(childRunName);
         _logger.LogInformation("[Orchestrator] Registered child run {Child} under parent {Parent}",
             childRunName, parentRunName);
+        return true;
+    }
+
+    /// <summary>
+    /// Lift the enqueue-time gate for ONE queued entry of this child. Called by the bridge after
+    /// the start attempt finishes, whatever the outcome: a started child is in _activeRuns by then
+    /// (which takes over blocking the parent), and one that failed to start must stop blocking — a
+    /// leaked gate would defer the parent's finalize for the process lifetime, re-checked every
+    /// 60s. Counted rather than boolean so two queued entries under the same child name cannot
+    /// release each other's gate.
+    /// </summary>
+    internal void ReleasePendingChildRun(string childRunName)
+    {
+        while (_pendingChildRuns.TryGetValue(childRunName, out var n))
+        {
+            if (n <= 1)
+            {
+                if (_pendingChildRuns.TryRemove(new KeyValuePair<string, int>(childRunName, n)))
+                    return;
+            }
+            else if (_pendingChildRuns.TryUpdate(childRunName, n - 1, n))
+            {
+                return;
+            }
+        }
     }
 
     private bool AllChildRunsComplete(string runName)
     {
         if (!_childRuns.TryGetValue(runName, out var children))
             return true;
-        // A run is never its own blocker. TryRegisterChildRun refuses self-links, but ones registered
-        // before that guard existed can still be sitting in the bag of a long-lived process.
+        // A run is never its own blocker. TryRegisterPendingChildRun refuses self-links, but ones
+        // registered before that guard existed can still be sitting in the bag of a long-lived
+        // process.
         return !children.Any(childName =>
             childName != runName &&
-            (_activeRuns.ContainsKey(childName) || _recoveringChildren.ContainsKey(childName)));
+            (_pendingChildRuns.ContainsKey(childName) ||
+             _activeRuns.ContainsKey(childName) ||
+             _recoveringChildren.ContainsKey(childName)));
     }
 
     /// <summary>

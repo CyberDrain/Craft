@@ -100,29 +100,38 @@ function Start-CraftOrchestrator {
         throw
     }
 
+    # The stamped operation context is the only way this function can see the enclosing run — the
+    # pipeline thread never sees OperationContext.Current (frozen ExecutionContext under
+    # ReuseThread; see PowerShellWorker.StampOperationContext) — so both the priority default and
+    # the parent-run lineage below must come from this variable.
+    $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+
     # Priority resolution: explicit on the InputObject wins; otherwise inherit the enclosing run's
-    # priority (stamped into the global CraftOperationContext variable by the worker — the pipeline
-    # thread never sees OperationContext.Current directly); otherwise the default band. Guard the
-    # explicit value — the store clamps into 0-99 buckets, so a stray negative would silently land
-    # in the critical P00 bucket.
+    # priority; otherwise the default band. Guard the explicit value — the store clamps into 0-99
+    # buckets, so a stray negative would silently land in the critical P00 bucket.
     $Priority = $InputObject.Priority
     if ($null -ne $Priority) {
         $Priority = [int]$Priority
         if ($Priority -lt 0 -or $Priority -gt 99) { $Priority = $null }
     }
     if ($null -eq $Priority) {
-        $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
         $Priority = $OpContext.Priority ?? 4
     }
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
+    # Lineage: pass the enclosing run explicitly. The bridge's own ambient read is null for calls
+    # made from the pipeline thread — which is exactly where this function runs — so without this
+    # a parent run would finalize (and dispatch its PostExecution) before its child runs complete.
+    $ParentRunName = $OpContext.RunName
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
         $BatchPath,
         $Priority,
         $PostExecFunctionName,
         $PostExecParametersJson,
-        $InputObject.Reference
+        $InputObject.Reference,
+        $ParentRunName
     )
     return "Craft-$OrchestratorName"
 }

@@ -7,16 +7,20 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Craft.Tests;
 
 /// <summary>
-/// A run must never wait on itself to finalize.
+/// A run must never wait on itself to finalize — and must genuinely wait on its children.
 ///
-/// The bridge captures the ambient RunName as the parent of every queued orchestration, so a run
-/// re-queued from inside its own context (the recurring-run pattern) arrived as its own child. The
+/// The bridge registers the queued run under the ambient-or-explicit parent, so a run re-queued
+/// from inside its own context (the recurring-run pattern) used to arrive as its own child. The
 /// child-run guard then blocked finalization until the "child" left _activeRuns — which only happens
 /// at finalization. Observed live as seven runs stuck "Running" for days, every task terminal,
 /// Remaining=0, and their PostExecutions (audit log processing) never dispatched.
 ///
-/// The guard has to stay specific: a REAL child (different name) must still block its parent, which
-/// is what sub-orchestration fan-out depends on. Both directions are asserted here.
+/// The guard has to stay specific: a REAL child (different name) must block its parent from the
+/// moment it is REGISTERED — which happens at enqueue time, while the child exists nowhere but the
+/// bridge queue. Registration takes a pending gate that only <see
+/// cref="OrchestratorService.ReleasePendingChildRun"/> lifts, once the start attempt has either put
+/// the child into _activeRuns (which takes over the blocking) or failed (so the parent must not
+/// wait forever). All directions are asserted here.
 /// </summary>
 public class OrchestratorChildRunGuardTests
 {
@@ -28,6 +32,7 @@ public class OrchestratorChildRunGuardTests
         Set(svc, "_activeRuns", new ConcurrentDictionary<string, OrchestratorRun>());
         Set(svc, "_childRuns", new ConcurrentDictionary<string, ConcurrentBag<string>>());
         Set(svc, "_recoveringChildren", new ConcurrentDictionary<string, bool>());
+        Set(svc, "_pendingChildRuns", new ConcurrentDictionary<string, int>());
         return svc;
     }
 
@@ -53,7 +58,7 @@ public class OrchestratorChildRunGuardTests
         var svc = NewService();
         Activate(svc, "StandardsApply");
 
-        svc.TryRegisterChildRun("StandardsApply", "StandardsApply");
+        Assert.False(svc.TryRegisterPendingChildRun("StandardsApply", "StandardsApply"));
 
         Assert.False(Get<ConcurrentDictionary<string, ConcurrentBag<string>>>(svc, "_childRuns")
             .ContainsKey("StandardsApply"));
@@ -61,18 +66,69 @@ public class OrchestratorChildRunGuardTests
     }
 
     [Fact]
-    public void RealChild_StillBlocksParent_UntilItLeavesTheLiveGraph()
+    public void InactiveParent_IsRefused()
+    {
+        // Runs queued from PostExecution land here: the spawning run has already finalized, so the
+        // new run keeps its lineage on the row but must not gate anything.
+        var svc = NewService();
+
+        Assert.False(svc.TryRegisterPendingChildRun("FinalizedParent", "FollowUpRun"));
+        Assert.True(AllChildRunsComplete(svc, "FinalizedParent"));
+    }
+
+    [Fact]
+    public void PendingChild_BlocksParent_ThroughItsWholeLifecycle()
     {
         var svc = NewService();
         Activate(svc, "Parent");
+
+        // Registered at enqueue time — the child exists nowhere but the bridge queue, and the
+        // parent must already be blocked, because its own last task is what queued the child.
+        Assert.True(svc.TryRegisterPendingChildRun("Parent", "Child"));
+        Assert.False(AllChildRunsComplete(svc, "Parent"));
+
+        // The drain starts the child (it enters the live graph) and then lifts the gate: still
+        // blocked, the live graph has taken over.
         Activate(svc, "Child");
-
-        svc.TryRegisterChildRun("Parent", "Child");
-
+        svc.ReleasePendingChildRun("Child");
         Assert.False(AllChildRunsComplete(svc, "Parent"));
 
         // Child finalizes and is evicted from the live graph — the parent unblocks.
         Get<ConcurrentDictionary<string, OrchestratorRun>>(svc, "_activeRuns").TryRemove("Child", out _);
+        Assert.True(AllChildRunsComplete(svc, "Parent"));
+    }
+
+    [Fact]
+    public void FailedStart_ReleasesTheGate()
+    {
+        // A child that never starts (0 tasks, missing task function, storage failure) must stop
+        // blocking once the start attempt is over — a leaked gate would defer the parent's
+        // finalize for the process lifetime.
+        var svc = NewService();
+        Activate(svc, "Parent");
+
+        Assert.True(svc.TryRegisterPendingChildRun("Parent", "StillbornChild"));
+        Assert.False(AllChildRunsComplete(svc, "Parent"));
+
+        svc.ReleasePendingChildRun("StillbornChild");
+        Assert.True(AllChildRunsComplete(svc, "Parent"));
+    }
+
+    [Fact]
+    public void DoubleQueuedChild_NeedsBothReleases()
+    {
+        // Two queue entries under the same child name (e.g. two parent tasks each queueing the
+        // same fan-out) hold independent gates: the first release must not lift the second's.
+        var svc = NewService();
+        Activate(svc, "Parent");
+
+        Assert.True(svc.TryRegisterPendingChildRun("Parent", "SharedChild"));
+        Assert.True(svc.TryRegisterPendingChildRun("Parent", "SharedChild"));
+
+        svc.ReleasePendingChildRun("SharedChild");
+        Assert.False(AllChildRunsComplete(svc, "Parent"));
+
+        svc.ReleasePendingChildRun("SharedChild");
         Assert.True(AllChildRunsComplete(svc, "Parent"));
     }
 
