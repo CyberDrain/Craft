@@ -6,14 +6,17 @@ function Start-CraftOrchestrator {
         Generic bridge function that serializes a batch of tasks and queues them
         for fan-out execution via the C# OrchestratorService.
 
-        This is the framework-provided default. Application-specific wrappers
-        (e.g. Start-CIPPOrchestrator) can override via Orchestrator.BridgeFunction
-        in appsettings.json if they need additional logic (queue routing, dual-boot, etc.)
+        This is the framework-provided default. Applications with additional logic
+        (queue routing, dual-boot, etc.) ship their own wrapper (e.g. Start-CIPPOrchestrator)
+        and simply call that instead of this function.
 
     .PARAMETER InputObject
         Orchestrator input with the following structure:
           - OrchestratorName  (string)  — unique run identifier
           - Batch             (array)   — task objects, each with at least FunctionName
+          - Priority          (int)     — optional; queue priority bucket for the run (lower = sooner).
+                                          Defaults to the parent run's priority when queued from inside
+                                          an orchestrator run, else 4.
           - QueueFunction     (object)  — optional; called first to generate the batch dynamically
             - FunctionName    (string)  — Push-{FunctionName} is called
             - Parameters      (object)  — passed as -Item to the queue function
@@ -97,14 +100,38 @@ function Start-CraftOrchestrator {
         throw
     }
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
+    # The stamped operation context is the only way this function can see the enclosing run — the
+    # pipeline thread never sees OperationContext.Current (frozen ExecutionContext under
+    # ReuseThread; see PowerShellWorker.StampOperationContext) — so both the priority default and
+    # the parent-run lineage below must come from this variable.
+    $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+
+    # Priority resolution: explicit on the InputObject wins; otherwise inherit the enclosing run's
+    # priority; otherwise the default band. Guard the explicit value — the store clamps into 0-99
+    # buckets, so a stray negative would silently land in the critical P00 bucket.
+    $Priority = $InputObject.Priority
+    if ($null -ne $Priority) {
+        $Priority = [int]$Priority
+        if ($Priority -lt 0 -or $Priority -gt 99) { $Priority = $null }
+    }
+    if ($null -eq $Priority) {
+        $Priority = $OpContext.Priority ?? 4
+    }
+
+    # Lineage: pass the enclosing run explicitly. The bridge's own ambient read is null for calls
+    # made from the pipeline thread — which is exactly where this function runs — so without this
+    # a parent run would finalize (and dispatch its PostExecution) before its child runs complete.
+    $ParentRunName = $OpContext.RunName
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
         $BatchPath,
-        4,
+        $Priority,
         $PostExecFunctionName,
         $PostExecParametersJson,
-        $InputObject.Reference
+        $InputObject.Reference,
+        $ParentRunName
     )
     return "Craft-$OrchestratorName"
 }

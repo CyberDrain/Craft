@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Craft.Hosting;
 using Craft.Orchestration;
+using Craft.Storage;
 
 // NAMESPACE PINNED — do not change.
 // Downstream PowerShell reaches these types by fully-qualified name, e.g.
@@ -24,11 +25,17 @@ public static class OrchestratorBridge
 
     public static void QueueOrchestration(string name, string batchJson, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null)
+        string? reference = null, string? parentRunName = null)
     {
-        var parentRunName = OperationContext.Current?.RunName;
+        // Sanitized here as well as at run creation so the child-run registration below
+        // records the SAME name the service ends up creating — a raw name with a table-illegal
+        // character would register a child link no live run ever matches.
+        name = TableKeys.Sanitize(name);
+        parentRunName = ResolveParentRunName(name, parentRunName);
+        var gated = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
-            postExecFunctionName, postExecParametersJson, parentRunName, reference));
+            postExecFunctionName, postExecParametersJson, parentRunName, reference,
+            PendingChildRegistered: gated));
     }
 
     /// <summary>
@@ -44,12 +51,53 @@ public static class OrchestratorBridge
     /// </summary>
     public static void QueueOrchestrationFromFile(string name, string batchFilePath, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null)
+        string? reference = null, string? parentRunName = null)
     {
-        var parentRunName = OperationContext.Current?.RunName;
+        name = TableKeys.Sanitize(name);
+        parentRunName = ResolveParentRunName(name, parentRunName);
+        var gated = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
-            postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath));
+            postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
+            PendingChildRegistered: gated));
     }
+
+    /// <summary>
+    /// Resolve the parent run of a queued orchestration. The explicit argument wins — PowerShell
+    /// callers MUST pass it (read from the stamped $global:CraftOperationContext), because the
+    /// ambient fallback cannot work for them: the pipeline runs on the runspace's reused thread,
+    /// whose frozen ExecutionContext never sees the per-invocation AsyncLocal (see
+    /// PowerShellWorker.StampOperationContext), so reading OperationContext.Current here yields
+    /// null and every PS-queued child run used to lose its lineage. The ambient read stays as the
+    /// fallback for .NET callers and for older wrapper scripts, where it degrades to null rather
+    /// than misattributing lineage. PowerShell marshals a $null argument to "" for string
+    /// parameters, so empty means "not passed".
+    /// </summary>
+    private static string? ResolveParentRunName(string name, string? parentRunName)
+    {
+        if (string.IsNullOrEmpty(parentRunName))
+            parentRunName = OperationContext.Current?.RunName;
+        if (string.IsNullOrEmpty(parentRunName))
+            return null;
+        // Sanitized like the child name: the parent was created under its sanitized name, and the
+        // registration below has to match that live run.
+        parentRunName = TableKeys.Sanitize(parentRunName);
+        // A run re-queued from inside its own context arrives with itself as parent (the
+        // recurring-run pattern). Never a real child — linking it would gate its finalize on
+        // itself; StartFromBatchAsync applies the same guard before persisting.
+        return parentRunName == name ? null : parentRunName;
+    }
+
+    /// <summary>
+    /// Register the child link at ENQUEUE time — while the parent task's script is still executing,
+    /// so the parent cannot pass its completion check before the gate exists. Registering after
+    /// StartFromBatchAsync (the old shape) loses that race for the parent's LAST task: the drain
+    /// runs in a background Task.Run while the enqueuing task is marked terminal immediately, so
+    /// the parent would finalize — and dispatch PostExecution — before its child was visible.
+    /// Returns whether a gate was taken, so the drain releases exactly what was registered.
+    /// </summary>
+    private static bool RegisterPendingChild(string? parentRunName, string childName) =>
+        !string.IsNullOrEmpty(parentRunName) &&
+        s_service?.TryRegisterPendingChildRun(parentRunName, childName) == true;
 
     /// <summary>
     /// Synchronous drain — blocks until all pending orchestrations are started.
@@ -62,20 +110,23 @@ public static class OrchestratorBridge
             try
             {
                 if (s_service == null) { DiscardUndispatchable(p); continue; }
-                {
-                    s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                        p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                        p.ParentRunName, p.Reference, p.BatchFilePath)
-                        .GetAwaiter().GetResult();
-
-                    // Register as child run if parent is still active
-                    if (!string.IsNullOrEmpty(p.ParentRunName))
-                        s_service.TryRegisterChildRun(p.ParentRunName, p.Name);
-                }
+                s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
+                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
+                    p.ParentRunName, p.Reference, p.BatchFilePath)
+                    .GetAwaiter().GetResult();
             }
             catch (Exception ex)
             {
                 s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
+            }
+            finally
+            {
+                // The enqueue-time gate lifts on EVERY path once the start attempt is over: a
+                // started child is in _activeRuns by now (which takes over blocking the parent),
+                // and one that failed to start must stop blocking — a leaked gate would defer the
+                // parent's finalize forever, re-checked every 60s for the process lifetime.
+                if (p.PendingChildRegistered)
+                    s_service?.ReleasePendingChildRun(p.Name);
             }
         }
         DrainPendingPlanners();
@@ -91,19 +142,19 @@ public static class OrchestratorBridge
             try
             {
                 if (s_service == null) { DiscardUndispatchable(p); continue; }
-                {
-                    await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                        p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                        p.ParentRunName, p.Reference, p.BatchFilePath);
-
-                    // Register as child run if parent is still active
-                    if (!string.IsNullOrEmpty(p.ParentRunName))
-                        s_service.TryRegisterChildRun(p.ParentRunName, p.Name);
-                }
+                await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
+                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
+                    p.ParentRunName, p.Reference, p.BatchFilePath);
             }
             catch (Exception ex)
             {
                 s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
+            }
+            finally
+            {
+                // See DrainPending: the gate lifts whatever the outcome of the start attempt.
+                if (p.PendingChildRegistered)
+                    s_service?.ReleasePendingChildRun(p.Name);
             }
         }
         await DrainPendingPlannersAsync();
@@ -129,10 +180,14 @@ public static class OrchestratorBridge
     /// <summary>
     /// A queued run. Exactly one of <paramref name="BatchJson"/> and <paramref name="BatchFilePath"/>
     /// carries the batch; the file path wins when both are set.
+    /// <paramref name="PendingChildRegistered"/> records whether enqueue took a pending-child gate on
+    /// the orchestrator, so the drain releases exactly the gates that were taken — releasing on a
+    /// refused registration could lift a gate held by ANOTHER queued entry of the same child name.
     /// </summary>
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
-        string? Reference = null, string? BatchFilePath = null);
+        string? Reference = null, string? BatchFilePath = null,
+        bool PendingChildRegistered = false);
 
     private static readonly ConcurrentQueue<PendingPlannerRun> s_pendingPlanners = new();
 

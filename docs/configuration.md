@@ -429,7 +429,7 @@ Start-CraftOrchestrator -InputObject @{
 }
 ```
 
-This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applications can provide their own wrapper function (e.g. CIPP uses `Start-CIPPOrchestrator` for dual-boot compatibility) — just have it call `[Craft.Services.OrchestratorBridge]::QueueOrchestration()` internally.
+This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applications can provide their own wrapper function (e.g. CIPP uses `Start-CIPPOrchestrator` for dual-boot compatibility) — just have it call `[Craft.Services.OrchestratorBridge]::QueueOrchestration()` internally. A wrapper **must pass the parent run name explicitly** (read `RunName` from the stamped `$global:CraftOperationContext`, as `Start-CraftOrchestrator` does) — the bridge cannot discover it on its own from the pipeline thread, and without it a parent run finalizes (and runs its `PostExecution`) before the child runs it spawned complete.
 
 **How orchestration works:**
 1. A scheduler task or HTTP endpoint calls `Start-CraftOrchestrator` with a batch

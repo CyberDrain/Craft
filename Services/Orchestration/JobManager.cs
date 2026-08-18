@@ -16,10 +16,11 @@ namespace Craft.Orchestration;
 ///   - Old completed jobs are cleaned up every 5 minutes
 ///
 /// Priority levels (lower = higher priority, callers can use any int):
-///   0-1 = Critical (system cleanup, user tasks)
-///   2-3 = High     (audit logs, webhooks)
-///   4-5 = Normal   (standards, drift, cache)
-///   6+  = Low      (alerts, DB cache, tests, extensions)
+///   0-1 = Critical (reserved: system cleanup, emergencies)
+///   2   = User-initiated (HTTP-triggered fan-outs, user scheduled tasks, run-now starters)
+///   3   = Elevated background (baseline runs)
+///   4-5 = Normal   (background fan-out default; non-HTTP queue starters)
+///   6+  = Low      (alerts, tests, extensions)
 ///
 /// How priority dispatch works:
 ///   The dispatch loop waits for both an item AND a concurrency slot.
@@ -109,8 +110,12 @@ public class JobManager : BackgroundService
     /// <param name="work">Async work function. Receives a CancellationToken for shutdown.</param>
     /// <param name="runName">Optional run group name (e.g. "CIPPDBCacheRun") for grouping in status APIs.</param>
     /// <param name="id">Optional explicit job ID. Auto-generated if null.</param>
+    /// <param name="inheritPriority">Priority that work THIS JOB ENQUEUES should inherit, exposed to the
+    /// job via <see cref="OperationContext.Invocation.Priority"/>. Distinct from <paramref name="priority"/>:
+    /// a starter script's own queue priority orders the starter, not its fan-out. Only post-execution jobs
+    /// pass this (the run's priority); leave null everywhere else.</param>
     public string Enqueue(string name, int priority, Func<CancellationToken, Task> work,
-        string? runName = null, string? id = null)
+        string? runName = null, string? id = null, int? inheritPriority = null)
     {
         var jobId = id ?? $"{name}_{Guid.NewGuid():N}";
         var record = new JobRecord
@@ -128,7 +133,7 @@ public class JobManager : BackgroundService
 
         lock (_queueLock)
         {
-            _pendingQueue.Enqueue(new QueuedJob(record, work, null), priority);
+            _pendingQueue.Enqueue(new QueuedJob(record, work, null) { InheritPriority = inheritPriority }, priority);
         }
         _itemAvailable.Release();
 
@@ -338,10 +343,15 @@ public class JobManager : BackgroundService
 
         try
         {
-            // Set operation context for traceability — ExecuteScript reads RunName from this
+            // Set operation context for traceability — ExecuteScript reads RunName from this.
+            // Priority is the value nested enqueues should inherit: for descriptor jobs (orchestrator
+            // activities) that is the task's own queue priority; for closures it is only set when the
+            // enqueuer said so (post-exec passes the run's priority). Plain starters expose none —
+            // their job priority orders the starter script, not the work it spawns.
             var parentInvocation = new OperationContext.Invocation(job.Record.Name)
             {
                 RunName = job.Record.RunName,
+                Priority = job.Descriptor != null ? job.Record.Priority : job.InheritPriority,
                 Category = "Job"
             };
             opScope = OperationContext.Set(parentInvocation);
@@ -702,5 +712,8 @@ public class JobManager : BackgroundService
     {
         /// <summary>Bumped by <see cref="ChangePriority"/>; entries below the live epoch are superseded.</summary>
         public int Epoch { get; init; }
+
+        /// <summary>Priority nested enqueues should inherit (closure jobs only — see Enqueue).</summary>
+        public int? InheritPriority { get; init; }
     }
 }

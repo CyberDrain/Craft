@@ -132,7 +132,7 @@ public class OrchestratorTableStore
         {
             Name = name,
             Status = runRow.GetString("Status") ?? "Pending",
-            Priority = runRow.GetInt32("Priority") ?? 2,
+            Priority = runRow.GetInt32("Priority") ?? 4,
             StartedUtc = runRow.GetDateTimeOffset("StartedUtc")?.UtcDateTime ?? DateTime.UtcNow,
             CompletedUtc = runRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime,
             TaskScriptName = runRow.GetString("TaskScriptName"),
@@ -290,6 +290,45 @@ public class OrchestratorTableStore
     }
 
     /// <summary>
+    /// Recount <c>Remaining</c> from the task rows the counter summarizes, and repair the counter row
+    /// when they disagree.
+    ///
+    /// A decrement that exhausts its retries is never re-applied — the terminal task rows landed but
+    /// the counter kept its old value, and from then on it permanently overstates the outstanding work
+    /// and finalize defers forever. The scan is the whole-partition read the counter exists to avoid,
+    /// which is why this runs only when a caller has evidence of drift (a lost decrement, a finalize
+    /// deferred repeatedly), never on the hot path.
+    /// </summary>
+    /// <returns>The reconciled outstanding count, or null if the run has no counter row or a concurrent
+    /// writer moved the counter mid-recount — the caller's next pass re-reads either way.</returns>
+    public async Task<int?> ReconcileRemainingAsync(string runName, CancellationToken ct = default)
+    {
+        var counter = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
+        if (counter == null) return null;
+
+        var outstanding = 0;
+        await foreach (var row in _store.QueryPartitionAsync(_tasksTable, runName, ct))
+        {
+            if (row.RowKey == CounterRowKey) continue;
+            if (!IsTerminal(row.GetString("Status"))) outstanding++;
+        }
+
+        var stored = counter.GetInt32("Remaining") ?? 0;
+        if (stored == outstanding) return outstanding;
+
+        // ETag-guarded: a decrement landing between the read above and this write rejects the
+        // replace, so a recount can never overwrite fresher progress with a stale count.
+        counter["Remaining"] = outstanding;
+        if (!await _store.TryReplaceBatchAsync(_tasksTable, runName, [counter], ct))
+            return null;
+
+        _logger.LogWarning(
+            "[OrchestratorStore] Reconciled remaining for {Run}: counter said {Stored}, task rows say {Actual}",
+            runName, stored, outstanding);
+        return outstanding;
+    }
+
+    /// <summary>
     /// Mark one task terminal and decrement its run's outstanding count, atomically.
     ///
     /// Both rows share the run's partition, so this is a single conditional transaction guarded by both
@@ -425,7 +464,13 @@ public class OrchestratorTableStore
                 // that knows a terminal write actually applied, and the writer never re-sends a group
                 // that did, which is what keeps the count honest.
                 var terminal = group.Count(w => IsTerminal(w.Status));
-                if (terminal > 0) await DecrementRemainingAsync(group.Key, terminal, ct);
+                if (terminal > 0 && await DecrementRemainingAsync(group.Key, terminal, ct) == null)
+                {
+                    // Retry exhaustion here loses the decrement for good — the terminal rows above
+                    // landed, so the writer will never re-send this group. Recount now rather than
+                    // letting the counter overstate the run's outstanding work forever.
+                    await ReconcileRemainingAsync(group.Key, ct);
+                }
             }
             catch (Exception ex)
             {

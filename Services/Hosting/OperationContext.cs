@@ -49,8 +49,26 @@ public static class OperationContext
         /// <summary>Worker identifier (e.g. "W3").</summary>
         public string? WorkerId { get; init; }
 
-        /// <summary>Parent orchestrator run name (null for HTTP requests).</summary>
+        /// <summary>
+        /// Parent orchestrator run name (null for HTTP requests).
+        /// Like <see cref="Priority"/>, PowerShell can only see this through the stamped
+        /// $global:CraftOperationContext — Start-CraftOrchestrator reads it there and passes it
+        /// back explicitly as the parent of runs it queues, because the bridge's own ambient read
+        /// is null on the pipeline thread.
+        /// </summary>
         public string? RunName { get; init; }
+
+        /// <summary>
+        /// Queue priority of the enclosing run, exposed so nested enqueues can inherit it.
+        /// PowerShell cannot read this statically — the pipeline thread never sees the AsyncLocal
+        /// (see PowerShellWorker.StampOperationContext) — so the worker stamps the whole Invocation
+        /// into $global:CraftOperationContext per invocation, and Start-CIPPOrchestrator defaults a
+        /// child run to the parent's priority from there.
+        /// Set only for orchestrator activity jobs and post-execution jobs — plain closure jobs
+        /// (scheduler starters, queue starters) deliberately leave it null, because their own job
+        /// priority orders the starter script, not the work it goes on to enqueue.
+        /// </summary>
+        public int? Priority { get; init; }
 
         /// <summary>Category: "HTTP", "Job", "Planner".</summary>
         public string Category { get; init; } = "Job";

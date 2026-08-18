@@ -458,13 +458,15 @@ public class PowerShellRunnerService : IDisposable
         var worker = _pool.CheckoutBackground(CancellationToken.None);
         if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
-        // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
+        // Set invocation context — inherits RunName and Priority from parent OperationContext if set
+        // by JobManager (Priority is what nested Start-CIPPOrchestrator calls inherit)
         var parentRun = OperationContext.Current?.RunName;
         var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
             RunName = parentRun,
+            Priority = OperationContext.Current?.Priority,
             Category = "Job"
         };
         using var opScope = OperationContext.Set(invocation);
@@ -588,13 +590,15 @@ public class PowerShellRunnerService : IDisposable
         var worker = _pool.CheckoutBackground(CancellationToken.None);
         if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
-        // Set invocation context — inherits RunName from parent OperationContext if set by JobManager
+        // Set invocation context — inherits RunName and Priority from parent OperationContext if set
+        // by JobManager (Priority is what nested Start-CIPPOrchestrator calls inherit)
         var parentRun = OperationContext.Current?.RunName;
         var parentFunction = OperationContext.Current?.Function;
         var invocation = new OperationContext.Invocation(functionName)
         {
             WorkerId = $"W{worker.Id}",
             RunName = parentRun,
+            Priority = OperationContext.Current?.Priority,
             Category = "Planner"
         };
         using var opScope = OperationContext.Set(invocation);

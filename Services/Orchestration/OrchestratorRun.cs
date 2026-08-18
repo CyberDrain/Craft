@@ -5,7 +5,9 @@ public class OrchestratorRun
     public string Name { get; set; } = string.Empty;
     public string? Reference { get; set; }
     public string Status { get; set; } = "Pending";
-    public int Priority { get; set; } = 2;
+    // 4 matches what every live enqueue path actually passes when a caller sets nothing — a run row
+    // rehydrated without a stored priority must not come back HIGHER than it originally ran.
+    public int Priority { get; set; } = 4;
     public DateTime StartedUtc { get; set; }
     public DateTime? CompletedUtc { get; set; }
     public List<OrchestratorTaskItem> Tasks { get; set; } = [];
