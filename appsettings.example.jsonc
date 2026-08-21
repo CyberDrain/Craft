@@ -378,6 +378,11 @@
       "TablePrefix": "Orchestrator",
       // Max task interruptions (crash/restart) before marking Failed
       "MaxRetries": 3,
+      // Retention sweep over the three tables: runs that finished (or, if nothing is driving them, last
+      // wrote to storage) longer ago than RetentionHours go, as do Tasks/Results partitions whose Run row
+      // is gone. Once at startup after crash recovery, then every CleanupIntervalHours (0 = startup only).
+      "RetentionHours": 48,
+      "CleanupIntervalHours": 4,
       // Batch + coalesce per-task/run status writes off the fan-out critical path (results are never batched).
       // Default true. Removes the per-task Azure Table write that gates worker throughput — see
       // docs/orch-analysis.md. Set false for the original per-task writes.

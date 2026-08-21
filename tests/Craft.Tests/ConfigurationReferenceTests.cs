@@ -73,6 +73,8 @@ public class ConfigurationReferenceTests
             { "App:Scheduler:ApplyTZOffset",           settings.Scheduler.ApplyTZOffset },
             { "App:Orchestrator:TablePrefix",          settings.Orchestrator.TablePrefix },
             { "App:Orchestrator:MaxRetries",           settings.Orchestrator.MaxRetries },
+            { "App:Orchestrator:RetentionHours",       settings.Orchestrator.RetentionHours },
+            { "App:Orchestrator:CleanupIntervalHours", settings.Orchestrator.CleanupIntervalHours },
             { "App:Cache:MaxEntries",                  settings.Cache.MaxEntries },
             { "App:Cache:DefaultTtlSeconds",           settings.Cache.DefaultTtlSeconds },
             { "App:Scripts:PermissionExtraction:Enabled", settings.Scripts.PermissionExtraction.Enabled },

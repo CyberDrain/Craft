@@ -209,6 +209,18 @@ public sealed class AzureTableStore : ICraftTableStore
             yield return ToRow(entity);
     }
 
+    /// <summary>
+    /// The filtered scan with a <c>$select</c>, for callers that want keys and a stamp rather than the
+    /// row. The retention sweep reads every Results row's partition this way, and a Results row is a
+    /// 64 KiB chunk of payload it has no use for.
+    /// </summary>
+    public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, IReadOnlyList<string>? properties,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var entity in Client(table).QueryAsync<TableEntity>(filter: filter, select: properties, cancellationToken: ct))
+            yield return ToRow(entity);
+    }
+
     public async Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
     {
         try

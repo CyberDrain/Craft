@@ -79,4 +79,18 @@ public class OrchestratorSettings
 
     /// <summary>Maximum number of times a task can be interrupted before being marked Failed.</summary>
     public int MaxRetries { get; set; } = 3;
+
+    /// <summary>
+    /// How long a run's rows outlive it (hours, default 48). A run that finished — or that nothing is
+    /// driving and that last wrote to storage — longer ago than this is removed from all three tables,
+    /// together with any Tasks/Results partition whose Run row is already gone. Craft itself needs the
+    /// rows only while a run is live; they stay this long for operators reading recent history.
+    /// </summary>
+    public int RetentionHours { get; set; } = 48;
+
+    /// <summary>
+    /// How often the retention sweep runs after the one at startup (hours, default 4). 0 disables the
+    /// periodic sweep; the startup pass, which follows crash recovery, still runs.
+    /// </summary>
+    public int CleanupIntervalHours { get; set; } = 4;
 }

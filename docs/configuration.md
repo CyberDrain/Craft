@@ -408,7 +408,15 @@ Fan-out/fan-in task execution with crash recovery.
   "PostExecFunction": "Invoke-CraftPostExecution",
 
   // Max task interruptions (host crash/restart) before marking Failed.
-  "MaxRetries": 3
+  "MaxRetries": 3,
+
+  // Retention sweep over the three tables. A run that finished — or that nothing is driving and that
+  // last wrote to storage — longer ago than RetentionHours is removed together with its Tasks/Results
+  // partitions, as is any Tasks/Results partition whose Run row is already gone. Runs once at startup
+  // (after crash recovery) and then every CleanupIntervalHours; 0 keeps only the startup pass. Craft
+  // needs the rows only while a run is live — the retention is for operators reading recent history.
+  "RetentionHours": 48,
+  "CleanupIntervalHours": 4
 }
 ```
 

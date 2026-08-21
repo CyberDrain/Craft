@@ -70,6 +70,19 @@ public interface ICraftTableStore
     IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, CancellationToken ct = default)
         => QueryTableAsync(table, ct);
 
+    /// <summary>
+    /// The filtered scan, additionally projected to <paramref name="properties"/> (a backend that
+    /// honours it still returns the keys and Timestamp) so that wide rows are not shipped just to read
+    /// their keys.
+    ///
+    /// Same contract as the filter: an optimisation a backend may ignore. This default returns full
+    /// rows, so a caller must only ever READ the properties it asked for and must not take a property's
+    /// absence to mean anything.
+    /// </summary>
+    IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, IReadOnlyList<string>? properties,
+        CancellationToken ct = default)
+        => QueryTableAsync(table, filter, ct);
+
     /// <summary>Delete a single row. A missing row is not an error.</summary>
     Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 
