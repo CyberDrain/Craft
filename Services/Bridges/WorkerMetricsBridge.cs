@@ -232,6 +232,7 @@ public static class WorkerMetricsBridge
                 Running = summary.Running,
                 Completed = summary.Completed,
                 Failed = summary.Failed,
+                Skipped = summary.Skipped,
                 TotalProcessed = summary.TotalProcessed,
                 MaxConcurrency = summary.MaxConcurrency,
                 ActiveConcurrency = summary.ActiveConcurrency,
