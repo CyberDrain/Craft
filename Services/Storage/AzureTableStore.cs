@@ -33,7 +33,9 @@ public sealed class AzureTableStore : ICraftTableStore
         "PartitionKey", "RowKey", "Timestamp", "odata.etag"
     };
 
-    public AzureTableStore(CraftSettings settings)
+    private readonly ILogger<AzureTableStore>? _logger;
+
+    public AzureTableStore(CraftSettings settings, ILogger<AzureTableStore>? logger = null)
     {
         // Resolved lazily so constructing the store on a role that never touches storage does not
         // require a connection string — it is only resolved on first actual use. Prefers the explicit
@@ -41,6 +43,7 @@ public sealed class AzureTableStore : ICraftTableStore
         _connectionString = new Lazy<string>(() =>
             settings.Storage.ResolveConnection(settings.Auth.UserStorageConnection, "table storage"));
         _clientOptions = BuildClientOptions(settings.Storage);
+        _logger = logger;
     }
 
     /// <summary>
@@ -85,11 +88,79 @@ public sealed class AzureTableStore : ICraftTableStore
             break;
     }
 
-    public Task EnsureTableAsync(string table, CancellationToken ct = default) =>
-        Client(table).CreateIfNotExistsAsync(ct);
+    /// <summary>
+    /// How long an operation that found its table missing waits for the service to allow the table to
+    /// be created again. A deleted table is "being deleted" for a while — Azure documents "at least 40
+    /// seconds"; measured at 62 s on a real account — and create answers 409 TableBeingDeleted until
+    /// then. (During that window the service still accepts reads and writes to the doomed table and
+    /// then discards them with it; nothing a client can detect, so the 404 that follows is the first
+    /// real signal.) Azurite has no such window. The wait honours the caller's cancellation token, so
+    /// a status-writer flush that times out simply requeues the write and the next flush resumes.
+    /// </summary>
+    private static readonly TimeSpan TableRecreateWait = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan TableRecreatePoll = TimeSpan.FromSeconds(3);
 
-    public Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default) =>
-        Client(table).UpsertEntityAsync(ToEntity(row), TableUpdateMode.Replace, ct);
+    public Task EnsureTableAsync(string table, CancellationToken ct = default) => CreateTableAsync(table, ct);
+
+    /// <summary>
+    /// The service's answer for a table that does not exist: 404 with error code TableNotFound. A row
+    /// that does not exist is also a 404, but ResourceNotFound, so the code is what separates "row is
+    /// gone" (routine) from "the whole table is gone" (deleted out from under a live host). Transactions
+    /// report it the same way, through <see cref="TableTransactionFailedException"/>.
+    /// </summary>
+    private static bool IsTableNotFound(RequestFailedException ex) =>
+        ex.Status == 404 && (
+            string.Equals(ex.ErrorCode, "TableNotFound", StringComparison.OrdinalIgnoreCase)
+            || ex.Message.Contains("TableNotFound", StringComparison.OrdinalIgnoreCase));
+
+    private async Task CreateTableAsync(string table, CancellationToken ct)
+    {
+        var client = Client(table);
+        var deadline = DateTime.UtcNow + TableRecreateWait;
+        while (true)
+        {
+            try
+            {
+                await client.CreateIfNotExistsAsync(ct);
+                return;
+            }
+            catch (RequestFailedException ex) when (ex.Status == 409
+                && string.Equals(ex.ErrorCode, "TableBeingDeleted", StringComparison.OrdinalIgnoreCase)
+                && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(TableRecreatePoll, ct);
+            }
+        }
+    }
+
+    /// <summary>
+    /// An operation just learned its table no longer exists. Put the table back so the caller can run
+    /// the operation again. A table deleted through table maintenance, or by a reset that cleared the
+    /// orchestrator's state, must not take the host's writes down with it until the next restart — and
+    /// it did, silently: the batch path's per-entity fallback failed the same way and swallowed it.
+    /// If the table cannot be created (still being deleted past <see cref="TableRecreateWait"/>), this
+    /// throws and so does the operation, which is the right outcome for a write that cannot land.
+    /// </summary>
+    private async Task RecreateTableAsync(string table, CancellationToken ct)
+    {
+        await CreateTableAsync(table, ct);
+        _logger?.LogWarning("[TableStore] Table {Table} was missing and has been recreated; retrying the operation that noticed", table);
+    }
+
+    public async Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
+    {
+        var client = Client(table);
+        var entity = ToEntity(row);
+        try
+        {
+            await client.UpsertEntityAsync(entity, TableUpdateMode.Replace, ct);
+        }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            await RecreateTableAsync(table, ct);
+            await client.UpsertEntityAsync(entity, TableUpdateMode.Replace, ct);
+        }
+    }
 
     public async Task UpsertBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows, CancellationToken ct = default)
     {
@@ -102,7 +173,7 @@ public sealed class AzureTableStore : ICraftTableStore
             var rowChars = EstimateChars(row);
             if (batch.Count > 0 && (batch.Count >= MaxBatch || chars + rowChars > MaxBatchChars))
             {
-                await SubmitAsync(client, batch, ct);
+                await SubmitAsync(table, client, batch, ct);
                 batch.Clear();
                 chars = 0;
             }
@@ -111,7 +182,7 @@ public sealed class AzureTableStore : ICraftTableStore
         }
 
         if (batch.Count > 0)
-            await SubmitAsync(client, batch, ct);
+            await SubmitAsync(table, client, batch, ct);
     }
 
     public async Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
@@ -142,6 +213,13 @@ public sealed class AzureTableStore : ICraftTableStore
             await Client(table).SubmitTransactionAsync(actions, ct);
             return true;
         }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            // No table, so no rows, so nothing was claimed. Put the table back for the writes that
+            // follow; this claim itself is simply lost — there is nothing left to retry it against.
+            await RecreateTableAsync(table, ct);
+            return false;
+        }
         catch (RequestFailedException ex) when (ex.Status is 412 or 404 or 409)
         {
             // 412 precondition failed / 409 conflict — someone else changed or claimed a row.
@@ -151,21 +229,41 @@ public sealed class AzureTableStore : ICraftTableStore
         }
     }
 
-    private static async Task SubmitAsync(TableClient client, List<TableTransactionAction> batch, CancellationToken ct)
+    private async Task SubmitAsync(string table, TableClient client, List<TableTransactionAction> batch, CancellationToken ct)
     {
         try
         {
             await client.SubmitTransactionAsync(batch, ct);
+            return;
+        }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            // The table is gone, not the batch. Put it back and submit the same transaction again; only
+            // if THAT fails does the per-entity fallback below get its turn. Without this the fallback
+            // ran against the missing table as well and swallowed every one of its failures, so a
+            // deleted table lost every status write until the next restart without a line in the log.
+            await RecreateTableAsync(table, ct);
+            try
+            {
+                await client.SubmitTransactionAsync(batch, ct);
+                return;
+            }
+            catch (Exception)
+            {
+                // Fall through to the per-entity fallback.
+            }
         }
         catch (Exception)
         {
-            // A transaction is all-or-nothing; on failure fall back to individual upserts so one bad
-            // entity (or a transient 4xx) doesn't drop the whole batch.
-            foreach (var action in batch)
-            {
-                try { await client.UpsertEntityAsync((TableEntity)action.Entity, TableUpdateMode.Replace, ct); }
-                catch { /* best-effort fallback */ }
-            }
+            // Fall through to the per-entity fallback.
+        }
+
+        // A transaction is all-or-nothing; on failure fall back to individual upserts so one bad
+        // entity (or a transient 4xx) doesn't drop the whole batch.
+        foreach (var action in batch)
+        {
+            try { await client.UpsertEntityAsync((TableEntity)action.Entity, TableUpdateMode.Replace, ct); }
+            catch { /* best-effort fallback */ }
         }
     }
 
@@ -176,9 +274,50 @@ public sealed class AzureTableStore : ICraftTableStore
             var response = await Client(table).GetEntityAsync<TableEntity>(partitionKey, rowKey, cancellationToken: ct);
             return ToRow(response.Value);
         }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            // The row cannot exist, which is the same answer as below — but bring the table back now
+            // rather than leaving that to whichever write comes next.
+            await RecreateTableAsync(table, ct);
+            return null;
+        }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Enumerates a query, recreating the table and starting over if the first page reports it missing.
+    /// The retry enumerates the fresh table — empty, but that is the query's answer, and it proves the
+    /// table is back. A table that vanishes mid-stream propagates; paging across a delete is not a case
+    /// worth hiding.
+    /// </summary>
+    private async IAsyncEnumerable<TableEntity> EnumerateAsync(string table, Func<AsyncPageable<TableEntity>> query,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var recreated = false;
+        while (true)
+        {
+            await using var rows = query().GetAsyncEnumerator(ct);
+            bool moved;
+            try
+            {
+                moved = await rows.MoveNextAsync();
+            }
+            catch (RequestFailedException ex) when (!recreated && IsTableNotFound(ex))
+            {
+                recreated = true;
+                await RecreateTableAsync(table, ct);
+                continue;
+            }
+
+            while (moved)
+            {
+                yield return rows.Current;
+                moved = await rows.MoveNextAsync();
+            }
+            yield break;
         }
     }
 
@@ -186,14 +325,14 @@ public sealed class AzureTableStore : ICraftTableStore
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var filter = $"PartitionKey eq '{Escape(partitionKey)}'";
-        await foreach (var entity in Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct))
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct), ct))
             yield return ToRow(entity);
     }
 
     public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        await foreach (var entity in Client(table).QueryAsync<TableEntity>(cancellationToken: ct))
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(cancellationToken: ct), ct))
             yield return ToRow(entity);
     }
 
@@ -205,7 +344,7 @@ public sealed class AzureTableStore : ICraftTableStore
     public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        await foreach (var entity in Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct))
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct), ct))
             yield return ToRow(entity);
     }
 
@@ -217,7 +356,7 @@ public sealed class AzureTableStore : ICraftTableStore
     public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, IReadOnlyList<string>? properties,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        await foreach (var entity in Client(table).QueryAsync<TableEntity>(filter: filter, select: properties, cancellationToken: ct))
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, select: properties, cancellationToken: ct), ct))
             yield return ToRow(entity);
     }
 
@@ -237,10 +376,8 @@ public sealed class AzureTableStore : ICraftTableStore
     {
         var client = Client(table);
         var keys = new List<(string pk, string rk)>();
-        await foreach (var entity in client.QueryAsync<TableEntity>(
-            filter: $"PartitionKey eq '{Escape(partitionKey)}'",
-            select: select,
-            cancellationToken: ct))
+        var filter = $"PartitionKey eq '{Escape(partitionKey)}'";
+        await foreach (var entity in EnumerateAsync(table, () => client.QueryAsync<TableEntity>(filter: filter, select: select, cancellationToken: ct), ct))
         {
             keys.Add((entity.PartitionKey, entity.RowKey));
         }

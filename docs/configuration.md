@@ -422,6 +422,12 @@ Fan-out/fan-in task execution with crash recovery.
 
 All three function settings have sensible defaults provided by the `CraftRuntime/` scripts. Most apps only need to set `TablePrefix`.
 
+A table that goes missing while the host is running — deleted through table maintenance, or by a reset
+that cleared the orchestrator's state — is recreated by the next read or write that notices it, and that
+operation is retried. If the table was only just dropped, the service refuses to recreate it for a while
+(Azure documents "at least 40 seconds"; about a minute in practice) and the operation waits that out, up
+to two minutes. A batch write into a missing table used to fail silently until the next restart.
+
 **Queuing orchestrator runs from PowerShell:**
 
 Call `Start-CraftOrchestrator` (provided in `CraftRuntime/`) to queue a fan-out run:
