@@ -421,6 +421,7 @@ public class JobManager : BackgroundService
             Running = jobs.Count(j => j.Status == "Running"),
             Completed = jobs.Count(j => j.Status == "Completed"),
             Failed = jobs.Count(j => j.Status == "Failed"),
+            Skipped = jobs.Count(j => j.Status == "Skipped"),
             TotalProcessed = _totalProcessed,
             OldestQueuedUtc = queued.Count > 0 ? queued.Min(j => j.QueuedUtc) : null,
             MaxConcurrency = MaxConcurrency,

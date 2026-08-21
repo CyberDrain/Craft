@@ -106,15 +106,12 @@ function Start-CraftOrchestrator {
     # the parent-run lineage below must come from this variable.
     $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
 
-    # Priority resolution: explicit on the InputObject wins; otherwise inherit the enclosing run's
-    # priority; otherwise the default band. Guard the explicit value — the store clamps into 0-99
-    # buckets, so a stray negative would silently land in the critical P00 bucket.
-    $Priority = $InputObject.Priority
-    if ($null -ne $Priority) {
-        $Priority = [int]$Priority
-        if ($Priority -lt 0 -or $Priority -gt 99) { $Priority = $null }
-    }
-    if ($null -eq $Priority) {
+    # Priority resolution: explicit on the InputObject wins when it is a valid bucket; otherwise
+    # inherit the enclosing run's priority; otherwise the default band. Out-of-range values take
+    # the fallback too — the store clamps into 0-99 buckets, so a stray negative would otherwise
+    # silently land in the critical P00 bucket.
+    $Priority = if ($null -ne $InputObject.Priority) { [int]$InputObject.Priority }
+    if ($null -eq $Priority -or $Priority -lt 0 -or $Priority -gt 99) {
         $Priority = $OpContext.Priority ?? 4
     }
 

@@ -20,6 +20,10 @@ public class JobSummary
     public int Running { get; set; }
     public int Completed { get; set; }
     public int Failed { get; set; }
+
+    /// <summary>Stale descriptors that resolved to no work — not failures, the queue entry simply outlived its task.</summary>
+    public int Skipped { get; set; }
+
     public long TotalProcessed { get; set; }
     public DateTime? OldestQueuedUtc { get; set; }
     public int MaxConcurrency { get; set; }
