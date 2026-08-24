@@ -794,31 +794,136 @@ public class OrchestratorTableStore
         }
     }
 
-    /// <summary>Delete all runs (and their tasks/results) older than the retention period.</summary>
-    public async Task CleanupOldRunsAsync(TimeSpan retention)
+    /// <summary>The statuses a RUN ends in. Distinct from <see cref="IsTerminal"/>, which is about tasks.</summary>
+    private static bool IsTerminalRun(string? status) =>
+        status is "Completed" or "CompletedWithErrors" or "Failed" or "Cancelled";
+
+    /// <summary>Keys and Timestamp only — what the orphan scan needs, and nothing a Results chunk carries.</summary>
+    private static readonly string[] s_keysAndTimestamp = ["PartitionKey", "RowKey", "Timestamp"];
+
+    /// <summary>
+    /// Retention sweep over the three tables. Everything removed is decided per run:
+    /// <list type="bullet">
+    ///   <item>A run in a terminal status (Completed, CompletedWithErrors, Failed, Cancelled) whose
+    ///   CompletedUtc — or StartedUtc, for a row written before completion was stamped — is older than
+    ///   <paramref name="retention"/> loses its Run row and its Tasks and Results partitions.</item>
+    ///   <item>A run in any other status is exempt while it is in <paramref name="activeRuns"/> (this
+    ///   process is driving it). Otherwise it is abandoned once nothing about it has been written for
+    ///   <paramref name="retention"/>: task completion is written in one transaction with the
+    ///   '!!run-counter' row, so that row's Timestamp is the heartbeat, and the Run row's own Timestamp
+    ///   and StartedUtc count too. That covers runs recovery could not resume (task script gone), runs
+    ///   queued but never dispatched, and — on a host that shares the tables — runs another process
+    ///   stopped driving.</item>
+    ///   <item>A Tasks or Results partition with no Run row at all is removed once its newest row is
+    ///   older than <paramref name="retention"/>. Those come from <see cref="CleanupRunAsync"/> racing a
+    ///   late status write, and from a Run row deleted while its partitions were still being written;
+    ///   nothing else ever looked at them.</item>
+    /// </list>
+    /// This used to consider only Completed/CompletedWithErrors/Failed runs that carried a CompletedUtc,
+    /// and ran only from the startup recovery pass — so Cancelled runs, abandoned runs and orphaned
+    /// partitions lived forever, and on a host that was not restarted so did everything else.
+    /// </summary>
+    public async Task<OrchestratorCleanupResult> CleanupOldRunsAsync(TimeSpan retention,
+        IReadOnlySet<string>? activeRuns = null, CancellationToken ct = default)
     {
         var cutoff = DateTimeOffset.UtcNow - retention;
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        var expired = new List<string>();
+        var abandoned = new List<string>();
 
         // Collect first, then delete — avoids mutating the "Run" partition while enumerating it.
-        var toClean = new List<string>();
-        await foreach (var row in _store.QueryPartitionAsync(_runsTable, "Run"))
-        {
-            var completedUtc = row.GetDateTimeOffset("CompletedUtc");
-            var status = row.GetString("Status");
+        var runs = new List<StoreRow>();
+        await foreach (var row in _store.QueryPartitionAsync(_runsTable, "Run", ct))
+            runs.Add(row);
 
-            if (status is "Completed" or "CompletedWithErrors" or "Failed"
-                && completedUtc.HasValue && completedUtc.Value < cutoff)
+        foreach (var row in runs)
+        {
+            known.Add(row.RowKey);
+
+            if (IsTerminalRun(row.GetString("Status")))
             {
-                toClean.Add(row.RowKey);
+                var ended = row.GetDateTimeOffset("CompletedUtc")
+                    ?? row.GetDateTimeOffset("StartedUtc")
+                    ?? row.Timestamp;
+                if (ended < cutoff) expired.Add(row.RowKey);
+                continue;
             }
+
+            if (activeRuns != null && activeRuns.Contains(row.RowKey)) continue;
+
+            var counter = await _store.GetAsync(_tasksTable, row.RowKey, CounterRowKey, ct);
+            var lastActivity = Newest(counter?.Timestamp, row.Timestamp, row.GetDateTimeOffset("StartedUtc"));
+            if (lastActivity < cutoff) abandoned.Add(row.RowKey);
         }
 
-        foreach (var name in toClean)
+        foreach (var name in expired)
             await CleanupRunAsync(name);
+        foreach (var name in abandoned)
+        {
+            _logger.LogInformation(
+                "[OrchestratorStore] Run {Name} is not active and has not been written to for {Hours:F0}h — treating it as abandoned",
+                name, retention.TotalHours);
+            await CleanupRunAsync(name);
+        }
 
-        if (toClean.Count > 0)
-            _logger.LogInformation("[OrchestratorStore] Cleaned up {Count} old runs (retention: {Days}d)",
-                toClean.Count, retention.TotalDays);
+        var orphans = 0;
+        foreach (var table in new[] { _tasksTable, _resultsTable })
+            orphans += await CleanupOrphanPartitionsAsync(table, known, cutoff, ct);
+
+        if (expired.Count + abandoned.Count + orphans > 0)
+            _logger.LogInformation(
+                "[OrchestratorStore] Retention sweep removed {Expired} finished run(s), {Abandoned} abandoned run(s) and {Orphans} orphaned partition(s) older than {Hours:F0}h ({Examined} runs examined)",
+                expired.Count, abandoned.Count, orphans, retention.TotalHours, runs.Count);
+
+        return new OrchestratorCleanupResult(runs.Count, expired, abandoned, orphans);
+    }
+
+    private async Task<int> CleanupOrphanPartitionsAsync(string table, HashSet<string> knownRuns,
+        DateTimeOffset cutoff, CancellationToken ct)
+    {
+        // Newest row per partition that has no Run row. Only keys and Timestamp travel: a Results
+        // partition IS the run's payload, and reading that back every sweep would be the cost this
+        // sweep exists to avoid. A backend that ignores the projection still answers correctly, just
+        // expensively.
+        var newest = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+        var unstamped = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var row in _store.QueryTableAsync(table, null, s_keysAndTimestamp, ct))
+        {
+            if (knownRuns.Contains(row.PartitionKey)) continue;
+            if (row.Timestamp is not { } stamped)
+            {
+                // No way to tell how old it is — never guess in the direction of deleting.
+                unstamped.Add(row.PartitionKey);
+                continue;
+            }
+            if (!newest.TryGetValue(row.PartitionKey, out var current) || stamped > current)
+                newest[row.PartitionKey] = stamped;
+        }
+
+        var removed = 0;
+        foreach (var (partition, stamped) in newest)
+        {
+            if (stamped >= cutoff || unstamped.Contains(partition)) continue;
+            try
+            {
+                await _store.DeletePartitionAsync(table, partition, ct);
+                removed++;
+                _logger.LogInformation("[OrchestratorStore] Removed orphaned partition {Table}/{Partition}", table, partition);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[OrchestratorStore] Failed to remove orphaned partition {Table}/{Partition}", table, partition);
+            }
+        }
+        return removed;
+    }
+
+    private static DateTimeOffset? Newest(params DateTimeOffset?[] candidates)
+    {
+        DateTimeOffset? newest = null;
+        foreach (var candidate in candidates)
+            if (candidate.HasValue && (!newest.HasValue || candidate.Value > newest.Value)) newest = candidate;
+        return newest;
     }
 
     /// <summary>Split a string into chunks of at most maxChars characters, avoiding surrogate splits.</summary>

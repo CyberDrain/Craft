@@ -94,6 +94,10 @@ public class SchedulerService : BackgroundService
             _logger.LogError(ex, "[Scheduler] Failed to resume interrupted orchestrator runs");
         }
 
+        // Retention sweeps for the rest of the process lifetime; recovery ran the first one. Fire and
+        // forget is deliberate: the loop handles its own failures and ends with the stopping token.
+        _ = _orchestrator.RunRetentionLoopAsync(stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;

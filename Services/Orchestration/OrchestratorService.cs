@@ -538,14 +538,85 @@ public class OrchestratorService : IJobDescriptorStateWriter
             }
         }
 
-        // Cleanup old runs (older than 7 days)
+        // First retention pass, now that every run that could be resumed is back in _activeRuns and so
+        // exempt from the abandoned-run rule. The scheduler keeps it going on an interval from here.
         try
         {
-            await _store.CleanupOldRunsAsync(TimeSpan.FromDays(7));
+            await RunRetentionSweepAsync(ct);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[Scheduler] Failed to cleanup old runs");
+            _logger.LogWarning(ex, "[Scheduler] Startup retention sweep failed");
+        }
+    }
+
+    /// <summary>
+    /// One retention pass over the orchestrator tables: finished runs past
+    /// <c>Orchestrator:RetentionHours</c>, runs nobody is driving that have not been written to for that
+    /// long, and Tasks/Results partitions whose Run row is already gone. Runs at the end of startup
+    /// recovery and then every <c>Orchestrator:CleanupIntervalHours</c> via <see cref="RunRetentionLoopAsync"/>.
+    /// </summary>
+    public async Task<OrchestratorCleanupResult> RunRetentionSweepAsync(CancellationToken ct)
+    {
+        var retention = TimeSpan.FromHours(Math.Max(1, _settings.Orchestrator.RetentionHours));
+        var active = _activeRuns.Keys.ToHashSet(StringComparer.Ordinal);
+        var result = await _store.CleanupOldRunsAsync(retention, active, ct);
+
+        // An abandoned run can still have rows in the durable queue. The pump would drop each as a
+        // stale descriptor when it came to claim it — but only after paying for the claim.
+        foreach (var name in result.AbandonedRuns)
+        {
+            try
+            {
+                await _queue.RemoveRunAsync(name, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[Scheduler] Could not remove queue rows for abandoned run {Name}", name);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Periodic retention sweeps for the life of the host, started by the scheduler once recovery has
+    /// run. A sweep that fails is logged and tried again next interval; <c>CleanupIntervalHours</c> of 0
+    /// leaves only the startup pass.
+    /// </summary>
+    public async Task RunRetentionLoopAsync(CancellationToken ct)
+    {
+        var hours = _settings.Orchestrator.CleanupIntervalHours;
+        if (hours <= 0)
+        {
+            _logger.LogInformation(
+                "[Scheduler] Periodic retention sweep disabled (CleanupIntervalHours={Hours}); only the startup pass runs", hours);
+            return;
+        }
+
+        var interval = TimeSpan.FromHours(hours);
+        using var timer = new PeriodicTimer(interval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try
+                {
+                    await RunRetentionSweepAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[Scheduler] Retention sweep failed; next attempt in {Interval}", interval);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutdown.
         }
     }
 
