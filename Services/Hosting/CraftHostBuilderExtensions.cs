@@ -316,9 +316,29 @@ public static class CraftHostBuilderExtensions
             // honour unprompted, so emitting it is what makes the limit self-documenting.
             options.OnRejected = (context, _) =>
             {
+                var retryAfter = ResolveRetryAfterSeconds(context.Lease, window);
                 context.HttpContext.Response.Headers.RetryAfter =
-                    ResolveRetryAfterSeconds(context.Lease, window)
-                        .ToString(CultureInfo.InvariantCulture);
+                    retryAfter.ToString(CultureInfo.InvariantCulture);
+
+                // A 429 is otherwise invisible — the caller sees it, the operator does not. Log the
+                // client the limit fired for (the same partition key the limiter counts against) so a
+                // throttled integration or a runaway loop can be identified. Warning, not Error: this
+                // is an expected, client-caused outcome, but one worth surfacing. Resolved per
+                // rejection because service registration has no built provider yet; CreateLogger is
+                // cheap and the factory caches per category. Never let logging break the response.
+                try
+                {
+                    context.HttpContext.RequestServices.GetService<ILoggerFactory>()?
+                        .CreateLogger("Craft.Hosting.RateLimiter")
+                        .LogWarning(
+                            "Rate limit exceeded — 429 for {Client} on {Method} {Path}; Retry-After {RetryAfter}s",
+                            RateLimitPartitionKey.Resolve(context.HttpContext),
+                            context.HttpContext.Request.Method,
+                            context.HttpContext.Request.Path.Value,
+                            retryAfter);
+                }
+                catch { /* logging must never turn a throttle into a 500 */ }
+
                 return ValueTask.CompletedTask;
             };
 
