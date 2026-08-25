@@ -26,6 +26,10 @@ public class PowerShellRunnerService : IDisposable
     private readonly AuthSettings _authSettings;
     private readonly ScriptRepoSettings _scriptsSettings;
 
+    // How long an HTTP request waits for a free runspace before it is shed with 503. Resolved once
+    // (env override → Worker:HttpQueueTimeoutSeconds → built-in default) — see ResolveHttpQueueTimeout.
+    private readonly TimeSpan _httpQueueTimeout;
+
     // Static JsonSerializerOptions — allocated once, reused everywhere
     private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = false };
 
@@ -45,6 +49,7 @@ public class PowerShellRunnerService : IDisposable
         _workerSettings = settings.Worker;
         _authSettings = settings.Auth;
         _scriptsSettings = settings.Scripts;
+        _httpQueueTimeout = CraftHostBuilderExtensions.ResolveHttpQueueTimeout(settings.Worker);
     }
 
     /// <summary>
@@ -90,7 +95,7 @@ public class PowerShellRunnerService : IDisposable
         EventHandler<DataAddedEventArgs>? onVerbose = null;
         try
         {
-            worker = _pool.CheckoutHttp(TimeSpan.FromSeconds(30));
+            worker = _pool.CheckoutHttp(_httpQueueTimeout);
             if (worker == null)
             {
                 return new ScriptResult
@@ -278,11 +283,12 @@ public class PowerShellRunnerService : IDisposable
             var checkoutStart = timing != null ? Stopwatch.GetTimestamp() : 0;
             if (isHttp)
             {
-                worker = _pool.CheckoutHttp(TimeSpan.FromSeconds(30));
+                worker = _pool.CheckoutHttp(_httpQueueTimeout);
                 if (timing != null) timing.CheckoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
                 if (worker == null)
                 {
-                    _logger.LogWarning("HTTP pool exhausted — no worker available within 30s for {Route}", route);
+                    _logger.LogWarning("HTTP pool exhausted — no worker available within {Timeout:0}s for {Route}",
+                        _httpQueueTimeout.TotalSeconds, route);
                     return new ScriptResult
                     {
                         StatusCode = 503,

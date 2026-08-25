@@ -76,6 +76,29 @@ public class WorkerSettings
     public int BgTimeoutSeconds { get; set; }
 
     /// <summary>
+    /// How long an incoming HTTP request waits for a free PowerShell runspace when every worker in the
+    /// HTTP pool is already busy, before it is shed with <c>503 "Server busy, please retry"</c>.
+    ///
+    /// <para>
+    /// This is a load-shedding bound, NOT a capacity or execution knob. It does not add throughput —
+    /// under sustained saturation it only changes how long callers wait before the 503 (longer waits
+    /// hold connections and lengthen the tail). Its value is in absorbing <b>brief</b> bursts: a
+    /// request that would have got a worker a few seconds later completes instead of failing spuriously.
+    /// When 503s appear under steady load the levers are <see cref="HttpPoolSize"/> /
+    /// <see cref="MinThreads"/> / a larger host, not this.
+    /// </para>
+    ///
+    /// <para>
+    /// Distinct from <see cref="HttpTimeoutSeconds"/> (which bounds how long a request may <i>execute</i>
+    /// once it holds a worker). 0 or negative = the built-in default of 30 seconds.
+    /// </para>
+    ///
+    /// Env override: <c>CRAFT_HTTP_QUEUE_TIMEOUT</c> (seconds), which wins over this setting.
+    /// Resolved by <c>CraftHostBuilderExtensions.ResolveHttpQueueTimeout</c>.
+    /// </summary>
+    public int HttpQueueTimeoutSeconds { get; set; }
+
+    /// <summary>
     /// Environment variables to inject into every PowerShell runspace.
     /// Use "{ApiBasePath}" as a placeholder — it will be replaced with the resolved API directory at startup.
     /// Example: { "MyAppRoot": "{ApiBasePath}", "AppMode": "container" }

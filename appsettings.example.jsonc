@@ -163,6 +163,14 @@
       // 0 = no timeout (default). Recommended: 600-3600 for background jobs
       // "BgTimeoutSeconds": 0,
 
+      // How long an HTTP request waits for a free runspace when the pool is saturated before it is
+      // shed with 503 "Server busy, please retry". A load-shedding bound, NOT a capacity knob — it
+      // does not add throughput, it only decides how long callers wait before a spurious 503. Widen
+      // it to absorb brief bursts; raise HttpPoolSize/MinThreads for steady saturation. Distinct from
+      // HttpTimeoutSeconds (which bounds execution once a worker is held).
+      // 0 = built-in default of 30s. Env override: CRAFT_HTTP_QUEUE_TIMEOUT (seconds).
+      // "HttpQueueTimeoutSeconds": 30,
+
       // Extra env vars injected into every runspace
       // "EnvVars": { "MY_VAR": "value" },
 

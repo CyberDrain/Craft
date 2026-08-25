@@ -74,6 +74,31 @@ public static class CraftHostBuilderExtensions
         return Math.Max(baseline, forPools);
     }
 
+    /// <summary>The built-in HTTP worker-checkout wait when nothing overrides it.</summary>
+    public const int DefaultHttpQueueTimeoutSeconds = 30;
+
+    /// <summary>
+    /// Resolves how long an HTTP request waits for a free runspace before it is shed with 503:
+    /// the <c>CRAFT_HTTP_QUEUE_TIMEOUT</c> env var (seconds) wins, then an explicit
+    /// <c>Worker:HttpQueueTimeoutSeconds</c>, otherwise the built-in
+    /// <see cref="DefaultHttpQueueTimeoutSeconds"/>. See <see cref="WorkerSettings.HttpQueueTimeoutSeconds"/>
+    /// for why this is a load-shedding bound and not a capacity knob.
+    /// </summary>
+    public static TimeSpan ResolveHttpQueueTimeout(WorkerSettings worker)
+    {
+        ArgumentNullException.ThrowIfNull(worker);
+
+        if (int.TryParse(
+                Environment.GetEnvironmentVariable("CRAFT_HTTP_QUEUE_TIMEOUT"),
+                NumberStyles.Integer, CultureInfo.InvariantCulture, out var fromEnv) && fromEnv > 0)
+            return TimeSpan.FromSeconds(fromEnv);
+
+        if (worker.HttpQueueTimeoutSeconds > 0)
+            return TimeSpan.FromSeconds(worker.HttpQueueTimeoutSeconds);
+
+        return TimeSpan.FromSeconds(DefaultHttpQueueTimeoutSeconds);
+    }
+
     /// <summary>
     /// Kestrel limits: request timeouts, HTTP/2 tuning, and the DoS-relevant caps (body size,
     /// connection count, slow-loris minimum data rates). The caps apply regardless of the timeout.
