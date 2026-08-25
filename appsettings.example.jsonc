@@ -80,11 +80,22 @@
     // collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
     // Set "Enabled": false to turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true
     // can also force it on.
+    //
+    // ApiConcurrencyLimit adds a second, orthogonal cap: the most requests a single app-only API
+    // client (client-credentials caller, idp=aad) may have occupying the worker system AT ONCE —
+    // counting both those queued waiting for a runspace and those executing, since the limiter's lease
+    // spans the whole downstream pipeline. Keyed per client (its AppId), so one automation cannot hold
+    // every runspace and starve the interactive UI, which is never capped by this. A rate cap
+    // (PermitPerWindow) bounds requests/second; this bounds simultaneous-in-flight. 0 (default) = off.
+    // Over-limit requests are rejected immediately with 429 + Retry-After (no concurrency queue).
+    // Env override: CRAFT_API_CONCURRENCY_LIMIT. Works even with "Enabled": false (rate limiter off,
+    // concurrency cap on) — the limiter middleware runs whenever either is active.
     // "RateLimit": {
     //   "Enabled": true,
-    //   "PermitPerWindow": 300,   // requests allowed per window, per client
-    //   "WindowSeconds": 10,      // window length in seconds
-    //   "QueueLimit": 0           // requests queued at the limit before rejecting (0 = reject immediately)
+    //   "PermitPerWindow": 300,     // requests allowed per window, per client
+    //   "WindowSeconds": 10,        // window length in seconds
+    //   "QueueLimit": 0,            // requests queued at the limit before rejecting (0 = reject immediately)
+    //   "ApiConcurrencyLimit": 0    // max simultaneous in-flight requests per API client (0 = unlimited)
     // },
 
     // Realtime SSE channel served at /.craft/events. Downstream code publishes job events through

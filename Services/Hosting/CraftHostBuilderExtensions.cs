@@ -293,9 +293,16 @@ public static class CraftHostBuilderExtensions
     }
 
     /// <summary>
-    /// Per-client fixed-window rate limiter so a single caller cannot exhaust the small HTTP worker
-    /// pool. Enabled by default; turn off with <c>App:RateLimit:Enabled=false</c>. Throttled requests
-    /// get a 429 carrying <c>Retry-After</c>.
+    /// The request limiter, a chain of up to two partitioned limiters sharing one 429 + Retry-After
+    /// rejection path:
+    /// <list type="bullet">
+    ///   <item><description>A per-client fixed-window <b>rate</b> limiter (on by default) so a single
+    ///   caller cannot exhaust the small HTTP worker pool; turn off with <c>App:RateLimit:Enabled=false</c>.</description></item>
+    ///   <item><description>A per-client <b>concurrency</b> cap on app-only API callers
+    ///   (<c>App:RateLimit:ApiConcurrencyLimit</c>, off by default) so one automation cannot hold every
+    ///   runspace at once and starve the interactive UI, which is never capped.</description></item>
+    /// </list>
+    /// The middleware is skipped entirely when neither is active.
     /// </summary>
     public static IServiceCollection AddCraftRateLimiter(
         this IServiceCollection services, CraftSettings settings)
@@ -303,9 +310,10 @@ public static class CraftHostBuilderExtensions
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(settings);
 
-        if (!settings.RateLimit.IsEnabled) return services;
+        var rl = settings.RateLimit;
+        if (!rl.RequiresLimiterMiddleware) return services;
 
-        var window = TimeSpan.FromSeconds(Math.Max(1, settings.RateLimit.WindowSeconds));
+        var window = TimeSpan.FromSeconds(Math.Max(1, rl.WindowSeconds));
 
         services.AddRateLimiter(options =>
         {
@@ -342,16 +350,51 @@ public static class CraftHostBuilderExtensions
                 return ValueTask.CompletedTask;
             };
 
-            options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
-                RateLimitPartition.GetFixedWindowLimiter(
-                    RateLimitPartitionKey.Resolve(context),
-                    _ => new FixedWindowRateLimiterOptions
-                    {
-                        PermitLimit = Math.Max(1, settings.RateLimit.PermitPerWindow),
-                        Window = window,
-                        QueueLimit = Math.Max(0, settings.RateLimit.QueueLimit),
-                        QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-                    }));
+            // Built as a chain so a request must satisfy every active limiter. Order is immaterial —
+            // rejection by either sheds the request through the one OnRejected above.
+            var limiters = new List<PartitionedRateLimiter<HttpContext>>(2);
+
+            if (rl.IsEnabled)
+            {
+                // Per-client request RATE. Partition key is the authenticated principal (else address).
+                limiters.Add(PartitionedRateLimiter.Create<HttpContext, string>(context =>
+                    RateLimitPartition.GetFixedWindowLimiter(
+                        RateLimitPartitionKey.Resolve(context),
+                        _ => new FixedWindowRateLimiterOptions
+                        {
+                            PermitLimit = Math.Max(1, rl.PermitPerWindow),
+                            Window = window,
+                            QueueLimit = Math.Max(0, rl.QueueLimit),
+                            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                        })));
+            }
+
+            var apiConcurrency = rl.ResolvedApiConcurrencyLimit;
+            if (apiConcurrency > 0)
+            {
+                // Per-client CONCURRENCY on app-only API callers only. The lease is held for the whole
+                // downstream pipeline, so a permit covers both the wait for a runspace and execution —
+                // that is what makes this cap "in flight + queued for a worker" rather than just one.
+                limiters.Add(PartitionedRateLimiter.Create<HttpContext, string>(context =>
+                {
+                    if (!CallerClassifier.IsApiClient(context))
+                        return RateLimitPartition.GetNoLimiter("ui");
+
+                    // Keyed on the AppId so each client's budget is its own, not shared across clients.
+                    return RateLimitPartition.GetConcurrencyLimiter(
+                        context.Request.Headers["x-ms-client-principal-name"].ToString(),
+                        _ => new ConcurrencyLimiterOptions
+                        {
+                            PermitLimit = apiConcurrency,
+                            QueueLimit = 0,   // fail fast: the excess is rejected, not parked
+                            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                        });
+                }));
+            }
+
+            options.GlobalLimiter = limiters.Count == 1
+                ? limiters[0]
+                : PartitionedRateLimiter.CreateChained(limiters.ToArray());
         });
 
         return services;

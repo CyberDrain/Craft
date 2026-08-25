@@ -382,7 +382,7 @@ if (capHttp)
 //     counting those against the caller's budget could throttle a user for opening a page.
 // Left outside the capHttp block on purpose: a frontend-only node has no auth middleware and no
 // worker pool, but should still be protected, partitioned by origin address as before.
-if (CraftSettings.RateLimit.IsEnabled)
+if (CraftSettings.RateLimit.RequiresLimiterMiddleware)
     app.UseRateLimiter();
 
 // Concurrent request tracking for diagnostics. A holder object, not an int: the dispatch endpoint
