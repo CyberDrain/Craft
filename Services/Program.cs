@@ -16,8 +16,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Bind App section to CraftSettings
 builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"));
-// Apply SkuProfiles override (host-tier pool sizing) before any consumer resolves the options
-builder.Services.PostConfigure<CraftSettings>(s => SkuProfileSelector.Apply(s));
+// Apply SkuProfiles override (host-tier pool sizing + GC heap limit) before any consumer resolves
+// the options — the heap limit lands via GC.RefreshMemoryLimit, so it must run before the worker
+// pools start growing the heap.
+builder.Services.PostConfigure<CraftSettings>(s => GcHeapLimit.Apply(SkuProfileSelector.Apply(s)));
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 

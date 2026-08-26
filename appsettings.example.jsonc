@@ -153,13 +153,18 @@
       //           (e.g. "Basic", "PremiumV3"). Ignored when SkuEnv is empty.
       //   Cpu:    compared to Environment.ProcessorCount (respects cgroup limits in
       //           Docker). Omit or 0 = match any CPU count.
+      //   GCHeapHardLimitMB: optional GC heap hard limit (MB) for this tier. The
+      //           DOTNET_GCHeapHardLimit env var is consumed before managed code runs,
+      //           so this lands via GC.RefreshMemoryLimit at startup instead. Omit or
+      //           0 = keep the process baseline. Raising is always safe; a value the
+      //           heap has already outgrown is refused and logged, keeping the baseline.
       // First match wins. No match (or any parse failure) leaves the baseline above.
       // Set IgnoreSkuProfiles: true to disable this entirely.
       // "IgnoreSkuProfiles": false,
       // "SkuProfiles": [
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 1, "HttpPoolSize": 2, "BgPoolSize": 2 },
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 2, "HttpPoolSize": 3, "BgPoolSize": 4 },
-      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 4, "HttpPoolSize": 4, "BgPoolSize": 4 },
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 4, "HttpPoolSize": 4, "BgPoolSize": 4, "GCHeapHardLimitMB": 5120 },
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 2, "HttpPoolSize": 4, "BgPoolSize": 8 },
       //   { "Cpu": 8,                                              "HttpPoolSize": 6, "BgPoolSize": 12 }
       // ],

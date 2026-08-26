@@ -15,6 +15,10 @@ namespace Craft.Hosting;
 /// Detection is best-effort by design: any failure logs and leaves the baseline sizes untouched
 /// rather than taking the host down over a pool-sizing hint.
 /// </para>
+/// <para>
+/// The returned profile may also carry a <see cref="SkuProfile.GCHeapHardLimitMB"/>; applying that
+/// is a process-wide side effect and lives in <see cref="GcHeapLimit"/>, not here.
+/// </para>
 /// </summary>
 public static class SkuProfileSelector
 {

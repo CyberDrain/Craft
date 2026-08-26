@@ -32,4 +32,13 @@ public class SkuProfile
 
     /// <summary>Background worker pool size to apply when this profile matches.</summary>
     public int BgPoolSize { get; set; }
+
+    /// <summary>
+    /// Optional GC heap hard limit, in MB, to apply when this profile matches. Omit or 0 = keep the
+    /// process baseline (typically the DOTNET_GCHeapHardLimit env var baked into the image for the
+    /// smallest tier). The env var is consumed by the CLR before any managed code runs, so this is
+    /// applied after the fact via <see cref="Craft.Hosting.GcHeapLimit"/> — raising the limit is
+    /// always safe; a value the heap has already outgrown is refused and logged.
+    /// </summary>
+    public int? GCHeapHardLimitMB { get; set; }
 }
