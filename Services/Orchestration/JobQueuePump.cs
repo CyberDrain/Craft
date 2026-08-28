@@ -92,7 +92,14 @@ public class JobQueuePump : BackgroundService
             {
                 // One bad cycle must not end the pump; the next tick tries again. A pump that dies
                 // silently would look exactly like an empty queue.
-                _logger.LogError(ex, "[JobQueuePump] Cycle failed; continuing");
+                //
+                // The log itself is guarded: under a pegged GC hard limit even LogError allocates and can
+                // throw OOM, and this catch is the last frame before ExecuteAsync — an escape here faults
+                // the service and, with the host's default StopHost behaviour, restarts the container
+                // mid-run. A failed log is never worth the pump. (BackgroundTaskLimiter guards its logs
+                // past the point of commitment for the same reason.)
+                try { _logger.LogError(ex, "[JobQueuePump] Cycle failed; continuing"); }
+                catch { /* logging is never worth the loop */ }
             }
 
             // Idle means this pump has nothing: it claimed nothing AND holds nothing. Note what is

@@ -41,6 +41,10 @@ public sealed class OrchestratorStatusWriter : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _drainLoop;
 
+    /// <summary>Set first in <see cref="Dispose"/> so a status enqueue racing shutdown drops its wake
+    /// instead of throwing ObjectDisposedException into a job that already succeeded.</summary>
+    private volatile bool _disposed;
+
     public bool Enabled => _enabled;
 
     public OrchestratorStatusWriter(OrchestratorTableStore store, ILogger<OrchestratorStatusWriter> logger, CraftSettings settings)
@@ -84,7 +88,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
             _pendingTasks[Key(runName, task.Id)] = Snap(runName, task);
             barrier = _barrier.Task;
         }
-        _signal.Release();
+        Signal();
 
         // Bounded. This wait sits between dispatch and worker checkout while holding a JobManager slot,
         // so waiting forever converts a slow flush into a whole-host outage — observed in production as
@@ -135,7 +139,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
     {
         if (!_enabled) { _ = _store.UpsertTaskAsync(runName, task); return; }
         lock (_lock) { _pendingTasks[Key(runName, task.Id)] = Snap(runName, task); }
-        _signal.Release();
+        Signal();
     }
 
     /// <summary>Queue a run's status — non-blocking, coalesced, flushed by the drain loop.</summary>
@@ -143,7 +147,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
     {
         if (!_enabled) { _ = _store.UpsertRunAsync(run); return; }
         lock (_lock) { _pendingRuns[run.Name] = run; }
-        _signal.Release();
+        Signal();
     }
 
     /// <summary>Flush all currently-pending writes and await their persistence. Call before finalizing a run
@@ -153,7 +157,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
         if (!_enabled) return;
         Task barrier;
         lock (_lock) { barrier = _barrier.Task; }
-        _signal.Release();
+        Signal();
 
         // Bounded for the same reason as the Running marker: this is awaited by FinalizeRunAsync, and an
         // unbounded wait meant no run could finalize while a flush was stuck. Requeue-on-failure means a
@@ -296,14 +300,28 @@ public sealed class OrchestratorStatusWriter : IDisposable
 
         if (restored > 0)
         {
-            _signal.Release(); // make sure the next flush actually runs
+            Signal(); // make sure the next flush actually runs
             _logger.LogWarning("[Orchestrator] Requeued {Count} un-persisted status writes across {Runs} runs",
                 restored, retry.Count);
         }
     }
 
+    /// <summary>
+    /// Wake the drain loop. Guarded so a status enqueue that races <see cref="Dispose"/> — an in-flight
+    /// job finishing after shutdown began — drops the wake instead of throwing ObjectDisposedException.
+    /// By the time a task queues its terminal status its data is already persisted, so a lost coalesced
+    /// wake on the way down is harmless; a task falsely marked Failed because the release threw is not.
+    /// </summary>
+    private void Signal()
+    {
+        if (_disposed) return;
+        try { _signal.Release(); }
+        catch (ObjectDisposedException) { /* shutting down; the drain loop has already stopped */ }
+    }
+
     public void Dispose()
     {
+        _disposed = true;
         _cts.Cancel();
         try { _drainLoop.Wait(TimeSpan.FromSeconds(5)); } catch { /* best effort final drain */ }
         _cts.Dispose();

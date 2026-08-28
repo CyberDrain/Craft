@@ -320,7 +320,13 @@ public class JobManager : BackgroundService
                 // Anything else — a throw out of the queue lock, the limiter or the semaphore — used to
                 // escape ExecuteAsync and silently end dispatch for the life of the process. One bad
                 // iteration must not stop every future job.
-                _logger.LogError(ex, "[JobManager] Dispatch iteration failed; continuing");
+                //
+                // The log is guarded too: under a pegged GC hard limit LogError can itself throw OOM, and
+                // this catch is the last frame before ExecuteAsync — an escape here faults the loop and,
+                // with the host's default StopHost behaviour, takes the container down mid-run. A failed
+                // log is never worth dispatch. (BackgroundTaskLimiter guards its logs for the same reason.)
+                try { _logger.LogError(ex, "[JobManager] Dispatch iteration failed; continuing"); }
+                catch { /* logging is never worth the loop */ }
             }
             finally
             {
