@@ -75,6 +75,9 @@ var nativeCatalog = NativeEndpointRegistry.Discover(
     LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Craft.Endpoints"));
 
 builder.Services.AddCraftServices(roles);
+// The discovered catalog, injectable so the startup telemetry emitter can report a native route count
+// without re-scanning. Registered even when empty so the dependency always resolves.
+builder.Services.AddSingleton(nativeCatalog);
 if (!nativeCatalog.IsEmpty)
     builder.Services.AddNativeEndpoints(nativeCatalog, builder.Configuration);
 builder.Services.AddCraftRateLimiter(craftSettings);

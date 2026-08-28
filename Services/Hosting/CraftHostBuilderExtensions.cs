@@ -11,6 +11,7 @@ using Craft.Realtime;
 using Craft.Services;
 using Craft.Setup;
 using Craft.Storage;
+using Craft.Telemetry;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Logging.Console;
@@ -267,6 +268,15 @@ public static class CraftHostBuilderExtensions
             var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger<ContainerHealthMonitor>();
             return new ContainerHealthMonitor(logger, health);
         });
+
+        // Startup telemetry emitter. Registered on EVERY node (not just Background) so a frontend+api
+        // node still reports; the service self-gates on role, config, and the persisted storm guard,
+        // and fires at most once per process. The roles are made injectable here for it to report
+        // host.roles, and IHttpClientFactory for the single outbound POST.
+        services.AddSingleton(roles);
+        services.AddHttpClient();
+        services.AddSingleton<StartupTelemetryService>();
+        services.AddHostedService(sp => sp.GetRequiredService<StartupTelemetryService>());
 
         return services;
     }

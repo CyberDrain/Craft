@@ -55,6 +55,14 @@
     <Authors>CyberDrain</Authors>
     <RepositoryUrl>https://github.com/CyberDrain/CRAFT</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <!--
+      Version stamping. Without this the assembly version defaults to 1.0.0, so the CRAFT version
+      reported in startup telemetry would be meaningless. Overridden at build time, e.g.
+      `dotnet build /p:Version=1.4.2+abc123` (CI feeds the real version). The default keeps a real,
+      non-1.0.0 marker for local builds. AssemblyInformationalVersion carries the full string
+      (including +metadata); the emitter reads that.
+    -->
+    <Version Condition="'$(Version)' == ''">0.0.0-dev</Version>
   </PropertyGroup>
 
 </Project>
