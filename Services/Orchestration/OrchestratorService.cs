@@ -792,9 +792,19 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // permanent, which is a worse failure than the premature finalize it exists to prevent.
             var timer = new Timer(_ =>
                 {
-                    LogRunStatus(run);
-                    RedrivePendingTasks(run);
-                    lock (_lock) { CheckRunCompletion(run); }
+                    // A System.Threading.Timer callback that throws crashes the process. This periodic
+                    // maintenance tick must never take the host down on a transient error — a dependency
+                    // disposed during shutdown, a race on run state — so it logs and waits for the next tick.
+                    try
+                    {
+                        LogRunStatus(run);
+                        RedrivePendingTasks(run);
+                        lock (_lock) { CheckRunCompletion(run); }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
+                    }
                 },
                 null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
             if (!_runStatusTimers.TryAdd(run.Name, timer))
