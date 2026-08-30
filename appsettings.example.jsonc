@@ -158,6 +158,9 @@
       //           so this lands via GC.RefreshMemoryLimit at startup instead. Omit or
       //           0 = keep the process baseline. Raising is always safe; a value the
       //           heap has already outgrown is refused and logged, keeping the baseline.
+      //           Per-instance override: CRAFT_GC_HEAP_LIMIT_MB wins over this (a positive
+      //           value sets the cap; 0 disables the cap entirely, deferring to container
+      //           memory) — hand-tune one host without touching the fleet-wide profiles.
       // First match wins. No match (or any parse failure) leaves the baseline above.
       // Set IgnoreSkuProfiles: true to disable this entirely.
       // "IgnoreSkuProfiles": false,

@@ -39,6 +39,11 @@ public class SkuProfile
     /// smallest tier). The env var is consumed by the CLR before any managed code runs, so this is
     /// applied after the fact via <see cref="Craft.Hosting.GcHeapLimit"/> — raising the limit is
     /// always safe; a value the heap has already outgrown is refused and logged.
+    /// <para>
+    /// Per-instance override: the <c>CRAFT_GC_HEAP_LIMIT_MB</c> env var wins over this value (a positive
+    /// value sets the cap; <c>0</c> disables the cap entirely), so an operator can hand-tune one host
+    /// without editing the fleet-wide profile list.
+    /// </para>
     /// </summary>
     public int? GCHeapHardLimitMB { get; set; }
 }

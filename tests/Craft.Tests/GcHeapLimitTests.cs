@@ -64,7 +64,7 @@ public class GcHeapLimitTests
             _ => throw new InvalidOperationException("RefreshMemoryLimit failed"));
 
         Assert.False(applied);
-        Assert.Contains(logs, l => l.Contains("GC heap hard limit refresh to 1 MB failed", StringComparison.Ordinal));
+        Assert.Contains(logs, l => l.Contains("GC heap hard limit change (1 MB) by SkuProfile failed", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -90,5 +90,84 @@ public class GcHeapLimitTests
             AppContext.SetData("GCHeapHardLimit", (ulong)before);
             GC.RefreshMemoryLimit();
         }
+    }
+
+    // ── CRAFT_GC_HEAP_LIMIT_MB: the per-instance escape hatch ─────────────────────────────────────────
+    // Restores the control a fleet-wide profile would otherwise take away: the profile writes the limit
+    // through AppContext, which overrides a hand-set DOTNET_GCHeapHardLimit, so an operator needs a way
+    // back in without editing the shared profile list. readEnv is injected here to keep the process
+    // environment untouched, exactly as refresh is injected to keep the real GC untouched.
+
+    [Fact]
+    public void EnvOverride_WinsOverProfile()
+    {
+        var profile = new SkuProfile { GCHeapHardLimitMB = 5120 };
+        var logs = new List<string>();
+        ulong? requested = null;
+
+        var applied = GcHeapLimit.Apply(profile, logs.Add, bytes => requested = bytes, () => "8192");
+
+        Assert.True(applied);
+        Assert.Equal(8192UL * 1024 * 1024, requested);   // env value, not the profile's 5120
+        Assert.Contains(logs, l => l.Contains("set to 8192 MB by CRAFT_GC_HEAP_LIMIT_MB", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EnvOverrideZero_DisablesTheCap_OverridingTheProfile()
+    {
+        var profile = new SkuProfile { GCHeapHardLimitMB = 5120 };
+        var logs = new List<string>();
+        ulong? requested = 123;   // sentinel: proves the 0 is what actually reaches refresh
+
+        var applied = GcHeapLimit.Apply(profile, logs.Add, bytes => requested = bytes, () => "0");
+
+        Assert.True(applied);
+        Assert.Equal(0UL, requested);
+        Assert.Contains(logs, l => l.Contains("disabled by CRAFT_GC_HEAP_LIMIT_MB", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EnvOverrideZero_DisablesTheCap_WithNoProfile()
+    {
+        var logs = new List<string>();
+        ulong? requested = 123;
+
+        var applied = GcHeapLimit.Apply(null, logs.Add, bytes => requested = bytes, () => "0");
+
+        Assert.True(applied);
+        Assert.Equal(0UL, requested);
+        Assert.Contains(logs, l => l.Contains("disabled by CRAFT_GC_HEAP_LIMIT_MB", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("not-a-number")]
+    [InlineData("-5")]      // negative = invalid, not a request to disable; that's what 0 is for
+    public void EnvOverrideAbsentOrInvalid_DefersToProfile(string? env)
+    {
+        var profile = new SkuProfile { GCHeapHardLimitMB = 5120 };
+        var logs = new List<string>();
+        ulong? requested = null;
+
+        var applied = GcHeapLimit.Apply(profile, logs.Add, bytes => requested = bytes, () => env);
+
+        Assert.True(applied);
+        Assert.Equal(5120UL * 1024 * 1024, requested);
+        Assert.Contains(logs, l => l.Contains("set to 5120 MB by SkuProfile", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EnvOverrideZero_WhenRefreshRefuses_LogsAndKeepsBaseline()
+    {
+        var logs = new List<string>();
+
+        var applied = GcHeapLimit.Apply(null, logs.Add,
+            _ => throw new InvalidOperationException("nope"), () => "0");
+
+        Assert.False(applied);
+        Assert.Contains(logs, l => l.Contains(
+            "GC heap hard limit change (disable) by CRAFT_GC_HEAP_LIMIT_MB failed", StringComparison.Ordinal));
     }
 }
