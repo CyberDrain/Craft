@@ -216,6 +216,20 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             catch (Exception ex) { _logger.LogWarning("Post-init script failed: {Error}", ex.Message); }
         }
 
+        // Capture the clean ExecutionContext baseline once (shared across the pool) so Cleanup can reset
+        // per-invocation AsyncLocal state on the reused pipeline thread. Runs on the pipeline thread via
+        // RunScript. Never fail worker init over this.
+        try
+        {
+            RunScript("[Craft.PowerShellHost.PipelineExecutionContext]::CaptureBaselineIfNeeded()");
+            if (PipelineExecutionContext.BaselineIsDefault)
+                _logger.LogWarning("Worker{Id}: ExecutionContext baseline captured as the runtime default; per-invocation reset will no-op.", Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Worker{Id}: failed to capture ExecutionContext baseline; per-invocation reset will be skipped.", Id);
+        }
+
         _initialized = true;
         _logger.LogInformation("Worker{Id}: {Count} functions deployed", Id, deployed);
     }
@@ -418,8 +432,33 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     {
         _pwsh.Commands.Clear();
         _pwsh.Streams.ClearStreams();
+        ResetPipelineExecutionContext();
         CleanupGlobalVariables();
         CleanupJobs();
+    }
+
+    /// <summary>
+    /// Reset the reused pipeline thread's ExecutionContext to the clean baseline, dropping any AsyncLocal
+    /// set during the invocation (which would otherwise leak to the next invocation on this worker). Runs
+    /// <see cref="PipelineExecutionContext.Reset"/> as a minimal pipeline so it executes ON the pipeline
+    /// thread. SessionState (module $script: vars, injected caches) is not in the ExecutionContext, so it
+    /// is unaffected. Never fail an invocation over this — catch, log, continue.
+    /// </summary>
+    private void ResetPipelineExecutionContext()
+    {
+        try
+        {
+            _pwsh.AddScript("[Craft.PowerShellHost.PipelineExecutionContext]::Reset()").Invoke();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Worker{Id}: per-invocation ExecutionContext reset failed; continuing.", Id);
+        }
+        finally
+        {
+            _pwsh.Commands.Clear();
+            _pwsh.Streams.ClearStreams();
+        }
     }
 
     private void CleanupGlobalVariables()
