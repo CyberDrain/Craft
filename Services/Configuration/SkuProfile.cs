@@ -34,11 +34,18 @@ public class SkuProfile
     public int BgPoolSize { get; set; }
 
     /// <summary>
-    /// Optional GC heap hard limit, in MB, to apply when this profile matches. Omit or 0 = keep the
-    /// process baseline (typically the DOTNET_GCHeapHardLimit env var baked into the image for the
-    /// smallest tier). The env var is consumed by the CLR before any managed code runs, so this is
-    /// applied after the fact via <see cref="Craft.Hosting.GcHeapLimit"/> — raising the limit is
-    /// always safe; a value the heap has already outgrown is refused and logged.
+    /// Optional GC heap hard limit, in MB, to apply when this profile matches. Three-way, mirroring the
+    /// <c>CRAFT_GC_HEAP_LIMIT_MB</c> override:
+    /// <list type="bullet">
+    /// <item><description>Omitted / null (or negative) = no opinion, keep the process baseline (typically
+    /// the DOTNET_GCHeapHardLimit env var baked into the image for the smallest tier).</description></item>
+    /// <item><description><c>0</c> = disable the cap entirely, so the GC uses the container's own memory
+    /// allowance — for tiers with more memory than the baked limit lets them use.</description></item>
+    /// <item><description>&gt; 0 = set that many MB.</description></item>
+    /// </list>
+    /// The baked env var is consumed by the CLR before any managed code runs, so this is applied after
+    /// the fact via <see cref="Craft.Hosting.GcHeapLimit"/> — raising or removing the limit is always
+    /// safe; a positive value the heap has already outgrown is refused and logged.
     /// <para>
     /// Per-instance override: the <c>CRAFT_GC_HEAP_LIMIT_MB</c> env var wins over this value (a positive
     /// value sets the cap; <c>0</c> disables the cap entirely), so an operator can hand-tune one host

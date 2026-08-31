@@ -50,10 +50,9 @@ public static class GcHeapLimit
         // wins over the fleet-wide profile — same shape as ResolvedApiConcurrencyLimit / ResolveHttpQueueTimeout.
         //   > 0 : set that many MB, overriding the profile.
         //     0 : disable the cap entirely — refresh to the container's own memory allowance, discarding
-        //         the image-baked DOTNET_GCHeapHardLimit. Distinct from a profile's 0/null, which means
-        //         "no opinion, keep the baseline". Removing the cap only ever raises the limit, so it
-        //         cannot trip RefreshMemoryLimit's "below committed heap" guard.
-        //   unset / negative / unparseable : defer to the profile (original behaviour).
+        //         the image-baked DOTNET_GCHeapHardLimit. Removing the cap only ever raises the limit, so
+        //         it cannot trip RefreshMemoryLimit's "below committed heap" guard.
+        //   unset / negative / unparseable : defer to the profile.
         readEnv ??= () => Environment.GetEnvironmentVariable("CRAFT_GC_HEAP_LIMIT_MB");
         var envMB = int.TryParse(readEnv(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var e) && e >= 0
             ? e
@@ -68,10 +67,15 @@ public static class GcHeapLimit
         }
         else
         {
-            mb = profile?.GCHeapHardLimitMB ?? 0;
             source = "SkuProfile";
-            // Profile 0/null/negative = keep the process baseline, silently (like unused SkuProfiles).
-            if (mb <= 0) return false;
+            // A profile carries the same three-way meaning as the env override above:
+            //   null / omitted / negative : no opinion — keep the process baseline (like unused SkuProfiles).
+            //     0 : disable the cap entirely, identical to CRAFT_GC_HEAP_LIMIT_MB=0 (a large tier that has
+            //         more memory to give than the baked limit lets it use container/physical memory).
+            //   > 0 : set that many MB.
+            var profileMB = profile?.GCHeapHardLimitMB;
+            if (profileMB is null or < 0) return false;
+            mb = profileMB.Value;
         }
 
         refresh ??= SetAndRefresh;

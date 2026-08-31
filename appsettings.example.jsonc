@@ -155,9 +155,12 @@
       //           Docker). Omit or 0 = match any CPU count.
       //   GCHeapHardLimitMB: optional GC heap hard limit (MB) for this tier. The
       //           DOTNET_GCHeapHardLimit env var is consumed before managed code runs,
-      //           so this lands via GC.RefreshMemoryLimit at startup instead. Omit or
-      //           0 = keep the process baseline. Raising is always safe; a value the
-      //           heap has already outgrown is refused and logged, keeping the baseline.
+      //           so this lands via GC.RefreshMemoryLimit at startup instead. Three-way,
+      //           mirroring the CRAFT_GC_HEAP_LIMIT_MB override below: omit/null (or a
+      //           negative value) = keep the process baseline; 0 = disable the cap entirely,
+      //           deferring to container memory (for a tier with more RAM than the baked
+      //           limit lets it use); > 0 = set that many MB. Raising or removing is always
+      //           safe; a positive value the heap has already outgrown is refused and logged.
       //           Per-instance override: CRAFT_GC_HEAP_LIMIT_MB wins over this (a positive
       //           value sets the cap; 0 disables the cap entirely, deferring to container
       //           memory) — hand-tune one host without touching the fleet-wide profiles.
@@ -171,6 +174,22 @@
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 2, "HttpPoolSize": 4, "BgPoolSize": 8 },
       //   { "Cpu": 8,                                              "HttpPoolSize": 6, "BgPoolSize": 12 }
       // ],
+      //
+      // A second SkuProfiles matrix, selected by the *presence* of an env var. When the var named by
+      // SkuProfilesAltEnv is set to any non-empty value, SkuProfilesAlt is matched instead of SkuProfiles
+      // — e.g. a smaller per-instance sizing for instances packed onto one shared App Service Plan. Falls
+      // back to SkuProfiles when the var is unset or SkuProfilesAlt is empty. Same fields as SkuProfiles.
+      // Set the var on the packed instances and leave it unset on dedicated ones. As with SkuProfiles, an
+      // entry that matches nothing just keeps the global HttpPoolSize/BgPoolSize — no catch-all needed.
+      // "SkuProfilesAltEnv": "CIPP_HOSTED",
+      // "SkuProfilesAlt": [
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 8, "HttpPoolSize": 2, "BgPoolSize": 4, "GCHeapHardLimitMB": 2048 }
+      // ],
+      //
+      // Per-instance overrides for the pool sizes themselves, winning over any matched profile (same
+      // shape as CRAFT_GC_HEAP_LIMIT_MB): CRAFT_HTTP_POOL_SIZE / CRAFT_BG_POOL_SIZE. A non-negative
+      // integer wins; unset / negative / unparseable defers to the matrix. Hand-tune one host without
+      // touching the fleet-wide profiles.
 
       // Maximum execution time (seconds) for HTTP request handlers
       // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed

@@ -25,10 +25,11 @@ public class GcHeapLimitTests
 
     [Theory]
     [InlineData(null)]
-    [InlineData(0)]
     [InlineData(-1)]
     public void ProfileWithoutALimit_IsANoOp(int? mb)
     {
+        // Omitted/null (or negative) = no opinion: keep the baseline, silently. A literal 0 is different
+        // — see ProfileZero_DisablesTheCap.
         var profile = new SkuProfile { HttpPoolSize = 2, BgPoolSize = 2, GCHeapHardLimitMB = mb };
         var logs = new List<string>();
 
@@ -36,6 +37,22 @@ public class GcHeapLimitTests
 
         Assert.False(applied);
         Assert.Empty(logs);
+    }
+
+    [Fact]
+    public void ProfileZero_DisablesTheCap()
+    {
+        // A profile's literal 0 disables the cap entirely — same meaning as CRAFT_GC_HEAP_LIMIT_MB=0 —
+        // so a large tier uses container memory instead of the baked smallest-tier limit.
+        var profile = new SkuProfile { HttpPoolSize = 2, BgPoolSize = 2, GCHeapHardLimitMB = 0 };
+        var logs = new List<string>();
+        ulong? requested = 123;   // sentinel: proves 0 is what reaches refresh
+
+        var applied = GcHeapLimit.Apply(profile, logs.Add, bytes => requested = bytes);
+
+        Assert.True(applied);
+        Assert.Equal(0UL, requested);
+        Assert.Contains(logs, l => l.Contains("disabled by SkuProfile", StringComparison.Ordinal));
     }
 
     [Fact]

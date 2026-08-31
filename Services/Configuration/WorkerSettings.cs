@@ -36,6 +36,23 @@ public class WorkerSettings
     public bool IgnoreSkuProfiles { get; set; }
 
     /// <summary>
+    /// A second SkuProfiles matrix, selected when the env var named by <see cref="SkuProfilesAltEnv"/> is
+    /// present (set to a non-empty value); otherwise <see cref="SkuProfiles"/> is used. Lets a deployment
+    /// ship one config with two sizings — e.g. a smaller per-instance matrix for instances packed onto a
+    /// shared App Service Plan — and pick between them with a single env var. Same matching rules as
+    /// <see cref="SkuProfiles"/>. Ignored (falls back to <see cref="SkuProfiles"/>) when empty.
+    /// </summary>
+    public List<SkuProfile> SkuProfilesAlt { get; set; } = [];
+
+    /// <summary>
+    /// Name of the env var whose presence selects <see cref="SkuProfilesAlt"/> instead of
+    /// <see cref="SkuProfiles"/> (e.g. "CIPP_HOSTED"). Null/empty = the second matrix is never used.
+    /// Only presence matters — set the var (to any non-empty value) on the instances that should use the
+    /// second matrix, and leave it unset on the rest. Configurable so each app picks its own flag.
+    /// </summary>
+    public string? SkuProfilesAltEnv { get; set; }
+
+    /// <summary>
     /// Minimum .NET thread-pool worker/completion threads. <b>0 (default) = derive from the pool
     /// sizes</b>, which is almost always what you want; set a number only to pin it.
     ///
