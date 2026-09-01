@@ -93,6 +93,11 @@ public class JobQueuePump : BackgroundService
             var claimedAny = false;
             try
             {
+                // Ensure the queue schema is migrated before this pump ever claims. It is a cheap bool
+                // check after the first success; before it, claiming could hand out a row the one-time
+                // key migration is still rewriting. Idempotent and shared with the enqueue paths.
+                await _queue.InitializeAsync(stoppingToken);
+
                 await ReleaseFinishedAsync(stoppingToken);
                 claimedAny = await RefillAsync(stoppingToken);
                 await RenewAsync(stoppingToken);

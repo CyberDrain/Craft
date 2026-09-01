@@ -50,17 +50,22 @@ public class JobQueueStoreTests
     }
 
     [Fact]
-    public async Task ClaimsOldestFirstWithinAPriority()
+    public async Task ReEnqueuingATaskUpsertsOneRowRatherThanDuplicating()
     {
         var (queue, _) = NewQueue();
         await queue.InitializeAsync();
 
-        await queue.EnqueueAsync("run", "newer", 4, At(10));
-        await queue.EnqueueAsync("run", "older", 4, At(1));
+        // The re-dispatch case (crash recovery, orphan re-drive). Schema v2 keys deterministically per
+        // (run, task), so the second enqueue UPDATES the first row instead of adding a duplicate — the
+        // duplicate that used to get claimed and executed a second time.
+        await queue.EnqueueAsync("run", "task-0", 4, At(1));
+        await queue.EnqueueAsync("run", "task-0", 4, At(10));
 
-        var claimed = await queue.ClaimBatchAsync("worker-a", 1, Lease);
+        Assert.Single(await queue.GetQueuedTaskIdsAsync("run"));
 
-        Assert.Equal("older", Assert.Single(claimed).TaskId);
+        Assert.Equal("task-0", Assert.Single(await queue.ClaimBatchAsync("worker-a", 8, Lease)).TaskId);
+        // Only one row ever existed, so nothing is left to claim a second time.
+        Assert.Empty(await queue.ClaimBatchAsync("worker-b", 8, Lease));
     }
 
     /// <summary>
@@ -187,13 +192,13 @@ public class JobQueueStoreTests
     }
 
     [Fact]
-    public void RowKeysSortByQueueTimeAcrossTickDigitBoundaries()
+    public void RowKeyIsDeterministicPerRunAndTask()
     {
-        var early = JobQueueStore.BuildRowKey(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc), "r", "t");
-        var later = JobQueueStore.BuildRowKey(new DateTime(2026, 1, 1, 0, 0, 1, DateTimeKind.Utc), "r", "t");
-
-        Assert.True(string.CompareOrdinal(early, later) < 0);
-        Assert.Equal(19, early.IndexOf('-', StringComparison.Ordinal));
+        // Schema v2: the key is a function of (run, task) only, so re-dispatching a task upserts its one
+        // row instead of writing a second, time-prefixed one — the duplicate-execution class.
+        Assert.Equal(JobQueueStore.BuildRowKey("r", "t"), JobQueueStore.BuildRowKey("r", "t"));
+        Assert.NotEqual(JobQueueStore.BuildRowKey("r", "t1"), JobQueueStore.BuildRowKey("r", "t2"));
+        Assert.NotEqual(JobQueueStore.BuildRowKey("r1", "t"), JobQueueStore.BuildRowKey("r2", "t"));
     }
 
     [Fact]
@@ -208,13 +213,15 @@ public class JobQueueStoreTests
     // ─── Status/maintenance surface (the table-backed worker-health view) ───
 
     [Fact]
-    public void ParseQueuedUtcInvertsBuildRowKey()
+    public void RowKeyEscapingKeepsDistinctPairsDistinctAndKeysLegal()
     {
-        var queuedUtc = new DateTime(2026, 8, 12, 3, 4, 5, DateTimeKind.Utc);
-        var rowKey = JobQueueStore.BuildRowKey(queuedUtc, "run", "task");
+        // The '|' separator and '%' escape are themselves escaped, so "a|b"+"c" and "a"+"b|c" cannot
+        // collide onto one row.
+        Assert.NotEqual(JobQueueStore.BuildRowKey("a|b", "c"), JobQueueStore.BuildRowKey("a", "b|c"));
 
-        Assert.Equal(queuedUtc, JobQueueStore.ParseQueuedUtc(rowKey));
-        Assert.Null(JobQueueStore.ParseQueuedUtc("not-a-tick-prefixed-key"));
+        // An illegal character in a component is escaped away, keeping the key legal for Azure Table.
+        var key = JobQueueStore.BuildRowKey("run", "Owner/Repo - No tenant");
+        Assert.DoesNotContain(key, c => c is '/' or '\\' or '#' or '?' || char.IsControl(c));
     }
 
     [Fact]

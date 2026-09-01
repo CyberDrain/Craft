@@ -135,16 +135,16 @@ public class JobQueueAzuriteTests
     }
 
     [Fact]
-    public async Task BackendReturnsWorkPriorityFirstThenOldestFirst()
+    public async Task BackendReturnsWorkHighestPriorityFirst()
     {
         var queue = await TryConnectAsync();
         if (queue == null) return;
 
-        // Inserted in the least helpful order: the bulk low-priority work first, urgent last, and the
-        // newest P4 before the oldest. If any of this came back in insertion order the scheme is broken.
+        // Inserted in the least helpful order: bulk P4 work first, urgent P0 last, idle P6 early. If any
+        // of this came back in insertion order the priority scheme is broken.
         await queue.EnqueueBatchAsync("StandardsApply",
-            [("std-newer", 4), ("std-older", 4)], At(30));
-        await queue.EnqueueAsync("StandardsApply", "std-oldest", 4, At(1));
+            [("std-a", 4), ("std-b", 4)], At(30));
+        await queue.EnqueueAsync("StandardsApply", "std-c", 4, At(1));
         await queue.EnqueueAsync("DbCache", "cache-0", 6, At(0));
         await queue.EnqueueAsync("AuditLogIngest", "audit-0", 0, At(59));
 
@@ -160,10 +160,12 @@ public class JobQueueAzuriteTests
         Assert.Equal("audit-0", order[0]);
         Assert.Equal("cache-0", order[4]);
 
-        // Within P4, oldest first — std-oldest was queued at minute 1, the other two at minute 30.
-        Assert.Equal("std-oldest", order[1]);
-        Assert.Contains("std-newer", order.GetRange(2, 2));
-        Assert.Contains("std-older", order.GetRange(2, 2));
+        // The three P4 tasks fill the middle, ahead of P6 and behind P0. Schema v2 keys per (run, task),
+        // so ORDER within a priority is no longer oldest-first — only that they all rank between the two.
+        var middle = order.GetRange(1, 3);
+        Assert.Contains("std-a", middle);
+        Assert.Contains("std-b", middle);
+        Assert.Contains("std-c", middle);
     }
 
     [Fact]

@@ -99,8 +99,7 @@ public class TableKeyTests
             }
             """);
 
-        var rowKey = JobQueueStore.BuildRowKey(
-            new DateTime(2026, 8, 11, 4, 31, 0, DateTimeKind.Utc), "UserTaskOrchestrator_No tenant", id);
+        var rowKey = JobQueueStore.BuildRowKey("UserTaskOrchestrator_No tenant", id);
 
         Assert.True(TableKeys.IsSafe(rowKey));
     }
