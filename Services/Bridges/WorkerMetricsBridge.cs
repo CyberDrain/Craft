@@ -693,6 +693,27 @@ public static class WorkerMetricsBridge
         => s_jobManager?.DeleteJob(jobId) ?? false;
 
     /// <summary>
+    /// Empty the durable job queue — a maintenance/reset primitive. Returns the number of queue rows
+    /// removed, or -1 if the orchestrator is unavailable or the clear failed. In-flight work is
+    /// unaffected and Pending tasks may be re-driven, so pair with <see cref="CancelRun"/> when the
+    /// intent is to STOP work rather than clear a wedged or corrupted queue.
+    /// PS usage: <c>[Craft.Services.WorkerMetricsBridge]::ClearQueue()</c>.
+    /// </summary>
+    public static int ClearQueue()
+    {
+        if (s_orchestrator is not { } orchestrator) return -1;
+        try
+        {
+            return Task.Run(() => orchestrator.ClearQueueAsync(CancellationToken.None)).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            s_logger?.LogWarning(ex, "[WorkerMetrics] ClearQueue failed");
+            return -1;
+        }
+    }
+
+    /// <summary>
     /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for an
     /// unclaimed durable row it moves the row to the new priority bucket (keeping its age) and records
     /// the override on the task so a restart re-queues it at the operator's priority.

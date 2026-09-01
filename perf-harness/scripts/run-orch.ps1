@@ -5,7 +5,7 @@
 .DESCRIPTION
   Brings up CRAFT in backend mode + Azurite, enqueues a parent orchestration of N tasks (each optionally
   sleeping -TaskMs to simulate work, and optionally spawning a child orchestration of -ChildN leaf tasks),
-  then polls /API/jobs/allocation at high frequency to build a timeline of:
+  then polls /API/PerfAllocation at high frequency to build a timeline of:
     - BG pool busy vs idle workers
     - the BackgroundTaskLimiter gate (currentMax)  ← the ramp
     - JobManager queued / active
@@ -84,7 +84,7 @@ try {
   $samples = New-Object System.Collections.ArrayList
   $idleStreak = 0; $sawWork = $false; $wdl = (Get-Date).AddSeconds($MaxWaitSec)
   while((Get-Date) -lt $wdl){
-    try { $a = Invoke-RestMethod "$baseUrl/API/jobs/allocation" -TimeoutSec 5 } catch { Start-Sleep -Milliseconds 250; continue }
+    try { $a = Invoke-RestMethod "$baseUrl/API/PerfAllocation" -TimeoutSec 5 } catch { Start-Sleep -Milliseconds 250; continue }
     $t = ((Get-Date) - $t0).TotalSeconds
     [void]$samples.Add([pscustomobject]@{ t=[math]::Round($t,2); busy=$a.pool.bgBusy; total=$a.pool.bgTotal
       max=$a.limiter.currentMax; limActive=$a.limiter.active; limWait=$a.limiter.waiting

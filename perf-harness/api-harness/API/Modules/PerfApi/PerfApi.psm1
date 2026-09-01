@@ -90,6 +90,50 @@ function Push-PerfBgLeaf {
     return @{ ok = $true; idx = $Item.idx }
 }
 
+# Worker/queue allocation snapshot — the harness's downstream wrapper around the CRAFT bridge, standing
+# in for what a real app (e.g. CIPP) does: CRAFT exposes the data as [Craft.Services.WorkerMetricsBridge],
+# the app wraps whichever fields it wants into its own endpoint. Returns the shape run-orch.ps1 and the
+# time-to-first-work probes read (jm/queue/limiter/pool) plus memory, for the OOM-resilience harness.
+function Invoke-PerfAllocation {
+    param($Request, $TriggerMetadata)
+    $s = [Craft.Services.WorkerMetricsBridge]::GetSnapshot()
+    return @{ StatusCode = 200; Body = @{
+        jm = @{
+            active         = $s.Jobs.Running
+            queued         = $s.Jobs.QueuedLocal
+            maxConcurrency = $s.Jobs.MaxConcurrency
+        }
+        queue = @{
+            unclaimed = $s.Jobs.QueuedDurable
+            total     = $s.Jobs.Queued
+        }
+        limiter = @{
+            currentMax    = $s.Limiter.CurrentMax
+            baseMax       = $s.Limiter.BaseConcurrency
+            ceiling       = $s.Limiter.CeilingConcurrency
+            active        = $s.Limiter.Active
+            waiting       = $s.Limiter.Waiting
+            httpThrottled = $s.Limiter.IsHttpThrottled
+        }
+        pool = @{
+            bgBusy    = $s.BgPool.BusyCount
+            bgTotal   = $s.BgPool.PoolSize
+            bgAvail   = $s.BgPool.Available
+            httpAvail = $s.HttpPool.Available
+        }
+        memory = @{
+            heapMB           = $s.Memory.HeapMB
+            rssMB            = $s.Memory.RssMB
+            committedMB      = $s.Memory.CommittedMB
+            containerLimitMB = $s.Memory.ContainerLimitMB
+            containerUsedMB  = $s.Memory.ContainerUsedMB
+            gcHeapLimitMB    = $s.Memory.GCHeapLimitMB
+            usagePct         = $s.Memory.UsagePct
+            gc0 = $s.Memory.GC0; gc1 = $s.Memory.GC1; gc2 = $s.Memory.GC2
+        }
+    } }
+}
+
 # Identity reflector: returns the principal CRAFT resolved for this request — the EasyAuth
 # x-ms-client-principal (base64 claims), plus X-Forwarded-For. Used to confirm header decoding,
 # role lookup, and client-IP pass-through.

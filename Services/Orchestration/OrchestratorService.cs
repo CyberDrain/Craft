@@ -1907,6 +1907,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
+    /// Empty the durable job queue (maintenance/reset). Delegates to <see cref="JobQueueStore.ClearAllAsync"/>
+    /// — see its remarks: in-flight work is unaffected and Pending tasks may be re-driven, so pair this
+    /// with <see cref="CancelRunAsync"/> when the intent is to STOP work rather than clear a wedged queue.
+    /// Returns the number of queue rows removed.
+    /// </summary>
+    public Task<int> ClearQueueAsync(CancellationToken ct = default) => _queue.ClearAllAsync(ct);
+
+    /// <summary>
     /// Cancel a running orchestrator run. Pending tasks are marked Cancelled immediately.
     /// Already-running tasks are allowed to finish (no force-kill).
     /// Queued jobs in the JobManager will be skipped when they are dequeued.

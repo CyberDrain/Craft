@@ -415,10 +415,11 @@ StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryServic
 if (capHttp)
 {
 
-    // Setup wizard API and job/run status API — both plain C#, no PowerShell involved.
-    // See Services/Hosting/Endpoints/.
+    // Setup wizard API — plain C#, no PowerShell involved. See Services/Hosting/Endpoints/.
+    // Job/run status and queue maintenance are intentionally NOT HTTP endpoints here: CRAFT exposes them
+    // as bridge methods (WorkerMetricsBridge / QueueStatusBridge) and a downstream app wraps whichever it
+    // needs into its own endpoints — the perf-harness's PerfApi module (Invoke-PerfAllocation) is one.
     app.MapCraftSetupEndpoints(CraftSettings);
-    app.MapCraftJobEndpoints();
 
     // Native C# endpoints. Mapped before the PowerShell dispatcher, though ASP.NET route precedence
     // would put a literal segment ahead of /API/{endpoint} regardless — which is what lets an app

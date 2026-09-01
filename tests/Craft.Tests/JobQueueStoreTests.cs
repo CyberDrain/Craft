@@ -225,6 +225,26 @@ public class JobQueueStoreTests
     }
 
     [Fact]
+    public async Task ClearAllEmptiesTheQueueButLeavesItUsable()
+    {
+        var (queue, _) = NewQueue();
+        await queue.InitializeAsync();
+        await queue.EnqueueBatchAsync("run-a",
+            Enumerable.Range(0, 3).Select(i => ($"task-{i}", 4)).ToList(), At(0));
+        await queue.EnqueueAsync("run-b", "solo", 4, At(0));
+
+        var removed = await queue.ClearAllAsync();
+
+        Assert.Equal(4, removed);
+        Assert.Empty(await queue.ListQueuedAsync());
+        Assert.Empty(await queue.GetQueuedTaskIdsAsync("run-a"));
+
+        // The schema marker survives, so the queue keeps working — a fresh enqueue lands and is claimable.
+        await queue.EnqueueAsync("run-c", "again", 4, At(1));
+        Assert.Equal("again", Assert.Single(await queue.ClaimBatchAsync("w", 8, Lease)).TaskId);
+    }
+
+    [Fact]
     public async Task ListQueuedReportsIdentityAgeAndClaimState()
     {
         var (queue, _) = NewQueue();

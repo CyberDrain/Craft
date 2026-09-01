@@ -508,6 +508,56 @@ public sealed class JobQueueStore : IDisposable
     }
 
     /// <summary>
+    /// Empty the durable queue: delete every queue row and every index row (keeping only the schema
+    /// marker). Returns the number of queue rows removed.
+    ///
+    /// A maintenance/reset primitive. It drops the BACKLOG, not in-flight work — a row a worker is already
+    /// running finishes, and the pump's later removal of it simply 404s. Tasks still Pending in the
+    /// orchestrator's own tables can be re-driven onto the queue by recovery, so pair this with cancelling
+    /// the runs when the intent is to STOP work rather than to clear a wedged or corrupted queue.
+    /// Deletes are streamed in bounded windows, so this holds a fixed amount of memory on any queue size.
+    /// </summary>
+    public async Task<int> ClearAllAsync(CancellationToken ct = default)
+    {
+        await InitializeAsync(ct);
+
+        var removed = await ClearTableAsync(_queueTable, keepSchema: false, ct);
+        await ClearTableAsync(_indexTable, keepSchema: true, ct);
+
+        _logger.LogWarning("[JobQueue] Durable queue cleared — {Count} queue row(s) removed", removed);
+        return removed;
+    }
+
+    /// <summary>Delete every row of one table (optionally sparing the schema marker), batched per
+    /// partition and flushed in bounded windows so a huge table never lands in memory at once.</summary>
+    private async Task<int> ClearTableAsync(string table, bool keepSchema, CancellationToken ct)
+    {
+        var removed = 0;
+        var pending = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var buffered = 0;
+
+        async Task FlushAsync()
+        {
+            foreach (var (partition, keys) in pending)
+                await _store.DeleteBatchAsync(table, partition, keys, ct);
+            removed += buffered;
+            pending.Clear();
+            buffered = 0;
+        }
+
+        await foreach (var row in _store.QueryTableAsync(table, ct))
+        {
+            if (keepSchema && row.PartitionKey == SchemaPartition) continue;
+            if (!pending.TryGetValue(row.PartitionKey, out var keys)) pending[row.PartitionKey] = keys = [];
+            keys.Add(row.RowKey);
+            if (++buffered >= BackfillFlushThreshold) await FlushAsync();
+        }
+
+        await FlushAsync();
+        return removed;
+    }
+
+    /// <summary>
     /// Hand back every claim on a run's rows, making them immediately claimable again. Returns how many
     /// were released.
     ///
