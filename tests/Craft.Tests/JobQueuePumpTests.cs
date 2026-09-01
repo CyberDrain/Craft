@@ -145,6 +145,69 @@ public class JobQueuePumpTests
         Assert.Null(ex);
     }
 
+    /// <summary>
+    /// The wake signal: an enqueue must start the pump now, not on its next poll tick. With a
+    /// deliberately long poll interval, a task queued after the pump has gone quiet is still claimed
+    /// promptly — which can only happen if the enqueue woke it. Without the signal this waits the full
+    /// poll interval, which on a cold system had backed off toward its idle ceiling.
+    /// </summary>
+    [Fact]
+    public async Task AnEnqueueWakesThePumpBeforeTheNextPollTick()
+    {
+        var settings = new CraftSettings();
+        settings.Worker.BgPoolSize = 4;
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["JobQueueBatchSize"] = "4",
+            ["JobQueueLowWaterMark"] = "2",
+            // Long enough that a poll-driven claim would miss the assertion window by an order of magnitude.
+            ["JobQueuePollIntervalMs"] = "5000",
+            ["JobQueueIdlePollIntervalMs"] = "5000",
+        }).Build();
+
+        var backing = new RunRemainingCounterTests.ConditionalStore();
+        var queue = new JobQueueStore(NullLogger<JobQueueStore>.Instance, settings, backing);
+        await queue.InitializeAsync();
+
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
+        var pump = new JobQueuePump(NullLogger<JobQueuePump>.Instance, queue, jobs, config, settings);
+
+        await pump.StartAsync(CancellationToken.None);
+        try
+        {
+            // Let the first (empty) cycle run and the pump settle into its long wait.
+            await Task.Delay(200);
+            Assert.Equal(0, jobs.QueuedCount);
+
+            await queue.EnqueueBatchAsync("run",
+                new[] { ("task-1", 4) },
+                new DateTime(2026, 8, 9, 2, 0, 0, DateTimeKind.Utc));
+
+            // Well under the 5s poll: only the wake can explain a claim this fast.
+            var claimed = await WaitUntilAsync(() => jobs.QueuedCount > 0, TimeSpan.FromMilliseconds(1500));
+            Assert.True(claimed,
+                "the pump did not claim the enqueued task within 1.5s despite a 5s poll — the wake signal did not fire");
+        }
+        finally
+        {
+            await Task.WhenAny(pump.StopAsync(CancellationToken.None), Task.Delay(3000));
+        }
+    }
+
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            if (condition()) return true;
+            await Task.Delay(20);
+        }
+        return condition();
+    }
+
     private sealed class ThrowingStore : ICraftTableStore
     {
         public Task PingAsync(CancellationToken ct = default) => Task.CompletedTask;

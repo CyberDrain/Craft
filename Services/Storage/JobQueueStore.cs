@@ -50,13 +50,40 @@ namespace Craft.Storage;
 /// claim path is untouched. The index is maintained by the enqueue/remove paths, and built once for a
 /// pre-existing queue by <see cref="BackfillIndexAsync"/>.
 /// </summary>
-public class JobQueueStore
+public sealed class JobQueueStore : IDisposable
 {
     private readonly ILogger<JobQueueStore> _logger;
     private readonly ICraftTableStore _store;
     private readonly string _queueTable;
     private readonly string _indexTable;
     private bool _initialized;
+
+    /// <summary>
+    /// Wakes the <see cref="Craft.Orchestration.JobQueuePump"/> the moment claimable rows appear, instead
+    /// of it discovering them only on its next poll tick. Bounded at one pending permit: many enqueues
+    /// between two pump cycles coalesce into a single wake, because one refill claims a whole batch anyway.
+    /// The pump keeps polling on its (idle-backing-off) interval as the backstop — this signal only
+    /// removes the wait, it does not replace the loop. Same-instance only, which is all that is needed:
+    /// the pump and the enqueue paths share this singleton, and a lease keeps cross-instance work safe.
+    /// </summary>
+    private readonly SemaphoreSlim _pumpWake = new(0, 1);
+
+    /// <summary>Signal the pump that new claimable rows exist. Never throws and never exceeds one permit.</summary>
+    private void WakePump()
+    {
+        try { _pumpWake.Release(); }
+        catch (SemaphoreFullException) { /* a wake is already pending; the pump will claim the batch */ }
+        catch (ObjectDisposedException) { /* shutting down; the pump loop has already stopped */ }
+    }
+
+    public void Dispose() => _pumpWake.Dispose();
+
+    /// <summary>
+    /// Block until the pump is woken by an enqueue or <paramref name="pollInterval"/> elapses, whichever
+    /// comes first. Returns true if woken (new work signalled), false on the poll timeout.
+    /// </summary>
+    public Task<bool> WaitForWorkAsync(TimeSpan pollInterval, CancellationToken ct = default) =>
+        _pumpWake.WaitAsync(pollInterval, ct);
 
     /// <summary>Priorities above this share the lowest bucket. Callers use 0-6; the cap only bounds the key.</summary>
     private const int MaxPriorityBucket = 99;
@@ -178,6 +205,8 @@ public class JobQueueStore
         }, ct);
 
         await _store.UpsertAsync(_indexTable, IndexRow(runName, taskId, bucket, rowKey), ct);
+
+        WakePump();
     }
 
     /// <summary>Queue many tasks for one run. Chunked by the caller's priority into per-bucket batches.</summary>
@@ -212,6 +241,8 @@ public class JobQueueStore
 
         if (indexRows.Count > 0)
             await _store.UpsertBatchAsync(_indexTable, IndexPartition(runName), indexRows, ct);
+
+        if (tasks.Count > 0) WakePump();
     }
 
     /// <summary>A queued task this worker now owns, with the row key needed to release it.</summary>
@@ -326,6 +357,29 @@ public class JobQueueStore
     }
 
     /// <summary>
+    /// Remove many finished tasks at once. The pump releases a whole claimed batch per cycle, so this
+    /// turns what was 2 point deletes per task (index + queue, one <see cref="RemoveAsync"/> each) into
+    /// one transaction per partition: index rows share a run's partition, queue rows share a bucket.
+    ///
+    /// Ordering matches <see cref="RemoveAsync"/> at the batch level: ALL index rows first, then the
+    /// queue rows. A crash in between leaves queue rows whose tasks are finished — claimed once more and
+    /// dropped as stale descriptors, an already-handled path — whereas deleting the queue rows first
+    /// would leave the index advertising work that no longer exists and stall those runs.
+    /// </summary>
+    public async Task RemoveBatchAsync(IReadOnlyList<ClaimedJob> jobs, CancellationToken ct = default)
+    {
+        if (jobs.Count == 0) return;
+
+        foreach (var byRun in jobs.GroupBy(j => IndexPartition(j.RunName)))
+            await _store.DeleteBatchAsync(_indexTable, byRun.Key,
+                byRun.Select(j => IndexRowKey(j.Bucket, j.RowKey)).ToList(), ct);
+
+        foreach (var byBucket in jobs.GroupBy(j => j.Bucket))
+            await _store.DeleteBatchAsync(_queueTable, byBucket.Key,
+                byBucket.Select(j => j.RowKey).ToList(), ct);
+    }
+
+    /// <summary>
     /// This run's index rows. One single-partition read — the operation every run-scoped method below
     /// used to perform as a full-table scan.
     /// </summary>
@@ -420,6 +474,10 @@ public class JobQueueStore
             await _store.UpsertAsync(_queueTable, row, ct);
             released++;
         }
+
+        // Freed claims are claimable again — wake the pump to pick them up rather than waiting for the
+        // recovery-path re-drive on its own timer.
+        if (released > 0) WakePump();
 
         return released;
     }

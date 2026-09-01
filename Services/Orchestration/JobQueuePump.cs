@@ -31,8 +31,17 @@ public class JobQueuePump : BackgroundService
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _idlePollInterval;
 
+    /// <summary>Renew a claim only once its lease has less than this left. The lease is set comfortably
+    /// longer than a task can run, so most claims finish without ever needing a renewal; this is the tail
+    /// (a deep buffer, or a genuinely long task) that has been held long enough to approach expiry.</summary>
+    private readonly TimeSpan _renewWhenWithin;
+
     /// <summary>Rows claimed by this instance, by the job id they were handed to the JobManager under.</summary>
     private readonly Dictionary<string, JobQueueStore.ClaimedJob> _inFlight = new(StringComparer.Ordinal);
+
+    /// <summary>UTC lease expiry per in-flight job id, so renewal can skip claims with plenty of lease
+    /// left instead of re-reading every row every tick.</summary>
+    private readonly Dictionary<string, DateTime> _leaseExpiry = new(StringComparer.Ordinal);
 
     public JobQueuePump(ILogger<JobQueuePump> logger, JobQueueStore queue, JobManager jobs,
         IConfiguration configuration, CraftSettings settings)
@@ -55,6 +64,10 @@ public class JobQueuePump : BackgroundService
         // Comfortably longer than the 1200s task timeout: a lease that lapses under a task still running
         // would hand its work to a second worker.
         _lease = TimeSpan.FromSeconds(Math.Max(60, configuration.GetValue("JobQueueLeaseSeconds", 1800)));
+
+        // Renew in the last third of the lease. Below the lease length by construction, so a claim is
+        // never renewed on the same tick it was taken.
+        _renewWhenWithin = TimeSpan.FromTicks(_lease.Ticks / 3);
 
         _pollInterval = TimeSpan.FromMilliseconds(
             Math.Max(100, configuration.GetValue("JobQueuePollIntervalMs", 1000)));
@@ -113,7 +126,12 @@ public class JobQueuePump : BackgroundService
             if (claimedAny || _inFlight.Count > 0) idleTicks = 0;
             else idleTicks++;
 
-            try { await Task.Delay(NextDelay(idleTicks), stoppingToken); }
+            // Wait for the poll interval OR an enqueue signal, whichever comes first. The signal is what
+            // makes a freshly-queued run start now instead of on the next tick — a cold system had backed
+            // the interval off toward its idle ceiling, so without this the first task of a quiet-time
+            // orchestration waited up to that ceiling just to be claimed. The interval stays as the
+            // backstop (a missed signal, cross-instance work, freed leases), so this only removes the wait.
+            try { await _queue.WaitForWorkAsync(NextDelay(idleTicks), stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
 
@@ -132,15 +150,20 @@ public class JobQueuePump : BackgroundService
         if (_inFlight.Count == 0) return;
 
         var finished = _inFlight.Where(kv => !_jobs.IsQueuedOrRunning(kv.Key)).ToList();
+        if (finished.Count == 0) return;
 
-        foreach (var (jobId, claim) in finished)
+        // One transaction per partition rather than two point deletes per task. Tracking is cleared only
+        // after the storage delete lands, so a failure here throws, the cycle guard logs it, and the same
+        // claims are retried next tick (the delete is idempotent — a row already gone is tolerated).
+        await _queue.RemoveBatchAsync(finished.Select(kv => kv.Value).ToList(), ct);
+
+        foreach (var (jobId, _) in finished)
         {
-            await _queue.RemoveAsync(claim, ct);
             _inFlight.Remove(jobId);
+            _leaseExpiry.Remove(jobId);
         }
 
-        if (finished.Count > 0)
-            _logger.LogDebug("[JobQueuePump] Released {Count} finished job(s)", finished.Count);
+        _logger.LogDebug("[JobQueuePump] Released {Count} finished job(s)", finished.Count);
     }
 
     /// <summary>
@@ -173,6 +196,7 @@ public class JobQueuePump : BackgroundService
         var claimed = await _queue.ClaimBatchAsync(_owner, _batchSize, _lease, ct);
         if (claimed.Count == 0) return false;
 
+        var leaseExpiry = DateTime.UtcNow + _lease;
         foreach (var job in claimed)
         {
             // Enqueued by identity, the way the orchestrator already does it, so the work is rebuilt at
@@ -180,6 +204,9 @@ public class JobQueuePump : BackgroundService
             var name = $"{job.RunName}-{job.TaskId}";
             var jobId = _jobs.Enqueue(new JobDescriptor(job.RunName, job.TaskId, job.Priority), name);
             _inFlight[jobId] = job;
+            // Slightly earlier than the lease storage actually recorded (claimed a moment before this),
+            // so renewal errs toward being early rather than late.
+            _leaseExpiry[jobId] = leaseExpiry;
         }
 
         _logger.LogDebug("[JobQueuePump] Claimed {Count} job(s) ({Queued} queued after refill)",
@@ -197,7 +224,23 @@ public class JobQueuePump : BackgroundService
     {
         if (_inFlight.Count == 0) return;
 
-        if (!await _queue.RenewAsync(_inFlight.Values.ToList(), _owner, _lease, ct))
+        // Only the claims whose lease is actually running low. Everything else has ample lease left and
+        // does not need a storage round-trip this tick — the old code re-read every in-flight row every
+        // tick regardless of how much lease remained.
+        var now = DateTime.UtcNow;
+        var dueIds = _inFlight.Keys
+            .Where(id => !_leaseExpiry.TryGetValue(id, out var expiry) || expiry - now < _renewWhenWithin)
+            .ToList();
+        if (dueIds.Count == 0) return;
+
+        var due = dueIds.Select(id => _inFlight[id]).ToList();
+        if (!await _queue.RenewAsync(due, _owner, _lease, ct))
+        {
             _logger.LogWarning("[JobQueuePump] One or more leases could not be renewed — work may have been reclaimed");
+            return;
+        }
+
+        var renewedExpiry = now + _lease;
+        foreach (var id in dueIds) _leaseExpiry[id] = renewedExpiry;
     }
 }

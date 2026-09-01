@@ -262,8 +262,50 @@ public sealed class AzureTableStore : ICraftTableStore
         // entity (or a transient 4xx) doesn't drop the whole batch.
         foreach (var action in batch)
         {
-            try { await client.UpsertEntityAsync((TableEntity)action.Entity, TableUpdateMode.Replace, ct); }
-            catch { /* best-effort fallback */ }
+            var entity = (TableEntity)action.Entity;
+            try { await client.UpsertEntityAsync(entity, TableUpdateMode.Replace, ct); }
+            catch (Exception exEntity)
+            {
+                // Best-effort fallback, but no longer silent: a genuinely poison row (an illegal key
+                // remnant, an oversized property) fails here identically forever, and swallowing it with
+                // no line in the log is how a task row can go missing while its seeded run counter still
+                // expects it — visible only later as a run that will not finalize. The row is still
+                // dropped (nothing else can be done in a fallback), but now it is at least reported.
+                try
+                {
+                    _logger?.LogWarning(exEntity,
+                        "[TableStore] Dropped a row that failed both the batch and its individual retry: {Table} {Pk}/{Rk}",
+                        table, entity.PartitionKey, entity.RowKey);
+                }
+                catch { /* logging is never worth failing the fallback loop */ }
+            }
+        }
+    }
+
+    public async Task DeleteBatchAsync(string table, string partitionKey, IReadOnlyList<string> rowKeys,
+        CancellationToken ct = default)
+    {
+        if (rowKeys.Count == 0) return;
+        var client = Client(table);
+
+        for (int i = 0; i < rowKeys.Count; i += MaxBatch)
+        {
+            var chunk = rowKeys.Skip(i).Take(MaxBatch).ToList();
+            var batch = chunk
+                .Select(rk => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(partitionKey, rk)))
+                .ToList();
+            try
+            {
+                await client.SubmitTransactionAsync(batch, ct);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 404)
+            {
+                // A transaction is all-or-nothing, so one already-deleted row (or a missing table) 404s
+                // the whole chunk. Fall back to per-row deletes, which tolerate a missing row (and a
+                // missing table) individually — the removal is idempotent either way.
+                foreach (var rk in chunk)
+                    await DeleteAsync(table, partitionKey, rk, ct);
+            }
         }
     }
 
