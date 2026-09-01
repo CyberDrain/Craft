@@ -20,6 +20,16 @@ public class OrchestratorSettings
     public bool BatchStatusWrites { get; set; } = true;
 
     /// <summary>
+    /// Coalesce SMALL task results (those that fit one Azure Table property) through the batched status
+    /// writer instead of a per-task upsert on the fan-out critical path. Each result is written BEFORE
+    /// its task's terminal marker in the same flush, so a result is always durable before the task is
+    /// counted done (and therefore before finalize/post-execution reads it). Large results keep the
+    /// directly-awaited chunked path. Default true; only applies when <see cref="BatchStatusWrites"/> is
+    /// also true. Set false to fall back to the original per-task awaited result write.
+    /// </summary>
+    public bool BatchResultWrites { get; set; } = true;
+
+    /// <summary>
     /// When batching status writes, write the pre-invoke "Running" marker under a synchronous barrier so it
     /// is durable BEFORE the task invokes (batched with other concurrently-starting tasks). Preserves the
     /// AttemptCount/MaxRetries poison-task guarantee. Default true. False = eventual (faster, weaker: the

@@ -1096,8 +1096,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
                             "[Scheduler] Task {TaskId} in {Run} returned {Chars} chars (~{ApproxKB:F1} KB in memory)",
                             task.Id, run.Name, output?.Length ?? 0, (output?.Length ?? 0) * 2 / 1024.0);
 
-                        if (!string.IsNullOrEmpty(output))
+                        if (!string.IsNullOrEmpty(output) && !_writer.TryQueueResult(run.Name, task.Id, output))
+                        {
+                            // Large result, or result-batching off: keep the directly-awaited chunked path.
+                            // Either way this awaits BEFORE the task is marked Completed below, so the result
+                            // is durable before the run can finalize. Small results instead ride the status
+                            // writer (TryQueueResult == true), which writes them before this task's terminal
+                            // marker in the same flush — same guarantee, off the slot-held critical path.
                             await _store.StoreResultAsync(run.Name, task.Id, output);
+                        }
                     }
                     else
                     {

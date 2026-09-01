@@ -490,6 +490,55 @@ public class OrchestratorTableStore
     private const int MaxPropertyChars = 30_000;
     private const int MaxEntityChars = 450_000;
 
+    /// <summary>
+    /// Write a set of coalesced SMALL task results (single-property rows) to the Results table, grouped
+    /// by run (partition) and chunked to the backend's transaction limits by the store. The batched
+    /// counterpart to <see cref="StoreResultAsync"/> for results that fit one property; larger results
+    /// still go through StoreResultAsync's multi-row chunking path.
+    /// </summary>
+    /// <returns>
+    /// The run names whose results did NOT persist. The caller must retry these AND withhold those runs'
+    /// terminal task markers this flush, or a task could be counted done while its result is lost.
+    /// An empty list means everything landed.
+    /// </returns>
+    public async Task<IReadOnlyList<string>> WriteResultBatchAsync(IReadOnlyList<ResultWrite> results,
+        int maxConcurrency = 8, CancellationToken ct = default)
+    {
+        var groups = results.GroupBy(r => r.RunName).ToList();
+        if (groups.Count == 0) return [];
+
+        var failed = new System.Collections.Concurrent.ConcurrentBag<string>();
+        using var gate = new SemaphoreSlim(Math.Max(1, maxConcurrency));
+
+        var tasks = groups.Select(async group =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                var rows = group.Select(r => new StoreRow(r.RunName, r.TaskId)
+                {
+                    Properties = { ["ResultJson"] = r.ResultJson }
+                }).ToList();
+                await _store.UpsertBatchAsync(_resultsTable, group.Key, rows, ct);
+            }
+            catch (Exception ex)
+            {
+                // One run's failure must not discard the others. Record it; the caller requeues just this
+                // run's results and holds its terminal markers until they land together.
+                failed.Add(group.Key);
+                _logger.LogWarning(ex, "[OrchestratorStore] Result write failed for run {Run} ({Count} results) — will retry",
+                    group.Key, group.Count());
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+        return failed.ToList();
+    }
+
     /// <summary>Store a single task result, chunking large JSON across properties/rows as needed.</summary>
     public async Task StoreResultAsync(string runName, string taskId, string resultJson)
     {

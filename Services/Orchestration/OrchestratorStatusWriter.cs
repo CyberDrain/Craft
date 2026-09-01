@@ -25,7 +25,13 @@ public sealed class OrchestratorStatusWriter : IDisposable
     private readonly ILogger<OrchestratorStatusWriter> _logger;
     private readonly bool _enabled;
     private readonly bool _durableBarrier;
+    private readonly bool _batchResults;
     private readonly int _flushIntervalMs;
+
+    /// <summary>Results at or below this many chars fit a single Azure Table property and can be coalesced
+    /// here; larger ones need the chunked multi-row path and are written directly by the caller. Matches
+    /// <c>OrchestratorTableStore</c>'s single-property fast-path bound.</summary>
+    private const int SmallResultMaxChars = 30_000;
     private readonly TimeSpan _barrierTimeout;
     private readonly TimeSpan _flushTimeout;
     private readonly int _flushConcurrency;
@@ -36,6 +42,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
     private readonly object _lock = new();
     private Dictionary<string, TaskStatusWrite> _pendingTasks = new(); // key: runName  taskId (last-wins coalesce)
     private Dictionary<string, OrchestratorRun> _pendingRuns = new();  // key: runName
+    private Dictionary<string, ResultWrite> _pendingResults = new();   // key: run + task
     private TaskCompletionSource _barrier = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim _signal = new(0, int.MaxValue);
     private readonly CancellationTokenSource _cts = new();
@@ -53,6 +60,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
         _logger = logger;
         _enabled = settings.Orchestrator.BatchStatusWrites;
         _durableBarrier = settings.Orchestrator.DurableRunningBarrier;
+        _batchResults = settings.Orchestrator.BatchResultWrites;
         _flushIntervalMs = Math.Max(5, settings.Orchestrator.StatusFlushIntervalMs);
         _barrierTimeout = TimeSpan.FromSeconds(Math.Max(1, settings.Orchestrator.RunningBarrierTimeoutSeconds));
         _flushTimeout = TimeSpan.FromSeconds(Math.Max(1, settings.Orchestrator.StatusFlushTimeoutSeconds));
@@ -150,6 +158,20 @@ public sealed class OrchestratorStatusWriter : IDisposable
         Signal();
     }
 
+    /// <summary>
+    /// Try to coalesce a task result. Returns true if it was queued (written before this task's terminal
+    /// marker in the next flush, so it is durable before the task is counted done); false if the caller
+    /// must write it directly — because batching or result-batching is off, or the result is too large
+    /// for a single table property and needs the chunked path.
+    /// </summary>
+    public bool TryQueueResult(string runName, string taskId, string resultJson)
+    {
+        if (!_enabled || !_batchResults || resultJson.Length > SmallResultMaxChars) return false;
+        lock (_lock) { _pendingResults[Key(runName, taskId)] = new ResultWrite(runName, taskId, resultJson); }
+        Signal();
+        return true;
+    }
+
     /// <summary>Flush all currently-pending writes and await their persistence. Call before finalizing a run
     /// so terminal task states + run state are durable before post-execution reads results.</summary>
     public async Task FlushAsync(CancellationToken ct = default)
@@ -208,12 +230,13 @@ public sealed class OrchestratorStatusWriter : IDisposable
     {
         Dictionary<string, TaskStatusWrite> tasks;
         Dictionary<string, OrchestratorRun> runs;
+        Dictionary<string, ResultWrite> results;
         TaskCompletionSource done;
         lock (_lock)
         {
             done = _barrier;
             _barrier = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (_pendingTasks.Count == 0 && _pendingRuns.Count == 0)
+            if (_pendingTasks.Count == 0 && _pendingRuns.Count == 0 && _pendingResults.Count == 0)
             {
                 // Nothing to flush — still release barrier waiters (e.g. FlushAsync on an already-drained run).
                 done.TrySetResult();
@@ -221,6 +244,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
             }
             tasks = _pendingTasks; _pendingTasks = new();
             runs = _pendingRuns; _pendingRuns = new();
+            results = _pendingResults; _pendingResults = new();
         }
 
         using var cts = ignoreShutdown
@@ -233,8 +257,27 @@ public sealed class OrchestratorStatusWriter : IDisposable
 
         try
         {
+            // Results FIRST, and a run whose result did not land withholds that run's terminal task and
+            // run-status writes THIS flush. A terminal marker must never persist ahead of its result: a
+            // crash in between would leave a task counted done with no result for post-execution to read.
+            var failedResultRuns = new HashSet<string>(StringComparer.Ordinal);
+            if (results.Count > 0)
+            {
+                var failedResults = await _store.WriteResultBatchAsync(results.Values.ToList(), _flushConcurrency, cts.Token);
+                foreach (var run in failedResults) failedResultRuns.Add(run);
+                unwritten.AddRange(failedResults);
+            }
+
             if (tasks.Count > 0)
-                unwritten.AddRange(await _store.WriteTaskStatusBatchAsync(tasks.Values.ToList(), _flushConcurrency, cts.Token));
+            {
+                var toWrite = failedResultRuns.Count == 0
+                    ? tasks.Values.ToList()
+                    : tasks.Values.Where(t => !failedResultRuns.Contains(t.RunName)).ToList();
+                unwritten.AddRange(await _store.WriteTaskStatusBatchAsync(toWrite, _flushConcurrency, cts.Token));
+                // Tasks held back because their run's result failed: requeue so they retry with the result.
+                if (failedResultRuns.Count > 0)
+                    unwritten.AddRange(tasks.Values.Where(t => failedResultRuns.Contains(t.RunName)).Select(t => t.RunName));
+            }
 
             // Batched, not one await per run. Run rows all share the "Run" partition key, so N of them
             // cost ceil(N/100) transactions; the previous per-run loop cost N round-trips inside a flush
@@ -242,22 +285,30 @@ public sealed class OrchestratorStatusWriter : IDisposable
             // budget and then the durable barrier. The store isolates a poison row by retrying a failed
             // chunk individually, so a single bad run no longer discards the other 99.
             if (runs.Count > 0)
-                unwritten.AddRange(await _store.WriteRunStatusBatchAsync(runs.Values.ToList(), cts.Token));
+            {
+                var toWrite = failedResultRuns.Count == 0
+                    ? runs.Values.ToList()
+                    : runs.Values.Where(r => !failedResultRuns.Contains(r.Name)).ToList();
+                unwritten.AddRange(await _store.WriteRunStatusBatchAsync(toWrite, cts.Token));
+                if (failedResultRuns.Count > 0)
+                    unwritten.AddRange(runs.Values.Where(r => failedResultRuns.Contains(r.Name)).Select(r => r.Name));
+            }
         }
         catch (Exception ex)
         {
             // Timed out or the store threw wholesale — treat EVERYTHING in this snapshot as unwritten.
             failure = ex;
+            unwritten.AddRange(results.Values.Select(r => r.RunName));
             unwritten.AddRange(tasks.Values.Select(t => t.RunName));
             unwritten.AddRange(runs.Keys);
-            _logger.LogError(ex, "[Orchestrator] Status flush failed ({Tasks} tasks, {Runs} runs) — requeued for retry",
-                tasks.Count, runs.Count);
+            _logger.LogError(ex, "[Orchestrator] Status flush failed ({Results} results, {Tasks} tasks, {Runs} runs) — requeued for retry",
+                results.Count, tasks.Count, runs.Count);
         }
 
         // Durability: anything that did not reach storage goes back on the pending set. Dropping it
         // (the previous behaviour on any exception) silently lost terminal task states — a completed
         // task would look Pending forever and be re-run by the next recovery.
-        if (unwritten.Count > 0) Requeue(tasks, runs, unwritten);
+        if (unwritten.Count > 0) Requeue(results, tasks, runs, unwritten);
 
         // The barrier may ONLY report success when this batch actually persisted. Waiters cannot tell
         // which run in the batch was theirs, so any un-persisted write has to fail all of them — a
@@ -278,14 +329,21 @@ public sealed class OrchestratorStatusWriter : IDisposable
     /// NEWER state for the same task may have arrived while the flush was in flight, and the retry of a
     /// stale snapshot must never overwrite it.
     /// </summary>
-    private void Requeue(Dictionary<string, TaskStatusWrite> tasks, Dictionary<string, OrchestratorRun> runs,
-        List<string> unwrittenRuns)
+    private void Requeue(Dictionary<string, ResultWrite> results, Dictionary<string, TaskStatusWrite> tasks,
+        Dictionary<string, OrchestratorRun> runs, List<string> unwrittenRuns)
     {
         var retry = new HashSet<string>(unwrittenRuns, StringComparer.OrdinalIgnoreCase);
         var restored = 0;
 
         lock (_lock)
         {
+            // Results before tasks, mirroring the flush order: a result put back must be in the pending
+            // set before the terminal marker it guards is retried.
+            foreach (var (key, write) in results)
+            {
+                if (!retry.Contains(write.RunName)) continue;
+                if (_pendingResults.TryAdd(key, write)) restored++;
+            }
             foreach (var (key, write) in tasks)
             {
                 if (!retry.Contains(write.RunName)) continue;
