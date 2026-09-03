@@ -1361,6 +1361,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
             {
                 try
                 {
+                    // Flush before the counter read below. The batched status writer decrements the counter
+                    // only when a terminal write flushes, so an unflushed read sees the pre-decrement value
+                    // and defers a finalize that is due — a single GET beats the drain+decrement every time,
+                    // stalling every run until the 60s timer. Same flush FinalizeRunCoreAsync relies on, just
+                    // ahead of the veto read; bounded by the barrier timeout, so it cannot hang.
+                    await _writer.FlushAsync();
+
                     // The in-memory graph proposes, storage disposes. Finalizing is irreversible - it
                     // writes the aggregate and cleans the run up - so it must not run while storage still
                     // shows work outstanding, which is exactly the case when terminal writes have not yet
