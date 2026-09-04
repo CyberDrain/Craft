@@ -191,4 +191,97 @@ public class SkuProfileSelectorTests
         Assert.Equal(2, settings.Worker.HttpPoolSize);
         Assert.Contains(logs, l => l.Contains("SkuProfile detection failed", StringComparison.Ordinal));
     }
+
+    // ---- Second SkuProfiles matrix — selected by env-var presence ----
+
+    [Fact]
+    public void AltEnvPresent_SelectsSecondMatrixOverDefault()
+    {
+        var settings = WithProfiles(new SkuProfile { SkuEnv = "", HttpPoolSize = 20, BgPoolSize = 30 }); // default
+        settings.Worker.SkuProfilesAltEnv = "CIPP_HOSTED";
+        settings.Worker.SkuProfilesAlt.Add(new SkuProfile { SkuEnv = "", HttpPoolSize = 2, BgPoolSize = 3 }); // second
+
+        var applied = SkuProfileSelector.Apply(settings, 8, Env(("CIPP_HOSTED", "true")), _ => { });
+
+        Assert.NotNull(applied);
+        Assert.Equal(2, settings.Worker.HttpPoolSize); // second matrix won
+        Assert.Equal(3, settings.Worker.BgPoolSize);
+    }
+
+    [Fact]
+    public void AltEnvName_IsConfigurable_AndAnyNonEmptyValueCounts()
+    {
+        var settings = WithProfiles(new SkuProfile { SkuEnv = "", HttpPoolSize = 20, BgPoolSize = 30 });
+        settings.Worker.SkuProfilesAltEnv = "MY_FLAG";
+        settings.Worker.SkuProfilesAlt.Add(new SkuProfile { SkuEnv = "", HttpPoolSize = 2, BgPoolSize = 2 });
+
+        var applied = SkuProfileSelector.Apply(settings, 8, Env(("MY_FLAG", "anything")), _ => { });
+
+        Assert.NotNull(applied);
+        Assert.Equal(2, settings.Worker.HttpPoolSize);
+    }
+
+    [Fact]
+    public void AltEnvAbsent_UsesDefaultMatrix()
+    {
+        var settings = WithProfiles(new SkuProfile { SkuEnv = "", HttpPoolSize = 20, BgPoolSize = 30 });
+        settings.Worker.SkuProfilesAltEnv = "CIPP_HOSTED";
+        settings.Worker.SkuProfilesAlt.Add(new SkuProfile { SkuEnv = "", HttpPoolSize = 2, BgPoolSize = 3 });
+
+        var applied = SkuProfileSelector.Apply(settings, 8, Env(), _ => { }); // flag not set
+
+        Assert.NotNull(applied);
+        Assert.Equal(20, settings.Worker.HttpPoolSize);
+    }
+
+    [Fact]
+    public void AltEnvPresent_ButSecondMatrixEmpty_FallsBackToDefaultAndLogs()
+    {
+        var settings = WithProfiles(new SkuProfile { SkuEnv = "", HttpPoolSize = 20, BgPoolSize = 30 });
+        settings.Worker.SkuProfilesAltEnv = "CIPP_HOSTED"; // SkuProfilesAlt left empty
+        var logs = new List<string>();
+
+        var applied = SkuProfileSelector.Apply(settings, 8, Env(("CIPP_HOSTED", "true")), logs.Add);
+
+        Assert.NotNull(applied);
+        Assert.Equal(20, settings.Worker.HttpPoolSize); // default matrix used
+        Assert.Contains(logs, l => l.Contains("SkuProfilesAlt is empty", StringComparison.Ordinal));
+    }
+
+    // ---- Per-instance env overrides (win over the matrix) ----
+
+    [Fact]
+    public void EnvOverride_HttpAndBg_WinOverMatchedProfile()
+    {
+        var settings = WithProfiles(new SkuProfile { SkuEnv = "", HttpPoolSize = 20, BgPoolSize = 30 });
+
+        SkuProfileSelector.Apply(settings, 8, Env(("CRAFT_HTTP_POOL_SIZE", "3"), ("CRAFT_BG_POOL_SIZE", "5")), _ => { });
+
+        Assert.Equal(3, settings.Worker.HttpPoolSize); // env beat the profile's 20
+        Assert.Equal(5, settings.Worker.BgPoolSize);   // env beat the profile's 30
+    }
+
+    [Fact]
+    public void EnvOverride_AppliesEvenWithNoProfilesConfigured()
+    {
+        var settings = WithProfiles(); // baseline 2 / 4, no profiles
+
+        SkuProfileSelector.Apply(settings, 8, Env(("CRAFT_HTTP_POOL_SIZE", "7")), _ => { });
+
+        Assert.Equal(7, settings.Worker.HttpPoolSize); // override applied over the baseline
+        Assert.Equal(4, settings.Worker.BgPoolSize);   // untouched
+    }
+
+    [Fact]
+    public void EnvOverride_ZeroIsHonored_NegativeAndGarbageAreIgnored()
+    {
+        var settings = WithProfiles();
+        settings.Worker.HttpPoolSize = 6;
+        settings.Worker.BgPoolSize = 8;
+
+        SkuProfileSelector.Apply(settings, 8, Env(("CRAFT_HTTP_POOL_SIZE", "0"), ("CRAFT_BG_POOL_SIZE", "-1")), _ => { });
+
+        Assert.Equal(0, settings.Worker.HttpPoolSize); // 0 is a valid HTTP pool size (native-only HTTP)
+        Assert.Equal(8, settings.Worker.BgPoolSize);   // negative ignored -> baseline kept
+    }
 }

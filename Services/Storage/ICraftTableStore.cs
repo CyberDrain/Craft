@@ -86,6 +86,21 @@ public interface ICraftTableStore
     /// <summary>Delete a single row. A missing row is not an error.</summary>
     Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 
+    /// <summary>
+    /// Delete many rows that share a partition key, in as few round-trips as the backend allows. A
+    /// missing row is never an error.
+    ///
+    /// This default keeps a backend that cannot batch correct by deleting one row at a time;
+    /// <see cref="AzureTableStore"/> overrides it with a per-partition transaction. Callers may pass
+    /// more than a single transaction can hold — implementations chunk internally.
+    /// </summary>
+    async Task DeleteBatchAsync(string table, string partitionKey, IReadOnlyList<string> rowKeys,
+        CancellationToken ct = default)
+    {
+        foreach (var rowKey in rowKeys)
+            await DeleteAsync(table, partitionKey, rowKey, ct);
+    }
+
     /// <summary>Delete every row in a partition.</summary>
     Task DeletePartitionAsync(string table, string partitionKey, CancellationToken ct = default);
 }

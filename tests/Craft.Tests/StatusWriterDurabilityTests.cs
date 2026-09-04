@@ -165,6 +165,42 @@ public class StatusWriterDurabilityTests
     private static OrchestratorTaskItem Task1(string id = "t1") =>
         new() { Id = id, Status = "Running", Parameters = new Dictionary<string, object> { ["TenantFilter"] = "x.com" } };
 
+    // ── R2: COALESCED SMALL-RESULT WRITES ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A small result rides the writer and is durable after a flush; one too large for a single table
+    /// property is refused, so the caller keeps the chunked StoreResultAsync path.
+    /// </summary>
+    [Fact]
+    public async Task SmallResult_Coalesces_AndIsDurable_WhileLargeResultIsRefused()
+    {
+        var settings = new CraftSettings();
+        var backing = new ControllableStore();
+        var store = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, backing);
+        using var writer = new OrchestratorStatusWriter(store, NullLogger<OrchestratorStatusWriter>.Instance, settings);
+
+        Assert.True(writer.TryQueueResult("run", "t1", "{\"ok\":true}"));
+        // 30 001 chars is one over the single-property bound — must fall back to the direct chunked path.
+        Assert.False(writer.TryQueueResult("run", "t2", new string('x', 30_001)));
+
+        await writer.FlushAsync();
+
+        Assert.Contains("{\"ok\":true}", await store.GetResultsAsync("run"));
+    }
+
+    /// <summary>With result-batching off, TryQueueResult refuses so the caller writes results directly.</summary>
+    [Fact]
+    public void TryQueueResult_IsRefused_WhenResultBatchingIsOff()
+    {
+        var settings = new CraftSettings();
+        settings.Orchestrator.BatchResultWrites = false;
+        var backing = new ControllableStore();
+        var store = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, backing);
+        using var writer = new OrchestratorStatusWriter(store, NullLogger<OrchestratorStatusWriter>.Instance, settings);
+
+        Assert.False(writer.TryQueueResult("run", "t1", "{\"ok\":true}"));
+    }
+
     // ── LIVENESS ────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>

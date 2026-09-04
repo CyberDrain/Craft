@@ -80,11 +80,22 @@
     // collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
     // Set "Enabled": false to turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true
     // can also force it on.
+    //
+    // ApiConcurrencyLimit adds a second, orthogonal cap: the most requests a single app-only API
+    // client (client-credentials caller, idp=aad) may have occupying the worker system AT ONCE —
+    // counting both those queued waiting for a runspace and those executing, since the limiter's lease
+    // spans the whole downstream pipeline. Keyed per client (its AppId), so one automation cannot hold
+    // every runspace and starve the interactive UI, which is never capped by this. A rate cap
+    // (PermitPerWindow) bounds requests/second; this bounds simultaneous-in-flight. 0 (default) = off.
+    // Over-limit requests are rejected immediately with 429 + Retry-After (no concurrency queue).
+    // Env override: CRAFT_API_CONCURRENCY_LIMIT. Works even with "Enabled": false (rate limiter off,
+    // concurrency cap on) — the limiter middleware runs whenever either is active.
     // "RateLimit": {
     //   "Enabled": true,
-    //   "PermitPerWindow": 300,   // requests allowed per window, per client
-    //   "WindowSeconds": 10,      // window length in seconds
-    //   "QueueLimit": 0           // requests queued at the limit before rejecting (0 = reject immediately)
+    //   "PermitPerWindow": 300,     // requests allowed per window, per client
+    //   "WindowSeconds": 10,        // window length in seconds
+    //   "QueueLimit": 0,            // requests queued at the limit before rejecting (0 = reject immediately)
+    //   "ApiConcurrencyLimit": 0    // max simultaneous in-flight requests per API client (0 = unlimited)
     // },
 
     // Realtime SSE channel served at /.craft/events. Downstream code publishes job events through
@@ -142,16 +153,43 @@
       //           (e.g. "Basic", "PremiumV3"). Ignored when SkuEnv is empty.
       //   Cpu:    compared to Environment.ProcessorCount (respects cgroup limits in
       //           Docker). Omit or 0 = match any CPU count.
+      //   GCHeapHardLimitMB: optional GC heap hard limit (MB) for this tier. The
+      //           DOTNET_GCHeapHardLimit env var is consumed before managed code runs,
+      //           so this lands via GC.RefreshMemoryLimit at startup instead. Three-way,
+      //           mirroring the CRAFT_GC_HEAP_LIMIT_MB override below: omit/null (or a
+      //           negative value) = keep the process baseline; 0 = disable the cap entirely,
+      //           deferring to container memory (for a tier with more RAM than the baked
+      //           limit lets it use); > 0 = set that many MB. Raising or removing is always
+      //           safe; a positive value the heap has already outgrown is refused and logged.
+      //           Per-instance override: CRAFT_GC_HEAP_LIMIT_MB wins over this (a positive
+      //           value sets the cap; 0 disables the cap entirely, deferring to container
+      //           memory) — hand-tune one host without touching the fleet-wide profiles.
       // First match wins. No match (or any parse failure) leaves the baseline above.
       // Set IgnoreSkuProfiles: true to disable this entirely.
       // "IgnoreSkuProfiles": false,
       // "SkuProfiles": [
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 1, "HttpPoolSize": 2, "BgPoolSize": 2 },
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 2, "HttpPoolSize": 3, "BgPoolSize": 4 },
-      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 4, "HttpPoolSize": 4, "BgPoolSize": 4 },
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "Basic",     "Cpu": 4, "HttpPoolSize": 4, "BgPoolSize": 4, "GCHeapHardLimitMB": 5120 },
       //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 2, "HttpPoolSize": 4, "BgPoolSize": 8 },
       //   { "Cpu": 8,                                              "HttpPoolSize": 6, "BgPoolSize": 12 }
       // ],
+      //
+      // A second SkuProfiles matrix, selected by the *presence* of an env var. When the var named by
+      // SkuProfilesAltEnv is set to any non-empty value, SkuProfilesAlt is matched instead of SkuProfiles
+      // — e.g. a smaller per-instance sizing for instances packed onto one shared App Service Plan. Falls
+      // back to SkuProfiles when the var is unset or SkuProfilesAlt is empty. Same fields as SkuProfiles.
+      // Set the var on the packed instances and leave it unset on dedicated ones. As with SkuProfiles, an
+      // entry that matches nothing just keeps the global HttpPoolSize/BgPoolSize — no catch-all needed.
+      // "SkuProfilesAltEnv": "CIPP_HOSTED",
+      // "SkuProfilesAlt": [
+      //   { "SkuEnv": "WEBSITE_SKU", "Sku": "PremiumV3", "Cpu": 8, "HttpPoolSize": 2, "BgPoolSize": 4, "GCHeapHardLimitMB": 2048 }
+      // ],
+      //
+      // Per-instance overrides for the pool sizes themselves, winning over any matched profile (same
+      // shape as CRAFT_GC_HEAP_LIMIT_MB): CRAFT_HTTP_POOL_SIZE / CRAFT_BG_POOL_SIZE. A non-negative
+      // integer wins; unset / negative / unparseable defers to the matrix. Hand-tune one host without
+      // touching the fleet-wide profiles.
 
       // Maximum execution time (seconds) for HTTP request handlers
       // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed
@@ -162,6 +200,14 @@
       // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed
       // 0 = no timeout (default). Recommended: 600-3600 for background jobs
       // "BgTimeoutSeconds": 0,
+
+      // How long an HTTP request waits for a free runspace when the pool is saturated before it is
+      // shed with 503 "Server busy, please retry". A load-shedding bound, NOT a capacity knob — it
+      // does not add throughput, it only decides how long callers wait before a spurious 503. Widen
+      // it to absorb brief bursts; raise HttpPoolSize/MinThreads for steady saturation. Distinct from
+      // HttpTimeoutSeconds (which bounds execution once a worker is held).
+      // 0 = built-in default of 30s. Env override: CRAFT_HTTP_QUEUE_TIMEOUT (seconds).
+      // "HttpQueueTimeoutSeconds": 30,
 
       // Extra env vars injected into every runspace
       // "EnvVars": { "MY_VAR": "value" },

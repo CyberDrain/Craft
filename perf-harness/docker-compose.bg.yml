@@ -39,6 +39,14 @@ services:
       - App__ReadinessMode=Immediate
       - App__Setup__Enabled=false
       - App__Orchestrator__TablePrefix=PerfBgOrch
+      # OOM-resilience harness (run-oom.ps1): cap the .NET GC heap just above baseline to prove the
+      # durable-queue backlog keeps memory bounded regardless of fan-out size. Empty = no cap.
+      - CRAFT_GC_HEAP_LIMIT_MB=${GC_HEAP_LIMIT_MB:-}
+      # Pump claim batch / poll interval. Empty = defaults (batch = Bg pool, poll 1000ms). The OOM harness
+      # raises the batch so a huge already-enqueued backlog drains at batch/interval instead of pool/interval
+      # — the JobManager buffer stays O(batch) (still tiny), which is the whole point being measured.
+      - JobQueueBatchSize=${JOB_BATCH:-}
+      - JobQueuePollIntervalMs=${JOB_POLL_MS:-}
       # BackgroundTaskLimiter tuning (top-level config keys). run-orch.ps1 A/Bs the ramp behavior.
       # Defaults reproduce the app defaults on a small box (base 2, scale-up after 15s, ceiling = BG pool).
       - BackgroundBaseConcurrency=${BG_BASE:-2}

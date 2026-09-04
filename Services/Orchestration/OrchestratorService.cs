@@ -792,9 +792,19 @@ public class OrchestratorService : IJobDescriptorStateWriter
             // permanent, which is a worse failure than the premature finalize it exists to prevent.
             var timer = new Timer(_ =>
                 {
-                    LogRunStatus(run);
-                    RedrivePendingTasks(run);
-                    lock (_lock) { CheckRunCompletion(run); }
+                    // A System.Threading.Timer callback that throws crashes the process. This periodic
+                    // maintenance tick must never take the host down on a transient error — a dependency
+                    // disposed during shutdown, a race on run state — so it logs and waits for the next tick.
+                    try
+                    {
+                        LogRunStatus(run);
+                        RedrivePendingTasks(run);
+                        lock (_lock) { CheckRunCompletion(run); }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
+                    }
                 },
                 null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
             if (!_runStatusTimers.TryAdd(run.Name, timer))
@@ -1086,8 +1096,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
                             "[Scheduler] Task {TaskId} in {Run} returned {Chars} chars (~{ApproxKB:F1} KB in memory)",
                             task.Id, run.Name, output?.Length ?? 0, (output?.Length ?? 0) * 2 / 1024.0);
 
-                        if (!string.IsNullOrEmpty(output))
+                        if (!string.IsNullOrEmpty(output) && !_writer.TryQueueResult(run.Name, task.Id, output))
+                        {
+                            // Large result, or result-batching off: keep the directly-awaited chunked path.
+                            // Either way this awaits BEFORE the task is marked Completed below, so the result
+                            // is durable before the run can finalize. Small results instead ride the status
+                            // writer (TryQueueResult == true), which writes them before this task's terminal
+                            // marker in the same flush — same guarantee, off the slot-held critical path.
                             await _store.StoreResultAsync(run.Name, task.Id, output);
+                        }
                     }
                     else
                     {
@@ -1344,6 +1361,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
             {
                 try
                 {
+                    // Flush before the counter read below. The batched status writer decrements the counter
+                    // only when a terminal write flushes, so an unflushed read sees the pre-decrement value
+                    // and defers a finalize that is due — a single GET beats the drain+decrement every time,
+                    // stalling every run until the 60s timer. Same flush FinalizeRunCoreAsync relies on, just
+                    // ahead of the veto read; bounded by the barrier timeout, so it cannot hang.
+                    await _writer.FlushAsync();
+
                     // The in-memory graph proposes, storage disposes. Finalizing is irreversible - it
                     // writes the aggregate and cleans the run up - so it must not run while storage still
                     // shows work outstanding, which is exactly the case when terminal writes have not yet
@@ -1888,6 +1912,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
             : runName;
         return _psRunner.FindScript($"Invoke-{baseName}Task");
     }
+
+    /// <summary>
+    /// Empty the durable job queue (maintenance/reset). Delegates to <see cref="JobQueueStore.ClearAllAsync"/>
+    /// — see its remarks: in-flight work is unaffected and Pending tasks may be re-driven, so pair this
+    /// with <see cref="CancelRunAsync"/> when the intent is to STOP work rather than clear a wedged queue.
+    /// Returns the number of queue rows removed.
+    /// </summary>
+    public Task<int> ClearQueueAsync(CancellationToken ct = default) => _queue.ClearAllAsync(ct);
 
     /// <summary>
     /// Cancel a running orchestrator run. Pending tasks are marked Cancelled immediately.

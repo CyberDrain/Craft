@@ -106,4 +106,7 @@ public class CraftSettings
 
     /// <summary>Realtime SSE channel (<c>/.craft/events</c>). See <see cref="RealtimeSettings"/>.</summary>
     public RealtimeSettings Realtime { get; set; } = new();
+
+    /// <summary>Startup phone-home usage telemetry. Off by default. See <see cref="TelemetrySettings"/>.</summary>
+    public TelemetrySettings Telemetry { get; set; } = new();
 }

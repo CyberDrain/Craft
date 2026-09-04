@@ -60,7 +60,9 @@ function Invoke-PerfBgEnqueue {
     $n = 500;  if ($Request.Query.n) { $n = [int]$Request.Query.n }
     $taskms = 0; if ($Request.Query.taskms) { $taskms = [int]$Request.Query.taskms }
     $childn = 0; if ($Request.Query.childn) { $childn = [int]$Request.Query.childn }
-    $batch = @(for ($i = 0; $i -lt $n; $i++) { @{ FunctionName = 'PerfBg'; idx = $i; taskms = $taskms; childn = $childn } })
+    $allocmb = 0; if ($Request.Query.allocmb) { $allocmb = [int]$Request.Query.allocmb }
+    $holdms = 0; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $batch = @(for ($i = 0; $i -lt $n; $i++) { @{ FunctionName = 'PerfBg'; idx = $i; taskms = $taskms; childn = $childn; allocmb = $allocmb; holdms = $holdms } })
     $run = Start-CraftOrchestrator -InputObject @{
         OrchestratorName = "PerfBg-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
         Batch            = $batch
@@ -69,10 +71,23 @@ function Invoke-PerfBgEnqueue {
 }
 
 # The background task each orchestrator batch item runs (Invoke-CraftTask calls Push-{FunctionName}).
-# Sleeps taskms to simulate real work, and optionally spawns a child orchestration (fan-out dependency).
+# Sleeps taskms to simulate work; allocmb/holdms allocate a large object (LOH) and hold it to create real
+# heap pressure across concurrent workers; optionally spawns a child orchestration (fan-out dependency).
 function Push-PerfBg {
     param($Item)
     if ($Item.taskms -and [int]$Item.taskms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.taskms) }
+
+    # Real memory pressure: a single large byte[] lands on the Large Object Heap (>85 KB), touched so the
+    # pages are actually committed, then held so concurrent tasks pile up live memory at once. Under a GC
+    # heap hard limit smaller than (workers x allocmb), the allocation throws OutOfMemoryException — which
+    # the orchestrator must catch as a task failure WITHOUT taking the dispatch loop down with it.
+    if ($Item.allocmb -and [int]$Item.allocmb -gt 0) {
+        $buf = [byte[]]::new([int]$Item.allocmb * 1MB)
+        for ($i = 0; $i -lt $buf.Length; $i += 4096) { $buf[$i] = 1 }
+        if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+        $buf = $null
+    }
+
     if ($Item.childn -and [int]$Item.childn -gt 0) {
         $cn = [int]$Item.childn
         $childBatch = @(for ($j = 0; $j -lt $cn; $j++) { @{ FunctionName = 'PerfBgLeaf'; idx = $j } })
@@ -88,6 +103,63 @@ function Push-PerfBg {
 function Push-PerfBgLeaf {
     param($Item)
     return @{ ok = $true; idx = $Item.idx }
+}
+
+# Worker/queue allocation snapshot — the harness's downstream wrapper around the CRAFT bridge, standing
+# in for what a real app (e.g. CIPP) does: CRAFT exposes the data as [Craft.Services.WorkerMetricsBridge],
+# the app wraps whichever fields it wants into its own endpoint. Returns the shape run-orch.ps1 and the
+# time-to-first-work probes read (jm/queue/limiter/pool) plus memory, for the OOM-resilience harness.
+function Invoke-PerfAllocation {
+    param($Request, $TriggerMetadata)
+    $s = [Craft.Services.WorkerMetricsBridge]::GetSnapshot()
+    return @{ StatusCode = 200; Body = @{
+        jm = @{
+            active         = $s.Jobs.Running
+            queued         = $s.Jobs.QueuedLocal
+            completed      = $s.Jobs.Completed
+            failed         = $s.Jobs.Failed
+            totalProcessed = $s.Jobs.TotalProcessed
+            maxConcurrency = $s.Jobs.MaxConcurrency
+        }
+        queue = @{
+            unclaimed = $s.Jobs.QueuedDurable
+            total     = $s.Jobs.Queued
+        }
+        limiter = @{
+            currentMax    = $s.Limiter.CurrentMax
+            baseMax       = $s.Limiter.BaseConcurrency
+            ceiling       = $s.Limiter.CeilingConcurrency
+            active        = $s.Limiter.Active
+            waiting       = $s.Limiter.Waiting
+            httpThrottled = $s.Limiter.IsHttpThrottled
+        }
+        pool = @{
+            bgBusy    = $s.BgPool.BusyCount
+            bgTotal   = $s.BgPool.PoolSize
+            bgAvail   = $s.BgPool.Available
+            httpAvail = $s.HttpPool.Available
+        }
+        memory = @{
+            heapMB           = $s.Memory.HeapMB
+            rssMB            = $s.Memory.RssMB
+            committedMB      = $s.Memory.CommittedMB
+            containerLimitMB = $s.Memory.ContainerLimitMB
+            containerUsedMB  = $s.Memory.ContainerUsedMB
+            gcHeapLimitMB    = $s.Memory.GCHeapLimitMB
+            usagePct         = $s.Memory.UsagePct
+            gc0 = $s.Memory.GC0; gc1 = $s.Memory.GC1; gc2 = $s.Memory.GC2
+        }
+    } }
+}
+
+# Durable run summaries (table-backed via the bridge), so the OOM harness can confirm ALL tasks reached a
+# terminal state even across a crash/restart — the in-memory JobManager counters reset, the tables do not.
+function Invoke-PerfRuns {
+    param($Request, $TriggerMetadata)
+    $runs = [Craft.Services.WorkerMetricsBridge]::GetRunSummaries()
+    return @{ StatusCode = 200; Body = @{ runs = @($runs | ForEach-Object {
+        @{ name = $_.Name; total = $_.Total; completed = $_.Completed; failed = $_.Failed; running = $_.Running; queued = $_.Queued }
+    }) } }
 }
 
 # Identity reflector: returns the principal CRAFT resolved for this request — the EasyAuth

@@ -36,6 +36,23 @@ public class WorkerSettings
     public bool IgnoreSkuProfiles { get; set; }
 
     /// <summary>
+    /// A second SkuProfiles matrix, selected when the env var named by <see cref="SkuProfilesAltEnv"/> is
+    /// present (set to a non-empty value); otherwise <see cref="SkuProfiles"/> is used. Lets a deployment
+    /// ship one config with two sizings — e.g. a smaller per-instance matrix for instances packed onto a
+    /// shared App Service Plan — and pick between them with a single env var. Same matching rules as
+    /// <see cref="SkuProfiles"/>. Ignored (falls back to <see cref="SkuProfiles"/>) when empty.
+    /// </summary>
+    public List<SkuProfile> SkuProfilesAlt { get; set; } = [];
+
+    /// <summary>
+    /// Name of the env var whose presence selects <see cref="SkuProfilesAlt"/> instead of
+    /// <see cref="SkuProfiles"/> (e.g. "CIPP_HOSTED"). Null/empty = the second matrix is never used.
+    /// Only presence matters — set the var (to any non-empty value) on the instances that should use the
+    /// second matrix, and leave it unset on the rest. Configurable so each app picks its own flag.
+    /// </summary>
+    public string? SkuProfilesAltEnv { get; set; }
+
+    /// <summary>
     /// Minimum .NET thread-pool worker/completion threads. <b>0 (default) = derive from the pool
     /// sizes</b>, which is almost always what you want; set a number only to pin it.
     ///
@@ -74,6 +91,29 @@ public class WorkerSettings
     /// 0 = no timeout (default). Recommended: 600-3600 for background jobs.
     /// </summary>
     public int BgTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// How long an incoming HTTP request waits for a free PowerShell runspace when every worker in the
+    /// HTTP pool is already busy, before it is shed with <c>503 "Server busy, please retry"</c>.
+    ///
+    /// <para>
+    /// This is a load-shedding bound, NOT a capacity or execution knob. It does not add throughput —
+    /// under sustained saturation it only changes how long callers wait before the 503 (longer waits
+    /// hold connections and lengthen the tail). Its value is in absorbing <b>brief</b> bursts: a
+    /// request that would have got a worker a few seconds later completes instead of failing spuriously.
+    /// When 503s appear under steady load the levers are <see cref="HttpPoolSize"/> /
+    /// <see cref="MinThreads"/> / a larger host, not this.
+    /// </para>
+    ///
+    /// <para>
+    /// Distinct from <see cref="HttpTimeoutSeconds"/> (which bounds how long a request may <i>execute</i>
+    /// once it holds a worker). 0 or negative = the built-in default of 30 seconds.
+    /// </para>
+    ///
+    /// Env override: <c>CRAFT_HTTP_QUEUE_TIMEOUT</c> (seconds), which wins over this setting.
+    /// Resolved by <c>CraftHostBuilderExtensions.ResolveHttpQueueTimeout</c>.
+    /// </summary>
+    public int HttpQueueTimeoutSeconds { get; set; }
 
     /// <summary>
     /// Environment variables to inject into every PowerShell runspace.

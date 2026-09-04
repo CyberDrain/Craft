@@ -97,21 +97,26 @@ public class JobQueueStatusReaderTests
         await f.Queue.EnqueueAsync("run", "claimed-elsewhere", 4, At(1));
         await f.Queue.EnqueueAsync("run", "waiting", 4, At(2));
 
-        // "claimed-here" is what the pump does: claim the row, enqueue the descriptor locally.
+        // Claim one locally, the way the pump does: claim the row, enqueue the descriptor locally. Which
+        // of the two "claimed-*" tasks comes first is no longer time-ordered under schema v2, so drive the
+        // local record off whatever was actually claimed rather than a hard-coded id.
         var mine = await f.Queue.ClaimBatchAsync("this-node", 1, Lease);
-        Assert.Equal("claimed-here", Assert.Single(mine).TaskId);
-        f.Jobs.Enqueue(new JobDescriptor("run", "claimed-here", 4), "run-claimed-here");
+        var mineId = Assert.Single(mine).TaskId;
+        f.Jobs.Enqueue(new JobDescriptor("run", mineId, 4), $"run-{mineId}");
 
         // Another instance's claim: a row under lease with no local record at all.
         var theirs = await f.Queue.ClaimBatchAsync("other-node", 1, Lease);
-        Assert.Equal("claimed-elsewhere", Assert.Single(theirs).TaskId);
+        var theirsId = Assert.Single(theirs).TaskId;
+        Assert.NotEqual(mineId, theirsId);
 
         var details = await f.Reader.GetJobDetailsAsync();
 
-        // claimed-here once (the local record), waiting once (durable), claimed-elsewhere not at all —
-        // it is running inside another instance and its records live there.
+        // The locally-claimed row once (its local record), the still-waiting row once (durable), the row
+        // claimed by the other instance not at all — its records live there. ("waiting" sorts last, so the
+        // two claims took the "claimed-*" pair and it is what remains.)
         Assert.Equal(2, details.Count);
-        Assert.Single(details, d => d.Id == "run-claimed-here");
+        Assert.Single(details, d => d.Id == $"run-{mineId}");
+        Assert.DoesNotContain(details, d => d.Id == $"run-{theirsId}");
         var waiting = Assert.Single(details, d => d.Id == "run-waiting");
         Assert.Equal("Queued", waiting.Status);
         Assert.Equal(At(2), waiting.QueuedUtc);

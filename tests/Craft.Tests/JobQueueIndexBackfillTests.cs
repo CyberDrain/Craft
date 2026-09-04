@@ -32,12 +32,16 @@ public class JobQueueIndexBackfillTests
     }
 
     /// <summary>
-    /// A queue row exactly as the pre-index code wrote it: no index row anywhere.
+    /// A queue row exactly as the v1 code wrote it: the legacy time-prefixed key
+    /// (<c>{ticks:D19}-{run}-{task}</c>), no <c>QueuedUtc</c> property, no index row anywhere. This is what
+    /// the v2 migration must re-key.
     /// </summary>
     private static Task SeedLegacyRowAsync(RunRemainingCounterTests.ConditionalStore store, string queueTable,
-        string runName, string taskId, int priority, DateTime queuedUtc) =>
-        store.UpsertAsync(queueTable,
-            new StoreRow(JobQueueStore.Bucket(priority), JobQueueStore.BuildRowKey(queuedUtc, runName, taskId))
+        string runName, string taskId, int priority, DateTime queuedUtc)
+    {
+        var legacyKey = $"{queuedUtc.Ticks.ToString("D19", System.Globalization.CultureInfo.InvariantCulture)}-{runName}-{taskId}";
+        return store.UpsertAsync(queueTable,
+            new StoreRow(JobQueueStore.Bucket(priority), legacyKey)
             {
                 Properties =
                 {
@@ -48,6 +52,7 @@ public class JobQueueIndexBackfillTests
                     ["LeaseUntil"] = (DateTimeOffset?)null,
                 }
             });
+    }
 
     [Fact]
     public async Task BuildsTheIndexForAQueueThatPredatesIt()
@@ -63,6 +68,31 @@ public class JobQueueIndexBackfillTests
         Assert.Equal(["task-0", "task-1"],
             (await queue.GetQueuedTaskIdsAsync("run-a")).OrderBy(x => x, StringComparer.Ordinal));
         Assert.Equal(["task-9"], await queue.GetQueuedTaskIdsAsync("run-b"));
+    }
+
+    /// <summary>
+    /// v2 re-keys a legacy time-prefixed row to the deterministic <c>{run}|{task}</c> scheme, carrying its
+    /// enqueue time into the QueuedUtc property, deleting the old row, and leaving the task claimable once.
+    /// </summary>
+    [Fact]
+    public async Task MigratesLegacyRowsToTheDeterministicKeyScheme()
+    {
+        var (queue, store, queueTable) = NewQueue();
+        await SeedLegacyRowAsync(store, queueTable, "run-a", "task-0", 4, At(3));
+
+        await queue.InitializeAsync();
+
+        var rows = new List<StoreRow>();
+        await foreach (var row in store.QueryTableAsync(queueTable)) rows.Add(row);
+
+        // The legacy row is gone; one row remains, keyed deterministically and carrying QueuedUtc.
+        var only = Assert.Single(rows);
+        Assert.Equal(JobQueueStore.BuildRowKey("run-a", "task-0"), only.RowKey);
+        Assert.Equal(new DateTimeOffset(At(3), TimeSpan.Zero), only.GetDateTimeOffset("QueuedUtc"));
+
+        // And it is still claimable, exactly once.
+        Assert.Equal("task-0",
+            Assert.Single(await queue.ClaimBatchAsync("w", 8, TimeSpan.FromMinutes(20))).TaskId);
     }
 
     [Fact]

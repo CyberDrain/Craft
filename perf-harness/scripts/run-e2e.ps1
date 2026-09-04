@@ -95,7 +95,7 @@ try {
   $enq = Api "/API/PerfBgEnqueue?n=$N&taskms=25"
   $t0 = Get-Date; $sawWork = $false; $idle = 0; $wdl = (Get-Date).AddSeconds(120)
   while ((Get-Date) -lt $wdl) {
-    $a = Api '/API/jobs/allocation'
+    $a = Api '/API/PerfAllocation'
     if (-not $a) { Start-Sleep -Milliseconds 250; continue }
     $work = [int]$a.jm.active + [int]$a.jm.queued
     if ($work -gt 0) { $sawWork = $true; $idle = 0 } elseif ($sawWork) { $idle++ }

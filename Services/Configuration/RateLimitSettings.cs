@@ -25,8 +25,44 @@ public class RateLimitSettings
     /// </summary>
     public int QueueLimit { get; set; }
 
+    /// <summary>
+    /// Maximum requests a single app-only API client (client-credentials caller) may have occupying
+    /// the HTTP worker system at once — counting both those queued waiting for a runspace and those
+    /// already executing, since the limiter's lease spans the whole downstream pipeline. Keyed per
+    /// client (its AppId), so one automation cannot monopolise the pool and starve the interactive UI,
+    /// which is never limited by this. Over-limit requests are rejected immediately with 429 (no
+    /// concurrency queue); the caller retries on <c>Retry-After</c>.
+    ///
+    /// <para>
+    /// 0 (default) = unlimited: the feature is off until a value is set. Distinct from
+    /// <see cref="PermitPerWindow"/>, which is a request-RATE cap; this is a simultaneous-in-flight cap.
+    /// Interactive (browser) callers are classified as UI and never counted here.
+    /// </para>
+    ///
+    /// Env override: <c>CRAFT_API_CONCURRENCY_LIMIT</c>.
+    /// </summary>
+    public int ApiConcurrencyLimit { get; set; }
+
     /// <summary>Resolved enabled state, honouring the CRAFT_RATELIMIT_ENABLED environment override.</summary>
     public bool IsEnabled =>
         Enabled
         || string.Equals(Environment.GetEnvironmentVariable("CRAFT_RATELIMIT_ENABLED"), "true", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Resolved per-client API concurrency cap, honouring the <c>CRAFT_API_CONCURRENCY_LIMIT</c>
+    /// environment override (which wins when it parses to a non-negative integer). 0 = unlimited/off.
+    /// </summary>
+    public int ResolvedApiConcurrencyLimit =>
+        int.TryParse(Environment.GetEnvironmentVariable("CRAFT_API_CONCURRENCY_LIMIT"),
+            System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture,
+            out var fromEnv) && fromEnv >= 0
+            ? fromEnv
+            : ApiConcurrencyLimit;
+
+    /// <summary>
+    /// Whether the rate-limiter middleware needs to run at all: either the per-client rate limiter is
+    /// enabled, or an API concurrency cap is configured. When both are off, the middleware is skipped
+    /// entirely (no per-request limiter cost).
+    /// </summary>
+    public bool RequiresLimiterMiddleware => IsEnabled || ResolvedApiConcurrencyLimit > 0;
 }

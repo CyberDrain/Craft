@@ -222,12 +222,15 @@ public class OrchestratorTableStore
     // Scanning instead is not an option: Azure Table cannot count server-side, so "is this run done"
     // would be a 7,000-row read per check.
     //
-    // The row lives in the TASKS table, in the run's own partition, and that placement is the whole
-    // design. A counter decremented separately from the task's terminal write is not idempotent — the
-    // status writer retries failed runs, so a replayed batch would decrement twice and strand a run that
-    // had actually finished. Sharing the partition lets CompleteTaskAsync mark the task terminal AND
-    // decrement the counter in ONE conditional transaction: exactly-once by construction, because a
-    // replay finds the task's ETag already moved on and the whole transaction is rejected.
+    // The row lives in the TASKS table, in the run's own partition, and that placement is deliberate: a
+    // task's terminal write and the counter decrement can then share ONE conditional transaction where
+    // exactly-once matters most — the cancel-a-run path (CancelPendingTaskAsync) uses exactly that, so a
+    // cancel racing a task's real completion cannot decrement the counter twice.
+    //
+    // The hot fan-out path decrements SEPARATELY (DecrementRemainingAsync), by design: the batched status
+    // writer coalesces terminal writes, and decrementing once per group after it lands keeps the write
+    // batched. Idempotency there rests on the writer never re-sending a group that landed, backstopped by
+    // ReconcileRemainingAsync (a full-partition recount) whenever a decrement is lost.
     //
     // The reserved row key cannot collide with a task id — task ids are caller-supplied names like
     // "CIPPStandard_IntuneTemplate_<guid>_<tenant>", never a control character.
@@ -326,47 +329,6 @@ public class OrchestratorTableStore
             "[OrchestratorStore] Reconciled remaining for {Run}: counter said {Stored}, task rows say {Actual}",
             runName, stored, outstanding);
         return outstanding;
-    }
-
-    /// <summary>
-    /// Mark one task terminal and decrement its run's outstanding count, atomically.
-    ///
-    /// Both rows share the run's partition, so this is a single conditional transaction guarded by both
-    /// ETags. That is what makes it exactly-once: a replay of the same completion finds the task row's
-    /// ETag already advanced, the transaction is rejected, and the counter is not decremented a second
-    /// time. A caller seeing false should re-read — either someone else completed this task, or the
-    /// counter moved under it and the decrement needs re-applying.
-    /// </summary>
-    /// <returns>The new outstanding count, or null if the transaction was rejected or rows are missing.</returns>
-    public async Task<int?> CompleteTaskAsync(string runName, OrchestratorTaskItem task,
-        CancellationToken ct = default)
-    {
-        for (var attempt = 0; attempt < CounterAttempts; attempt++)
-        {
-            var counter = await _store.GetAsync(_tasksTable, runName, CounterRowKey, ct);
-            var existing = await _store.GetAsync(_tasksTable, runName, task.Id, ct);
-            if (counter == null || existing == null) return null;
-
-            // Already terminal in storage — this is a replay. The ETag guard alone does not catch it,
-            // because each attempt re-reads the CURRENT row and would happily guard against the
-            // post-completion version and decrement a second time. Completing a completed task is a
-            // no-op, not another decrement: report the count and leave it alone.
-            if (IsTerminal(existing.GetString("Status")))
-                return counter.GetInt32("Remaining") ?? 0;
-
-            var taskRow = BuildTaskRow(runName, task);
-            // Guard on the row as it stands now; a concurrent writer invalidates this and we re-read.
-            var guarded = new StoreRow(runName, task.Id) { ETag = existing.ETag, Properties = taskRow.Properties };
-
-            counter["Remaining"] = Math.Max(0, (counter.GetInt32("Remaining") ?? 0) - 1);
-
-            if (await _store.TryReplaceBatchAsync(_tasksTable, runName, [guarded, counter], ct))
-                return (int)counter["Remaining"]!;
-        }
-
-        _logger.LogWarning("[OrchestratorStore] Could not complete {Task} in {Run} after {Attempts} attempts",
-            task.Id, runName, CounterAttempts);
-        return null;
     }
 
     /// <summary>What a status-guarded cancel actually did, so the caller can keep its view honest.</summary>
@@ -527,6 +489,55 @@ public class OrchestratorTableStore
     // unnecessary but still correct, and it keeps per-row payloads small (good for e.g. SQL packet size).
     private const int MaxPropertyChars = 30_000;
     private const int MaxEntityChars = 450_000;
+
+    /// <summary>
+    /// Write a set of coalesced SMALL task results (single-property rows) to the Results table, grouped
+    /// by run (partition) and chunked to the backend's transaction limits by the store. The batched
+    /// counterpart to <see cref="StoreResultAsync"/> for results that fit one property; larger results
+    /// still go through StoreResultAsync's multi-row chunking path.
+    /// </summary>
+    /// <returns>
+    /// The run names whose results did NOT persist. The caller must retry these AND withhold those runs'
+    /// terminal task markers this flush, or a task could be counted done while its result is lost.
+    /// An empty list means everything landed.
+    /// </returns>
+    public async Task<IReadOnlyList<string>> WriteResultBatchAsync(IReadOnlyList<ResultWrite> results,
+        int maxConcurrency = 8, CancellationToken ct = default)
+    {
+        var groups = results.GroupBy(r => r.RunName).ToList();
+        if (groups.Count == 0) return [];
+
+        var failed = new System.Collections.Concurrent.ConcurrentBag<string>();
+        using var gate = new SemaphoreSlim(Math.Max(1, maxConcurrency));
+
+        var tasks = groups.Select(async group =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                var rows = group.Select(r => new StoreRow(r.RunName, r.TaskId)
+                {
+                    Properties = { ["ResultJson"] = r.ResultJson }
+                }).ToList();
+                await _store.UpsertBatchAsync(_resultsTable, group.Key, rows, ct);
+            }
+            catch (Exception ex)
+            {
+                // One run's failure must not discard the others. Record it; the caller requeues just this
+                // run's results and holds its terminal markers until they land together.
+                failed.Add(group.Key);
+                _logger.LogWarning(ex, "[OrchestratorStore] Result write failed for run {Run} ({Count} results) — will retry",
+                    group.Key, group.Count());
+            }
+            finally
+            {
+                gate.Release();
+            }
+        });
+
+        await Task.WhenAll(tasks);
+        return failed.ToList();
+    }
 
     /// <summary>Store a single task result, chunking large JSON across properties/rows as needed.</summary>
     public async Task StoreResultAsync(string runName, string taskId, string resultJson)

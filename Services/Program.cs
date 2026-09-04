@@ -16,8 +16,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Bind App section to CraftSettings
 builder.Services.Configure<CraftSettings>(builder.Configuration.GetSection("App"));
-// Apply SkuProfiles override (host-tier pool sizing) before any consumer resolves the options
-builder.Services.PostConfigure<CraftSettings>(s => SkuProfileSelector.Apply(s));
+// Apply SkuProfiles override (host-tier pool sizing + GC heap limit) before any consumer resolves
+// the options — the heap limit lands via GC.RefreshMemoryLimit, so it must run before the worker
+// pools start growing the heap.
+builder.Services.PostConfigure<CraftSettings>(s => GcHeapLimit.Apply(SkuProfileSelector.Apply(s)));
 // Also register a singleton accessor for non-DI contexts
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<CraftSettings>>().Value);
 
@@ -73,6 +75,9 @@ var nativeCatalog = NativeEndpointRegistry.Discover(
     LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Craft.Endpoints"));
 
 builder.Services.AddCraftServices(roles);
+// The discovered catalog, injectable so the startup telemetry emitter can report a native route count
+// without re-scanning. Registered even when empty so the dependency always resolves.
+builder.Services.AddSingleton(nativeCatalog);
 if (!nativeCatalog.IsEmpty)
     builder.Services.AddNativeEndpoints(nativeCatalog, builder.Configuration);
 builder.Services.AddCraftRateLimiter(craftSettings);
@@ -382,7 +387,7 @@ if (capHttp)
 //     counting those against the caller's budget could throttle a user for opening a page.
 // Left outside the capHttp block on purpose: a frontend-only node has no auth middleware and no
 // worker pool, but should still be protected, partitioned by origin address as before.
-if (CraftSettings.RateLimit.IsEnabled)
+if (CraftSettings.RateLimit.RequiresLimiterMiddleware)
     app.UseRateLimiter();
 
 // Concurrent request tracking for diagnostics. A holder object, not an int: the dispatch endpoint
@@ -410,10 +415,11 @@ StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryServic
 if (capHttp)
 {
 
-    // Setup wizard API and job/run status API — both plain C#, no PowerShell involved.
-    // See Services/Hosting/Endpoints/.
+    // Setup wizard API — plain C#, no PowerShell involved. See Services/Hosting/Endpoints/.
+    // Job/run status and queue maintenance are intentionally NOT HTTP endpoints here: CRAFT exposes them
+    // as bridge methods (WorkerMetricsBridge / QueueStatusBridge) and a downstream app wraps whichever it
+    // needs into its own endpoints — the perf-harness's PerfApi module (Invoke-PerfAllocation) is one.
     app.MapCraftSetupEndpoints(CraftSettings);
-    app.MapCraftJobEndpoints();
 
     // Native C# endpoints. Mapped before the PowerShell dispatcher, though ASP.NET route precedence
     // would put a literal segment ahead of /API/{endpoint} regardless — which is what lets an app

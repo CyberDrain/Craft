@@ -167,70 +167,6 @@ public class RunRemainingCounterTests
         return store;
     }
 
-    [Fact]
-    public async Task CounterStartsAtTheTaskCountAndFallsToZero()
-    {
-        var backing = new ConditionalStore();
-        var store = await SeededAsync(backing, 3);
-
-        Assert.Equal(3, await store.GetRemainingAsync(Run));
-
-        Assert.Equal(2, await store.CompleteTaskAsync(Run, Task_("task-0")));
-        Assert.Equal(1, await store.CompleteTaskAsync(Run, Task_("task-1")));
-        Assert.Equal(0, await store.CompleteTaskAsync(Run, Task_("task-2")));
-
-        Assert.Equal(0, await store.GetRemainingAsync(Run));
-    }
-
-    /// <summary>
-    /// THE GUARANTEE. Replaying a completion — which the status writer does whenever a run's batch fails
-    /// and is requeued — must not decrement twice. A run that double-counts finishes on paper before its
-    /// work is done.
-    /// </summary>
-    [Fact]
-    public async Task ReplayingACompletionDoesNotDecrementTwice()
-    {
-        var backing = new ConditionalStore();
-        var store = await SeededAsync(backing, 2);
-
-        var task = Task_("task-0");
-        Assert.Equal(1, await store.CompleteTaskAsync(Run, task));
-
-        // Same completion again. Completing a completed task reports the count and changes nothing.
-        var writesBefore = backing.ConditionalWrites;
-        var replay = await store.CompleteTaskAsync(Run, task);
-
-        Assert.Equal(1, replay);
-        Assert.Equal(1, await store.GetRemainingAsync(Run));
-        Assert.Equal(writesBefore, backing.ConditionalWrites);
-    }
-
-    /// <summary>
-    /// A competitor updating the counter between our read and our write must not cost us our decrement.
-    /// Both completions have to count.
-    /// </summary>
-    [Fact]
-    public async Task ConcurrentCompletionsBothCount()
-    {
-        var backing = new ConditionalStore();
-        var store = await SeededAsync(backing, 5);
-
-        var interfered = false;
-        backing.OnBeforeConditionalWrite = () =>
-        {
-            if (interfered) return;
-            interfered = true;
-            // Land a competing completion first, invalidating the counter ETag we just read.
-            store.CompleteTaskAsync(Run, Task_("task-9")).GetAwaiter().GetResult();
-        };
-
-        await store.CompleteTaskAsync(Run, Task_("task-0"));
-        backing.OnBeforeConditionalWrite = null;
-
-        // task-9 does not exist, so only our own decrement should have landed.
-        Assert.Equal(4, await store.GetRemainingAsync(Run));
-    }
-
     /// <summary>
     /// The counter shares the task partition so it can ride the same transaction. Nothing that reads
     /// tasks may mistake it for one — a phantom task never completes, and the run never finalizes.
@@ -284,7 +220,7 @@ public class RunRemainingCounterTests
         await store.InitializeAsync();
 
         Assert.Null(await store.GetRemainingAsync("never-seeded"));
-        Assert.Null(await store.CompleteTaskAsync("never-seeded", Task_("task-0")));
+        Assert.Null(await store.DecrementRemainingAsync("never-seeded", 1));
     }
 
     // ─── Reconciliation (the lost-decrement repair) ───
@@ -348,11 +284,11 @@ public class RunRemainingCounterTests
         backing.OnBeforeConditionalWrite = () =>
         {
             backing.OnBeforeConditionalWrite = null;
-            store.CompleteTaskAsync(Run, Task_("task-1")).GetAwaiter().GetResult();
+            store.DecrementRemainingAsync(Run, 1).GetAwaiter().GetResult();
         };
 
         Assert.Null(await store.ReconcileRemainingAsync(Run));
-        // The competitor's decrement survived: 3 seeded − 1 completed-by-competitor.
+        // The competitor's decrement survived: 3 seeded − 1 decremented-by-competitor.
         Assert.Equal(2, await store.GetRemainingAsync(Run));
     }
 
