@@ -950,13 +950,6 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// </summary>
     private async Task<Func<CancellationToken, Task>?> ResolveTaskWorkAsync(JobDescriptor descriptor, CancellationToken ct)
     {
-        if (!_taskScriptPaths.TryGetValue(descriptor.RunName, out var taskPath))
-        {
-            _logger.LogWarning("[Orchestrator] No task script path known for run {Run} — dropping {Task}",
-                descriptor.RunName, descriptor.TaskId);
-            return null;
-        }
-
         OrchestratorRun? run;
         OrchestratorTaskItem? task;
 
@@ -1003,6 +996,35 @@ public class OrchestratorService : IJobDescriptorStateWriter
             _logger.LogDebug("[Orchestrator] Stale descriptor {Run}/{Task} — no longer in storage",
                 descriptor.RunName, descriptor.TaskId);
             return null;
+        }
+
+        // Resolve the task script (a PowerShell function name) for this run. The steady-state path finds
+        // it in _taskScriptPaths, cached by DispatchPendingTasksAsync when the run was dispatched. A MISS
+        // is NOT a reason to drop the task. The pump is a BackgroundService that begins claiming persisted
+        // queue rows at host start, whereas the only writer of _taskScriptPaths does not run for a resumed
+        // run until ResumeInterruptedRunsAsync reaches it — and that waits on the worker pool first — and
+        // the rehydration branch above re-adds a run to _activeRuns without a cached path either. In both
+        // windows the run record still carries TaskScriptName, so rebuild the path from it exactly as the
+        // resume path does (ScriptRepository is fully loaded before the pump's first claim) and cache it,
+        // so sibling tasks of the same run cost nothing. Only an empty TaskScriptName with no
+        // naming-convention match is genuinely unrunnable. Returning null on the miss instead lets the
+        // JobManager mark the job Skipped and the pump delete its queue row, permanently dropping a task
+        // that is still Pending in the run — with no queue row left, nothing re-dispatches it.
+        if (!_taskScriptPaths.TryGetValue(run.Name, out var taskPath))
+        {
+            taskPath = !string.IsNullOrEmpty(run.TaskScriptName)
+                ? _psRunner.FindScript(run.TaskScriptName)
+                : FindTaskScript(run.Name);
+
+            if (string.IsNullOrEmpty(taskPath))
+            {
+                _logger.LogWarning(
+                    "[Orchestrator] No task script for run {Run} (TaskScriptName={Script}) — dropping {Task}",
+                    run.Name, run.TaskScriptName, descriptor.TaskId);
+                return null;
+            }
+
+            _taskScriptPaths[run.Name] = taskPath;
         }
 
         // Already terminal (e.g. cancelled, or completed by a previous attempt while queued), or already
@@ -1294,11 +1316,19 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
         if (candidates.Count == 0) return;
 
-        // Storage decides. A Pending task that still has a row is waiting its turn, not orphaned.
-        HashSet<string> stillQueued;
+        // Storage decides — but the queue TABLE decides, not the index. Asking the index (the old
+        // GetQueuedTaskIdsAsync here) reports a task queued whenever its index row exists, and an index
+        // row can outlive the queue row it points at. Such a task is invisible to the pump yet looks
+        // "queued" to this check, so it is never re-driven and its run stalls indefinitely with the task
+        // Pending — this watchdog keeps ticking and finds nothing orphaned. GetDispatchableTaskIdsAsync
+        // verifies each candidate against the queue table (one point read apiece; the candidate set is
+        // small), returning only tasks the pump can actually still claim. Anything else is a ghost to
+        // re-enqueue.
+        HashSet<string> dispatchable;
         try
         {
-            stillQueued = await _queue.GetQueuedTaskIdsAsync(run.Name);
+            dispatchable = await _queue.GetDispatchableTaskIdsAsync(
+                run.Name, candidates.Select(t => t.Id).ToList());
         }
         catch (Exception ex)
         {
@@ -1308,7 +1338,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
             return;
         }
 
-        var orphaned = candidates.Where(t => !stillQueued.Contains(t.Id)).ToList();
+        var orphaned = candidates.Where(t => !dispatchable.Contains(t.Id)).ToList();
         if (orphaned.Count == 0) return;
 
         foreach (var task in orphaned)
@@ -1319,7 +1349,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
 
         _logger.LogWarning(
-            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no queue row and not queued or running",
+            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no runnable queue row and not queued or running",
             orphaned.Count, run.Name);
     }
 

@@ -729,6 +729,60 @@ public sealed class JobQueueStore : IDisposable
     }
 
     /// <summary>
+    /// Of <paramref name="taskIds"/> (all belonging to <paramref name="runName"/>), the ones the pump
+    /// can still dispatch: they have a queue row that EXISTS and that the claim filter will match — now,
+    /// because it is free, or later, because it holds a lease that will lapse.
+    ///
+    /// This is the queue-table counterpart to <see cref="GetQueuedTaskIdsAsync"/>, which answers purely
+    /// from the index. The index is what makes "does this run still have queued work" a single-partition
+    /// read, but it can OUTLIVE the queue rows it points at, and then it lies: it reports a task queued
+    /// that no pump will ever run. That divergence is not hypothetical —
+    /// <list type="bullet">
+    ///   <item><description>a removal deletes the index row first, so a crash in between (or a
+    ///     <see cref="RemoveRunAsync"/> that deleted queue rows before its index partition) can leave the
+    ///     opposite;</description></item>
+    ///   <item><description>a run left Pending under a build that dispatched into memory rather than this
+    ///     queue re-enters here with index rows and no queue rows;</description></item>
+    ///   <item><description>a row owned with NO <c>LeaseUntil</c> is excluded by
+    ///     <see cref="ClaimableFilter"/> forever, so it sits with an index entry advertising it.</description></item>
+    /// </list>
+    /// A task in any of those states is invisible to the pump AND reported "queued" by the index, so the
+    /// re-drive that trusts the index never re-enqueues it and the run stalls indefinitely with it, its
+    /// watchdog never firing. Verifying against the queue table costs one point read per id, so the caller
+    /// passes a SMALL candidate set (the re-drive's aged-Pending tasks), never the whole run.
+    /// </summary>
+    public async Task<HashSet<string>> GetDispatchableTaskIdsAsync(
+        string runName, IReadOnlyCollection<string> taskIds, CancellationToken ct = default)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        if (taskIds.Count == 0) return result;
+
+        var wanted = taskIds as HashSet<string> ?? new HashSet<string>(taskIds, StringComparer.Ordinal);
+        var now = DateTimeOffset.UtcNow;
+
+        // The index carries the bucket + queue row key to address each row directly — one partition read,
+        // then a point read only for the ids the caller asked about.
+        foreach (var e in await ReadIndexAsync(runName, ct))
+        {
+            if (!wanted.Contains(e.TaskId)) continue;
+
+            var row = await _store.GetAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
+            if (row == null) continue;   // index points at a queue row that is gone — a ghost
+
+            // Owned with no lease is what the server-side claim filter cannot match (it is neither
+            // Owner eq '' nor LeaseUntil lt now), so the pump would never dispatch it however long it
+            // waits — a ghost as surely as a missing row. A free row, or one under a lease live or
+            // lapsed, the pump will get.
+            if (!string.IsNullOrEmpty(row.GetString("Owner")) && row.GetDateTimeOffset("LeaseUntil") == null)
+                continue;
+
+            result.Add(e.TaskId);
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Bring the queue tables up to <see cref="SchemaVersion"/>, once per storage account. The marker row
     /// written at the end is checked first, so every later start is a single point read.
     ///
