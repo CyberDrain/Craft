@@ -337,6 +337,56 @@ function Invoke-PerfSeqResult {
         order = [string]$c['order']; maxActive = [int]$c['maxActive'] } }
 }
 
+# ── Worker-pinning probe ────────────────────────────────────────────────────────────────────────────
+# Proves the pinned sequential driver: every step of a sequential run runs on the SAME worker, and
+# concurrently-running sequential runs each pin their OWN worker. Each step records (run, idx, worker) under
+# a unique key so distinct-key writes stay concurrency-safe on the synchronized Hashtable. The worker id is
+# the per-invoke stamped $global:CraftOperationContext.WorkerId ("W<n>"); the run name is carried on the item
+# so grouping never depends on RunName propagation into the task context. Read via /API/PerfSeqWorkerResult.
+function Push-PerfSeqWorker {
+    param($Item)
+    $ctx = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    $worker = if ($ctx -and $ctx.WorkerId) { [string]$ctx.WorkerId } else { 'W?' }
+    $run = [string]$Item.run
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker')
+    $c["$run|$([int]$Item.idx)"] = "$worker@$([DateTime]::UtcNow.Ticks)"
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    return @{ ok = $true; run = $run; idx = $Item.idx; worker = $worker }
+}
+
+# Start N sequential (or fan-out, with seq=false) runs of K steps each, holding holdms per step so several
+# runs are in flight at once — the case that shows each sequential run keeps its own single worker. Each step
+# carries its run name. Clears the shared cache first so a run of the harness starts clean.
+function Invoke-PerfSeqWorkerEnqueue {
+    param($Request, $TriggerMetadata)
+    $runs = 4;     if ($Request.Query.runs)   { $runs = [int]$Request.Query.runs }
+    $steps = 5;    if ($Request.Query.steps)  { $steps = [int]$Request.Query.steps }
+    $holdms = 500; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $seq = -not ([string]$Request.Query.seq -eq 'false')  # default sequential; seq=false → fan-out contrast
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker'); $c.Clear()
+    $names = @()
+    for ($r = 0; $r -lt $runs; $r++) {
+        $name = "SeqW$r-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
+        $names += $name
+        $batch = @(for ($i = 0; $i -lt $steps; $i++) { @{ FunctionName = 'PerfSeqWorker'; run = $name; idx = $i; holdms = $holdms } })
+        Start-CraftOrchestrator -InputObject @{ OrchestratorName = $name; Batch = $batch; Sequential = $seq } | Out-Null
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfSeqWorkerEnqueue'
+            runs = $runs; steps = $steps; holdms = $holdms; sequential = $seq; names = $names } }
+}
+
+function Invoke-PerfSeqWorkerResult {
+    param($Request, $TriggerMetadata)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker')
+    $rows = @()
+    foreach ($k in @($c.Keys)) {
+        $parts = ([string]$k) -split '\|', 2
+        $vp = ([string]$c[$k]) -split '@', 2
+        $rows += @{ run = $parts[0]; idx = [int]$parts[1]; worker = $vp[0]; ticks = [long]$vp[1] }
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfSeqWorkerResult'; count = $rows.Count; rows = @($rows) } }
+}
+
 # Thread-pool + process-thread telemetry, for the "thread constrained" half of the many-runs harness. The
 # per-run timers fire their re-drive as fire-and-forget work onto the .NET thread pool, so PendingWorkItemCount
 # climbing (work queued faster than threads drain it) is the thread-starvation signal that inflates the
