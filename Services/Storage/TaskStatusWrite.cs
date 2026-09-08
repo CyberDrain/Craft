@@ -9,4 +9,4 @@ namespace Craft.Storage;
 /// time the task moved to Running.
 /// </summary>
 public record TaskStatusWrite(string RunName, string TaskId, string Status, string? ParametersJson,
-    int AttemptCount, string? LastError, DateTime? CompletedUtc, int? Priority);
+    int AttemptCount, string? LastError, DateTime? CompletedUtc, int? Priority, int Sequence = 0);

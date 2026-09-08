@@ -25,7 +25,7 @@ public static class OrchestratorBridge
 
     public static void QueueOrchestration(string name, string batchJson, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null)
+        string? reference = null, string? parentRunName = null, bool sequential = false)
     {
         // Sanitized here as well as at run creation so the child-run registration below
         // records the SAME name the service ends up creating — a raw name with a table-illegal
@@ -35,7 +35,7 @@ public static class OrchestratorBridge
         var gated = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference,
-            PendingChildRegistered: gated));
+            PendingChildRegistered: gated, Sequential: sequential));
     }
 
     /// <summary>
@@ -51,14 +51,14 @@ public static class OrchestratorBridge
     /// </summary>
     public static void QueueOrchestrationFromFile(string name, string batchFilePath, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null)
+        string? reference = null, string? parentRunName = null, bool sequential = false)
     {
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
         var gated = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
-            PendingChildRegistered: gated));
+            PendingChildRegistered: gated, Sequential: sequential));
     }
 
     /// <summary>
@@ -112,7 +112,7 @@ public static class OrchestratorBridge
                 if (s_service == null) { DiscardUndispatchable(p); continue; }
                 s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                     p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath)
+                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential)
                     .GetAwaiter().GetResult();
             }
             catch (Exception ex)
@@ -144,7 +144,7 @@ public static class OrchestratorBridge
                 if (s_service == null) { DiscardUndispatchable(p); continue; }
                 await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                     p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath);
+                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential);
             }
             catch (Exception ex)
             {
@@ -187,7 +187,7 @@ public static class OrchestratorBridge
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
         string? Reference = null, string? BatchFilePath = null,
-        bool PendingChildRegistered = false);
+        bool PendingChildRegistered = false, bool Sequential = false);
 
     private static readonly ConcurrentQueue<PendingPlannerRun> s_pendingPlanners = new();
 

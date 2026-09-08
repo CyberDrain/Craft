@@ -118,7 +118,10 @@ public class OrchestratorTableStore
             ["PostExecAttemptCount"] = run.PostExecAttemptCount,
             ["Reference"] = run.Reference,
             ["ParentRunName"] = run.ParentRunName,
-            ["TaskCount"] = run.Tasks.Count
+            ["TaskCount"] = run.Tasks.Count,
+            // Persisted so a resumed sequential run keeps advancing one task at a time (0/1 — StoreRow has
+            // no bool reader). Absent on older rows reads as 0 = the fan-out default.
+            ["Sequential"] = run.Sequential ? 1 : 0
         }
     };
 
@@ -145,7 +148,8 @@ public class OrchestratorTableStore
             // (so FindRunByReference could not see it) and a null ParentRunName (so its finalize
             // never re-checked the parent). Absent on rows written before this existed.
             Reference = runRow.GetString("Reference"),
-            ParentRunName = runRow.GetString("ParentRunName")
+            ParentRunName = runRow.GetString("ParentRunName"),
+            Sequential = (runRow.GetInt32("Sequential") ?? 0) == 1
         };
 
         var tasks = new List<OrchestratorTaskItem>();
@@ -178,6 +182,7 @@ public class OrchestratorTableStore
                 LastError = taskRow.GetString("LastError"),
                 // Absent on rows written before per-task priority existed — null means "inherit the run's".
                 Priority = taskRow.GetInt32("Priority"),
+                Sequence = taskRow.GetInt32("Sequence") ?? 0,
                 CompletedUtc = taskRow.GetDateTimeOffset("CompletedUtc")?.UtcDateTime
             });
         }
@@ -483,6 +488,7 @@ public class OrchestratorTableStore
             ["AttemptCount"] = task.AttemptCount,
             ["LastError"] = task.LastError,
             ["Priority"] = task.Priority,
+            ["Sequence"] = task.Sequence,
             ["CompletedUtc"] = task.CompletedUtc.HasValue
                 ? new DateTimeOffset(task.CompletedUtc.Value, TimeSpan.Zero)
                 : (DateTimeOffset?)null
@@ -498,6 +504,7 @@ public class OrchestratorTableStore
             ["AttemptCount"] = w.AttemptCount,
             ["LastError"] = w.LastError,
             ["Priority"] = w.Priority,
+            ["Sequence"] = w.Sequence,
             ["CompletedUtc"] = w.CompletedUtc.HasValue
                 ? new DateTimeOffset(w.CompletedUtc.Value, TimeSpan.Zero)
                 : (DateTimeOffset?)null

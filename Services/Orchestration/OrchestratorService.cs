@@ -734,7 +734,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// </summary>
     public async Task StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
-        string? parentRunName = null, string? reference = null, string? batchFilePath = null)
+        string? parentRunName = null, string? reference = null, string? batchFilePath = null,
+        bool sequential = false)
     {
         // The batch file is this method's to dispose of, on EVERY path — including the two
         // "already running, skipping" returns below, which never look at it. Those are the common
@@ -743,7 +744,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await StartFromBatchCoreAsync(name, batchJson, priority, postExecFunctionName,
-                postExecParametersJson, parentRunName, reference, batchFilePath, ct);
+                postExecParametersJson, parentRunName, reference, batchFilePath, sequential, ct);
         }
         finally
         {
@@ -760,7 +761,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     private async Task StartFromBatchCoreAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson,
-        string? parentRunName, string? reference, string? batchFilePath, CancellationToken ct)
+        string? parentRunName, string? reference, string? batchFilePath, bool sequential, CancellationToken ct)
     {
         // Run names become PartitionKeys verbatim, and batch names carry user-typed task names
         // ("Alert on Entra ID P1/P2 …"). An illegal key character 400s every write for the run —
@@ -822,6 +823,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 return;
             }
 
+            // Stamp payload order. Sequential dispatch reads this to run tasks one at a time in the order
+            // they were submitted; fan-out ignores it. The parser preserves batch order, so the index is it.
+            for (var i = 0; i < tasks.Count; i++) tasks[i].Sequence = i;
+
             var genericTaskFunc = _settings.Orchestrator.GenericTaskFunction;
             if (string.IsNullOrEmpty(genericTaskFunc))
             {
@@ -846,7 +851,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 TaskScriptName = genericTaskFunc,
                 PostExecFunctionName = postExecFunctionName,
                 PostExecParametersJson = postExecParametersJson,
-                ParentRunName = parentRunName
+                ParentRunName = parentRunName,
+                Sequential = sequential
             };
 
             await _store.UpsertRunAsync(run);
@@ -921,7 +927,23 @@ public class OrchestratorService : IJobDescriptorStateWriter
             alreadyQueued = [];
         }
 
-        var toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+        List<OrchestratorTaskItem> toQueue;
+        if (run.Sequential)
+        {
+            // Sequential mode: the invariant is that ONLY the current task — the lowest-Sequence task still
+            // Pending — ever has a queue row, and the next is enqueued when it reaches a terminal state (see
+            // the completion path in BuildTaskWork). So enqueue that one task, and only if it does not
+            // already have a row. Enqueuing the NEXT task when the current one is already queued (which a
+            // naive "first not-already-queued" would do after a restart that preserved the current task's
+            // row) would put two of this run's tasks in flight and break the ordering. Covers both first
+            // dispatch (enqueues Sequence 0) and resume (re-enqueues the reached task only if its row is gone).
+            var current = pending.OrderBy(t => t.Sequence).FirstOrDefault();
+            toQueue = current != null && !alreadyQueued.Contains(current.Id) ? [current] : [];
+        }
+        else
+        {
+            toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+        }
 
         // Shed the Parameters payload BEFORE the tasks become claimable. The caller has already persisted
         // them (UpsertTaskBatchAsync), so the Tasks table is authoritative; the live graph keeps each task
@@ -931,8 +953,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // what walks the live-set into the GC heap ceiling. Ordering matters: shedding AFTER the enqueue
         // could null a task the pump had already claimed and whose BuildTaskWork had just rehydrated it, so
         // shed here, before EnqueueBatchAsync makes the rows claimable. Only toQueue (the rows enqueued in
-        // THIS call) is touched — a task already queued from a prior call may be mid-dispatch.
-        if (_shedParameters)
+        // THIS call) is touched — a task already queued from a prior call may be mid-dispatch. Sequential
+        // runs are exempt: they are small (a handful of ordered steps) and their advance path enqueues the
+        // next task without a rehydrate, so shedding would buy no memory and add a needless read per step.
+        if (_shedParameters && !run.Sequential)
         {
             lock (_lock)
                 foreach (var t in toQueue)
@@ -968,6 +992,37 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
     /// re-drive finds it again.
     /// </summary>
+    /// <summary>
+    /// Advance a sequential run by one step: once the current task reaches a terminal state, enqueue the
+    /// next task — the lowest-Sequence task still Pending — so the run proceeds one task at a time in
+    /// payload order. No-op when nothing is Pending (the run is finishing; finalize is already scheduled)
+    /// or when the next task is somehow already queued/running (idempotent). It advances past a FAILED task
+    /// as well, so one failing step cannot strand the rest Pending forever. The task's payload is not shed
+    /// for sequential runs, so no rehydrate is needed here — a plain queue row is all that is required.
+    /// </summary>
+    private async Task AdvanceSequentialAsync(OrchestratorRun run)
+    {
+        OrchestratorTaskItem? next;
+        lock (_lock)
+        {
+            next = run.Tasks.Where(t => t.Status == "Pending").OrderBy(t => t.Sequence).FirstOrDefault();
+        }
+        if (next == null) return;
+        if (_jobManager.IsQueuedOrRunning($"{run.Name}-{next.Id}")) return;
+        try
+        {
+            await _queue.EnqueueAsync(run.Name, next.Id, next.Priority ?? run.Priority, DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            // Not fatal: the re-drive (restricted to the current task for a sequential run) is the backstop —
+            // it finds this task Pending with no queue row and re-enqueues it on its next tick.
+            _logger.LogWarning(ex,
+                "[Scheduler] Could not enqueue next sequential task {Task} in {Run} — the re-drive will retry",
+                next.Id, run.Name);
+        }
+    }
+
     private void RequeueToTable(OrchestratorRun run, OrchestratorTaskItem task)
     {
         var priority = task.Priority ?? run.Priority;
@@ -1262,6 +1317,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     // table and re-runs anything not marked Completed (idempotent).
                     PersistTaskAndRunAsync(run, task);
 
+                    // Sequential run: this task is done, so queue the next one in payload order. No-op if
+                    // this was the last (finalize is already scheduled by CheckRunCompletion above).
+                    if (run.Sequential) await AdvanceSequentialAsync(run);
+
                     _logger.LogDebug("[Scheduler] Task completed: {TaskId}", task.Id);
                 }
                 catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
@@ -1282,6 +1341,11 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         CheckRunCompletion(run);
                     }
                     PersistTaskAndRunAsync(run, task);
+
+                    // Sequential run: advance past a FAILED step too, or the remaining tasks sit Pending
+                    // forever and the run never finalizes. (Stop-on-error would be a future option.)
+                    if (run.Sequential) await AdvanceSequentialAsync(run);
+
                     _logger.LogError(ex, "[Scheduler] Task failed: {TaskId}", task.Id);
                     throw; // Let JobManager also track the failure
                 }
@@ -1442,6 +1506,25 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 .Where(t => !_deferrals.TryGetValue(DeferralKey(run.Name, t.Id), out var s)
                             || now - s.LastUtc >= RedriveAge)
                 .ToList();
+
+            // Sequential run: at most one task is ever in flight, and the not-yet-reached tasks
+            // deliberately have NO queue row — so the generic "Pending with no queue row = orphaned" rule
+            // would re-drive them all and shatter the ordering. While a task is Running the chain is
+            // progressing, so re-drive nothing. Otherwise consider ONLY the next task (lowest Sequence
+            // still Pending); the queue-table check below then re-enqueues it just if its own row is truly
+            // gone — a stalled chain, the real recovery case.
+            if (run.Sequential)
+            {
+                if (run.Tasks.Any(t => t.Status == "Running"))
+                {
+                    candidates.Clear();
+                }
+                else
+                {
+                    var next = candidates.OrderBy(t => t.Sequence).FirstOrDefault();
+                    candidates = next != null ? [next] : [];
+                }
+            }
         }
 
         if (candidates.Count == 0)

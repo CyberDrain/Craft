@@ -75,7 +75,7 @@ public sealed class OrchestratorStatusWriter : IDisposable
     private static string Key(string run, string task) => run + "" + task;
     private static TaskStatusWrite Snap(string run, OrchestratorTaskItem t) => new(
         run, t.Id, t.Status, JsonSerializer.Serialize(t.Parameters, s_json), t.AttemptCount, t.LastError,
-        t.CompletedUtc, t.Priority);
+        t.CompletedUtc, t.Priority, t.Sequence);
 
     /// <summary>Persist the pre-invoke "Running" marker durably before the task runs. Under the barrier it is
     /// batched with other concurrently-starting tasks (N tasks → ~1 transaction) yet still lands before the

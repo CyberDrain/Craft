@@ -24,6 +24,10 @@ function Start-CraftOrchestrator {
             - FunctionName    (string)  — Push-{FunctionName} is called with aggregated results
             - Parameters      (object)  — extra parameters forwarded to the post-exec function
           - SkipLog           (bool)    — optional; suppress run logging
+          - Sequential        (bool)    — optional; run the batch ONE TASK AT A TIME in payload order
+                                          (Durable-style sequencing) instead of fanning out in parallel.
+                                          Only the current task is queued; the next is queued when it
+                                          finishes. Runs on any free worker (no pinning).
 
     .EXAMPLE
         Start-CraftOrchestrator -InputObject @{
@@ -120,7 +124,11 @@ function Start-CraftOrchestrator {
     # a parent run would finalize (and dispatch its PostExecution) before its child runs complete.
     $ParentRunName = $OpContext.RunName
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
+    # Sequential mode: PowerShell marshals absent/$false to $false. When set, the orchestrator queues the
+    # batch one task at a time in payload order rather than fanning out.
+    $Sequential = [bool]($InputObject.Sequential)
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
         $BatchPath,
@@ -128,7 +136,8 @@ function Start-CraftOrchestrator {
         $PostExecFunctionName,
         $PostExecParametersJson,
         $InputObject.Reference,
-        $ParentRunName
+        $ParentRunName,
+        $Sequential
     )
     return "Craft-$OrchestratorName"
 }

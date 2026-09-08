@@ -28,4 +28,13 @@ public class OrchestratorRun
     public int PostExecAttemptCount { get; set; }
 
     public string? ParentRunName { get; set; }
+
+    /// <summary>
+    /// Sequential execution mode. When true the run's tasks are dispatched ONE AT A TIME, in ascending
+    /// <see cref="OrchestratorTaskItem.Sequence"/> (batch) order: only the current task is ever enqueued,
+    /// and the next is enqueued when it reaches a terminal state. Runs on any free worker (no pinning) —
+    /// the durable queue simply never holds more than one of this run's tasks at once. The default (false)
+    /// is the fan-out behaviour: every task is enqueued up front and drained in parallel by the pool.
+    /// </summary>
+    public bool Sequential { get; set; }
 }
