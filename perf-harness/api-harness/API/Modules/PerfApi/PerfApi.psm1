@@ -214,6 +214,58 @@ function Invoke-PerfTableOp {
     }
 }
 
+# Pre-seed live runs directly into the orchestrator tables, bypassing Start-CraftOrchestrator's per-run
+# enqueue cost — so a HIGH-scale thread comparison (per-run timers vs the single sweep) is not gated by how
+# fast the batch/planner path can create runs. Writes the Runs rows (Status=Running), each run's Tasks rows
+# (Status=Pending) + the "!!run-counter" row, in Azure Table batch transactions. RESTART the container after
+# seeding: ResumeInterruptedRunsAsync reads the Running run rows and resumes them into live _activeRuns
+# entries (each with a per-run status timer on the old build, or joined to the sweep on the new one).
+# Query: runs=M (default 2000), tasks=K (default 1), holdms=H, prefix=P, tableprefix=T (default PerfBgOrch).
+function Invoke-PerfSeedRuns {
+    param($Request, $TriggerMetadata)
+    $runs = 2000;      if ($Request.Query.runs) { $runs = [int]$Request.Query.runs }
+    $tasks = 1;        if ($Request.Query.tasks) { $tasks = [int]$Request.Query.tasks }
+    $holdms = 3600000; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $prefix = 'seed';  if ($Request.Query.prefix) { $prefix = [string]$Request.Query.prefix }
+    $tp = 'PerfBgOrch'; if ($Request.Query.tableprefix) { $tp = [string]$Request.Query.tableprefix }
+    try {
+        $svc = [Azure.Data.Tables.TableServiceClient]::new($env:AzureWebJobsStorage)
+        $rc = $svc.GetTableClient("${tp}Runs");  $rc.CreateIfNotExists() | Out-Null
+        $tc = $svc.GetTableClient("${tp}Tasks"); $tc.CreateIfNotExists() | Out-Null
+        $now = [DateTimeOffset]::UtcNow
+        $upsert = [Azure.Data.Tables.TableTransactionActionType]::UpsertReplace
+        $runBatch = [System.Collections.Generic.List[Azure.Data.Tables.TableTransactionAction]]::new()
+        $created = 0
+        for ($i = 0; $i -lt $runs; $i++) {
+            $name = "$prefix-$i"
+            $r = [Azure.Data.Tables.TableEntity]::new('Run', $name)
+            $r['Status'] = 'Running'; $r['Priority'] = [int]4; $r['StartedUtc'] = $now
+            $r['TaskScriptName'] = 'Invoke-CraftTask'; $r['TaskCount'] = [int]$tasks; $r['Sequential'] = [int]0
+            $runBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $r))
+            if ($runBatch.Count -eq 100) { $rc.SubmitTransaction($runBatch) | Out-Null; $runBatch.Clear() }
+
+            $taskBatch = [System.Collections.Generic.List[Azure.Data.Tables.TableTransactionAction]]::new()
+            for ($j = 0; $j -lt $tasks; $j++) {
+                $t = [Azure.Data.Tables.TableEntity]::new($name, "${name}_t$j")
+                $t['Status'] = 'Pending'
+                $t['ParametersJson'] = "{`"FunctionName`":`"PerfHold`",`"idx`":$j,`"holdms`":$holdms}"
+                $t['AttemptCount'] = [int]0; $t['Sequence'] = [int]$j
+                $taskBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $t))
+            }
+            $cnt = [Azure.Data.Tables.TableEntity]::new($name, '!!run-counter')
+            $cnt['Remaining'] = [int]$tasks; $cnt['Total'] = [int]$tasks
+            $taskBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $cnt))
+            $tc.SubmitTransaction($taskBatch) | Out-Null
+            $created++
+        }
+        if ($runBatch.Count -gt 0) { $rc.SubmitTransaction($runBatch) | Out-Null }
+        return @{ StatusCode = 200; Body = @{ ok = $true; seeded = $created; tasksPerRun = $tasks
+                note = 'restart the container to resume these into live runs' } }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
+    }
+}
+
 # Parameters-integrity task: verifies the payload the run was created with survived the shed→rehydrate round
 # trip. Increments a shared 'ok' counter when its marker parameter is present and correct, 'lost' when it is
 # missing/empty (payload lost — a shedding race, or the Tasks row was deleted before dispatch so rehydration
