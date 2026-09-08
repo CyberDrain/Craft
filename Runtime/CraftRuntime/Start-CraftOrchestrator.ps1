@@ -30,6 +30,7 @@ function Start-CraftOrchestrator {
                                           finishes. Runs on any free worker (no pinning).
 
     .EXAMPLE
+        # Fan-out (default): every task is queued up front and drained in parallel by the worker pool.
         Start-CraftOrchestrator -InputObject @{
             OrchestratorName = 'MyDataCollection'
             Batch = @(
@@ -37,6 +38,20 @@ function Start-CraftOrchestrator {
                 @{ FunctionName = 'CollectTenantData'; TenantFilter = 'fabrikam.com' }
             )
             PostExecution = @{ FunctionName = 'AggregateResults' }
+        }
+
+    .EXAMPLE
+        # Sequential: run ordered steps ONE AT A TIME, in payload order (Durable-style). Each step starts
+        # only after the previous one finishes, so a step that must follow another (here ConvertToShared
+        # after the mailbox grants that precede it) cannot race it. Runs on any free worker — no pinning.
+        Start-CraftOrchestrator -InputObject @{
+            OrchestratorName = 'Offboard-jdoe@contoso.com'
+            Sequential       = $true
+            Batch = @(
+                @{ FunctionName = 'RevokeSessions';  User = 'jdoe@contoso.com' }
+                @{ FunctionName = 'GrantMailboxAccess'; User = 'jdoe@contoso.com'; Delegate = 'manager@contoso.com' }
+                @{ FunctionName = 'ConvertToShared';  User = 'jdoe@contoso.com' }
+            )
         }
 
     .FUNCTIONALITY
