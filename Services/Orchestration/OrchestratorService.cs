@@ -3,6 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Craft.Configuration;
+using Craft.PowerShellHost;
 using Craft.Services;
 using Craft.Storage;
 
@@ -126,6 +127,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// empty set is the correct starting state.
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _finalizingRuns = new();
+
+    /// <summary>
+    /// Sequential runs whose single driver job is currently executing. A sequential run's steps all run on
+    /// one pinned worker inside one driver, and the not-yet-run steps deliberately have no queue row — so
+    /// while a driver is active the re-drive must not treat those steps as orphaned and enqueue them (which
+    /// would spawn a second driver). Set when the driver starts, cleared when it finishes; in-memory only,
+    /// so after a crash it is empty and the re-drive/resume correctly re-triggers the driver.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _activeSequentialDrivers = new();
 
     /// <summary>
     /// Get the Reference for a given run name, or null if not found/no reference set.
@@ -954,13 +964,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
         List<OrchestratorTaskItem> toQueue;
         if (run.Sequential)
         {
-            // Sequential mode: the invariant is that ONLY the current task — the lowest-Sequence task still
-            // Pending — ever has a queue row, and the next is enqueued when it reaches a terminal state (see
-            // the completion path in BuildTaskWork). So enqueue that one task, and only if it does not
-            // already have a row. Enqueuing the NEXT task when the current one is already queued (which a
-            // naive "first not-already-queued" would do after a restart that preserved the current task's
-            // row) would put two of this run's tasks in flight and break the ordering. Covers both first
-            // dispatch (enqueues Sequence 0) and resume (re-enqueues the reached task only if its row is gone).
+            // Sequential mode: a single entry row starts the ONE pinned driver that then runs every step of
+            // the run inline (see BuildSequentialRunWork), so exactly ONE queue row ever exists for the run —
+            // the lowest-Sequence task still Pending — and the later steps get no rows at all. Enqueue that
+            // one task, and only if it does not already have a row. A second row for the same run would let a
+            // second driver start and break the pinning/ordering. This covers both first dispatch (enqueues
+            // Sequence 0 to start the driver) and resume (re-enqueues the current step only if its row is
+            // gone, so a fresh driver picks the run back up where it left off).
             var current = pending.OrderBy(t => t.Sequence).FirstOrDefault();
             toQueue = current != null && !alreadyQueued.Contains(current.Id) ? [current] : [];
         }
@@ -978,8 +988,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // could null a task the pump had already claimed and whose BuildTaskWork had just rehydrated it, so
         // shed here, before EnqueueBatchAsync makes the rows claimable. Only toQueue (the rows enqueued in
         // THIS call) is touched — a task already queued from a prior call may be mid-dispatch. Sequential
-        // runs are exempt: they are small (a handful of ordered steps) and their advance path enqueues the
-        // next task without a rehydrate, so shedding would buy no memory and add a needless read per step.
+        // runs are exempt: they are small (a handful of ordered steps) and their pinned driver holds every
+        // step's payload in the live graph while it runs, so shedding would buy no memory and only add reads.
         if (_shedParameters && !run.Sequential)
         {
             lock (_lock)
@@ -1010,46 +1020,232 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
-    /// Enqueue one task BY IDENTITY. The JobManager holds only (runName, taskId, priority) — no run
-    /// graph, no task, no script path, no service reference — and calls back into
-    /// <see cref="ResolveTaskWorkAsync"/> at dispatch time to rebuild the work.
+    /// Build the work for a SEQUENTIAL run: a single delegate that checks out ONE background worker and
+    /// runs every step of the run on it, in payload (Sequence) order, one at a time, then reclaims the
+    /// worker once at the end. This is what "pin one worker for the whole run" means — the run starts on a
+    /// worker and stays there until it finishes, never going back to the pool between steps to be
+    /// re-scheduled onto a different one. The run is dispatched as a SINGLE queue row (the entry task; see
+    /// DispatchPendingTasksAsync), so exactly one JobManager slot and one worker are held for the run's
+    /// whole duration and the mid-run steps never get their own rows.
+    ///
+    /// Failure policy is best-effort: a step that throws is recorded Failed and the driver moves on to the
+    /// next, so one bad step cannot strand the rest and the run ends CompletedWithErrors. Each step runs
+    /// through InvokeAsync, whose finally resets the runspace after success, failure OR cancellation, so
+    /// steps stay isolated on the shared worker. Registered in <see cref="_activeSequentialDrivers"/> for
+    /// its whole life so the re-drive leaves the not-yet-reached (deliberately row-less) steps alone while
+    /// the driver is progressing.
     /// </summary>
+    private Func<CancellationToken, Task> BuildSequentialRunWork(OrchestratorRun run, string taskPath)
+    {
+        return async (jobCt) =>
+        {
+            // One driver per run. Registered for the driver's whole life so the re-drive does not mistake
+            // the run's row-less pending steps for orphans and enqueue them. TryAdd (not an unconditional
+            // set) also closes the duplicate-entry-row race: if two rows for the same run are claimed before
+            // either driver marks the entry step Running, the loser here does nothing and the winner runs
+            // every step. Because this guard is OUTSIDE the try/finally, the loser never runs the finally
+            // that would otherwise remove the winner's registration.
+            if (!_activeSequentialDrivers.TryAdd(run.Name, true))
+            {
+                _logger.LogDebug(
+                    "[Scheduler] Sequential run {Run} already has an active driver — skipping duplicate entry", run.Name);
+                return;
+            }
+            PowerShellWorker? worker = null;
+            var workerFaulted = false;
+            try
+            {
+                // One worker for the whole run: checked out once here, reclaimed once in the finally.
+                worker = CheckoutSequentialWorker(jobCt);
+
+                while (true)
+                {
+                    OrchestratorTaskItem? task;
+                    lock (_lock)
+                    {
+                        task = run.Tasks.Where(t => t.Status == "Pending")
+                                        .OrderBy(t => t.Sequence)
+                                        .FirstOrDefault();
+                    }
+                    if (task == null) break; // every step is terminal — the run is done
+
+                    // Run cancelled while we were working through it: mark this and every remaining step
+                    // Cancelled and stop.
+                    if (_cancelledRuns.ContainsKey(run.Name))
+                    {
+                        CancelRemainingSequentialTasks(run);
+                        break;
+                    }
+
+                    // Rehydrate a shed payload. Sequential runs are exempt from shedding (see
+                    // DispatchPendingTasksAsync), so this is normally a no-op — kept for a resumed run whose
+                    // in-memory payload was dropped. A missing row means the durable state was lost: fail
+                    // that step closed rather than run it blank, then carry on with the next.
+                    if (_shedParameters && task.Parameters == null)
+                    {
+                        var rehydrated = await _store.GetTaskParametersAsync(run.Name, task.Id, jobCt);
+                        if (rehydrated == null)
+                        {
+                            FailTaskTerminally(run, task,
+                                "Parameters could not be rehydrated at dispatch — the Tasks-table row is missing. " +
+                                "The task's payload was shed from memory and storage no longer has it.");
+                            continue;
+                        }
+                        lock (_lock) { task.Parameters ??= rehydrated; }
+                    }
+
+                    lock (_lock) { task.Status = "Running"; }
+                    // Durable "Running" marker — awaited before the invoke, same as the parallel path.
+                    try
+                    {
+                        await _writer.MarkRunningAsync(run.Name, task, jobCt);
+                    }
+                    catch (MarkerNotPersistedException ex)
+                    {
+                        // The marker never landed, so storage still has this step Pending. Unlike the
+                        // parallel path we cannot just give a slot back and let a re-drive retry the one
+                        // task — we own the worker and the whole run — and running later steps out of order
+                        // is not allowed. Put the step back to Pending and STOP the driver. The entry job
+                        // then completes with pending work left and no driver active, so the re-drive
+                        // re-enqueues the current step and a fresh driver resumes the run here.
+                        lock (_lock) { task.Status = "Pending"; }
+                        _logger.LogWarning(ex,
+                            "[Scheduler] Sequential run {Run}: could not persist the Running marker for {Task} — " +
+                            "leaving the run for the re-drive to resume", run.Name, task.Id);
+                        break;
+                    }
+
+                    try
+                    {
+                        // Run the step on the pinned worker. Only a PostExecution run needs the output
+                        // captured and stored; otherwise the seam returns empty and nothing is stored.
+                        var output = await RunSequentialStepAsync(run, task, taskPath, worker);
+                        if (!string.IsNullOrEmpty(run.PostExecFunctionName)
+                            && !string.IsNullOrEmpty(output)
+                            && !_writer.TryQueueResult(run.Name, task.Id, output))
+                        {
+                            await _store.StoreResultAsync(run.Name, task.Id, output);
+                        }
+
+                        lock (_lock)
+                        {
+                            task.Status = "Completed";
+                            task.CompletedUtc = DateTime.UtcNow;
+                            task.Parameters = null!;
+                            CheckRunCompletion(run);
+                        }
+                        PersistTaskAndRunAsync(run, task);
+                        _logger.LogDebug("[Scheduler] Sequential task completed: {TaskId}", task.Id);
+                    }
+                    catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
+                    {
+                        // App shutting down mid-step. Leave this step Running (its durable marker is written)
+                        // for resume on next startup, and let the exception abort the driver.
+                        _logger.LogInformation(
+                            "[Scheduler] Sequential run {Run} interrupted by shutdown at {TaskId}", run.Name, task.Id);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (_lock)
+                        {
+                            task.Status = "Failed";
+                            task.LastError = ex.Message;
+                            task.CompletedUtc = DateTime.UtcNow;
+                            task.Parameters = null!;
+                            CheckRunCompletion(run);
+                        }
+                        PersistTaskAndRunAsync(run, task);
+                        _logger.LogError(ex,
+                            "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", task.Id);
+                        // best-effort: fall through to the next Pending step
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
+            {
+                // Shutdown (checkout or a step was cancelled). The pipeline may have been Stop()'d, so treat
+                // the worker as faulted on reclaim; rethrow so the JobManager marks the entry job Cancelled.
+                workerFaulted = true;
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // An unexpected driver-level failure — not a per-step task error, which is handled inline.
+                workerFaulted = true;
+                _logger.LogError(ex, "[Scheduler] Sequential driver for {Run} failed", run.Name);
+                throw;
+            }
+            finally
+            {
+                ReclaimSequentialWorker(worker, workerFaulted);
+                _activeSequentialDrivers.TryRemove(run.Name, out _);
+            }
+        };
+    }
+
+    // ── sequential-driver seams ───────────────────────────────────────────────────────────────────────
+    // The driver's loop logic (ordering, best-effort, cancellation, marker recovery) is exercised by unit
+    // tests through a subclass that overrides these three methods, so the tests need no PowerShell worker
+    // pool. Production runs the real pool: one worker checked out for the whole run, each step invoked on
+    // it, reclaimed once at the end. Keep the checkout/run/reclaim split — the whole point is one checkout
+    // and one reclaim around many step invocations.
+
+    /// <summary>Check out the single worker a sequential run is pinned to. Virtual for tests.</summary>
+    internal virtual PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct)
+        => _psRunner.CheckoutBackgroundWorker(ct);
+
+    /// <summary>Return the pinned worker once the run is done. No-op for a null worker (checkout failed).
+    /// Virtual for tests.</summary>
+    internal virtual void ReclaimSequentialWorker(PowerShellWorker? worker, bool faulted)
+    {
+        if (worker != null) _psRunner.ReclaimBackgroundWorker(worker, faulted: faulted);
+    }
+
+    /// <summary>Run one sequential step on the pinned worker and return its captured output (empty when the
+    /// run has no PostExecution and so needs no result). Virtual for tests. InvokeAsync resets the runspace
+    /// afterwards, so successive steps stay isolated on the shared worker.</summary>
+    internal virtual async Task<string> RunSequentialStepAsync(
+        OrchestratorRun run, OrchestratorTaskItem task, string taskPath, PowerShellWorker? worker)
+    {
+        var parameters = new Dictionary<string, object>
+        {
+            { "TaskJson", JsonSerializer.Serialize(task.Parameters, s_jsonOptions) }
+        };
+        if (!string.IsNullOrEmpty(run.PostExecFunctionName))
+            return await _psRunner.ExecuteScriptWithOutput(taskPath, parameters, pinnedWorker: worker);
+        await _psRunner.ExecuteScript(taskPath, parameters, pinnedWorker: worker);
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Mark every still-Pending or Running step of a cancelled sequential run Cancelled, in one lock, and
+    /// persist them. Called by the driver when it notices the run was cancelled between steps.
+    /// </summary>
+    private void CancelRemainingSequentialTasks(OrchestratorRun run)
+    {
+        List<OrchestratorTaskItem> remaining;
+        lock (_lock)
+        {
+            remaining = run.Tasks.Where(t => t.Status is "Pending" or "Running").ToList();
+            foreach (var t in remaining)
+            {
+                t.Status = "Cancelled";
+                t.LastError = "Cancelled by user";
+                t.CompletedUtc = DateTime.UtcNow;
+                t.Parameters = null!;
+            }
+            CheckRunCompletion(run);
+        }
+        foreach (var t in remaining) _writer.QueueTask(run.Name, t);
+        _writer.QueueRun(run);
+    }
+
     /// <summary>
     /// Put one task back on the durable queue. Fire-and-forget because every caller is on a lock or a
     /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
     /// re-drive finds it again.
     /// </summary>
-    /// <summary>
-    /// Advance a sequential run by one step: once the current task reaches a terminal state, enqueue the
-    /// next task — the lowest-Sequence task still Pending — so the run proceeds one task at a time in
-    /// payload order. No-op when nothing is Pending (the run is finishing; finalize is already scheduled)
-    /// or when the next task is somehow already queued/running (idempotent). It advances past a FAILED task
-    /// as well, so one failing step cannot strand the rest Pending forever. The task's payload is not shed
-    /// for sequential runs, so no rehydrate is needed here — a plain queue row is all that is required.
-    /// </summary>
-    private async Task AdvanceSequentialAsync(OrchestratorRun run)
-    {
-        OrchestratorTaskItem? next;
-        lock (_lock)
-        {
-            next = run.Tasks.Where(t => t.Status == "Pending").OrderBy(t => t.Sequence).FirstOrDefault();
-        }
-        if (next == null) return;
-        if (_jobManager.IsQueuedOrRunning($"{run.Name}-{next.Id}")) return;
-        try
-        {
-            await _queue.EnqueueAsync(run.Name, next.Id, next.Priority ?? run.Priority, DateTime.UtcNow);
-        }
-        catch (Exception ex)
-        {
-            // Not fatal: the re-drive (restricted to the current task for a sequential run) is the backstop —
-            // it finds this task Pending with no queue row and re-enqueues it on its next tick.
-            _logger.LogWarning(ex,
-                "[Scheduler] Could not enqueue next sequential task {Task} in {Run} — the re-drive will retry",
-                next.Id, run.Name);
-        }
-    }
-
     private void RequeueToTable(OrchestratorRun run, OrchestratorTaskItem task)
     {
         var priority = task.Priority ?? run.Priority;
@@ -1213,6 +1409,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 return null;
         }
 
+        // Sequential runs are dispatched as a single entry row; that one claim drives the WHOLE run on one
+        // pinned worker (BuildSequentialRunWork ignores which step this descriptor named and works through
+        // every Pending step in order). The "Running" guard above already stops a duplicate row from
+        // starting a second driver once the entry step is marked Running, and the driver's own TryAdd closes
+        // the remaining pre-mark race.
+        if (run.Sequential)
+            return BuildSequentialRunWork(run, taskPath);
+
         return BuildTaskWork(run, task, taskPath);
     }
 
@@ -1344,10 +1548,6 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     // table and re-runs anything not marked Completed (idempotent).
                     PersistTaskAndRunAsync(run, task);
 
-                    // Sequential run: this task is done, so queue the next one in payload order. No-op if
-                    // this was the last (finalize is already scheduled by CheckRunCompletion above).
-                    if (run.Sequential) await AdvanceSequentialAsync(run);
-
                     _logger.LogDebug("[Scheduler] Task completed: {TaskId}", task.Id);
                 }
                 catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
@@ -1368,10 +1568,6 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         CheckRunCompletion(run);
                     }
                     PersistTaskAndRunAsync(run, task);
-
-                    // Sequential run: advance past a FAILED step too, or the remaining tasks sit Pending
-                    // forever and the run never finalizes. (Stop-on-error would be a future option.)
-                    if (run.Sequential) await AdvanceSequentialAsync(run);
 
                     _logger.LogError(ex, "[Scheduler] Task failed: {TaskId}", task.Id);
                     throw; // Let JobManager also track the failure
@@ -1534,15 +1730,20 @@ public class OrchestratorService : IJobDescriptorStateWriter
                             || now - s.LastUtc >= RedriveAge)
                 .ToList();
 
-            // Sequential run: at most one task is ever in flight, and the not-yet-reached tasks
-            // deliberately have NO queue row — so the generic "Pending with no queue row = orphaned" rule
-            // would re-drive them all and shatter the ordering. While a task is Running the chain is
-            // progressing, so re-drive nothing. Otherwise consider ONLY the next task (lowest Sequence
-            // still Pending); the queue-table check below then re-enqueues it just if its own row is truly
-            // gone — a stalled chain, the real recovery case.
+            // Sequential run: one pinned driver runs every step, so the ONLY queue row that ever exists is
+            // the entry row that started the driver — the not-yet-reached steps deliberately have none.
+            // Applying the generic "Pending with no queue row = orphaned" rule to them would re-drive them
+            // all and spawn a second driver. The run is progressing whenever a driver is registered for it
+            // OR its entry job is still queued/running (that job's identity is one of this run's tasks) —
+            // re-drive nothing in either case. The driver registration closes the gap the entry-job check
+            // alone leaves open between steps (no task queued, none marked Running for an instant). Only when
+            // neither holds is the driver truly gone (never started, or died with the process): re-enqueue
+            // ONLY the current step (lowest Sequence still Pending) so a fresh driver resumes the run.
             if (run.Sequential)
             {
-                if (run.Tasks.Any(t => t.Status == "Running"))
+                var driverActive = _activeSequentialDrivers.ContainsKey(run.Name)
+                    || run.Tasks.Any(t => _jobManager.IsQueuedOrRunning($"{run.Name}-{t.Id}"));
+                if (driverActive)
                 {
                     candidates.Clear();
                 }

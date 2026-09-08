@@ -26,8 +26,10 @@ function Start-CraftOrchestrator {
           - SkipLog           (bool)    — optional; suppress run logging
           - Sequential        (bool)    — optional; run the batch ONE TASK AT A TIME in payload order
                                           (Durable-style sequencing) instead of fanning out in parallel.
-                                          Only the current task is queued; the next is queued when it
-                                          finishes. Runs on any free worker (no pinning).
+                                          The whole run is PINNED to a single worker: it starts on one
+                                          worker and runs every step on it to completion, without going
+                                          back to the pool between steps. A step that fails is recorded and
+                                          the run carries on with the next (best-effort).
 
     .EXAMPLE
         # Fan-out (default): every task is queued up front and drained in parallel by the worker pool.
@@ -41,9 +43,10 @@ function Start-CraftOrchestrator {
         }
 
     .EXAMPLE
-        # Sequential: run ordered steps ONE AT A TIME, in payload order (Durable-style). Each step starts
-        # only after the previous one finishes, so a step that must follow another (here ConvertToShared
-        # after the mailbox grants that precede it) cannot race it. Runs on any free worker — no pinning.
+        # Sequential: run ordered steps ONE AT A TIME, in payload order (Durable-style), all on ONE pinned
+        # worker. Each step starts only after the previous one finishes, so a step that must follow another
+        # (here ConvertToShared after the mailbox grants that precede it) cannot race it. Once the run starts
+        # it keeps the same worker until every step is done.
         Start-CraftOrchestrator -InputObject @{
             OrchestratorName = 'Offboard-jdoe@contoso.com'
             Sequential       = $true

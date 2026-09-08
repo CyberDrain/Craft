@@ -452,16 +452,19 @@ public class PowerShellRunnerService : IDisposable
 
     /// <summary>
     /// Execute a script by function name (for scheduler / orchestrator). No HTTP context needed.
-    /// Runs on the background pool.
+    /// Runs on the background pool. When <paramref name="pinnedWorker"/> is supplied the script runs on
+    /// THAT worker and it is NOT returned to the pool here — the caller owns its lifecycle (see
+    /// <see cref="ExecuteScriptWithOutput"/> for the same contract and why a sequential run uses it).
     /// </summary>
-    public async Task ExecuteScript(string functionName, Dictionary<string, object>? parameters = null)
+    public async Task ExecuteScript(string functionName, Dictionary<string, object>? parameters = null,
+        PowerShellWorker? pinnedWorker = null)
     {
         var prof = DispatchProfiler.Enabled;
         var totalStart = prof ? Stopwatch.GetTimestamp() : 0;
         long checkoutTicks = 0, invokeTicks = 0;
         var checkoutStart = prof ? Stopwatch.GetTimestamp() : 0;
         var sw = Stopwatch.StartNew();
-        var worker = _pool.CheckoutBackground(CancellationToken.None);
+        var worker = pinnedWorker ?? _pool.CheckoutBackground(CancellationToken.None);
         if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
         // Set invocation context — inherits RunName and Priority from parent OperationContext if set
@@ -570,7 +573,9 @@ public class PowerShellRunnerService : IDisposable
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
             if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
             if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
-            _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
+            // A pinned worker is owned by the caller (sequential driver) — it reclaims once, after the
+            // whole run. Only reclaim here when we checked the worker out ourselves.
+            if (pinnedWorker == null) _pool.Reclaim(worker, isHttp: false, faulted: exceptionOccurred);
         }
 
         // BG dispatch profiling (checkout + invoke + total; marshal/extract N/A for a script call).
@@ -586,14 +591,22 @@ public class PowerShellRunnerService : IDisposable
     /// Execute a script on the background pool and capture its output stream as a string.
     /// Used by OrchestratorService for planner scripts that return JSON task lists.
     /// </summary>
-    public async Task<string> ExecuteScriptWithOutput(string functionName, Dictionary<string, object>? parameters = null)
+    /// <summary>
+    /// Run one script and return its output. When <paramref name="pinnedWorker"/> is supplied the script
+    /// runs on THAT worker and it is NOT returned to the pool here — the caller owns its lifecycle. This is
+    /// how a sequential orchestration keeps one worker for its whole run: check a worker out once, invoke
+    /// each step on it (InvokeAsync still resets the runspace per step, so steps stay isolated), reclaim
+    /// once at the end. Passing null preserves the original checkout-per-call, reclaim-in-finally behaviour.
+    /// </summary>
+    public async Task<string> ExecuteScriptWithOutput(string functionName, Dictionary<string, object>? parameters = null,
+        PowerShellWorker? pinnedWorker = null)
     {
         var prof = DispatchProfiler.Enabled;
         var totalStart = prof ? Stopwatch.GetTimestamp() : 0;
         long checkoutTicks = 0, invokeTicks = 0;
         var checkoutStart = prof ? Stopwatch.GetTimestamp() : 0;
         var sw = Stopwatch.StartNew();
-        var worker = _pool.CheckoutBackground(CancellationToken.None);
+        var worker = pinnedWorker ?? _pool.CheckoutBackground(CancellationToken.None);
         if (prof) checkoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
 
         // Set invocation context — inherits RunName and Priority from parent OperationContext if set
@@ -692,9 +705,18 @@ public class PowerShellRunnerService : IDisposable
             if (onInfo != null) worker.Streams.Information.DataAdded -= onInfo;
             if (onDebug != null) worker.Streams.Debug.DataAdded -= onDebug;
             if (onVerbose != null) worker.Streams.Verbose.DataAdded -= onVerbose;
-            _pool.Reclaim(worker, isHttp: false);
+            // A pinned worker is owned by the caller (sequential driver) — it reclaims once, after the
+            // whole run. Only reclaim here when we checked the worker out ourselves.
+            if (pinnedWorker == null) _pool.Reclaim(worker, isHttp: false);
         }
     }
+
+    /// <summary>Check out a background worker to pin across a run's steps. Pair with <see cref="ReclaimBackgroundWorker"/>.</summary>
+    public PowerShellWorker CheckoutBackgroundWorker(CancellationToken ct = default) => _pool.CheckoutBackground(ct);
+
+    /// <summary>Return a worker taken with <see cref="CheckoutBackgroundWorker"/>.</summary>
+    public void ReclaimBackgroundWorker(PowerShellWorker worker, bool faulted = false)
+        => _pool.Reclaim(worker, isHttp: false, faulted: faulted);
 
     /// <summary>
     /// Find a script by command name. Checks ScriptRepository (standalone files)
