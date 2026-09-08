@@ -103,4 +103,28 @@ public class OrchestratorSettings
     /// periodic sweep; the startup pass, which follows crash recovery, still runs.
     /// </summary>
     public int CleanupIntervalHours { get; set; } = 4;
+
+    /// <summary>
+    /// The per-run status/re-drive tick cadence (seconds, default 60). Each live run has a timer firing at
+    /// this interval to log status, re-drive orphaned tasks, and re-check completion. It is also the floor
+    /// of the re-drive backoff. Raising it cuts per-run overhead at high live-run counts; the perf harness
+    /// lowers it to exercise the backoff in compressed time. Minimum 1s.
+    /// </summary>
+    public int StatusTimerIntervalSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Whether the per-run re-drive backs off geometrically once it has verified a run has no orphaned
+    /// tasks (default true). When false the re-drive verifies against storage on every tick — the old
+    /// behaviour, retained as a safety switch and for A/B measurement of the backoff's effect.
+    /// </summary>
+    public bool RedriveBackoff { get; set; } = true;
+
+    /// <summary>
+    /// Whether a task sheds its <c>Parameters</c> payload from the in-memory run graph once it is durably
+    /// persisted and enqueued, rehydrating it from the Tasks table at dispatch (default true). This bounds
+    /// the retained memory of a large pending backlog — thousands of runs each holding every task's payload
+    /// is what drives the live-set toward the GC heap ceiling — at the cost of one point read per task at
+    /// dispatch. False keeps the payload resident the whole time (the old behaviour), for A/B or safety.
+    /// </summary>
+    public bool ShedPendingParameters { get; set; } = true;
 }

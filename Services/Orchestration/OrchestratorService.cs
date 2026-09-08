@@ -59,8 +59,46 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// drain runs in the background while the enqueuing task is marked terminal immediately.
     /// </summary>
     private readonly ConcurrentDictionary<string, int> _pendingChildRuns = new();
-    private readonly ConcurrentDictionary<string, Timer> _runStatusTimers = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledRuns = new();
+
+    /// <summary>
+    /// Last status line emitted per run — the (completed, failed, running, pending) tuple and when. Lets
+    /// <see cref="LogRunStatus"/> skip re-emitting an identical line every 60s for a run that has not
+    /// changed (the dominant log volume at scale — thousands of runs parked at "0 running / N pending"),
+    /// while a slow heartbeat still proves a long-lived run is alive. Dropped at finalize.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, (int C, int F, int R, int P, DateTime LoggedUtc)> _lastStatusLog = new();
+
+    /// <summary>
+    /// Per-run re-drive backoff: when the storage verification in <see cref="RedrivePendingTasksAsync"/> may
+    /// next run, and the interval it grew to. The re-drive is a watchdog for the rare orphaned-Pending task;
+    /// in steady state it reads storage and finds nothing, so once it does it backs off geometrically instead
+    /// of paying a full index read (+ a point read per candidate) on every 60s tick for every live run — the
+    /// dominant per-tick storage cost at scale. Snaps back to the base interval the moment it finds an orphan.
+    /// Dropped at finalize.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, (DateTime NextUtc, TimeSpan Interval)> _redriveBackoff = new();
+
+    /// <summary>Per-run status/re-drive tick cadence, from <c>Orchestrator:StatusTimerIntervalSeconds</c>.</summary>
+    private readonly TimeSpan _statusInterval;
+
+    /// <summary>Re-drive backoff floor — one tick. The interval grows from here to <see cref="RedriveMax"/>.</summary>
+    private readonly TimeSpan _redriveBase;
+
+    /// <summary>Whether the re-drive backoff is active, from <c>Orchestrator:RedriveBackoff</c>.</summary>
+    private readonly bool _redriveBackoffEnabled;
+
+    /// <summary>Whether pending tasks shed their Parameters payload, from <c>Orchestrator:ShedPendingParameters</c>.</summary>
+    private readonly bool _shedParameters;
+
+    private static long _redriveStorageReads;
+
+    /// <summary>
+    /// Count of storage verifications the re-drive has performed (a <see cref="JobQueueStore.GetDispatchableTaskIdsAsync"/>
+    /// call: one index-partition read + a point read per candidate). Instrumentation for the perf harness —
+    /// the backoff's whole purpose is to hold this down at high live-run counts.
+    /// </summary>
+    public static long RedriveStorageReads => Interlocked.Read(ref _redriveStorageReads);
 
     /// <summary>
     /// Resolved task-script path per run. One entry per RUN (not per task), so a 738-task fan-out costs
@@ -74,6 +112,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// then stop and release the storage rather than retrying forever.
     /// </summary>
     private const int MaxPostExecAttempts = 3;
+
+    /// <summary>
+    /// How often an UNCHANGED run still emits a status line, so a long-lived run proves it is alive without
+    /// logging the identical line on every 60s tick. A real status change always logs immediately.
+    /// </summary>
+    private static readonly TimeSpan StatusHeartbeat = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// Runs whose finalize has been claimed, so it happens once. Claimed in CheckRunCompletion,
@@ -127,6 +171,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _writer = writer;
         _settings = settings;
 
+        // Status/re-drive tick cadence. Configurable so a constrained deployment can slow it (fewer ticks =
+        // less per-run overhead at high live-run counts) and so the perf harness can compress it to exercise
+        // the re-drive backoff quickly. The backoff floor is one tick.
+        _statusInterval = TimeSpan.FromSeconds(Math.Max(1, _settings.Orchestrator.StatusTimerIntervalSeconds));
+        _redriveBase = _statusInterval;
+        _redriveBackoffEnabled = _settings.Orchestrator.RedriveBackoff;
+        _shedParameters = _settings.Orchestrator.ShedPendingParameters;
+
         // The queue holds descriptors; this is how they become work again at dispatch time, and how
         // operator changes to a queued task are made durable.
         _jobManager.SetWorkResolver(ResolveTaskWorkAsync);
@@ -143,6 +195,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public void PriorityChanged(JobDescriptor descriptor, int newPriority)
     {
         if (!TryFindLive(descriptor, out _, out var task)) return;
+
+        // Rehydrate a shed payload before the durable write below (Replace mode) overwrites the stored
+        // ParametersJson with null. This is a rare, operator-initiated path, so the blocking read is fine.
+        if (_shedParameters && task.Parameters == null)
+        {
+            var p = _store.GetTaskParametersAsync(descriptor.RunName, task.Id).GetAwaiter().GetResult() ?? [];
+            lock (_lock) { task.Parameters ??= p; }
+        }
 
         lock (_lock) task.Priority = newPriority;
         _writer.QueueTask(descriptor.RunName, task);
@@ -621,6 +681,46 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
+    /// One loop that ticks every live run's status / re-drive / completion-recheck, at
+    /// <see cref="_statusInterval"/>. It replaces the per-run <see cref="Timer"/> that used to do this: at
+    /// high live-run counts that meant one Timer object per run and a continuous stream of fire-and-forget
+    /// callbacks onto the thread pool (~M/interval per second), whereas one sweep over <see cref="_activeRuns"/>
+    /// is a single scheduling source that allocates nothing per run. The per-run work stays cheap —
+    /// <see cref="LogRunStatus"/> skips an unchanged line, <see cref="RedrivePendingTasksAsync"/> is gated by
+    /// its backoff and returns synchronously when backed off, and <see cref="CheckRunCompletion"/>
+    /// short-circuits — so ticking thousands of runs in one pass is fast. A throw for one run is logged and
+    /// neither stops the sweep nor takes the host down (a Timer callback that threw would have crashed it).
+    /// Started once by <see cref="SchedulerService"/>, alongside the retention loop.
+    /// </summary>
+    public async Task RunStatusSweepLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(_statusInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                foreach (var run in _activeRuns.Values)
+                {
+                    try
+                    {
+                        LogRunStatus(run);
+                        RedrivePendingTasks(run);
+                        lock (_lock) { CheckRunCompletion(run); }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutdown.
+        }
+    }
+
+    /// <summary>
     /// Start an orchestrator run from a pre-built batch.
     /// Called by OrchestratorBridge.DrainPending() when PowerShell's Start-CIPPOrchestrator
     /// queues a run on CIPPNG (bypassing the planner script phase).
@@ -783,39 +883,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // this, the finalize claim from their previous outing would strand the next one forever.
         _finalizingRuns.TryRemove(run.Name, out _);
 
-        // Start periodic status timer (every 60s) for this run
-        if (!_runStatusTimers.ContainsKey(run.Name))
-        {
-            // CheckRunCompletion is re-run here on purpose. It is normally driven by task transitions,
-            // but a run whose finalize was deferred because storage still showed work outstanding has no
-            // transitions left to retrigger it - without this periodic re-check that deferral would be
-            // permanent, which is a worse failure than the premature finalize it exists to prevent.
-            var timer = new Timer(_ =>
-                {
-                    // A System.Threading.Timer callback that throws crashes the process. This periodic
-                    // maintenance tick must never take the host down on a transient error — a dependency
-                    // disposed during shutdown, a race on run state — so it logs and waits for the next tick.
-                    try
-                    {
-                        LogRunStatus(run);
-                        RedrivePendingTasks(run);
-                        lock (_lock) { CheckRunCompletion(run); }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
-                    }
-                },
-                null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
-            if (!_runStatusTimers.TryAdd(run.Name, timer))
-            {
-                // Lost the ContainsKey→TryAdd race (concurrent dispatch of the same run — startup
-                // resume vs a scheduler tick). An active periodic Timer is rooted by the runtime's
-                // timer queue, so an undisposed loser would fire — and pin this run graph through its
-                // closure — for the process lifetime.
-                timer.Dispose();
-            }
-        }
+        // No per-run timer: the single RunStatusSweepLoopAsync ticks every run in _activeRuns (which this
+        // run was just added to). One sweep replaces what used to be a System.Threading.Timer per run — at
+        // high live-run counts that was thousands of Timer objects and a continuous drizzle of fire-and-forget
+        // callbacks onto the thread pool. The sweep still runs LogRunStatus + RedrivePendingTasks +
+        // CheckRunCompletion for each run at the same cadence (the last re-run on purpose: a finalize deferred
+        // while storage showed work outstanding has no task transition left to retrigger it).
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
 
@@ -849,6 +922,22 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
 
         var toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+
+        // Shed the Parameters payload BEFORE the tasks become claimable. The caller has already persisted
+        // them (UpsertTaskBatchAsync), so the Tasks table is authoritative; the live graph keeps each task
+        // object (its identity + Status drive completion tracking) but drops the payload it does not need
+        // while it waits, and BuildTaskWork rehydrates it from storage at dispatch. This is what bounds the
+        // retained memory of a large pending backlog — thousands of runs each holding every task's payload is
+        // what walks the live-set into the GC heap ceiling. Ordering matters: shedding AFTER the enqueue
+        // could null a task the pump had already claimed and whose BuildTaskWork had just rehydrated it, so
+        // shed here, before EnqueueBatchAsync makes the rows claimable. Only toQueue (the rows enqueued in
+        // THIS call) is touched — a task already queued from a prior call may be mid-dispatch.
+        if (_shedParameters)
+        {
+            lock (_lock)
+                foreach (var t in toQueue)
+                    if (t.Status == "Pending") t.Parameters = null!;
+        }
 
         // One batched write per priority bucket rather than one per task. The queue is the backlog now;
         // the JobManager only ever sees the batch JobQueuePump claims from it.
@@ -1050,6 +1139,31 @@ public class OrchestratorService : IJobDescriptorStateWriter
         return
             async (jobCt) =>
             {
+                // Rehydrate the Parameters payload shed while this task waited in the backlog. Done BEFORE
+                // any status write — MarkRunningAsync snapshots Parameters and every task-row write is
+                // Replace, so a null payload here would overwrite the stored one. One point read, only for a
+                // task actually being dispatched. The ??= keeps a value another dispatch attempt already set.
+                if (_shedParameters && task.Parameters == null)
+                {
+                    // GetTaskParametersAsync returns null only when the Tasks row itself is GONE (a
+                    // present-but-empty payload comes back as an empty dictionary). A missing row means this
+                    // task's durable state was lost out from under a live run — the shed dropped the in-memory
+                    // copy on the promise that storage still had it. Running now would invoke the task with NO
+                    // parameters (its FunctionName and inputs both live in the payload), which for a real task
+                    // is worse than not running it. Fail closed instead of executing blank. Before shedding
+                    // the payload was resident, so a deleted row could not affect an in-flight dispatch; this
+                    // guard restores that safety for the one case shedding introduced.
+                    var rehydrated = await _store.GetTaskParametersAsync(run.Name, task.Id, jobCt);
+                    if (rehydrated == null)
+                    {
+                        FailTaskTerminally(run, task,
+                            "Parameters could not be rehydrated at dispatch — the Tasks-table row is missing. " +
+                            "The task's payload was shed from memory and storage no longer has it.");
+                        return;
+                    }
+                    lock (_lock) { task.Parameters ??= rehydrated; }
+                }
+
                 // Check if run was cancelled while this job was queued
                 if (_cancelledRuns.ContainsKey(run.Name))
                 {
@@ -1267,6 +1381,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private static readonly TimeSpan RedriveAge = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Re-drive backoff bounds. The first verification for a run runs at the status-timer cadence; each time
+    /// it confirms nothing orphaned the interval doubles up to <see cref="RedriveMax"/>, so a run stuck for
+    /// hours costs a handful of index reads rather than one per minute. The cap bounds how long a genuinely
+    /// orphaned task can wait to be caught (worst case ~RedriveMax), which the watchdog trades for the cost.
+    /// </summary>
+    private static readonly TimeSpan RedriveMax = TimeSpan.FromMinutes(15);
+
+    /// <summary>
     /// Re-queue tasks that are Pending in memory but that nothing owns — no queued job, no running job.
     ///
     /// This is the safety net for the state a deferral leaves behind. A task whose durable "Running" marker
@@ -1302,6 +1424,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private async Task RedrivePendingTasksAsync(OrchestratorRun run)
     {
         var now = DateTime.UtcNow;
+
+        // Backoff gate. Once the verification below has confirmed a run has nothing orphaned, it need not run
+        // again for a while: orphaning is caused by specific rare events (a removed/expired queue row, a
+        // crash/migration), not something that spontaneously arises every 60s. Skipping here avoids the whole
+        // tick body — the candidates scan AND the storage read — for a run that verified clean, which for a
+        // large stuck backlog is nearly every run on nearly every tick.
+        if (_redriveBackoffEnabled && _redriveBackoff.TryGetValue(run.Name, out var st) && now < st.NextUtc) return;
+
         List<OrchestratorTaskItem> candidates;
 
         lock (_lock)
@@ -1314,7 +1444,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 .ToList();
         }
 
-        if (candidates.Count == 0) return;
+        if (candidates.Count == 0)
+        {
+            // No candidates to verify (all Pending tasks are queued/running, or none are Pending). Don't grow
+            // the backoff — a run mid-drain legitimately produces no candidates and should stay responsive —
+            // just clear any prior backoff so the next real candidate is checked promptly.
+            _redriveBackoff.TryRemove(run.Name, out _);
+            return;
+        }
 
         // Storage decides — but the queue TABLE decides, not the index. Asking the index (the old
         // GetQueuedTaskIdsAsync here) reports a task queued whenever its index row exists, and an index
@@ -1327,6 +1464,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         HashSet<string> dispatchable;
         try
         {
+            Interlocked.Increment(ref _redriveStorageReads);
             dispatchable = await _queue.GetDispatchableTaskIdsAsync(
                 run.Name, candidates.Select(t => t.Id).ToList());
         }
@@ -1339,8 +1477,24 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
 
         var orphaned = candidates.Where(t => !dispatchable.Contains(t.Id)).ToList();
-        if (orphaned.Count == 0) return;
+        if (orphaned.Count == 0)
+        {
+            // Verified clean: grow the interval (double, capped) so this run's next storage read is further
+            // out. A run stuck for hours thus costs O(log) reads, not one per minute.
+            if (_redriveBackoffEnabled)
+            {
+                var next = _redriveBackoff.TryGetValue(run.Name, out var cur)
+                    ? TimeSpan.FromTicks(Math.Min(cur.Interval.Ticks * 2, RedriveMax.Ticks))
+                    : _redriveBase;
+                _redriveBackoff[run.Name] = (now + next, next);
+            }
+            return;
+        }
 
+        // Found orphans — something is wrong with this run's queue rows, so snap back to close watch and
+        // re-drive them.
+        if (_redriveBackoffEnabled)
+            _redriveBackoff[run.Name] = (now + _redriveBase, _redriveBase);
         foreach (var task in orphaned)
         {
             // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
@@ -1355,21 +1509,44 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     private void LogRunStatus(OrchestratorRun run)
     {
-        var elapsed = DateTime.UtcNow - run.StartedUtc;
-        int completed, failed, running, pending;
+        // Nothing consumes this Info line at a higher level, and the flood of them is itself a measured
+        // cost, so do no work at all when Info is disabled.
+        if (!_logger.IsEnabled(LogLevel.Information)) return;
+
+        // One pass, not four Count(predicate) calls. Enumerable.Count over the List boxes an enumerator per
+        // call, and this runs on every run's 60s timer — four boxed enumerators × M runs per minute.
+        int completed = 0, failed = 0, running = 0, pending = 0;
         lock (_lock)
         {
-            completed = run.Tasks.Count(t => t.Status == "Completed");
-            failed = run.Tasks.Count(t => t.Status == "Failed");
-            running = run.Tasks.Count(t => t.Status == "Running");
-            pending = run.Tasks.Count(t => t.Status == "Pending");
+            foreach (var t in run.Tasks)
+            {
+                switch (t.Status)
+                {
+                    case "Completed": completed++; break;
+                    case "Failed": failed++; break;
+                    case "Running": running++; break;
+                    case "Pending": pending++; break;
+                }
+            }
         }
-        var memSnapshot = BackgroundTaskLimiter.GetMemorySnapshot();
+
+        // Skip the line — and the string format, the nine boxed args, and the memory snapshot it needs —
+        // when nothing has changed since the last tick. A run parked at "0 running / N pending" for hours
+        // re-emitted the identical line every 60s (M of them per minute at scale). Log on a real transition,
+        // plus a slow heartbeat so a long-lived run still shows it is alive.
+        var now = DateTime.UtcNow;
+        if (_lastStatusLog.TryGetValue(run.Name, out var prev)
+            && prev.C == completed && prev.F == failed && prev.R == running && prev.P == pending
+            && now - prev.LoggedUtc < StatusHeartbeat)
+            return;
+        _lastStatusLog[run.Name] = (completed, failed, running, pending, now);
+
+        var elapsed = now - run.StartedUtc;
         _logger.LogInformation(
             "[Scheduler] Run {Name} T+{Elapsed:F1}min: {Completed}/{Total} done {Running} running {Pending} pending {Failed} failed jobs={Active}a/{Queued}q {Memory}",
             run.Name, elapsed.TotalMinutes, completed, run.Tasks.Count, running, pending, failed,
             _jobManager.ActiveCount, _jobManager.QueuedCount,
-            memSnapshot);
+            BackgroundTaskLimiter.GetMemorySnapshot());
     }
 
     private void CheckRunCompletion(OrchestratorRun run)
@@ -1554,11 +1731,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _writer.QueueRun(run);
         await _writer.FlushAsync();
 
+        // Removed from _activeRuns first, so the status sweep stops ticking it before its per-run maps go.
         _activeRuns.TryRemove(run.Name, out _);
         _cancelledRuns.TryRemove(run.Name, out _);
         _taskScriptPaths.TryRemove(run.Name, out _);
-        _runStatusTimers.TryRemove(run.Name, out var timer);
-        timer?.Dispose();
+        _lastStatusLog.TryRemove(run.Name, out _);
+        _redriveBackoff.TryRemove(run.Name, out _);
         _finalizeDeferrals.TryRemove(run.Name, out _);
         // Deferral and re-queue tracking is keyed per task and nothing else removes entries for tasks
         // that ended without passing through their happy-path cleanup — without this sweep the residue

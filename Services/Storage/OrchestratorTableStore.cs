@@ -186,6 +186,28 @@ public class OrchestratorTableStore
         return run;
     }
 
+    /// <summary>
+    /// Read one task's Parameters from the Tasks table (a single point read + deserialize), matching the
+    /// deserialization <see cref="GetRunAsync"/> uses. For the pending-Parameters shedding path: the live
+    /// graph keeps the task object but drops its Parameters payload while it waits, and this rehydrates them
+    /// at dispatch. Null if the row or its ParametersJson is missing.
+    /// </summary>
+    public async Task<Dictionary<string, object>?> GetTaskParametersAsync(
+        string runName, string taskId, CancellationToken ct = default)
+    {
+        var row = await _store.GetAsync(_tasksTable, runName, taskId, ct);
+        var parametersJson = row?.GetString("ParametersJson");
+        if (string.IsNullOrEmpty(parametersJson)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, object>>(parametersJson, s_jsonOptions) ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
     /// <summary>List all known run names.</summary>
     public async Task<List<string>> ListRunsAsync()
     {

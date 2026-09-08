@@ -234,7 +234,8 @@ public class OrchestratorFinalizedRunTests
     {
         var (svc, _) = NewService();
         Set(svc, "_finalizingRuns", new ConcurrentDictionary<string, bool>());
-        Set(svc, "_runStatusTimers", new ConcurrentDictionary<string, Timer>());
+        // No _runStatusTimers any more: the per-run status timer was replaced by a single sweep loop
+        // (RunStatusSweepLoopAsync), so DispatchPendingTasksAsync no longer creates or tracks a timer.
         Claims(svc)["recurring-run"] = true;
 
         var run = new OrchestratorRun { Name = "recurring-run", Status = "Running", StartedUtc = DateTime.UtcNow };
