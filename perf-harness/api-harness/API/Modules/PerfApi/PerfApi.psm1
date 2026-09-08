@@ -130,6 +130,7 @@ function Invoke-PerfManyRuns {
     $paramkb = 0;    if ($Request.Query.paramkb) { $paramkb = [int]$Request.Query.paramkb }
     $func = 'PerfHold'; if ($Request.Query.func) { $func = [string]$Request.Query.func }  # PerfHold | PerfCheck
     $prefix = 'PerfHold'; if ($Request.Query.prefix) { $prefix = [string]$Request.Query.prefix }
+    $seq = ([string]$Request.Query.seq -eq 'true')  # sequential: one task at a time, payload order
     $payload = if ($paramkb -gt 0) { 'x' * ($paramkb * 1024) } else { $null }
 
     $created = 0
@@ -143,10 +144,11 @@ function Invoke-PerfManyRuns {
         Start-CraftOrchestrator -InputObject @{
             OrchestratorName = "$prefix-$([guid]::NewGuid().ToString('N').Substring(0, 10))"
             Batch            = $batch
+            Sequential       = $seq
         } | Out-Null
         $created++
     }
-    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfManyRuns'; created = $created; tasksPerRun = $tasks; holdms = $holdms; paramkb = $paramkb } }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfManyRuns'; created = $created; tasksPerRun = $tasks; holdms = $holdms; paramkb = $paramkb; sequential = $seq } }
 }
 
 # Table manipulation for failure-mode exploration: delete/inspect orchestrator table rows WHILE runs are
@@ -247,6 +249,27 @@ function Push-PerfHold {
     $ms = 3600000; if ($Item.holdms) { $ms = [int]$Item.holdms }
     Start-Sleep -Milliseconds $ms
     return @{ ok = $true; idx = $Item.idx }
+}
+
+# Sequential-mode probe: records the ORDER tasks start in and the MAX concurrency observed, into a shared
+# cache. A sequential run should show order = payload order (0,1,2,...) and maxActive = 1 (one at a time);
+# a fan-out run shows interleaved order and maxActive > 1. Read via /API/PerfSeqResult.
+function Push-PerfSeq {
+    param($Item)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeq')
+    $c['order'] = "$($c['order'])$($Item.idx),"
+    $a = [int]$c['active'] + 1; $c['active'] = $a
+    if ($a -gt [int]$c['maxActive']) { $c['maxActive'] = $a }
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    $c['active'] = [int]$c['active'] - 1
+    return @{ ok = $true; idx = $Item.idx }
+}
+
+function Invoke-PerfSeqResult {
+    param($Request, $TriggerMetadata)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeq')
+    return @{ StatusCode = 200; Body = @{ ok = $true
+        order = [string]$c['order']; maxActive = [int]$c['maxActive'] } }
 }
 
 # Thread-pool + process-thread telemetry, for the "thread constrained" half of the many-runs harness. The
