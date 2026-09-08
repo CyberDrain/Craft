@@ -265,6 +265,19 @@ function Push-PerfSeq {
     return @{ ok = $true; idx = $Item.idx }
 }
 
+# Live OS-thread breakdown via the C# bridge: total thread count and a tally by ThreadState, plus the
+# processor count and PS worker-pool size. Answers "where are Craft's threads" at a point in time —
+# bounded PS pool + thread-pool workers, and whether anything is growing under load.
+function Invoke-PerfThreadBreakdown {
+    param($Request, $TriggerMetadata)
+    $b = [Craft.Services.WorkerMetricsBridge]::GetMemoryBreakdown()
+    $states = @{}
+    foreach ($k in $b.ThreadStates.Keys) { $states[$k] = $b.ThreadStates[$k] }
+    return @{ StatusCode = 200; Body = @{ ok = $true
+            threadCount = $b.ThreadCount; processorCount = $b.ProcessorCount
+            httpWorkers = $b.HttpWorkers; bgWorkers = $b.BgWorkers; threadStates = $states } }
+}
+
 function Invoke-PerfSeqResult {
     param($Request, $TriggerMetadata)
     $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeq')
