@@ -476,6 +476,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         if (reattached > 0)
             _logger.LogInformation("[Scheduler] Reattached {Count} in-flight child runs to their parents", reattached);
 
+        // Recovery emits ONE aggregate line, not a handful per run: at scale a crash-loop replayed thousands
+        // of per-run "Found/Resuming/Released/Dispatched" lines on every restart. Per-run detail is kept at
+        // Debug; the counts below carry the summary. Genuine problems (unresumable, post-exec abandoned) still
+        // log at their own level as they happen.
+        var resumed = 0; var pendingTotal = 0; var postExecResumed = 0;
+        var staleReleased = 0; var finalizedNow = 0; var unresumable = 0; var postExecGaveUp = 0;
         foreach (var runName in summaries.Select(s => s.Name))
         {
             try
@@ -504,19 +510,21 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         await _store.UpsertRunAsync(run);
                         await _store.CleanupRunAsync(run.Name);
                         await _queue.RemoveRunAsync(run.Name, ct);
+                        postExecGaveUp++;
                         continue;
                     }
 
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[Scheduler] Resuming interrupted PostExecution for run: {Name} (PostExecStatus={Status}, attempt {Attempt}/{Max})",
                         run.Name, run.PostExecStatus, run.PostExecAttemptCount + 1, MaxPostExecAttempts);
                     DispatchPostExecution(run);
+                    postExecResumed++;
                     continue;
                 }
 
                 if (run.Status != "Running") continue;
 
-                _logger.LogInformation("[Scheduler] Found interrupted run: {Name}", run.Name);
+                _logger.LogDebug("[Scheduler] Found interrupted run: {Name}", run.Name);
 
                 // Use the stored task script name, fall back to naming convention
                 var taskPath = !string.IsNullOrEmpty(run.TaskScriptName)
@@ -526,6 +534,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 {
                     _logger.LogWarning("[Scheduler] Cannot resume {Name}: task script not found (tried {Script})",
                         run.Name, run.TaskScriptName ?? $"Invoke-{run.Name}Task");
+                    unresumable++;
                     continue;
                 }
 
@@ -567,9 +576,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     {
                         var released = await _queue.ReleaseRunClaimsAsync(run.Name, ct);
                         if (released > 0)
-                            _logger.LogInformation(
+                        {
+                            staleReleased += released;
+                            _logger.LogDebug(
                                 "[Scheduler] Released {Count} stale claim(s) held by the previous process for {Name}",
                                 released, run.Name);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -577,12 +589,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         _logger.LogWarning(ex, "[Scheduler] Could not release stale claims for {Name}", run.Name);
                     }
 
-                    _logger.LogInformation("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
-                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
+                    _logger.LogDebug("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
+                    resumed++; pendingTotal += pending;
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct, quiet: true);
                 }
                 else
                 {
                     await FinalizeRunAsync(run);
+                    finalizedNow++;
                 }
             }
             catch (Exception ex)
@@ -597,6 +611,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 _recoveringChildren.TryRemove(runName, out _);
             }
         }
+
+        if (resumed + finalizedNow + postExecResumed + unresumable + postExecGaveUp > 0)
+            _logger.LogInformation(
+                "[Scheduler] Crash recovery: resumed {Resumed} run(s) ({Pending} pending tasks re-dispatched), " +
+                "{PostExec} post-execution(s), {Finalized} finalized, {Stale} stale claim(s) released" +
+                "{Unresumable}{GaveUp}",
+                resumed, pendingTotal, postExecResumed, finalizedNow, staleReleased,
+                unresumable > 0 ? $", {unresumable} unresumable" : "",
+                postExecGaveUp > 0 ? $", {postExecGaveUp} post-exec abandoned" : "");
 
         // First retention pass, now that every run that could be resumed is back in _activeRuns and so
         // exempt from the abandoned-run rule. The scheduler keeps it going on an interval from here.
@@ -878,7 +901,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
     }
 
-    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
+    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority,
+        CancellationToken ct, bool quiet = false)
     {
         _activeRuns.TryAdd(run.Name, run);
         // Registered before anything is enqueued — the resolver reads it on the dispatch side.
@@ -969,14 +993,17 @@ public class OrchestratorService : IJobDescriptorStateWriter
             toQueue.Select(t => (t.Id, t.Priority ?? priority)).ToList(),
             DateTime.UtcNow, ct);
 
+        // quiet = called from crash recovery, where a per-run line per resumed run is the flood the
+        // aggregate summary replaces — drop to Debug. A normal orchestration start logs it at Info (one line).
+        var level = quiet ? LogLevel.Debug : LogLevel.Information;
         if (toQueue.Count == pending.Count)
         {
-            _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
+            _logger.Log(level, "[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
                 toQueue.Count, run.Name, priority);
         }
         else
         {
-            _logger.LogInformation(
+            _logger.Log(level,
                 "[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority} ({Existing} already queued)",
                 toQueue.Count, run.Name, priority, pending.Count - toQueue.Count);
         }

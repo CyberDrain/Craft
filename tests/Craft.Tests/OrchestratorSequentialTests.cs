@@ -87,7 +87,7 @@ public class OrchestratorSequentialTests
             .Invoke(svc, args)!;
 
     private static Task Dispatch(Harness h, OrchestratorRun run) =>
-        Invoke(h.Svc, "DispatchPendingTasksAsync", run, TaskFunc, run.Priority, CancellationToken.None);
+        Invoke(h.Svc, "DispatchPendingTasksAsync", run, TaskFunc, run.Priority, CancellationToken.None, false);
     private static Task Advance(Harness h, OrchestratorRun run) => Invoke(h.Svc, "AdvanceSequentialAsync", run);
     private static Task Redrive(Harness h, OrchestratorRun run) => Invoke(h.Svc, "RedrivePendingTasksAsync", run);
 

@@ -245,7 +245,7 @@ public class OrchestratorFinalizedRunTests
         {
             var mi = typeof(OrchestratorService).GetMethod("DispatchPendingTasksAsync",
                 BindingFlags.NonPublic | BindingFlags.Instance)!;
-            await (Task)mi.Invoke(svc, [run, "Invoke-CraftTask", 4, CancellationToken.None])!;
+            await (Task)mi.Invoke(svc, [run, "Invoke-CraftTask", 4, CancellationToken.None, false])!;
         }
         catch { /* expected: no queue on this instance */ }
 
