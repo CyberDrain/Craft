@@ -98,6 +98,10 @@ public class SchedulerService : BackgroundService
         // forget is deliberate: the loop handles its own failures and ends with the stopping token.
         _ = _orchestrator.RunRetentionLoopAsync(stoppingToken);
 
+        // One status/re-drive sweep over all live runs, replacing the per-run timers. Same fire-and-forget
+        // contract: it handles its own per-run errors and ends with the stopping token.
+        _ = _orchestrator.RunStatusSweepLoopAsync(stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             var now = DateTimeOffset.UtcNow;

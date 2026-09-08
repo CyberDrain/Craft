@@ -19,4 +19,11 @@ public class OrchestratorTaskItem
     /// priority when <c>ResumeInterruptedRunsAsync</c> re-queues the task.
     /// </summary>
     public int? Priority { get; set; }
+
+    /// <summary>
+    /// Position of this task in the batch as submitted (0-based). Only meaningful for a run marked
+    /// <see cref="OrchestratorRun.Sequential"/>, where tasks are dispatched one at a time in ascending
+    /// Sequence order. Non-sequential runs leave it 0 and ignore it.
+    /// </summary>
+    public int Sequence { get; set; }
 }

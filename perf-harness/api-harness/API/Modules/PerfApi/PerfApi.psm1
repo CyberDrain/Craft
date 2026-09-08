@@ -105,6 +105,316 @@ function Push-PerfBgLeaf {
     return @{ ok = $true; idx = $Item.idx }
 }
 
+# Run-COUNT axis driver (run-manyruns.ps1). The OOM harness above tests one run of N tasks (fan-out
+# WIDTH); this creates MANY separate runs that stay live (fan-out COUNT), reproducing the production shape
+# where thousands of scheduled runs sit in _activeRuns — each pinning a per-run 60s status Timer + its
+# task graph, and each re-reading the queue index on every tick. Memory is bounded in run-width but scales
+# with run-COUNT, which this exercises.
+#
+# Each run is a small batch of PerfHold tasks that sleep for the whole observation window, so with a tiny
+# BG pool only a few are ever claimed and the rest sit Pending — the run never finalizes, so it stays in
+# _activeRuns with its timer firing every 60s. Called in chunks by the harness to avoid a long single HTTP
+# request. Query:
+#   runs=M      how many runs to create THIS call (default 200)
+#   tasks=K     tasks per run (default 4) — K > (claimable) keeps each run with Pending work forever
+#   holdms=H    per-task sleep so a claimed task never completes during the window (default 3600000 = 1h)
+#   paramkb=P   per-task payload string in KB (default 0) — inflates each OrchestratorTaskItem.Parameters
+#               so the retained run graph is production-weight (real runs carry tenant/audit data, not no-ops).
+#               Retained memory then scales as M x K x paramkb, which is the axis that reaches the heap ceiling.
+#   prefix=P    run-name prefix (default PerfHold) so the harness can group a wave
+function Invoke-PerfManyRuns {
+    param($Request, $TriggerMetadata)
+    $runs = 200;     if ($Request.Query.runs) { $runs = [int]$Request.Query.runs }
+    $tasks = 4;      if ($Request.Query.tasks) { $tasks = [int]$Request.Query.tasks }
+    $holdms = 3600000; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $paramkb = 0;    if ($Request.Query.paramkb) { $paramkb = [int]$Request.Query.paramkb }
+    $func = 'PerfHold'; if ($Request.Query.func) { $func = [string]$Request.Query.func }  # PerfHold | PerfCheck
+    $prefix = 'PerfHold'; if ($Request.Query.prefix) { $prefix = [string]$Request.Query.prefix }
+    $seq = ([string]$Request.Query.seq -eq 'true')  # sequential: one task at a time, payload order
+    $payload = if ($paramkb -gt 0) { 'x' * ($paramkb * 1024) } else { $null }
+
+    $created = 0
+    for ($r = 0; $r -lt $runs; $r++) {
+        $batch = @(for ($i = 0; $i -lt $tasks; $i++) {
+            # marker = 'm'+idx lets Push-PerfCheck confirm the payload survived shed→rehydrate at dispatch.
+            $item = @{ FunctionName = $func; idx = $i; holdms = $holdms; marker = ('m' + $i) }
+            if ($payload) { $item['payload'] = $payload }
+            $item
+        })
+        Start-CraftOrchestrator -InputObject @{
+            OrchestratorName = "$prefix-$([guid]::NewGuid().ToString('N').Substring(0, 10))"
+            Batch            = $batch
+            Sequential       = $seq
+        } | Out-Null
+        $created++
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfManyRuns'; created = $created; tasksPerRun = $tasks; holdms = $holdms; paramkb = $paramkb; sequential = $seq } }
+}
+
+# Table manipulation for failure-mode exploration: delete/inspect orchestrator table rows WHILE runs are
+# live, to see whether Craft survives losing state under it. Uses the same storage connection the app uses.
+#   op=count        rows in a partition (needs table[,pk])
+#   op=list         first rows of a partition (table[,pk]) — RowKeys only
+#   op=deleteRow    delete one entity (table,pk,rk)
+#   op=deletePart   delete every row in a partition (table,pk) — e.g. a run's Tasks or Queue-index partition
+#   op=tables       list table names
+# Tables (prefix PerfBgOrch): PerfBgOrchRuns (pk 'Run'), PerfBgOrchTasks (pk=runName, rk=taskId, + Counter),
+# PerfBgOrchResults, PerfBgOrchQueue, PerfBgOrchQueueIndex.
+function Invoke-PerfTableOp {
+    param($Request, $TriggerMetadata)
+    $op = [string]$Request.Query.op; if (-not $op) { $op = 'count' }
+    $table = [string]$Request.Query.table
+    $pk = [string]$Request.Query.pk
+    $rk = [string]$Request.Query.rk
+    try {
+        $svc = [Azure.Data.Tables.TableServiceClient]::new($env:AzureWebJobsStorage)
+        if ($op -eq 'tables') {
+            $names = @($svc.Query() | ForEach-Object { $_.Name })
+            return @{ StatusCode = 200; Body = @{ ok = $true; op = $op; tables = $names } }
+        }
+        $tc = $svc.GetTableClient($table)
+        switch ($op) {
+            'deleteRow' {
+                $tc.DeleteEntity($pk, $rk) | Out-Null
+                return @{ StatusCode = 200; Body = @{ ok = $true; op = $op; table = $table; deleted = "$pk/$rk" } }
+            }
+            'deletePart' {
+                $filter = "PartitionKey eq '$pk'"
+                $n = 0
+                foreach ($e in $tc.Query[Azure.Data.Tables.TableEntity]($filter)) {
+                    $tc.DeleteEntity($e.PartitionKey, $e.RowKey) | Out-Null; $n++
+                }
+                return @{ StatusCode = 200; Body = @{ ok = $true; op = $op; table = $table; pk = $pk; deleted = $n } }
+            }
+            'deleteAll' {
+                $n = 0
+                foreach ($e in $tc.Query[Azure.Data.Tables.TableEntity]("PartitionKey gt ''")) {
+                    $tc.DeleteEntity($e.PartitionKey, $e.RowKey) | Out-Null; $n++
+                }
+                return @{ StatusCode = 200; Body = @{ ok = $true; op = $op; table = $table; deleted = $n } }
+            }
+            'list' {
+                $filter = if ($pk) { "PartitionKey eq '$pk'" } else { "PartitionKey gt ''" }
+                $rows = @()
+                foreach ($e in $tc.Query[Azure.Data.Tables.TableEntity]($filter)) {
+                    $rows += @{ pk = $e.PartitionKey; rk = $e.RowKey }
+                    if ($rows.Count -ge 25) { break }
+                }
+                return @{ StatusCode = 200; Body = @{ ok = $true; op = $op; table = $table; rows = $rows } }
+            }
+            default {
+                $filter = if ($pk) { "PartitionKey eq '$pk'" } else { "PartitionKey gt ''" }
+                $n = 0
+                foreach ($e in $tc.Query[Azure.Data.Tables.TableEntity]($filter)) { $n++ }
+                return @{ StatusCode = 200; Body = @{ ok = $true; op = 'count'; table = $table; pk = $pk; count = $n } }
+            }
+        }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; op = $op; error = "$_" } }
+    }
+}
+
+# Pre-seed live runs directly into the orchestrator tables, bypassing Start-CraftOrchestrator's per-run
+# enqueue cost — so a HIGH-scale thread comparison (per-run timers vs the single sweep) is not gated by how
+# fast the batch/planner path can create runs. Writes the Runs rows (Status=Running), each run's Tasks rows
+# (Status=Pending) + the "!!run-counter" row, in Azure Table batch transactions. RESTART the container after
+# seeding: ResumeInterruptedRunsAsync reads the Running run rows and resumes them into live _activeRuns
+# entries (each with a per-run status timer on the old build, or joined to the sweep on the new one).
+# Query: runs=M (default 2000), tasks=K (default 1), holdms=H, prefix=P, tableprefix=T (default PerfBgOrch).
+function Invoke-PerfSeedRuns {
+    param($Request, $TriggerMetadata)
+    $runs = 2000;      if ($Request.Query.runs) { $runs = [int]$Request.Query.runs }
+    $tasks = 1;        if ($Request.Query.tasks) { $tasks = [int]$Request.Query.tasks }
+    $holdms = 3600000; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $prefix = 'seed';  if ($Request.Query.prefix) { $prefix = [string]$Request.Query.prefix }
+    $tp = 'PerfBgOrch'; if ($Request.Query.tableprefix) { $tp = [string]$Request.Query.tableprefix }
+    try {
+        $svc = [Azure.Data.Tables.TableServiceClient]::new($env:AzureWebJobsStorage)
+        $rc = $svc.GetTableClient("${tp}Runs");  $rc.CreateIfNotExists() | Out-Null
+        $tc = $svc.GetTableClient("${tp}Tasks"); $tc.CreateIfNotExists() | Out-Null
+        $now = [DateTimeOffset]::UtcNow
+        $upsert = [Azure.Data.Tables.TableTransactionActionType]::UpsertReplace
+        $runBatch = [System.Collections.Generic.List[Azure.Data.Tables.TableTransactionAction]]::new()
+        $created = 0
+        for ($i = 0; $i -lt $runs; $i++) {
+            $name = "$prefix-$i"
+            $r = [Azure.Data.Tables.TableEntity]::new('Run', $name)
+            $r['Status'] = 'Running'; $r['Priority'] = [int]4; $r['StartedUtc'] = $now
+            $r['TaskScriptName'] = 'Invoke-CraftTask'; $r['TaskCount'] = [int]$tasks; $r['Sequential'] = [int]0
+            $runBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $r))
+            if ($runBatch.Count -eq 100) { $rc.SubmitTransaction($runBatch) | Out-Null; $runBatch.Clear() }
+
+            $taskBatch = [System.Collections.Generic.List[Azure.Data.Tables.TableTransactionAction]]::new()
+            for ($j = 0; $j -lt $tasks; $j++) {
+                $t = [Azure.Data.Tables.TableEntity]::new($name, "${name}_t$j")
+                $t['Status'] = 'Pending'
+                $t['ParametersJson'] = "{`"FunctionName`":`"PerfHold`",`"idx`":$j,`"holdms`":$holdms}"
+                $t['AttemptCount'] = [int]0; $t['Sequence'] = [int]$j
+                $taskBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $t))
+            }
+            $cnt = [Azure.Data.Tables.TableEntity]::new($name, '!!run-counter')
+            $cnt['Remaining'] = [int]$tasks; $cnt['Total'] = [int]$tasks
+            $taskBatch.Add([Azure.Data.Tables.TableTransactionAction]::new($upsert, $cnt))
+            $tc.SubmitTransaction($taskBatch) | Out-Null
+            $created++
+        }
+        if ($runBatch.Count -gt 0) { $rc.SubmitTransaction($runBatch) | Out-Null }
+        return @{ StatusCode = 200; Body = @{ ok = $true; seeded = $created; tasksPerRun = $tasks
+                note = 'restart the container to resume these into live runs' } }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
+    }
+}
+
+# Parameters-integrity task: verifies the payload the run was created with survived the shed→rehydrate round
+# trip. Increments a shared 'ok' counter when its marker parameter is present and correct, 'lost' when it is
+# missing/empty (payload lost — a shedding race, or the Tasks row was deleted before dispatch so rehydration
+# read nothing). Read the tallies via /API/PerfCheckCounts. holdms lets it sit Pending like PerfHold.
+function Push-PerfCheck {
+    param($Item)
+    $cache = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfCheck')
+    $marker = [string]$Item.marker
+    $key = if ($marker -and $marker -eq ('m' + $Item.idx)) { 'ok' } else { 'lost' }
+    # Interlocked-ish: the shared cache is concurrent; a coarse increment is fine for a tally.
+    $n = 0; if ($cache[$key]) { $n = [int]$cache[$key] }
+    $cache[$key] = $n + 1
+    if ($key -eq 'lost') {
+        $ln = 0; if ($cache['lostSample']) { $ln = [int]$cache['lostSample'] }
+        $cache['lastLost'] = "idx=$($Item.idx) marker='$marker'"
+    }
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    return @{ ok = $true; idx = $Item.idx; check = $key }
+}
+
+function Invoke-PerfCheckCounts {
+    param($Request, $TriggerMetadata)
+    $cache = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfCheck')
+    return @{ StatusCode = 200; Body = @{ ok = $true
+        okCount = [int]$cache['ok']; lostCount = [int]$cache['lost']; lastLost = [string]$cache['lastLost'] } }
+}
+
+# The hold-open task: sleeps holdms so a claimed task never reaches a terminal state during the test, which
+# is what keeps its run live in _activeRuns (and its 60s status timer firing). No allocation, no fan-out —
+# this axis is about run COUNT, not per-task work.
+function Push-PerfHold {
+    param($Item)
+    $ms = 3600000; if ($Item.holdms) { $ms = [int]$Item.holdms }
+    Start-Sleep -Milliseconds $ms
+    return @{ ok = $true; idx = $Item.idx }
+}
+
+# Sequential-mode probe: records the ORDER tasks start in and the MAX concurrency observed, into a shared
+# cache. A sequential run should show order = payload order (0,1,2,...) and maxActive = 1 (one at a time);
+# a fan-out run shows interleaved order and maxActive > 1. Read via /API/PerfSeqResult.
+function Push-PerfSeq {
+    param($Item)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeq')
+    $c['order'] = "$($c['order'])$($Item.idx),"
+    $a = [int]$c['active'] + 1; $c['active'] = $a
+    if ($a -gt [int]$c['maxActive']) { $c['maxActive'] = $a }
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    $c['active'] = [int]$c['active'] - 1
+    return @{ ok = $true; idx = $Item.idx }
+}
+
+# Live OS-thread breakdown via the C# bridge: total thread count and a tally by ThreadState, plus the
+# processor count and PS worker-pool size. Answers "where are Craft's threads" at a point in time —
+# bounded PS pool + thread-pool workers, and whether anything is growing under load.
+function Invoke-PerfThreadBreakdown {
+    param($Request, $TriggerMetadata)
+    $b = [Craft.Services.WorkerMetricsBridge]::GetMemoryBreakdown()
+    $states = @{}
+    foreach ($k in $b.ThreadStates.Keys) { $states[$k] = $b.ThreadStates[$k] }
+    return @{ StatusCode = 200; Body = @{ ok = $true
+            threadCount = $b.ThreadCount; processorCount = $b.ProcessorCount
+            httpWorkers = $b.HttpWorkers; bgWorkers = $b.BgWorkers; threadStates = $states } }
+}
+
+function Invoke-PerfSeqResult {
+    param($Request, $TriggerMetadata)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeq')
+    return @{ StatusCode = 200; Body = @{ ok = $true
+        order = [string]$c['order']; maxActive = [int]$c['maxActive'] } }
+}
+
+# ── Worker-pinning probe ────────────────────────────────────────────────────────────────────────────
+# Proves the pinned sequential driver: every step of a sequential run runs on the SAME worker, and
+# concurrently-running sequential runs each pin their OWN worker. Each step records (run, idx, worker) under
+# a unique key so distinct-key writes stay concurrency-safe on the synchronized Hashtable. The worker id is
+# the per-invoke stamped $global:CraftOperationContext.WorkerId ("W<n>"); the run name is carried on the item
+# so grouping never depends on RunName propagation into the task context. Read via /API/PerfSeqWorkerResult.
+function Push-PerfSeqWorker {
+    param($Item)
+    $ctx = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    $worker = if ($ctx -and $ctx.WorkerId) { [string]$ctx.WorkerId } else { 'W?' }
+    $run = [string]$Item.run
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker')
+    $c["$run|$([int]$Item.idx)"] = "$worker@$([DateTime]::UtcNow.Ticks)"
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    return @{ ok = $true; run = $run; idx = $Item.idx; worker = $worker }
+}
+
+# Start N sequential (or fan-out, with seq=false) runs of K steps each, holding holdms per step so several
+# runs are in flight at once — the case that shows each sequential run keeps its own single worker. Each step
+# carries its run name. Clears the shared cache first so a run of the harness starts clean.
+function Invoke-PerfSeqWorkerEnqueue {
+    param($Request, $TriggerMetadata)
+    $runs = 4;     if ($Request.Query.runs)   { $runs = [int]$Request.Query.runs }
+    $steps = 5;    if ($Request.Query.steps)  { $steps = [int]$Request.Query.steps }
+    $holdms = 500; if ($Request.Query.holdms) { $holdms = [int]$Request.Query.holdms }
+    $seq = -not ([string]$Request.Query.seq -eq 'false')  # default sequential; seq=false → fan-out contrast
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker'); $c.Clear()
+    $names = @()
+    for ($r = 0; $r -lt $runs; $r++) {
+        $name = "SeqW$r-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
+        $names += $name
+        $batch = @(for ($i = 0; $i -lt $steps; $i++) { @{ FunctionName = 'PerfSeqWorker'; run = $name; idx = $i; holdms = $holdms } })
+        Start-CraftOrchestrator -InputObject @{ OrchestratorName = $name; Batch = $batch; Sequential = $seq } | Out-Null
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfSeqWorkerEnqueue'
+            runs = $runs; steps = $steps; holdms = $holdms; sequential = $seq; names = $names } }
+}
+
+function Invoke-PerfSeqWorkerResult {
+    param($Request, $TriggerMetadata)
+    $c = [Craft.Services.PowerShellRunnerService]::GetSharedCache('PerfSeqWorker')
+    $rows = @()
+    foreach ($k in @($c.Keys)) {
+        $parts = ([string]$k) -split '\|', 2
+        $vp = ([string]$c[$k]) -split '@', 2
+        $rows += @{ run = $parts[0]; idx = [int]$parts[1]; worker = $vp[0]; ticks = [long]$vp[1] }
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfSeqWorkerResult'; count = $rows.Count; rows = @($rows) } }
+}
+
+# Thread-pool + process-thread telemetry, for the "thread constrained" half of the many-runs harness. The
+# per-run timers fire their re-drive as fire-and-forget work onto the .NET thread pool, so PendingWorkItemCount
+# climbing (work queued faster than threads drain it) is the thread-starvation signal that inflates the
+# client-side wall-time of otherwise-fast table reads.
+function Invoke-PerfThreads {
+    param($Request, $TriggerMetadata)
+    $maxW = 0; $maxIo = 0; $minW = 0; $minIo = 0; $availW = 0; $availIo = 0
+    [System.Threading.ThreadPool]::GetMaxThreads([ref]$maxW, [ref]$maxIo) | Out-Null
+    [System.Threading.ThreadPool]::GetMinThreads([ref]$minW, [ref]$minIo) | Out-Null
+    [System.Threading.ThreadPool]::GetAvailableThreads([ref]$availW, [ref]$availIo) | Out-Null
+    $proc = [System.Diagnostics.Process]::GetCurrentProcess()
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfThreads'
+        threadPool = @{
+            threadCount           = [System.Threading.ThreadPool]::ThreadCount
+            pendingWorkItems      = [long][System.Threading.ThreadPool]::PendingWorkItemCount
+            completedWorkItems    = [long][System.Threading.ThreadPool]::CompletedWorkItemCount
+            maxWorker             = $maxW; maxIo = $maxIo
+            minWorker             = $minW; minIo = $minIo
+            busyWorker            = ($maxW - $availW); busyIo = ($maxIo - $availIo)
+        }
+        process = @{
+            osThreadCount = $proc.Threads.Count
+            # Cumulative re-drive storage verifications (index read + point reads). ②'s backoff holds this down.
+            redriveReads = [long][Craft.Orchestration.OrchestratorService]::RedriveStorageReads
+        }
+    } }
+}
+
 # Worker/queue allocation snapshot — the harness's downstream wrapper around the CRAFT bridge, standing
 # in for what a real app (e.g. CIPP) does: CRAFT exposes the data as [Craft.Services.WorkerMetricsBridge],
 # the app wraps whichever fields it wants into its own endpoint. Returns the shape run-orch.ps1 and the

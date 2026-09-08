@@ -61,32 +61,40 @@ public class StatsHistoryService : BackgroundService
         // Load persisted history from disk
         LoadFromDisk();
 
-        // Wait for worker pool to be ready before starting collection
-        await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
-
-        _logger.LogInformation("[StatsHistory] Started — sampling every {Interval}s, retaining {Days} days",
-            SampleIntervalSeconds, RetentionDays);
-
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(SampleIntervalSeconds));
-
-        while (await timer.WaitForNextTickAsync(stoppingToken))
+        try
         {
-            try
-            {
-                var point = CollectSample();
-                AppendPointToDisk(point);
+            // Wait for worker pool to be ready before starting collection
+            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
 
-                _ticksSinceCompact++;
-                if (_ticksSinceCompact >= CompactEveryNTicks)
+            _logger.LogInformation("[StatsHistory] Started — sampling every {Interval}s, retaining {Days} days",
+                SampleIntervalSeconds, RetentionDays);
+
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(SampleIntervalSeconds));
+
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                try
                 {
-                    CompactFile();
-                    _ticksSinceCompact = 0;
+                    var point = CollectSample();
+                    AppendPointToDisk(point);
+
+                    _ticksSinceCompact++;
+                    if (_ticksSinceCompact >= CompactEveryNTicks)
+                    {
+                        CompactFile();
+                        _ticksSinceCompact = 0;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[StatsHistory] Sample collection failed");
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "[StatsHistory] Sample collection failed");
-            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Host shutting down (the Task.Delay or the timer await was cancelled). Expected —
+            // swallow it so we don't fault the host under BackgroundServiceExceptionBehavior.StopHost.
         }
 
         // Final compaction on shutdown so retention is applied before we exit

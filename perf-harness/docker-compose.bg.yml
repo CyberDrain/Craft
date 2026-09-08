@@ -58,8 +58,16 @@ services:
       - App__Orchestrator__BatchStatusWrites=${BATCH_WRITES:-true}
       - App__Orchestrator__DurableRunningBarrier=${DURABLE_BARRIER:-true}
       - App__Orchestrator__StatusFlushIntervalMs=${FLUSH_MS:-25}
-      - CRAFT_LOG_LEVEL=Warning
-      - Logging__LogLevel__Default=Warning
+      # Per-run status/re-drive tick cadence. run-manyruns.ps1 lowers it to compress the re-drive backoff.
+      - App__Orchestrator__StatusTimerIntervalSeconds=${STATUS_INTERVAL:-60}
+      # Re-drive backoff (② ). run-manyruns.ps1 flips it to A/B the backoff's effect at a fixed interval.
+      - App__Orchestrator__RedriveBackoff=${REDRIVE_BACKOFF:-true}
+      # Pending-Parameters shedding (retained-memory fix). run-manyruns.ps1 flips it to A/B the memory effect.
+      - App__Orchestrator__ShedPendingParameters=${SHED_PARAMS:-true}
+      # Default Warning keeps the other bg-harness runs quiet; run-manyruns.ps1 sets LOG_LEVEL=Information
+      # to reproduce production's Info-level per-run status logging (the log flood is part of the cost under test).
+      - CRAFT_LOG_LEVEL=${LOG_LEVEL:-Warning}
+      - Logging__LogLevel__Default=${LOG_LEVEL:-Warning}
       - CRAFT_DISPATCH_TIMING=${DISPATCH_TIMING:-}
       # Reused pipeline thread default on; run-bg.ps1 -NoReuseThread sets false for A/B (must be a valid bool).
       - App__Worker__ReuseRunspaceThread=${REUSE_THREAD:-true}

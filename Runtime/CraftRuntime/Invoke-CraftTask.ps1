@@ -23,7 +23,10 @@ function Invoke-CraftTask {
 
     $PushFunction = "Push-$FunctionName"
     $TenantLabel = $Item.TenantFilter ?? $Item.QueueName ?? $Item.defaultDomainName ?? $(if ($Item.Tenant -is [string]) { $Item.Tenant } elseif ($Item.Tenant.defaultDomainName) { $Item.Tenant.defaultDomainName } else { 'unknown' })
-    Write-Information "Dispatching task to $PushFunction for $TenantLabel"
+    # Per-task dispatch/complete are Debug: at scale (and especially during crash recovery, when every
+    # pending task re-dispatches) two Info lines per task flooded the log. Push-* functions still log their
+    # own meaningful output at Info; enable Debug to correlate an individual task to its tenant.
+    Write-Debug "Dispatching task to $PushFunction for $TenantLabel"
 
     $Result = & $PushFunction -Item ([PSCustomObject]$Item)
 
@@ -32,5 +35,5 @@ function Invoke-CraftTask {
         ConvertTo-Json -InputObject @($Result) -Depth 20 -Compress
     }
 
-    Write-Information "Completed task $PushFunction for $TenantLabel"
+    Write-Debug "Completed task $PushFunction for $TenantLabel"
 }

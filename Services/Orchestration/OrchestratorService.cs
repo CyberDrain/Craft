@@ -3,6 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Craft.Configuration;
+using Craft.PowerShellHost;
 using Craft.Services;
 using Craft.Storage;
 
@@ -59,8 +60,46 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// drain runs in the background while the enqueuing task is marked terminal immediately.
     /// </summary>
     private readonly ConcurrentDictionary<string, int> _pendingChildRuns = new();
-    private readonly ConcurrentDictionary<string, Timer> _runStatusTimers = new();
     private readonly ConcurrentDictionary<string, bool> _cancelledRuns = new();
+
+    /// <summary>
+    /// Last status line emitted per run — the (completed, failed, running, pending) tuple and when. Lets
+    /// <see cref="LogRunStatus"/> skip re-emitting an identical line every 60s for a run that has not
+    /// changed (the dominant log volume at scale — thousands of runs parked at "0 running / N pending"),
+    /// while a slow heartbeat still proves a long-lived run is alive. Dropped at finalize.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, (int C, int F, int R, int P, DateTime LoggedUtc)> _lastStatusLog = new();
+
+    /// <summary>
+    /// Per-run re-drive backoff: when the storage verification in <see cref="RedrivePendingTasksAsync"/> may
+    /// next run, and the interval it grew to. The re-drive is a watchdog for the rare orphaned-Pending task;
+    /// in steady state it reads storage and finds nothing, so once it does it backs off geometrically instead
+    /// of paying a full index read (+ a point read per candidate) on every 60s tick for every live run — the
+    /// dominant per-tick storage cost at scale. Snaps back to the base interval the moment it finds an orphan.
+    /// Dropped at finalize.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, (DateTime NextUtc, TimeSpan Interval)> _redriveBackoff = new();
+
+    /// <summary>Per-run status/re-drive tick cadence, from <c>Orchestrator:StatusTimerIntervalSeconds</c>.</summary>
+    private readonly TimeSpan _statusInterval;
+
+    /// <summary>Re-drive backoff floor — one tick. The interval grows from here to <see cref="RedriveMax"/>.</summary>
+    private readonly TimeSpan _redriveBase;
+
+    /// <summary>Whether the re-drive backoff is active, from <c>Orchestrator:RedriveBackoff</c>.</summary>
+    private readonly bool _redriveBackoffEnabled;
+
+    /// <summary>Whether pending tasks shed their Parameters payload, from <c>Orchestrator:ShedPendingParameters</c>.</summary>
+    private readonly bool _shedParameters;
+
+    private static long _redriveStorageReads;
+
+    /// <summary>
+    /// Count of storage verifications the re-drive has performed (a <see cref="JobQueueStore.GetDispatchableTaskIdsAsync"/>
+    /// call: one index-partition read + a point read per candidate). Instrumentation for the perf harness —
+    /// the backoff's whole purpose is to hold this down at high live-run counts.
+    /// </summary>
+    public static long RedriveStorageReads => Interlocked.Read(ref _redriveStorageReads);
 
     /// <summary>
     /// Resolved task-script path per run. One entry per RUN (not per task), so a 738-task fan-out costs
@@ -76,12 +115,27 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private const int MaxPostExecAttempts = 3;
 
     /// <summary>
+    /// How often an UNCHANGED run still emits a status line, so a long-lived run proves it is alive without
+    /// logging the identical line on every 60s tick. A real status change always logs immediately.
+    /// </summary>
+    private static readonly TimeSpan StatusHeartbeat = TimeSpan.FromMinutes(10);
+
+    /// <summary>
     /// Runs whose finalize has been claimed, so it happens once. Claimed in CheckRunCompletion,
     /// released on the deferral/failure paths there, and cleared in DispatchPendingTasksAsync when a
     /// run becomes live again. In-memory only: after a restart nothing has been finalized yet, so an
     /// empty set is the correct starting state.
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _finalizingRuns = new();
+
+    /// <summary>
+    /// Sequential runs whose single driver job is currently executing. A sequential run's steps all run on
+    /// one pinned worker inside one driver, and the not-yet-run steps deliberately have no queue row — so
+    /// while a driver is active the re-drive must not treat those steps as orphaned and enqueue them (which
+    /// would spawn a second driver). Set when the driver starts, cleared when it finishes; in-memory only,
+    /// so after a crash it is empty and the re-drive/resume correctly re-triggers the driver.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _activeSequentialDrivers = new();
 
     /// <summary>
     /// Get the Reference for a given run name, or null if not found/no reference set.
@@ -127,6 +181,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _writer = writer;
         _settings = settings;
 
+        // Status/re-drive tick cadence. Configurable so a constrained deployment can slow it (fewer ticks =
+        // less per-run overhead at high live-run counts) and so the perf harness can compress it to exercise
+        // the re-drive backoff quickly. The backoff floor is one tick.
+        _statusInterval = TimeSpan.FromSeconds(Math.Max(1, _settings.Orchestrator.StatusTimerIntervalSeconds));
+        _redriveBase = _statusInterval;
+        _redriveBackoffEnabled = _settings.Orchestrator.RedriveBackoff;
+        _shedParameters = _settings.Orchestrator.ShedPendingParameters;
+
         // The queue holds descriptors; this is how they become work again at dispatch time, and how
         // operator changes to a queued task are made durable.
         _jobManager.SetWorkResolver(ResolveTaskWorkAsync);
@@ -143,6 +205,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     public void PriorityChanged(JobDescriptor descriptor, int newPriority)
     {
         if (!TryFindLive(descriptor, out _, out var task)) return;
+
+        // Rehydrate a shed payload before the durable write below (Replace mode) overwrites the stored
+        // ParametersJson with null. This is a rare, operator-initiated path, so the blocking read is fine.
+        if (_shedParameters && task.Parameters == null)
+        {
+            var p = _store.GetTaskParametersAsync(descriptor.RunName, task.Id).GetAwaiter().GetResult() ?? [];
+            lock (_lock) { task.Parameters ??= p; }
+        }
 
         lock (_lock) task.Priority = newPriority;
         _writer.QueueTask(descriptor.RunName, task);
@@ -416,6 +486,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         if (reattached > 0)
             _logger.LogInformation("[Scheduler] Reattached {Count} in-flight child runs to their parents", reattached);
 
+        // Recovery emits ONE aggregate line, not a handful per run: at scale a crash-loop replayed thousands
+        // of per-run "Found/Resuming/Released/Dispatched" lines on every restart. Per-run detail is kept at
+        // Debug; the counts below carry the summary. Genuine problems (unresumable, post-exec abandoned) still
+        // log at their own level as they happen.
+        var resumed = 0; var pendingTotal = 0; var postExecResumed = 0;
+        var staleReleased = 0; var finalizedNow = 0; var unresumable = 0; var postExecGaveUp = 0;
         foreach (var runName in summaries.Select(s => s.Name))
         {
             try
@@ -444,19 +520,21 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         await _store.UpsertRunAsync(run);
                         await _store.CleanupRunAsync(run.Name);
                         await _queue.RemoveRunAsync(run.Name, ct);
+                        postExecGaveUp++;
                         continue;
                     }
 
-                    _logger.LogInformation(
+                    _logger.LogDebug(
                         "[Scheduler] Resuming interrupted PostExecution for run: {Name} (PostExecStatus={Status}, attempt {Attempt}/{Max})",
                         run.Name, run.PostExecStatus, run.PostExecAttemptCount + 1, MaxPostExecAttempts);
                     DispatchPostExecution(run);
+                    postExecResumed++;
                     continue;
                 }
 
                 if (run.Status != "Running") continue;
 
-                _logger.LogInformation("[Scheduler] Found interrupted run: {Name}", run.Name);
+                _logger.LogDebug("[Scheduler] Found interrupted run: {Name}", run.Name);
 
                 // Use the stored task script name, fall back to naming convention
                 var taskPath = !string.IsNullOrEmpty(run.TaskScriptName)
@@ -466,6 +544,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 {
                     _logger.LogWarning("[Scheduler] Cannot resume {Name}: task script not found (tried {Script})",
                         run.Name, run.TaskScriptName ?? $"Invoke-{run.Name}Task");
+                    unresumable++;
                     continue;
                 }
 
@@ -507,9 +586,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     {
                         var released = await _queue.ReleaseRunClaimsAsync(run.Name, ct);
                         if (released > 0)
-                            _logger.LogInformation(
+                        {
+                            staleReleased += released;
+                            _logger.LogDebug(
                                 "[Scheduler] Released {Count} stale claim(s) held by the previous process for {Name}",
                                 released, run.Name);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -517,12 +599,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         _logger.LogWarning(ex, "[Scheduler] Could not release stale claims for {Name}", run.Name);
                     }
 
-                    _logger.LogInformation("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
-                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct);
+                    _logger.LogDebug("[Scheduler] Resuming interrupted run {Name}: {Pending} pending", run.Name, pending);
+                    resumed++; pendingTotal += pending;
+                    await DispatchPendingTasksAsync(run, taskPath, run.Priority, ct, quiet: true);
                 }
                 else
                 {
                     await FinalizeRunAsync(run);
+                    finalizedNow++;
                 }
             }
             catch (Exception ex)
@@ -537,6 +621,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 _recoveringChildren.TryRemove(runName, out _);
             }
         }
+
+        if (resumed + finalizedNow + postExecResumed + unresumable + postExecGaveUp > 0)
+            _logger.LogInformation(
+                "[Scheduler] Crash recovery: resumed {Resumed} run(s) ({Pending} pending tasks re-dispatched), " +
+                "{PostExec} post-execution(s), {Finalized} finalized, {Stale} stale claim(s) released" +
+                "{Unresumable}{GaveUp}",
+                resumed, pendingTotal, postExecResumed, finalizedNow, staleReleased,
+                unresumable > 0 ? $", {unresumable} unresumable" : "",
+                postExecGaveUp > 0 ? $", {postExecGaveUp} post-exec abandoned" : "");
 
         // First retention pass, now that every run that could be resumed is back in _activeRuns and so
         // exempt from the abandoned-run rule. The scheduler keeps it going on an interval from here.
@@ -621,6 +714,46 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     /// <summary>
+    /// One loop that ticks every live run's status / re-drive / completion-recheck, at
+    /// <see cref="_statusInterval"/>. It replaces the per-run <see cref="Timer"/> that used to do this: at
+    /// high live-run counts that meant one Timer object per run and a continuous stream of fire-and-forget
+    /// callbacks onto the thread pool (~M/interval per second), whereas one sweep over <see cref="_activeRuns"/>
+    /// is a single scheduling source that allocates nothing per run. The per-run work stays cheap —
+    /// <see cref="LogRunStatus"/> skips an unchanged line, <see cref="RedrivePendingTasksAsync"/> is gated by
+    /// its backoff and returns synchronously when backed off, and <see cref="CheckRunCompletion"/>
+    /// short-circuits — so ticking thousands of runs in one pass is fast. A throw for one run is logged and
+    /// neither stops the sweep nor takes the host down (a Timer callback that threw would have crashed it).
+    /// Started once by <see cref="SchedulerService"/>, alongside the retention loop.
+    /// </summary>
+    public async Task RunStatusSweepLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(_statusInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                foreach (var run in _activeRuns.Values)
+                {
+                    try
+                    {
+                        LogRunStatus(run);
+                        RedrivePendingTasks(run);
+                        lock (_lock) { CheckRunCompletion(run); }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Host shutdown.
+        }
+    }
+
+    /// <summary>
     /// Start an orchestrator run from a pre-built batch.
     /// Called by OrchestratorBridge.DrainPending() when PowerShell's Start-CIPPOrchestrator
     /// queues a run on CIPPNG (bypassing the planner script phase).
@@ -634,7 +767,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// </summary>
     public async Task StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
-        string? parentRunName = null, string? reference = null, string? batchFilePath = null)
+        string? parentRunName = null, string? reference = null, string? batchFilePath = null,
+        bool sequential = false)
     {
         // The batch file is this method's to dispose of, on EVERY path — including the two
         // "already running, skipping" returns below, which never look at it. Those are the common
@@ -643,7 +777,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try
         {
             await StartFromBatchCoreAsync(name, batchJson, priority, postExecFunctionName,
-                postExecParametersJson, parentRunName, reference, batchFilePath, ct);
+                postExecParametersJson, parentRunName, reference, batchFilePath, sequential, ct);
         }
         finally
         {
@@ -660,7 +794,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     private async Task StartFromBatchCoreAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson,
-        string? parentRunName, string? reference, string? batchFilePath, CancellationToken ct)
+        string? parentRunName, string? reference, string? batchFilePath, bool sequential, CancellationToken ct)
     {
         // Run names become PartitionKeys verbatim, and batch names carry user-typed task names
         // ("Alert on Entra ID P1/P2 …"). An illegal key character 400s every write for the run —
@@ -722,6 +856,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 return;
             }
 
+            // Stamp payload order. Sequential dispatch reads this to run tasks one at a time in the order
+            // they were submitted; fan-out ignores it. The parser preserves batch order, so the index is it.
+            for (var i = 0; i < tasks.Count; i++) tasks[i].Sequence = i;
+
             var genericTaskFunc = _settings.Orchestrator.GenericTaskFunction;
             if (string.IsNullOrEmpty(genericTaskFunc))
             {
@@ -746,7 +884,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 TaskScriptName = genericTaskFunc,
                 PostExecFunctionName = postExecFunctionName,
                 PostExecParametersJson = postExecParametersJson,
-                ParentRunName = parentRunName
+                ParentRunName = parentRunName,
+                Sequential = sequential
             };
 
             await _store.UpsertRunAsync(run);
@@ -772,7 +911,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
     }
 
-    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority, CancellationToken ct)
+    private async Task DispatchPendingTasksAsync(OrchestratorRun run, string taskPath, int priority,
+        CancellationToken ct, bool quiet = false)
     {
         _activeRuns.TryAdd(run.Name, run);
         // Registered before anything is enqueued — the resolver reads it on the dispatch side.
@@ -783,39 +923,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // this, the finalize claim from their previous outing would strand the next one forever.
         _finalizingRuns.TryRemove(run.Name, out _);
 
-        // Start periodic status timer (every 60s) for this run
-        if (!_runStatusTimers.ContainsKey(run.Name))
-        {
-            // CheckRunCompletion is re-run here on purpose. It is normally driven by task transitions,
-            // but a run whose finalize was deferred because storage still showed work outstanding has no
-            // transitions left to retrigger it - without this periodic re-check that deferral would be
-            // permanent, which is a worse failure than the premature finalize it exists to prevent.
-            var timer = new Timer(_ =>
-                {
-                    // A System.Threading.Timer callback that throws crashes the process. This periodic
-                    // maintenance tick must never take the host down on a transient error — a dependency
-                    // disposed during shutdown, a race on run state — so it logs and waits for the next tick.
-                    try
-                    {
-                        LogRunStatus(run);
-                        RedrivePendingTasks(run);
-                        lock (_lock) { CheckRunCompletion(run); }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogWarning(ex, "[Scheduler] Run status tick failed for {Name}", run?.Name);
-                    }
-                },
-                null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
-            if (!_runStatusTimers.TryAdd(run.Name, timer))
-            {
-                // Lost the ContainsKey→TryAdd race (concurrent dispatch of the same run — startup
-                // resume vs a scheduler tick). An active periodic Timer is rooted by the runtime's
-                // timer queue, so an undisposed loser would fire — and pin this run graph through its
-                // closure — for the process lifetime.
-                timer.Dispose();
-            }
-        }
+        // No per-run timer: the single RunStatusSweepLoopAsync ticks every run in _activeRuns (which this
+        // run was just added to). One sweep replaces what used to be a System.Threading.Timer per run — at
+        // high live-run counts that was thousands of Timer objects and a continuous drizzle of fire-and-forget
+        // callbacks onto the thread pool. The sweep still runs LogRunStatus + RedrivePendingTasks +
+        // CheckRunCompletion for each run at the same cadence (the last re-run on purpose: a finalize deferred
+        // while storage showed work outstanding has no task transition left to retrigger it).
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
 
@@ -848,7 +961,41 @@ public class OrchestratorService : IJobDescriptorStateWriter
             alreadyQueued = [];
         }
 
-        var toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+        List<OrchestratorTaskItem> toQueue;
+        if (run.Sequential)
+        {
+            // Sequential mode: a single entry row starts the ONE pinned driver that then runs every step of
+            // the run inline (see BuildSequentialRunWork), so exactly ONE queue row ever exists for the run —
+            // the lowest-Sequence task still Pending — and the later steps get no rows at all. Enqueue that
+            // one task, and only if it does not already have a row. A second row for the same run would let a
+            // second driver start and break the pinning/ordering. This covers both first dispatch (enqueues
+            // Sequence 0 to start the driver) and resume (re-enqueues the current step only if its row is
+            // gone, so a fresh driver picks the run back up where it left off).
+            var current = pending.OrderBy(t => t.Sequence).FirstOrDefault();
+            toQueue = current != null && !alreadyQueued.Contains(current.Id) ? [current] : [];
+        }
+        else
+        {
+            toQueue = pending.Where(t => !alreadyQueued.Contains(t.Id)).ToList();
+        }
+
+        // Shed the Parameters payload BEFORE the tasks become claimable. The caller has already persisted
+        // them (UpsertTaskBatchAsync), so the Tasks table is authoritative; the live graph keeps each task
+        // object (its identity + Status drive completion tracking) but drops the payload it does not need
+        // while it waits, and BuildTaskWork rehydrates it from storage at dispatch. This is what bounds the
+        // retained memory of a large pending backlog — thousands of runs each holding every task's payload is
+        // what walks the live-set into the GC heap ceiling. Ordering matters: shedding AFTER the enqueue
+        // could null a task the pump had already claimed and whose BuildTaskWork had just rehydrated it, so
+        // shed here, before EnqueueBatchAsync makes the rows claimable. Only toQueue (the rows enqueued in
+        // THIS call) is touched — a task already queued from a prior call may be mid-dispatch. Sequential
+        // runs are exempt: they are small (a handful of ordered steps) and their pinned driver holds every
+        // step's payload in the live graph while it runs, so shedding would buy no memory and only add reads.
+        if (_shedParameters && !run.Sequential)
+        {
+            lock (_lock)
+                foreach (var t in toQueue)
+                    if (t.Status == "Pending") t.Parameters = null!;
+        }
 
         // One batched write per priority bucket rather than one per task. The queue is the backlog now;
         // the JobManager only ever sees the batch JobQueuePump claims from it.
@@ -856,24 +1003,244 @@ public class OrchestratorService : IJobDescriptorStateWriter
             toQueue.Select(t => (t.Id, t.Priority ?? priority)).ToList(),
             DateTime.UtcNow, ct);
 
+        // quiet = called from crash recovery, where a per-run line per resumed run is the flood the
+        // aggregate summary replaces — drop to Debug. A normal orchestration start logs it at Info (one line).
+        var level = quiet ? LogLevel.Debug : LogLevel.Information;
         if (toQueue.Count == pending.Count)
         {
-            _logger.LogInformation("[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
+            _logger.Log(level, "[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority}",
                 toQueue.Count, run.Name, priority);
         }
         else
         {
-            _logger.LogInformation(
+            _logger.Log(level,
                 "[Scheduler] Dispatched {Count} tasks for {Name} at P{Priority} ({Existing} already queued)",
                 toQueue.Count, run.Name, priority, pending.Count - toQueue.Count);
         }
     }
 
     /// <summary>
-    /// Enqueue one task BY IDENTITY. The JobManager holds only (runName, taskId, priority) — no run
-    /// graph, no task, no script path, no service reference — and calls back into
-    /// <see cref="ResolveTaskWorkAsync"/> at dispatch time to rebuild the work.
+    /// Build the work for a SEQUENTIAL run: a single delegate that checks out ONE background worker and
+    /// runs every step of the run on it, in payload (Sequence) order, one at a time, then reclaims the
+    /// worker once at the end. This is what "pin one worker for the whole run" means — the run starts on a
+    /// worker and stays there until it finishes, never going back to the pool between steps to be
+    /// re-scheduled onto a different one. The run is dispatched as a SINGLE queue row (the entry task; see
+    /// DispatchPendingTasksAsync), so exactly one JobManager slot and one worker are held for the run's
+    /// whole duration and the mid-run steps never get their own rows.
+    ///
+    /// Failure policy is best-effort: a step that throws is recorded Failed and the driver moves on to the
+    /// next, so one bad step cannot strand the rest and the run ends CompletedWithErrors. Each step runs
+    /// through InvokeAsync, whose finally resets the runspace after success, failure OR cancellation, so
+    /// steps stay isolated on the shared worker. Registered in <see cref="_activeSequentialDrivers"/> for
+    /// its whole life so the re-drive leaves the not-yet-reached (deliberately row-less) steps alone while
+    /// the driver is progressing.
     /// </summary>
+    private Func<CancellationToken, Task> BuildSequentialRunWork(OrchestratorRun run, string taskPath)
+    {
+        return async (jobCt) =>
+        {
+            // One driver per run. Registered for the driver's whole life so the re-drive does not mistake
+            // the run's row-less pending steps for orphans and enqueue them. TryAdd (not an unconditional
+            // set) also closes the duplicate-entry-row race: if two rows for the same run are claimed before
+            // either driver marks the entry step Running, the loser here does nothing and the winner runs
+            // every step. Because this guard is OUTSIDE the try/finally, the loser never runs the finally
+            // that would otherwise remove the winner's registration.
+            if (!_activeSequentialDrivers.TryAdd(run.Name, true))
+            {
+                _logger.LogDebug(
+                    "[Scheduler] Sequential run {Run} already has an active driver — skipping duplicate entry", run.Name);
+                return;
+            }
+            PowerShellWorker? worker = null;
+            var workerFaulted = false;
+            try
+            {
+                // One worker for the whole run: checked out once here, reclaimed once in the finally.
+                worker = CheckoutSequentialWorker(jobCt);
+
+                while (true)
+                {
+                    OrchestratorTaskItem? task;
+                    lock (_lock)
+                    {
+                        task = run.Tasks.Where(t => t.Status == "Pending")
+                                        .OrderBy(t => t.Sequence)
+                                        .FirstOrDefault();
+                    }
+                    if (task == null) break; // every step is terminal — the run is done
+
+                    // Run cancelled while we were working through it: mark this and every remaining step
+                    // Cancelled and stop.
+                    if (_cancelledRuns.ContainsKey(run.Name))
+                    {
+                        CancelRemainingSequentialTasks(run);
+                        break;
+                    }
+
+                    // Rehydrate a shed payload. Sequential runs are exempt from shedding (see
+                    // DispatchPendingTasksAsync), so this is normally a no-op — kept for a resumed run whose
+                    // in-memory payload was dropped. A missing row means the durable state was lost: fail
+                    // that step closed rather than run it blank, then carry on with the next.
+                    if (_shedParameters && task.Parameters == null)
+                    {
+                        var rehydrated = await _store.GetTaskParametersAsync(run.Name, task.Id, jobCt);
+                        if (rehydrated == null)
+                        {
+                            FailTaskTerminally(run, task,
+                                "Parameters could not be rehydrated at dispatch — the Tasks-table row is missing. " +
+                                "The task's payload was shed from memory and storage no longer has it.");
+                            continue;
+                        }
+                        lock (_lock) { task.Parameters ??= rehydrated; }
+                    }
+
+                    lock (_lock) { task.Status = "Running"; }
+                    // Durable "Running" marker — awaited before the invoke, same as the parallel path.
+                    try
+                    {
+                        await _writer.MarkRunningAsync(run.Name, task, jobCt);
+                    }
+                    catch (MarkerNotPersistedException ex)
+                    {
+                        // The marker never landed, so storage still has this step Pending. Unlike the
+                        // parallel path we cannot just give a slot back and let a re-drive retry the one
+                        // task — we own the worker and the whole run — and running later steps out of order
+                        // is not allowed. Put the step back to Pending and STOP the driver. The entry job
+                        // then completes with pending work left and no driver active, so the re-drive
+                        // re-enqueues the current step and a fresh driver resumes the run here.
+                        lock (_lock) { task.Status = "Pending"; }
+                        _logger.LogWarning(ex,
+                            "[Scheduler] Sequential run {Run}: could not persist the Running marker for {Task} — " +
+                            "leaving the run for the re-drive to resume", run.Name, task.Id);
+                        break;
+                    }
+
+                    try
+                    {
+                        // Run the step on the pinned worker. Only a PostExecution run needs the output
+                        // captured and stored; otherwise the seam returns empty and nothing is stored.
+                        var output = await RunSequentialStepAsync(run, task, taskPath, worker);
+                        if (!string.IsNullOrEmpty(run.PostExecFunctionName)
+                            && !string.IsNullOrEmpty(output)
+                            && !_writer.TryQueueResult(run.Name, task.Id, output))
+                        {
+                            await _store.StoreResultAsync(run.Name, task.Id, output);
+                        }
+
+                        lock (_lock)
+                        {
+                            task.Status = "Completed";
+                            task.CompletedUtc = DateTime.UtcNow;
+                            task.Parameters = null!;
+                            CheckRunCompletion(run);
+                        }
+                        PersistTaskAndRunAsync(run, task);
+                        _logger.LogDebug("[Scheduler] Sequential task completed: {TaskId}", task.Id);
+                    }
+                    catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
+                    {
+                        // App shutting down mid-step. Leave this step Running (its durable marker is written)
+                        // for resume on next startup, and let the exception abort the driver.
+                        _logger.LogInformation(
+                            "[Scheduler] Sequential run {Run} interrupted by shutdown at {TaskId}", run.Name, task.Id);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        lock (_lock)
+                        {
+                            task.Status = "Failed";
+                            task.LastError = ex.Message;
+                            task.CompletedUtc = DateTime.UtcNow;
+                            task.Parameters = null!;
+                            CheckRunCompletion(run);
+                        }
+                        PersistTaskAndRunAsync(run, task);
+                        _logger.LogError(ex,
+                            "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", task.Id);
+                        // best-effort: fall through to the next Pending step
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
+            {
+                // Shutdown (checkout or a step was cancelled). The pipeline may have been Stop()'d, so treat
+                // the worker as faulted on reclaim; rethrow so the JobManager marks the entry job Cancelled.
+                workerFaulted = true;
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // An unexpected driver-level failure — not a per-step task error, which is handled inline.
+                workerFaulted = true;
+                _logger.LogError(ex, "[Scheduler] Sequential driver for {Run} failed", run.Name);
+                throw;
+            }
+            finally
+            {
+                ReclaimSequentialWorker(worker, workerFaulted);
+                _activeSequentialDrivers.TryRemove(run.Name, out _);
+            }
+        };
+    }
+
+    // ── sequential-driver seams ───────────────────────────────────────────────────────────────────────
+    // The driver's loop logic (ordering, best-effort, cancellation, marker recovery) is exercised by unit
+    // tests through a subclass that overrides these three methods, so the tests need no PowerShell worker
+    // pool. Production runs the real pool: one worker checked out for the whole run, each step invoked on
+    // it, reclaimed once at the end. Keep the checkout/run/reclaim split — the whole point is one checkout
+    // and one reclaim around many step invocations.
+
+    /// <summary>Check out the single worker a sequential run is pinned to. Virtual for tests.</summary>
+    internal virtual PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct)
+        => _psRunner.CheckoutBackgroundWorker(ct);
+
+    /// <summary>Return the pinned worker once the run is done. No-op for a null worker (checkout failed).
+    /// Virtual for tests.</summary>
+    internal virtual void ReclaimSequentialWorker(PowerShellWorker? worker, bool faulted)
+    {
+        if (worker != null) _psRunner.ReclaimBackgroundWorker(worker, faulted: faulted);
+    }
+
+    /// <summary>Run one sequential step on the pinned worker and return its captured output (empty when the
+    /// run has no PostExecution and so needs no result). Virtual for tests. InvokeAsync resets the runspace
+    /// afterwards, so successive steps stay isolated on the shared worker.</summary>
+    internal virtual async Task<string> RunSequentialStepAsync(
+        OrchestratorRun run, OrchestratorTaskItem task, string taskPath, PowerShellWorker? worker)
+    {
+        var parameters = new Dictionary<string, object>
+        {
+            { "TaskJson", JsonSerializer.Serialize(task.Parameters, s_jsonOptions) }
+        };
+        if (!string.IsNullOrEmpty(run.PostExecFunctionName))
+            return await _psRunner.ExecuteScriptWithOutput(taskPath, parameters, pinnedWorker: worker);
+        await _psRunner.ExecuteScript(taskPath, parameters, pinnedWorker: worker);
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// Mark every still-Pending or Running step of a cancelled sequential run Cancelled, in one lock, and
+    /// persist them. Called by the driver when it notices the run was cancelled between steps.
+    /// </summary>
+    private void CancelRemainingSequentialTasks(OrchestratorRun run)
+    {
+        List<OrchestratorTaskItem> remaining;
+        lock (_lock)
+        {
+            remaining = run.Tasks.Where(t => t.Status is "Pending" or "Running").ToList();
+            foreach (var t in remaining)
+            {
+                t.Status = "Cancelled";
+                t.LastError = "Cancelled by user";
+                t.CompletedUtc = DateTime.UtcNow;
+                t.Parameters = null!;
+            }
+            CheckRunCompletion(run);
+        }
+        foreach (var t in remaining) _writer.QueueTask(run.Name, t);
+        _writer.QueueRun(run);
+    }
+
     /// <summary>
     /// Put one task back on the durable queue. Fire-and-forget because every caller is on a lock or a
     /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
@@ -950,13 +1317,6 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// </summary>
     private async Task<Func<CancellationToken, Task>?> ResolveTaskWorkAsync(JobDescriptor descriptor, CancellationToken ct)
     {
-        if (!_taskScriptPaths.TryGetValue(descriptor.RunName, out var taskPath))
-        {
-            _logger.LogWarning("[Orchestrator] No task script path known for run {Run} — dropping {Task}",
-                descriptor.RunName, descriptor.TaskId);
-            return null;
-        }
-
         OrchestratorRun? run;
         OrchestratorTaskItem? task;
 
@@ -1005,6 +1365,35 @@ public class OrchestratorService : IJobDescriptorStateWriter
             return null;
         }
 
+        // Resolve the task script (a PowerShell function name) for this run. The steady-state path finds
+        // it in _taskScriptPaths, cached by DispatchPendingTasksAsync when the run was dispatched. A MISS
+        // is NOT a reason to drop the task. The pump is a BackgroundService that begins claiming persisted
+        // queue rows at host start, whereas the only writer of _taskScriptPaths does not run for a resumed
+        // run until ResumeInterruptedRunsAsync reaches it — and that waits on the worker pool first — and
+        // the rehydration branch above re-adds a run to _activeRuns without a cached path either. In both
+        // windows the run record still carries TaskScriptName, so rebuild the path from it exactly as the
+        // resume path does (ScriptRepository is fully loaded before the pump's first claim) and cache it,
+        // so sibling tasks of the same run cost nothing. Only an empty TaskScriptName with no
+        // naming-convention match is genuinely unrunnable. Returning null on the miss instead lets the
+        // JobManager mark the job Skipped and the pump delete its queue row, permanently dropping a task
+        // that is still Pending in the run — with no queue row left, nothing re-dispatches it.
+        if (!_taskScriptPaths.TryGetValue(run.Name, out var taskPath))
+        {
+            taskPath = !string.IsNullOrEmpty(run.TaskScriptName)
+                ? _psRunner.FindScript(run.TaskScriptName)
+                : FindTaskScript(run.Name);
+
+            if (string.IsNullOrEmpty(taskPath))
+            {
+                _logger.LogWarning(
+                    "[Orchestrator] No task script for run {Run} (TaskScriptName={Script}) — dropping {Task}",
+                    run.Name, run.TaskScriptName, descriptor.TaskId);
+                return null;
+            }
+
+            _taskScriptPaths[run.Name] = taskPath;
+        }
+
         // Already terminal (e.g. cancelled, or completed by a previous attempt while queued), or already
         // executing.
         //
@@ -1020,6 +1409,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 return null;
         }
 
+        // Sequential runs are dispatched as a single entry row; that one claim drives the WHOLE run on one
+        // pinned worker (BuildSequentialRunWork ignores which step this descriptor named and works through
+        // every Pending step in order). The "Running" guard above already stops a duplicate row from
+        // starting a second driver once the entry step is marked Running, and the driver's own TryAdd closes
+        // the remaining pre-mark race.
+        if (run.Sequential)
+            return BuildSequentialRunWork(run, taskPath);
+
         return BuildTaskWork(run, task, taskPath);
     }
 
@@ -1028,6 +1425,31 @@ public class OrchestratorService : IJobDescriptorStateWriter
         return
             async (jobCt) =>
             {
+                // Rehydrate the Parameters payload shed while this task waited in the backlog. Done BEFORE
+                // any status write — MarkRunningAsync snapshots Parameters and every task-row write is
+                // Replace, so a null payload here would overwrite the stored one. One point read, only for a
+                // task actually being dispatched. The ??= keeps a value another dispatch attempt already set.
+                if (_shedParameters && task.Parameters == null)
+                {
+                    // GetTaskParametersAsync returns null only when the Tasks row itself is GONE (a
+                    // present-but-empty payload comes back as an empty dictionary). A missing row means this
+                    // task's durable state was lost out from under a live run — the shed dropped the in-memory
+                    // copy on the promise that storage still had it. Running now would invoke the task with NO
+                    // parameters (its FunctionName and inputs both live in the payload), which for a real task
+                    // is worse than not running it. Fail closed instead of executing blank. Before shedding
+                    // the payload was resident, so a deleted row could not affect an in-flight dispatch; this
+                    // guard restores that safety for the one case shedding introduced.
+                    var rehydrated = await _store.GetTaskParametersAsync(run.Name, task.Id, jobCt);
+                    if (rehydrated == null)
+                    {
+                        FailTaskTerminally(run, task,
+                            "Parameters could not be rehydrated at dispatch — the Tasks-table row is missing. " +
+                            "The task's payload was shed from memory and storage no longer has it.");
+                        return;
+                    }
+                    lock (_lock) { task.Parameters ??= rehydrated; }
+                }
+
                 // Check if run was cancelled while this job was queued
                 if (_cancelledRuns.ContainsKey(run.Name))
                 {
@@ -1146,6 +1568,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         CheckRunCompletion(run);
                     }
                     PersistTaskAndRunAsync(run, task);
+
                     _logger.LogError(ex, "[Scheduler] Task failed: {TaskId}", task.Id);
                     throw; // Let JobManager also track the failure
                 }
@@ -1245,6 +1668,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private static readonly TimeSpan RedriveAge = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Re-drive backoff bounds. The first verification for a run runs at the status-timer cadence; each time
+    /// it confirms nothing orphaned the interval doubles up to <see cref="RedriveMax"/>, so a run stuck for
+    /// hours costs a handful of index reads rather than one per minute. The cap bounds how long a genuinely
+    /// orphaned task can wait to be caught (worst case ~RedriveMax), which the watchdog trades for the cost.
+    /// </summary>
+    private static readonly TimeSpan RedriveMax = TimeSpan.FromMinutes(15);
+
+    /// <summary>
     /// Re-queue tasks that are Pending in memory but that nothing owns — no queued job, no running job.
     ///
     /// This is the safety net for the state a deferral leaves behind. A task whose durable "Running" marker
@@ -1280,6 +1711,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private async Task RedrivePendingTasksAsync(OrchestratorRun run)
     {
         var now = DateTime.UtcNow;
+
+        // Backoff gate. Once the verification below has confirmed a run has nothing orphaned, it need not run
+        // again for a while: orphaning is caused by specific rare events (a removed/expired queue row, a
+        // crash/migration), not something that spontaneously arises every 60s. Skipping here avoids the whole
+        // tick body — the candidates scan AND the storage read — for a run that verified clean, which for a
+        // large stuck backlog is nearly every run on nearly every tick.
+        if (_redriveBackoffEnabled && _redriveBackoff.TryGetValue(run.Name, out var st) && now < st.NextUtc) return;
+
         List<OrchestratorTaskItem> candidates;
 
         lock (_lock)
@@ -1290,15 +1729,55 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 .Where(t => !_deferrals.TryGetValue(DeferralKey(run.Name, t.Id), out var s)
                             || now - s.LastUtc >= RedriveAge)
                 .ToList();
+
+            // Sequential run: one pinned driver runs every step, so the ONLY queue row that ever exists is
+            // the entry row that started the driver — the not-yet-reached steps deliberately have none.
+            // Applying the generic "Pending with no queue row = orphaned" rule to them would re-drive them
+            // all and spawn a second driver. The run is progressing whenever a driver is registered for it
+            // OR its entry job is still queued/running (that job's identity is one of this run's tasks) —
+            // re-drive nothing in either case. The driver registration closes the gap the entry-job check
+            // alone leaves open between steps (no task queued, none marked Running for an instant). Only when
+            // neither holds is the driver truly gone (never started, or died with the process): re-enqueue
+            // ONLY the current step (lowest Sequence still Pending) so a fresh driver resumes the run.
+            if (run.Sequential)
+            {
+                var driverActive = _activeSequentialDrivers.ContainsKey(run.Name)
+                    || run.Tasks.Any(t => _jobManager.IsQueuedOrRunning($"{run.Name}-{t.Id}"));
+                if (driverActive)
+                {
+                    candidates.Clear();
+                }
+                else
+                {
+                    var next = candidates.OrderBy(t => t.Sequence).FirstOrDefault();
+                    candidates = next != null ? [next] : [];
+                }
+            }
         }
 
-        if (candidates.Count == 0) return;
+        if (candidates.Count == 0)
+        {
+            // No candidates to verify (all Pending tasks are queued/running, or none are Pending). Don't grow
+            // the backoff — a run mid-drain legitimately produces no candidates and should stay responsive —
+            // just clear any prior backoff so the next real candidate is checked promptly.
+            _redriveBackoff.TryRemove(run.Name, out _);
+            return;
+        }
 
-        // Storage decides. A Pending task that still has a row is waiting its turn, not orphaned.
-        HashSet<string> stillQueued;
+        // Storage decides — but the queue TABLE decides, not the index. Asking the index (the old
+        // GetQueuedTaskIdsAsync here) reports a task queued whenever its index row exists, and an index
+        // row can outlive the queue row it points at. Such a task is invisible to the pump yet looks
+        // "queued" to this check, so it is never re-driven and its run stalls indefinitely with the task
+        // Pending — this watchdog keeps ticking and finds nothing orphaned. GetDispatchableTaskIdsAsync
+        // verifies each candidate against the queue table (one point read apiece; the candidate set is
+        // small), returning only tasks the pump can actually still claim. Anything else is a ghost to
+        // re-enqueue.
+        HashSet<string> dispatchable;
         try
         {
-            stillQueued = await _queue.GetQueuedTaskIdsAsync(run.Name);
+            Interlocked.Increment(ref _redriveStorageReads);
+            dispatchable = await _queue.GetDispatchableTaskIdsAsync(
+                run.Name, candidates.Select(t => t.Id).ToList());
         }
         catch (Exception ex)
         {
@@ -1308,9 +1787,25 @@ public class OrchestratorService : IJobDescriptorStateWriter
             return;
         }
 
-        var orphaned = candidates.Where(t => !stillQueued.Contains(t.Id)).ToList();
-        if (orphaned.Count == 0) return;
+        var orphaned = candidates.Where(t => !dispatchable.Contains(t.Id)).ToList();
+        if (orphaned.Count == 0)
+        {
+            // Verified clean: grow the interval (double, capped) so this run's next storage read is further
+            // out. A run stuck for hours thus costs O(log) reads, not one per minute.
+            if (_redriveBackoffEnabled)
+            {
+                var next = _redriveBackoff.TryGetValue(run.Name, out var cur)
+                    ? TimeSpan.FromTicks(Math.Min(cur.Interval.Ticks * 2, RedriveMax.Ticks))
+                    : _redriveBase;
+                _redriveBackoff[run.Name] = (now + next, next);
+            }
+            return;
+        }
 
+        // Found orphans — something is wrong with this run's queue rows, so snap back to close watch and
+        // re-drive them.
+        if (_redriveBackoffEnabled)
+            _redriveBackoff[run.Name] = (now + _redriveBase, _redriveBase);
         foreach (var task in orphaned)
         {
             // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
@@ -1319,27 +1814,50 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
 
         _logger.LogWarning(
-            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no queue row and not queued or running",
+            "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no runnable queue row and not queued or running",
             orphaned.Count, run.Name);
     }
 
     private void LogRunStatus(OrchestratorRun run)
     {
-        var elapsed = DateTime.UtcNow - run.StartedUtc;
-        int completed, failed, running, pending;
+        // Nothing consumes this Info line at a higher level, and the flood of them is itself a measured
+        // cost, so do no work at all when Info is disabled.
+        if (!_logger.IsEnabled(LogLevel.Information)) return;
+
+        // One pass, not four Count(predicate) calls. Enumerable.Count over the List boxes an enumerator per
+        // call, and this runs on every run's 60s timer — four boxed enumerators × M runs per minute.
+        int completed = 0, failed = 0, running = 0, pending = 0;
         lock (_lock)
         {
-            completed = run.Tasks.Count(t => t.Status == "Completed");
-            failed = run.Tasks.Count(t => t.Status == "Failed");
-            running = run.Tasks.Count(t => t.Status == "Running");
-            pending = run.Tasks.Count(t => t.Status == "Pending");
+            foreach (var t in run.Tasks)
+            {
+                switch (t.Status)
+                {
+                    case "Completed": completed++; break;
+                    case "Failed": failed++; break;
+                    case "Running": running++; break;
+                    case "Pending": pending++; break;
+                }
+            }
         }
-        var memSnapshot = BackgroundTaskLimiter.GetMemorySnapshot();
+
+        // Skip the line — and the string format, the nine boxed args, and the memory snapshot it needs —
+        // when nothing has changed since the last tick. A run parked at "0 running / N pending" for hours
+        // re-emitted the identical line every 60s (M of them per minute at scale). Log on a real transition,
+        // plus a slow heartbeat so a long-lived run still shows it is alive.
+        var now = DateTime.UtcNow;
+        if (_lastStatusLog.TryGetValue(run.Name, out var prev)
+            && prev.C == completed && prev.F == failed && prev.R == running && prev.P == pending
+            && now - prev.LoggedUtc < StatusHeartbeat)
+            return;
+        _lastStatusLog[run.Name] = (completed, failed, running, pending, now);
+
+        var elapsed = now - run.StartedUtc;
         _logger.LogInformation(
             "[Scheduler] Run {Name} T+{Elapsed:F1}min: {Completed}/{Total} done {Running} running {Pending} pending {Failed} failed jobs={Active}a/{Queued}q {Memory}",
             run.Name, elapsed.TotalMinutes, completed, run.Tasks.Count, running, pending, failed,
             _jobManager.ActiveCount, _jobManager.QueuedCount,
-            memSnapshot);
+            BackgroundTaskLimiter.GetMemorySnapshot());
     }
 
     private void CheckRunCompletion(OrchestratorRun run)
@@ -1524,11 +2042,12 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _writer.QueueRun(run);
         await _writer.FlushAsync();
 
+        // Removed from _activeRuns first, so the status sweep stops ticking it before its per-run maps go.
         _activeRuns.TryRemove(run.Name, out _);
         _cancelledRuns.TryRemove(run.Name, out _);
         _taskScriptPaths.TryRemove(run.Name, out _);
-        _runStatusTimers.TryRemove(run.Name, out var timer);
-        timer?.Dispose();
+        _lastStatusLog.TryRemove(run.Name, out _);
+        _redriveBackoff.TryRemove(run.Name, out _);
         _finalizeDeferrals.TryRemove(run.Name, out _);
         // Deferral and re-queue tracking is keyed per task and nothing else removes entries for tasks
         // that ended without passing through their happy-path cleanup — without this sweep the residue

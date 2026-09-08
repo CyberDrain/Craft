@@ -24,8 +24,15 @@ function Start-CraftOrchestrator {
             - FunctionName    (string)  — Push-{FunctionName} is called with aggregated results
             - Parameters      (object)  — extra parameters forwarded to the post-exec function
           - SkipLog           (bool)    — optional; suppress run logging
+          - Sequential        (bool)    — optional; run the batch ONE TASK AT A TIME in payload order
+                                          (Durable-style sequencing) instead of fanning out in parallel.
+                                          The whole run is PINNED to a single worker: it starts on one
+                                          worker and runs every step on it to completion, without going
+                                          back to the pool between steps. A step that fails is recorded and
+                                          the run carries on with the next (best-effort).
 
     .EXAMPLE
+        # Fan-out (default): every task is queued up front and drained in parallel by the worker pool.
         Start-CraftOrchestrator -InputObject @{
             OrchestratorName = 'MyDataCollection'
             Batch = @(
@@ -33,6 +40,21 @@ function Start-CraftOrchestrator {
                 @{ FunctionName = 'CollectTenantData'; TenantFilter = 'fabrikam.com' }
             )
             PostExecution = @{ FunctionName = 'AggregateResults' }
+        }
+
+    .EXAMPLE
+        # Sequential: run ordered steps ONE AT A TIME, in payload order (Durable-style), all on ONE pinned
+        # worker. Each step starts only after the previous one finishes, so a step that must follow another
+        # (here ConvertToShared after the mailbox grants that precede it) cannot race it. Once the run starts
+        # it keeps the same worker until every step is done.
+        Start-CraftOrchestrator -InputObject @{
+            OrchestratorName = 'Offboard-jdoe@contoso.com'
+            Sequential       = $true
+            Batch = @(
+                @{ FunctionName = 'RevokeSessions';  User = 'jdoe@contoso.com' }
+                @{ FunctionName = 'GrantMailboxAccess'; User = 'jdoe@contoso.com'; Delegate = 'manager@contoso.com' }
+                @{ FunctionName = 'ConvertToShared';  User = 'jdoe@contoso.com' }
+            )
         }
 
     .FUNCTIONALITY
@@ -120,7 +142,11 @@ function Start-CraftOrchestrator {
     # a parent run would finalize (and dispatch its PostExecution) before its child runs complete.
     $ParentRunName = $OpContext.RunName
 
-    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
+    # Sequential mode: PowerShell marshals absent/$false to $false. When set, the orchestrator queues the
+    # batch one task at a time in payload order rather than fanning out.
+    $Sequential = [bool]($InputObject.Sequential)
+
+    Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
         $OrchestratorName,
         $BatchPath,
@@ -128,7 +154,8 @@ function Start-CraftOrchestrator {
         $PostExecFunctionName,
         $PostExecParametersJson,
         $InputObject.Reference,
-        $ParentRunName
+        $ParentRunName,
+        $Sequential
     )
     return "Craft-$OrchestratorName"
 }
