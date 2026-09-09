@@ -84,23 +84,52 @@ public class AuthService : IDisposable
     // --- allowedUsers Table ---
 
     /// <summary>
-    /// Gets the CIPP roles for a user from the allowedUsers table.
-    /// Returns null if user is not authorized (not in table and AllowAllTenantUsers is false).
+    /// Gets the roles for a user from the allowedUsers table, keyed on a single identifier.
+    /// Returns null if the user is not authorized (not in the table and AllowAllTenantUsers is false).
     /// Returns ["anonymous", "authenticated"] as default roles if AllowAllTenantUsers is true.
     /// </summary>
-    public async Task<string[]?> GetUserRoles(string upn, CancellationToken ct = default)
+    public Task<string[]?> GetUserRoles(string upn, CancellationToken ct = default) =>
+        GetUserRoles(new[] { upn }, ct);
+
+    /// <summary>
+    /// Gets the roles for a user who may be listed in the allowedUsers table under any of several
+    /// identifiers, and unions the roles of every row that matches. This is what lets a non-Entra
+    /// login (a GitHub user) be authorised by either its login name or its numeric id — an admin can
+    /// list whichever is stable for them — and equally lets an Entra user be listed by UPN or object
+    /// id. A row keyed on any supplied identifier contributes its roles; empty identifiers are ignored.
+    /// Returns null (unauthorized) only when NONE of the identifiers is in the table and
+    /// AllowAllTenantUsers is false; otherwise the default roles when nothing matched, or the union
+    /// plus anonymous/authenticated when something did.
+    /// </summary>
+    public async Task<string[]?> GetUserRoles(IEnumerable<string?> identifiers, CancellationToken ct = default)
     {
-        var user = await GetAllowedUser(upn, ct);
-        if (user == null)
+        var roles = new List<string>();
+        var matched = false;
+
+        foreach (var identifier in identifiers)
+        {
+            if (string.IsNullOrEmpty(identifier)) continue;
+            var user = await GetAllowedUser(identifier, ct);
+            if (user is null) continue;
+
+            matched = true;
+            foreach (var role in user.Roles)
+            {
+                if (!roles.Contains(role, StringComparer.Ordinal)) roles.Add(role);
+            }
+        }
+
+        if (!matched)
         {
             if (!_settings.Auth.AllowAllTenantUsers)
             {
-                _logger.LogWarning("[Auth] User {Upn} not in allowedUsers table — denied (AllowAllTenantUsers=false)", upn);
+                _logger.LogWarning("[Auth] None of [{Identifiers}] in allowedUsers table — denied (AllowAllTenantUsers=false)",
+                    string.Join(", ", identifiers.Where(i => !string.IsNullOrEmpty(i))));
                 return null;
             }
             return new[] { "anonymous", "authenticated" };
         }
-        var roles = new List<string>(user.Roles);
+
         if (!roles.Contains("anonymous")) roles.Add("anonymous");
         if (!roles.Contains("authenticated")) roles.Add("authenticated");
         return roles.ToArray();

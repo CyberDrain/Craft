@@ -112,7 +112,9 @@ public static class CraftAuthMiddleware
             var userName = !string.IsNullOrEmpty(claims.Upn) ? claims.Upn : claims.Login;
             if (string.IsNullOrEmpty(userName)) return true;
 
-            var roles = await authService.GetUserRoles(userName);
+            // Resolve roles by the display name AND the stable object id (a GitHub user's numeric id,
+            // an Entra user's oid), so an allowedUsers row keyed on either one grants the user its roles.
+            var roles = await authService.GetUserRoles(new[] { userName, claims.ObjectId });
             if (roles is null)
             {
                 // Authenticated by the platform but not authorised here. Strip the header so nothing
