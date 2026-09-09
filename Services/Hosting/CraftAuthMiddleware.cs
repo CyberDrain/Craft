@@ -103,9 +103,16 @@ public static class CraftAuthMiddleware
                 return true;
             }
 
-            if (string.IsNullOrEmpty(claims.Upn)) return true;
+            // A signed-in interactive user: an Entra UPN, or a provider login (e.g. GitHub) for a
+            // principal that carries no UPN. Both are resolved against the allowedUsers table and
+            // normalised to the same SWA shape; a UPN wins if a principal somehow carries both. A
+            // principal with neither (an unrecognised provider) passes through untouched, exactly as
+            // before. For a login-only principal, ObjectId holds the provider's numeric id, so userId
+            // and userDetails together let the hosted app match on either the id or the login.
+            var userName = !string.IsNullOrEmpty(claims.Upn) ? claims.Upn : claims.Login;
+            if (string.IsNullOrEmpty(userName)) return true;
 
-            var roles = await authService.GetUserRoles(claims.Upn);
+            var roles = await authService.GetUserRoles(userName);
             if (roles is null)
             {
                 // Authenticated by the platform but not authorised here. Strip the header so nothing
@@ -119,12 +126,12 @@ public static class CraftAuthMiddleware
             context.Request.Headers["x-ms-client-principal"] = EasyAuthPrincipal.Encode(new
             {
                 identityProvider = realIdp,
-                userId = claims.ObjectId ?? claims.Upn,
-                userDetails = claims.Upn,
+                userId = claims.ObjectId ?? userName,
+                userDetails = userName,
                 userRoles = roles,
             });
             context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
-            context.Request.Headers["x-ms-client-principal-name"] = claims.Upn;
+            context.Request.Headers["x-ms-client-principal-name"] = userName;
 
             return true;
         }
