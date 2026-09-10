@@ -5,10 +5,10 @@
 .DESCRIPTION
   Brings up CRAFT with the Frontend + Http roles (so the disk-backed response cache is on and the auth header
   middleware runs), warms the cache, then drives k6 load at /API/ListPerf with an x-ms-client-principal
-  header. Reads the cache/auth profiler's windowed breakdown (auth / roleHash / keyBuild / get / disk / set)
+  header. Reads the cache/auth profiler's windowed breakdown (auth / userKey / keyBuild / get / disk / set)
   plus k6 latency + the X-Cache hit ratio.
 
-  -Mode hit  : fixed query → all cache hits after the first (profiles the hit path: roleHash + get + disk read)
+  -Mode hit  : fixed query → all cache hits after the first (profiles the hit path: userKey + get + disk read)
   -Mode miss : unique query per iteration → all misses (profiles PS invoke + cache Set disk write)
 
 .EXAMPLE

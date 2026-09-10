@@ -176,10 +176,10 @@ public static class PowerShellDispatchEndpoint
         var profiling = CacheProfiler.Enabled;
         var t0 = profiling ? Stopwatch.GetTimestamp() : 0;
 
-        var userRoleHash = CacheService.GetUserRoleHash(context);
+        var userKey = CacheService.GetUserKey(context);
         var t1 = profiling ? Stopwatch.GetTimestamp() : 0;
 
-        var key = cache.BuildCacheKey(endpoint, context.Request.Query, userRoleHash);
+        var key = cache.BuildCacheKey(endpoint, context.Request.Query, userKey);
         var t2 = profiling ? Stopwatch.GetTimestamp() : 0;
 
         var cached = await cache.Get(key, endpoint);

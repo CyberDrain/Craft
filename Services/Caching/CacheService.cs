@@ -116,9 +116,9 @@ public class CacheService : IDisposable
     }
 
     /// <summary>
-    /// Build a cache key from endpoint, query params (excluding control params), and user roles.
+    /// Build a cache key from endpoint, query params (excluding control params), and the caller.
     /// </summary>
-    public string BuildCacheKey(string endpoint, IQueryCollection query, string? userRoleHash)
+    public string BuildCacheKey(string endpoint, IQueryCollection query, string? userKey)
     {
         var sb = new StringBuilder(endpoint);
 
@@ -129,19 +129,32 @@ public class CacheService : IDisposable
             sb.Append('|').Append(kv.Key).Append('=').Append(kv.Value);
         }
 
-        if (!string.IsNullOrEmpty(userRoleHash))
+        if (!string.IsNullOrEmpty(userKey))
         {
-            sb.Append("|_roles=").Append(userRoleHash);
+            sb.Append("|_user=").Append(userKey);
         }
 
         return sb.ToString();
     }
 
     /// <summary>
-    /// Extract a stable hash of the user's roles from the x-ms-client-principal header.
-    /// Returns null if the header is missing or unparseable.
+    /// Extract a stable per-user key component from the x-ms-client-principal header, so a cached
+    /// response is only ever served back to the same caller that produced it.
+    /// <para>
+    /// Keyed to the identity, not the role set: two callers with identical roles are still different
+    /// users and must not share entries, because a cache hit skips the handler and with it every
+    /// per-user authorization and filtering it would have applied. Uses the normalised principal's
+    /// <c>userId</c> (Entra object id, GitHub numeric id, or a service principal's object/app id),
+    /// falling back to <c>userDetails</c>.
+    /// </para>
+    /// <para>
+    /// Returns null when there is no principal (an anonymous request) or the header is unparseable;
+    /// all such requests share one bucket, which is correct because they share one (empty) identity.
+    /// Hashed rather than raw: the value lands in the in-memory index keys and in cache log lines,
+    /// and there is no reason to carry a UPN through either.
+    /// </para>
     /// </summary>
-    public static string? GetUserRoleHash(HttpContext context)
+    public static string? GetUserKey(HttpContext context)
     {
         if (!context.Request.Headers.TryGetValue("x-ms-client-principal", out var headerValue))
             return null;
@@ -150,27 +163,24 @@ public class CacheService : IDisposable
         {
             var json = Encoding.UTF8.GetString(Convert.FromBase64String(headerValue.ToString()));
             using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
 
-            if (doc.RootElement.TryGetProperty("userRoles", out var rolesElement))
-            {
-                var roles = new List<string>();
-                foreach (var role in rolesElement.EnumerateArray())
-                {
-                    var r = role.GetString();
-                    if (r != null && r != "anonymous" && r != "authenticated")
-                        roles.Add(r);
-                }
-                roles.Sort(StringComparer.OrdinalIgnoreCase);
-                var joined = string.Join(",", roles);
-                // Short hash — just for cache key differentiation, not security
-                var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joined)))[..16];
-                return hash;
-            }
+            var id = GetStringProperty(root, "userId");
+            if (string.IsNullOrEmpty(id)) id = GetStringProperty(root, "userDetails");
+            if (string.IsNullOrEmpty(id)) return null;
+
+            // Short hash — just for cache key differentiation, not security.
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(id)))[..16];
         }
-        catch { /* swallow parse errors — treat as no roles */ }
+        catch { /* swallow parse errors — treat as no principal */ }
 
         return null;
     }
+
+    private static string? GetStringProperty(JsonElement root, string name) =>
+        root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var el)
+            ? el.GetString()
+            : null;
 
     /// <summary>
     /// Get the TTL for a given endpoint.
