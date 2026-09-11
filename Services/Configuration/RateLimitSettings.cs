@@ -43,6 +43,13 @@ public class RateLimitSettings
     /// </summary>
     public int ApiConcurrencyLimit { get; set; }
 
+    /// <summary>
+    /// Per-instance daily API egress (bandwidth) cap. See <see cref="EgressLimitSettings"/>. Distinct
+    /// from the rate and concurrency caps above: those bound requests/second and simultaneous-in-flight,
+    /// this bounds total outbound bytes/day. Off unless the deployment is hosted.
+    /// </summary>
+    public EgressLimitSettings Egress { get; set; } = new();
+
     /// <summary>Resolved enabled state, honouring the CRAFT_RATELIMIT_ENABLED environment override.</summary>
     public bool IsEnabled =>
         Enabled

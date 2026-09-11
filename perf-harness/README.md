@@ -144,9 +144,11 @@ results/                outputs (gitignored)
 
 ── HTTP API mode (below) ──
 docker-compose.api.yml  http-only SUT (CRAFT_SERVE_API=true) + PerfApi module mount
+docker-compose.egress.yml  overlay: egress accounting on (fast flush, known log dir) for run-egress.ps1
 api-harness/API/Modules/PerfApi/  synthetic PS HTTP endpoints (dependency-free; not for prod)
 k6/api_load.js          API load test (weighted endpoint mix or single-endpoint focus)
 scripts/run-api.ps1     API orchestrator (up → /healthz → warm → sample → k6 → report → down)
+scripts/run-egress.ps1  e2e for the per-instance API egress cap (drive traffic → flush → read ledger → assert)
 scripts/compare-api.ps1 before/after diff of two API result JSONs (incl. per-endpoint p95)
 ```
 
@@ -187,3 +189,29 @@ rate so CPU-at-equal-load is comparable before/after; omit it (`-Vus N`) for pea
 
 Outputs, like the static harness, are `results/<label>-<timestamp>.json` + `.md` (adds a per-endpoint
 latency table). No Azurite/storage — bare endpoints touch none; the response cache is off in http-only.
+
+---
+
+## API egress cap (e2e)
+
+Verifies the per-instance daily API **egress cap** end to end against a real image. It layers
+`docker-compose.egress.yml` on the API harness to force accounting on
+(`CRAFT_API_EGRESS_LIMIT_ENABLED=true`) with a fast flush and a known log dir, then drives real
+**app-only API-client** traffic (it presents an `x-ms-client-principal` blob with an `appid` claim, so
+`CraftAuthMiddleware` normalises it to `idp=aad`+AppId and the egress middleware counts it exactly as it
+would a hosted client-credentials caller). After the flush interval it `docker cp`s the ledger file back
+out and asserts both properties are present, the day stamp is today (UTC), and the byte counter is > 0 —
+then cross-checks the server-side count against the bytes curl actually received.
+
+```powershell
+docker build -f ..\build\Dockerfile -t craft:local ..     # image must include the egress code
+
+pwsh scripts\run-egress.ps1                       # accounting-only: flush + non-zero properties
+pwsh scripts\run-egress.ps1 -Cap 200000           # also assert 429 enforcement past a 200 KB/day budget
+pwsh scripts\run-egress.ps1 -Requests 100 -JsonN 2000 -KeepUp
+```
+
+Exits non-zero on any failed check (CI-friendly). The ledger file is copied to
+`results/egress-ledger-<timestamp>.json`. This covers what the xunit suite can't: the real file location
+and serialization, real byte counting through the actual response stream, and the real
+auth→classify→count path.
