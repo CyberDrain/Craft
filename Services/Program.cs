@@ -81,6 +81,9 @@ builder.Services.AddSingleton(nativeCatalog);
 if (!nativeCatalog.IsEmpty)
     builder.Services.AddNativeEndpoints(nativeCatalog, builder.Configuration);
 builder.Services.AddCraftRateLimiter(craftSettings);
+// Per-instance daily API egress cap. Self-gates to hosted (CIPP_HOSTED) or a forced env; registers
+// nothing otherwise. See Services/Hosting/EgressLedger.cs and ApiEgressLimiterMiddleware.cs.
+builder.Services.AddCraftEgressLimiter(craftSettings);
 
 var app = builder.Build();
 
@@ -389,6 +392,13 @@ if (capHttp)
 // worker pool, but should still be protected, partitioned by origin address as before.
 if (CraftSettings.RateLimit.RequiresLimiterMiddleware)
     app.UseRateLimiter();
+
+// Per-instance daily API-egress cap. Same placement rules as the rate limiter above: after UseCraftAuth
+// (so an app-only caller's AppId is resolved and CallerClassifier can tell API from UI) and after static
+// serving (so a page load's assets are never charged). Only added when egress accounting is enabled —
+// see AddCraftEgressLimiter. Counts only app-only API callers; enforces (429) only once a budget is set.
+if (CraftSettings.RateLimit.Egress.ResolvedEnabled)
+    app.UseMiddleware<ApiEgressLimiterMiddleware>();
 
 // Concurrent request tracking for diagnostics. A holder object, not an int: the dispatch endpoint
 // is registered elsewhere and a lambda cannot capture a ref local.

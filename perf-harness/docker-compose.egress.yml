@@ -1,0 +1,22 @@
+# Egress-cap overlay for the API harness. Layered on top of docker-compose.api.yml:
+#   docker compose -f docker-compose.api.yml -f docker-compose.egress.yml up -d
+#
+# Turns on per-instance API egress accounting (forced on, off-host via the CRAFT_API_EGRESS_LIMIT_ENABLED
+# escape hatch) with a fast flush interval and a known, writable log directory, so run-egress.ps1 can
+# docker-cp the ledger file back out and assert its contents. Nothing here is baked into a special image.
+name: craft-perf-api
+
+services:
+  sut:
+    environment:
+      # Force accounting + the middleware on without needing the CIPP_HOSTED marker.
+      - CRAFT_API_EGRESS_LIMIT_ENABLED=true
+      # Daily budget in bytes. 0 (default) = accounting only, no 429s. run-egress.ps1 -Cap sets a value
+      # to also exercise enforcement.
+      - CRAFT_API_EGRESS_LIMIT_BYTES=${EGRESS_CAP:-0}
+      # Short flush so the test doesn't wait a minute for the counter to reach disk.
+      - CRAFT_API_EGRESS_FLUSH_SECONDS=${EGRESS_FLUSH:-2}
+      # The ledger lives in the SAME directory as the logs; point that at a known, app-owned, writable
+      # path (/app is chowned to the non-root user — see build/Dockerfile) so the file location is
+      # deterministic for docker cp. This also demonstrates the ledger following App__FileLogging__Directory.
+      - App__FileLogging__Directory=/app/_logs

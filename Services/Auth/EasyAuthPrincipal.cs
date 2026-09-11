@@ -12,7 +12,13 @@ namespace Craft.Auth;
 /// <param name="ObjectId">Entra object id of the user or service principal.</param>
 /// <param name="AppId">Client application id, present on client-credentials tokens.</param>
 /// <param name="IdentityType">The <c>idtyp</c> claim — <c>"app"</c> for app-only tokens.</param>
-public sealed record EasyAuthClaims(string? Upn, string? ObjectId, string? AppId, string? IdentityType)
+/// <param name="Login">
+/// Provider login for a signed-in principal that carries no UPN — e.g. the GitHub username. Lets a
+/// non-Entra interactive user be resolved and authorised the same way a UPN user is. For such a
+/// principal <see cref="ObjectId"/> carries the provider's own stable user id (the GitHub numeric
+/// id), so the hosted app can match on either the login or the id.
+/// </param>
+public sealed record EasyAuthClaims(string? Upn, string? ObjectId, string? AppId, string? IdentityType, string? Login = null)
 {
     /// <summary>
     /// Whether this is an app-only (client-credentials) token rather than a signed-in user.
@@ -72,7 +78,7 @@ public static class EasyAuthPrincipal
     /// </summary>
     public static EasyAuthClaims ExtractClaims(JsonElement root)
     {
-        string? upn = null, preferredUsername = null, oid = null, appId = null, idtyp = null;
+        string? upn = null, preferredUsername = null, oid = null, appId = null, idtyp = null, login = null;
 
         if (root.ValueKind == JsonValueKind.Object &&
             root.TryGetProperty("claims", out var claims) &&
@@ -104,6 +110,16 @@ public static class EasyAuthPrincipal
                     case "idtyp":
                         idtyp ??= val;
                         break;
+                    // GitHub (and other non-Entra providers) carry a login rather than a UPN, and no
+                    // Entra object id. App Service emits the login as 'urn:github:login' and the numeric
+                    // id as 'urn:github:id'; the id is reused as the object id (a github principal never
+                    // also carries an Entra objectidentifier) so it surfaces as userId downstream.
+                    case "urn:github:login":
+                        login ??= val;
+                        break;
+                    case "urn:github:id":
+                        oid ??= val;
+                        break;
                     default:
                         break;
                 }
@@ -118,7 +134,8 @@ public static class EasyAuthPrincipal
             string.IsNullOrEmpty(upn) ? null : upn,
             string.IsNullOrEmpty(oid) ? null : oid,
             string.IsNullOrEmpty(appId) ? null : appId,
-            string.IsNullOrEmpty(idtyp) ? null : idtyp);
+            string.IsNullOrEmpty(idtyp) ? null : idtyp,
+            string.IsNullOrEmpty(login) ? null : login);
     }
 
     /// <summary>

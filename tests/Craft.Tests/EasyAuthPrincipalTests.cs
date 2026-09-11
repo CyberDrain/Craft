@@ -144,6 +144,43 @@ public class EasyAuthPrincipalTests
     }
 
     [Fact]
+    public void GitHubLoginAndId_AreExtracted()
+    {
+        // A GitHub principal carries no UPN. App Service emits the login (the Sponsors key) on
+        // urn:github:login and the numeric id on urn:github:id; the id is reused as the object id so
+        // it surfaces as userId. Observed on the test deployment 2026-09-09.
+        var claims = EasyAuthPrincipal.ExtractClaims(WithClaims(
+            ("urn:github:login", "octocat"),
+            ("urn:github:id", "583231")));
+
+        Assert.Null(claims.Upn);
+        Assert.Equal("octocat", claims.Login);
+        Assert.Equal("583231", claims.ObjectId);
+        Assert.False(claims.IsAppOnly);   // a login is an interactive user, not a service principal
+    }
+
+    [Fact]
+    public void GitHubLogin_NeverLeaksIntoUpn()
+    {
+        // The login must stay in Login and never populate Upn — the two are authorised differently
+        // and a login is not a UPN.
+        var claims = EasyAuthPrincipal.ExtractClaims(WithClaims(("urn:github:login", "octocat")));
+        Assert.Null(claims.Upn);
+        Assert.Equal("octocat", claims.Login);
+    }
+
+    [Fact]
+    public void UpnWins_WhenAPrincipalSomehowCarriesBothUpnAndLogin()
+    {
+        var claims = EasyAuthPrincipal.ExtractClaims(WithClaims(
+            ("upn", "real@contoso.com"),
+            ("urn:github:login", "octocat")));
+
+        Assert.Equal("real@contoso.com", claims.Upn);
+        Assert.Equal("octocat", claims.Login);
+    }
+
+    [Fact]
     public void IdentityProviderHeader_WinsOverAuthTyp()
     {
         var root = Principal("""{"auth_typ":"from-principal"}""");

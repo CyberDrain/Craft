@@ -409,4 +409,27 @@ public static class CraftHostBuilderExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Registers the per-instance API egress ledger and its background flush service, but only when
+    /// egress accounting is enabled — i.e. the deployment is hosted (the env var named by
+    /// <c>RateLimit.Egress.HostedEnv</c>, default <c>CIPP_HOSTED</c>, is present) or
+    /// <c>CRAFT_API_EGRESS_LIMIT_ENABLED</c> forces it on. When off, nothing is registered and the
+    /// middleware is never added, so a non-hosted instance pays nothing. See
+    /// <see cref="EgressLimitSettings"/> and <see cref="ApiEgressLimiterMiddleware"/>.
+    /// </summary>
+    public static IServiceCollection AddCraftEgressLimiter(
+        this IServiceCollection services, CraftSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(settings);
+
+        if (!settings.RateLimit.Egress.ResolvedEnabled) return services;
+
+        // Singleton so the middleware and the flush loop share one counter; the same instance is the
+        // hosted service that loads on start and flushes on a timer and on shutdown.
+        services.AddSingleton<EgressLedger>();
+        services.AddHostedService(sp => sp.GetRequiredService<EgressLedger>());
+        return services;
+    }
 }

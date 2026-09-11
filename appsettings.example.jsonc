@@ -95,7 +95,26 @@
     //   "PermitPerWindow": 300,     // requests allowed per window, per client
     //   "WindowSeconds": 10,        // window length in seconds
     //   "QueueLimit": 0,            // requests queued at the limit before rejecting (0 = reject immediately)
-    //   "ApiConcurrencyLimit": 0    // max simultaneous in-flight requests per API client (0 = unlimited)
+    //   "ApiConcurrencyLimit": 0,   // max simultaneous in-flight requests per API client (0 = unlimited)
+    //
+    //   // Egress: a THIRD, orthogonal cap — outbound response bytes/day for the WHOLE instance, counting
+    //   // only app-only API clients (UI is never counted or capped). A caller can pull tens of GB/day
+    //   // while staying under the rate and concurrency caps (one slow, large request every few seconds),
+    //   // which is what this bounds. Two-step by design:
+    //   //   1. Accounting turns on when the env named by HostedEnv (default CIPP_HOSTED — the same flag
+    //   //      the SKU profiles use) is present, or CRAFT_API_EGRESS_LIMIT_ENABLED forces it (true = on
+    //   //      even off-host for testing, false = kill switch even when hosted).
+    //   //   2. Enforcement (429 + Retry-After to the next UTC midnight) begins only once BytesPerDay > 0,
+    //   //      so you can run accounting-only first and watch real numbers before rejecting anything.
+    //   // The counter lives in memory (no per-request IO) and is flushed to egress-ledger.json in the same
+    //   // directory as the log files every FlushSeconds and on shutdown, so a restart doesn't reset the day.
+    //   // Nothing is read from Azure.
+    //   // Env overrides: CRAFT_API_EGRESS_LIMIT_BYTES, CRAFT_API_EGRESS_FLUSH_SECONDS.
+    //   "Egress": {
+    //     "HostedEnv": "CIPP_HOSTED", // env var whose presence enables accounting ("" = never auto-enable)
+    //     "BytesPerDay": 0,           // per-instance daily budget in bytes (0 = accounting only, no 429s; 1 GB = 1073741824)
+    //     "FlushSeconds": 60          // how often the counter is written to disk (also on shutdown)
+    //   }
     // },
 
     // Realtime SSE channel served at /.craft/events. Downstream code publishes job events through
