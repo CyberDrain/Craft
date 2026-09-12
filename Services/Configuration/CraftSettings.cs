@@ -79,6 +79,10 @@ public class CraftSettings
     /// <summary>Frontend serving policy — CSP header injection (EasyAuth handles auth/redirects).</summary>
     public FrontendSettings Frontend { get; set; } = new();
 
+    /// <summary>Dynamic <c>/api</c> response policy (compression), independent of the static frontend.
+    /// See <see cref="ApiSettings"/>.</summary>
+    public ApiSettings Api { get; set; } = new();
+
     /// <summary>
     /// Deployment roles (capabilities) — which parts of the host this process serves. One image, three
     /// independent switches. See <see cref="RolesSettings"/>. Also settable via the CRAFT_SERVE_FRONTEND /

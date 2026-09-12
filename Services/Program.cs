@@ -56,6 +56,7 @@ var cacheEnabled = roles.ResponseCacheEnabled;
 var healthEnabled = roles.HealthEnabled;
 var healthPath = roles.HealthPath;
 var compressionEnabled = roles.CompressionEnabled;
+var apiCompressionEnabled = roles.ApiCompressionEnabled;
 
 // Kestrel limits, logging sinks, compression, the service graph and the rate limiter all live in
 // Services/Hosting/CraftHostBuilderExtensions.cs.
@@ -64,7 +65,8 @@ builder.ConfigureCraftKestrel(craftSettings);
 // The resolved level is logged at startup and also gates PowerShell stream capture.
 var configuredLogLevel = builder.AddCraftLogging();
 
-builder.Services.AddCraftResponseCompression();
+var compressionLevel = CraftHostBuilderExtensions.ResolveCompressionLevel(craftSettings);
+builder.Services.AddCraftResponseCompression(compressionLevel);
 // ── Native C# endpoints and scheduled tasks ────────────────────────────────────────────────────────
 // Discovered before the container is built so the endpoint/task types, the central handler and any
 // application service module they ship can be registered into it. Costs nothing when no assemblies
@@ -269,11 +271,47 @@ if (app.Environment.IsDevelopment())
         string.Join(", ", CraftSettings.Auth.DevRoles));
 }
 
-// Response compression must be before static files. Skipped entirely when compression is disabled
-// (App:Frontend:Compression=false / CRAFT_COMPRESSION=false) so everything is served raw/identity.
+// Response body pipeline, split by path so /api and static compression are governed independently and
+// the egress cap can bill the size that actually leaves the box. Both must sit before static file
+// serving (a compressor has to wrap the static middleware to compress its output).
+//
+//   /api  : [egress wire counter?] -> [/api response compression?]
+//           The counter is OUTSIDE compression on purpose — it measures the compressed, on-the-wire
+//           bytes, and its finally runs only after the compressor has flushed. See
+//           ApiEgressWireCounterMiddleware. Compression here is generic; it knows nothing of accounting.
+//   other : [static/frontend on-the-fly compression?]
+//           Precompressed .br/.gz siblings are served by the static pipeline itself; this is the
+//           on-the-fly fallback for static assets without a sibling and for the SPA fallback HTML.
+//
+// A request takes exactly one branch, so an /api body is never re-compressed by the static compressor.
+// /api compression (App:Api:Compression / CRAFT_API_COMPRESSION, default on) is independent of static
+// compression (App:Frontend:Compression / CRAFT_COMPRESSION): a CDN that compresses the static bundle
+// does not re-compress API JSON, so the origin keeps doing it even with static compression delegated.
+var egressAccountingEnabled = CraftSettings.RateLimit.Egress.ResolvedEnabled;
+
+if (egressAccountingEnabled || apiCompressionEnabled)
+{
+    app.UseWhen(IsApiPath, api =>
+    {
+        if (egressAccountingEnabled) api.UseMiddleware<ApiEgressWireCounterMiddleware>();
+        if (apiCompressionEnabled) api.UseResponseCompression();
+    });
+}
+
 if (compressionEnabled)
-    app.UseResponseCompression();
-logger.LogInformation("[System] Static compression: {State}", compressionEnabled ? "enabled (precompressed .br/.gz + on-the-fly fallback)" : "DISABLED (raw/identity)");
+    app.UseWhen(ctx => !IsApiPath(ctx), sf => sf.UseResponseCompression());
+
+logger.LogInformation(
+    "[System] Compression — static: {Static}  /api: {Api}  level: {Level}  (egress accounting: {Egress})",
+    compressionEnabled ? "on (precompressed .br/.gz + on-the-fly)" : "off (raw/identity)",
+    apiCompressionEnabled ? "on (on-the-fly br/gzip)" : "off (identity)",
+    compressionLevel,
+    egressAccountingEnabled ? "on — billing compressed wire bytes" : "off");
+
+// True for /api (and /api/...), case-insensitive — the only paths the egress counter and /api
+// compressor act on. Static, /.auth, /healthz and SPA routes take the other branch.
+static bool IsApiPath(HttpContext c) =>
+    c.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase);
 
 // Nodes without the Http role do not short-circuit /api or auth paths: the HTTP endpoints simply aren't
 // mapped (see the `if (capHttp)` blocks below), so those requests fall through to static file serving
@@ -396,8 +434,10 @@ if (CraftSettings.RateLimit.RequiresLimiterMiddleware)
 // Per-instance daily API-egress cap. Same placement rules as the rate limiter above: after UseCraftAuth
 // (so an app-only caller's AppId is resolved and CallerClassifier can tell API from UI) and after static
 // serving (so a page load's assets are never charged). Only added when egress accounting is enabled —
-// see AddCraftEgressLimiter. Counts only app-only API callers; enforces (429) only once a budget is set.
-if (CraftSettings.RateLimit.Egress.ResolvedEnabled)
+// see AddCraftEgressLimiter. Flags only app-only API callers for billing (ApiEgressWireCounterMiddleware,
+// registered outside compression above, records their compressed wire bytes); enforces (429) only once a
+// budget is set.
+if (egressAccountingEnabled)
     app.UseMiddleware<ApiEgressLimiterMiddleware>();
 
 // Concurrent request tracking for diagnostics. A holder object, not an int: the dispatch endpoint

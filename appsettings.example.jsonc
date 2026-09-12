@@ -571,5 +571,24 @@
     //   // A/B measuring compressed vs raw. Env override: CRAFT_COMPRESSION=true|false (wins over this).
     //   "Compression": true
     // }
+
+    // Dynamic /api response policy — independent of the static Frontend block above.
+    // "Api": {
+    //   // Compress /api (PowerShell / native dispatch) responses on the fly: Brotli preferred, gzip
+    //   // fallback, negotiated from the caller's Accept-Encoding. Default true, and INDEPENDENT of
+    //   // Frontend.Compression — an origin behind a CDN that compresses the static bundle typically does
+    //   // not re-compress API JSON, so the origin keeps doing it even with static compression off. A
+    //   // response is only compressed when the caller advertises an accepted encoding; otherwise it is
+    //   // served identity. Env override: CRAFT_API_COMPRESSION=true|false (wins over this).
+    //   "Compression": true,
+    //   // On-the-fly compression level for the Brotli/gzip providers: Fastest | Optimal | SmallestSize
+    //   // | NoCompression. Default Optimal — measured on 2 vCPU, Brotli Optimal ~8.4x vs Fastest ~4.9x at
+    //   // the SAME CPU (~14%) and latency, so it is a near-free win. Do NOT use SmallestSize for /api:
+    //   // Brotli q11 pegs both cores (~180% CPU) and drives p95 into the tens of seconds. Drop to Fastest
+    //   // (or NoCompression) on a very small SKU if the compressor competes with the PowerShell pool.
+    //   // Applies to on-the-fly compression (dynamic /api + the static fallback for sibling-less assets);
+    //   // precompressed .br/.gz siblings are unaffected. Env override: CRAFT_API_COMPRESSION_LEVEL.
+    //   "CompressionLevel": "Optimal"
+    // }
   }
 }
