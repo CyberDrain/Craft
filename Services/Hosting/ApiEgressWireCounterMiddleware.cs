@@ -27,9 +27,10 @@ namespace Craft.Hosting;
 public sealed class ApiEgressWireCounterMiddleware
 {
     /// <summary>
-    /// Request item set by <see cref="ApiEgressLimiterMiddleware"/> on an API request it lets through,
-    /// signalling this middleware to bill the response's wire bytes. Absent for UI, anonymous, static
-    /// and shed requests, which are never charged.
+    /// Request item set by <see cref="ApiEgressLimiterMiddleware"/> on an API request it lets through:
+    /// the caller's AppId (a non-empty string), signalling this middleware to bill the response's wire
+    /// bytes against that client. Absent for UI, anonymous, static and shed requests, which are never
+    /// charged.
     /// </summary>
     public const string ChargeItemKey = "Craft.Egress.Charge";
 
@@ -60,8 +61,8 @@ public sealed class ApiEgressWireCounterMiddleware
         finally
         {
             context.Response.Body = original;
-            if (context.Items.TryGetValue(ChargeItemKey, out var charge) && charge is true)
-                _ledger.Record(counting.BytesWritten);
+            if (context.Items.TryGetValue(ChargeItemKey, out var charge) && charge is string appId && appId.Length > 0)
+                _ledger.Record(counting.BytesWritten, appId);
         }
     }
 }

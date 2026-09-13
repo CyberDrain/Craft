@@ -49,21 +49,26 @@ public sealed class ApiEgressLimiterMiddleware
             return;
         }
 
+        // The AppId (GUID) is the per-client accounting key — the same principal name the concurrency
+        // limiter partitions on. Carried on the charge flag below and recorded on a shed.
+        var appId = context.Request.Headers["x-ms-client-principal-name"].ToString();
+
         // Already over budget for today → shed before running the (often minute-long) downstream call,
         // saving both the compute and the egress. Accounting is post-hoc, so the request that tips the
         // total over still completes; the NEXT one is the first to be refused. Combined with the API
         // concurrency cap, the overshoot is bounded to (concurrency × largest response).
         if (_ledger.ShouldReject())
         {
+            _ledger.RecordShed(appId);
             await RejectAsync(context);
             return;
         }
 
-        // Greenlit: mark the request so ApiEgressWireCounterMiddleware (running outside the response
-        // compressor) bills its on-the-wire bytes. We don't count here — a counter at this position
-        // would see the pre-compression body and miss the compressor's final flush, which unwinds
-        // further out. The shed body above is deliberately left unflagged, so it is never charged.
-        context.Items[ApiEgressWireCounterMiddleware.ChargeItemKey] = true;
+        // Greenlit: carry the AppId so ApiEgressWireCounterMiddleware (running outside the response
+        // compressor) bills its on-the-wire bytes against this client. We don't count here — a counter at
+        // this position would see the pre-compression body and miss the compressor's final flush, which
+        // unwinds further out. The shed body above is left unflagged, so it is never charged.
+        context.Items[ApiEgressWireCounterMiddleware.ChargeItemKey] = appId;
         await _next(context);
     }
 

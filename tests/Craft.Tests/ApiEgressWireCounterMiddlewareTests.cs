@@ -42,10 +42,12 @@ public class ApiEgressWireCounterMiddlewareTests : IDisposable
         return ctx;
     }
 
-    // The limiter greenlights an API request by setting this on the way through; the fake handlers below
-    // do the same, since in the real pipeline the flag is set inside the counter's own invocation.
+    private const string App = "11111111-2222-3333-4444-555555555555";
+
+    // The limiter greenlights an API request by setting the caller's AppId on the way through; the fake
+    // handlers below do the same, since in the real pipeline the flag is set inside the counter's own invocation.
     private static void Flag(HttpContext ctx) =>
-        ctx.Items[ApiEgressWireCounterMiddleware.ChargeItemKey] = true;
+        ctx.Items[ApiEgressWireCounterMiddleware.ChargeItemKey] = App;
 
     // ── records the flagged request's wire bytes, through either write path ───────────────────────────
 
@@ -192,7 +194,7 @@ public class ApiEgressWireCounterMiddlewareTests : IDisposable
     public async Task OverBudget_LimiterSheds_CounterDoesNotBillThe429()
     {
         var ledger = Ledger(cap: 1000);
-        ledger.Record(1000);                    // at budget → the limiter sheds
+        ledger.Record(1000, "seed");                    // at budget → the limiter sheds
         var before = ledger.CurrentBytes;
 
         var limiter = new ApiEgressLimiterMiddleware(

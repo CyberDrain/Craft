@@ -55,8 +55,9 @@ public class ApiEgressLimiterMiddlewareTests : IDisposable
         return ctx;
     }
 
+    // The charge flag now carries the caller's AppId (a non-empty string), not a bare bool.
     private static bool Charged(HttpContext ctx) =>
-        ctx.Items.TryGetValue(ApiEgressWireCounterMiddleware.ChargeItemKey, out var v) && v is true;
+        ctx.Items.TryGetValue(ApiEgressWireCounterMiddleware.ChargeItemKey, out var v) && v is string s && s.Length > 0;
 
     private static string BodyText(HttpContext ctx)
     {
@@ -70,7 +71,7 @@ public class ApiEgressLimiterMiddlewareTests : IDisposable
     public async Task UiCaller_OverBudget_IsNeverRejectedNorFlagged()
     {
         var ledger = Ledger(cap: 10);
-        ledger.Record(1_000_000);                 // instance is way over budget
+        ledger.Record(1_000_000, "seed");                 // instance is way over budget
         Assert.True(ledger.ShouldReject());
 
         var called = false;
@@ -89,7 +90,7 @@ public class ApiEgressLimiterMiddlewareTests : IDisposable
     public async Task AnonymousCaller_IsIgnored()
     {
         var ledger = Ledger(cap: 10);
-        ledger.Record(1_000_000);
+        ledger.Record(1_000_000, "seed");
 
         var called = false;
         var mw = Middleware(ctx => { called = true; return Task.CompletedTask; }, ledger);
@@ -142,7 +143,7 @@ public class ApiEgressLimiterMiddlewareTests : IDisposable
     public async Task ApiCaller_OverBudget_Is429_WithRetryAfter_DownstreamSkipped_AndNotFlagged()
     {
         var ledger = Ledger(cap: 1000);
-        ledger.Record(1000);                      // exactly at budget → reject
+        ledger.Record(1000, "seed");                      // exactly at budget → reject
         Assert.True(ledger.ShouldReject());
 
         var called = false;
