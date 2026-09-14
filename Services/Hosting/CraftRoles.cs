@@ -24,7 +24,7 @@ public sealed class CraftRoles
 {
     private CraftRoles(bool frontend, bool http, bool background,
                        bool responseCacheEnabled, bool healthEnabled, string healthPath,
-                       bool compressionEnabled)
+                       bool compressionEnabled, bool apiCompressionEnabled)
     {
         Frontend = frontend;
         Http = http;
@@ -33,6 +33,7 @@ public sealed class CraftRoles
         HealthEnabled = healthEnabled;
         HealthPath = healthPath;
         CompressionEnabled = compressionEnabled;
+        ApiCompressionEnabled = apiCompressionEnabled;
     }
 
     /// <summary>Serve static web content from <c>Frontend/</c>.</summary>
@@ -67,9 +68,19 @@ public sealed class CraftRoles
 
     /// <summary>
     /// When false the host serves all static content raw/identity: precompressed <c>.br</c>/<c>.gz</c>
-    /// siblings are not served and on-the-fly compression is not applied.
+    /// siblings are not served and on-the-fly compression is not applied. Governs <i>static</i> content
+    /// only — dynamic <c>/api</c> compression is <see cref="ApiCompressionEnabled"/>.
     /// </summary>
     public bool CompressionEnabled { get; }
+
+    /// <summary>
+    /// Whether dynamic <c>/api</c> responses are compressed on the fly (Brotli/gzip, negotiated from the
+    /// caller's Accept-Encoding). Default true, and deliberately independent of
+    /// <see cref="CompressionEnabled"/>: an origin behind a CDN that compresses the static bundle should
+    /// still compress its API JSON, so the two toggles do not share a switch. Env override
+    /// <c>CRAFT_API_COMPRESSION</c> wins over <c>App:Api:Compression</c>.
+    /// </summary>
+    public bool ApiCompressionEnabled { get; }
 
     /// <summary>
     /// Resolves roles and derived toggles from configuration and the environment.
@@ -115,9 +126,11 @@ public sealed class CraftRoles
         if (!healthPath.StartsWith('/')) healthPath = "/" + healthPath;
 
         var compressionEnabled = EnvFlag.Read(env, "CRAFT_COMPRESSION") ?? settings.Frontend.Compression;
+        var apiCompressionEnabled = EnvFlag.Read(env, "CRAFT_API_COMPRESSION") ?? settings.Api.Compression;
 
         return new CraftRoles(frontend, http, background,
-                              cacheEnabled, healthEnabled, healthPath, compressionEnabled);
+                              cacheEnabled, healthEnabled, healthPath,
+                              compressionEnabled, apiCompressionEnabled);
     }
 
     /// <summary>Convenience overload reading the real process environment.</summary>

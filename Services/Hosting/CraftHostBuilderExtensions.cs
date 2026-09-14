@@ -185,8 +185,38 @@ public static class CraftHostBuilderExtensions
 
     private static readonly string[] second = new[] { "application/json", "text/json", "application/javascript", "text/javascript" };
 
+    /// <summary>
+    /// Resolves the on-the-fly compression level from the <c>CRAFT_API_COMPRESSION_LEVEL</c> env var
+    /// (which wins) or <c>App:Api:CompressionLevel</c>, parsed as a
+    /// <see cref="CompressionLevel"/> name (case-insensitive). An unset or unrecognised value is
+    /// <see cref="CompressionLevel.Fastest"/> — the safe default on a small, shared-core container.
+    /// </summary>
+    public static CompressionLevel ResolveCompressionLevel(CraftSettings settings, Func<string, string?> env)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(env);
+
+        var raw = env("CRAFT_API_COMPRESSION_LEVEL");
+        if (string.IsNullOrWhiteSpace(raw)) raw = settings.Api.CompressionLevel;
+
+        return Enum.TryParse<CompressionLevel>(raw, ignoreCase: true, out var level)
+            ? level
+            : CompressionLevel.Fastest;
+    }
+
+    /// <summary>Convenience overload resolving against the real process environment.</summary>
+    public static CompressionLevel ResolveCompressionLevel(CraftSettings settings) =>
+        ResolveCompressionLevel(settings, Environment.GetEnvironmentVariable);
+
     /// <summary>Response compression, matching Azure Static Web Apps behaviour.</summary>
-    public static IServiceCollection AddCraftResponseCompression(this IServiceCollection services)
+    /// <param name="level">
+    /// Compression level applied to both the Brotli and gzip providers. Defaults to
+    /// <see cref="CompressionLevel.Fastest"/> — deliberate on a small container, where the request-path
+    /// CPU of Optimal/SmallestSize usually costs more than the bytes it saves. Resolve it from config
+    /// with <see cref="ResolveCompressionLevel(CraftSettings)"/>.
+    /// </param>
+    public static IServiceCollection AddCraftResponseCompression(
+        this IServiceCollection services, CompressionLevel level = CompressionLevel.Fastest)
     {
         ArgumentNullException.ThrowIfNull(services);
 
@@ -199,10 +229,8 @@ public static class CraftHostBuilderExtensions
                 second);
         });
 
-        // Fastest, not Optimal: these run on the request path on a small container, where the extra
-        // CPU costs more than the bytes saved. Precompressed .br/.gz siblings cover the static assets.
-        services.Configure<BrotliCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
-        services.Configure<GzipCompressionProviderOptions>(o => o.Level = CompressionLevel.Fastest);
+        services.Configure<BrotliCompressionProviderOptions>(o => o.Level = level);
+        services.Configure<GzipCompressionProviderOptions>(o => o.Level = level);
 
         return services;
     }

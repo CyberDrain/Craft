@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using Craft.Hosting;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -8,13 +9,18 @@ namespace Craft.Tests;
 /// <summary>
 /// The egress ledger is the instance-wide byte counter behind the daily API bandwidth cap. Its
 /// correctness is what makes the cap trustworthy in both directions: under-counting lets an abuser past
-/// the budget, over-counting throttles a well-behaved caller. These pin the four behaviours that matter
-/// — it accumulates, it rejects exactly at the budget, it resets at UTC midnight, and it survives a
-/// restart within the same day without resetting (John's hard requirement) while starting fresh on a
-/// new day. The clock is injected so rollover is testable without waiting for midnight.
+/// the budget, over-counting throttles a well-behaved caller. These pin the behaviours that matter — it
+/// accumulates, it rejects exactly at the budget, it resets at UTC midnight, it survives a restart within
+/// the same day without resetting (John's hard requirement) while starting fresh on a new day, and it
+/// keeps per-client totals + a shed count + the cap-reached stamp in the persisted file. The clock is
+/// injected so rollover is testable without waiting for midnight. Table mirroring is covered separately
+/// in <see cref="EgressLedgerTableTests"/>.
 /// </summary>
 public class EgressLedgerTests : IDisposable
 {
+    private const string App = "11111111-2222-3333-4444-555555555555";
+    private const string App2 = "99999999-8888-7777-6666-555555555555";
+
     private readonly string _dir =
         Path.Combine(Path.GetTempPath(), "craft-egress-test-" + Guid.NewGuid().ToString("N")[..8]);
 
@@ -37,8 +43,8 @@ public class EgressLedgerTests : IDisposable
     public void Record_Accumulates()
     {
         var ledger = New(cap: 0);
-        ledger.Record(100);
-        ledger.Record(250);
+        ledger.Record(100, App);
+        ledger.Record(250, App);
         Assert.Equal(350L, ledger.CurrentBytes);
     }
 
@@ -46,8 +52,8 @@ public class EgressLedgerTests : IDisposable
     public void Record_IgnoresZeroAndNegative()
     {
         var ledger = New(cap: 0);
-        ledger.Record(0);
-        ledger.Record(-99);
+        ledger.Record(0, App);
+        ledger.Record(-99, App);
         Assert.Equal(0L, ledger.CurrentBytes);
     }
 
@@ -55,13 +61,13 @@ public class EgressLedgerTests : IDisposable
     public void ShouldReject_FalseBelowCap_TrueAtOrAboveCap()
     {
         var ledger = New(cap: 1000);
-        ledger.Record(999);
+        ledger.Record(999, App);
         Assert.False(ledger.ShouldReject());   // one byte under
 
-        ledger.Record(1);
+        ledger.Record(1, App);
         Assert.True(ledger.ShouldReject());    // exactly at the cap rejects
 
-        ledger.Record(5000);
+        ledger.Record(5000, App);
         Assert.True(ledger.ShouldReject());    // and stays rejecting past it
     }
 
@@ -69,9 +75,63 @@ public class EgressLedgerTests : IDisposable
     public void CapZero_IsAccountingOnly_NeverRejects()
     {
         var ledger = New(cap: 0);
-        ledger.Record(long.MaxValue / 2);
+        ledger.Record(long.MaxValue / 2, App);
         Assert.False(ledger.ShouldReject());   // accounting-only rollout phase: counts, never 429s
         Assert.True(ledger.CurrentBytes > 0);
+    }
+
+    // ── Per-client totals + shed count + cap-reached stamp (persisted) ────────────────────────────────
+
+    [Fact]
+    public void Record_TracksPerClientTotals_InFile()
+    {
+        var ledger = New(cap: 0);
+        ledger.Record(100, App);
+        ledger.Record(250, App);
+        ledger.Record(400, App2);
+        ledger.Flush();
+
+        var state = ReadFile();
+        Assert.Equal(750L, state.RootElement.GetProperty("bytes").GetInt64());
+        var clients = state.RootElement.GetProperty("clients");
+        Assert.Equal(350L, clients.GetProperty(App).GetProperty("bytes").GetInt64());
+        Assert.Equal(2, clients.GetProperty(App).GetProperty("requests").GetInt32());
+        Assert.Equal(400L, clients.GetProperty(App2).GetProperty("bytes").GetInt64());
+    }
+
+    [Fact]
+    public void RecordShed_CountsAndStampsCapReached()
+    {
+        var clock = new DateTime(2026, 9, 11, 12, 0, 0, DateTimeKind.Utc);
+        var ledger = New(cap: 1000, () => clock);
+        ledger.RecordShed(App);
+        ledger.RecordShed(App);
+        ledger.Flush();
+
+        Assert.Equal(2L, ledger.ShedRequests);
+        var state = ReadFile();
+        Assert.Equal(2L, state.RootElement.GetProperty("shedRequests").GetInt64());
+        Assert.Equal(2, state.RootElement.GetProperty("clients").GetProperty(App).GetProperty("shed").GetInt32());
+        Assert.True(state.RootElement.TryGetProperty("capReachedUtc", out var cr) && cr.ValueKind != JsonValueKind.Null);
+        Assert.Equal(1000L, state.RootElement.GetProperty("capBytes").GetInt64());
+    }
+
+    [Fact]
+    public void PerClientTotals_RestoredAcrossRestart_SameDay()
+    {
+        var clock = new DateTime(2026, 9, 11, 6, 0, 0, DateTimeKind.Utc);
+        var first = New(cap: 0, () => clock);
+        first.Record(111, App);
+        first.Record(222, App2);
+        first.RecordShed(App);
+        first.Flush();
+
+        var restarted = New(cap: 0, () => clock);
+        restarted.Flush();   // re-persist the loaded state
+        var state = ReadFile();
+        Assert.Equal(333L, restarted.CurrentBytes);
+        Assert.Equal(1L, restarted.ShedRequests);
+        Assert.Equal(111L, state.RootElement.GetProperty("clients").GetProperty(App).GetProperty("bytes").GetInt64());
     }
 
     // ── UTC midnight rollover ───────────────────────────────────────────────────────────────────────
@@ -82,13 +142,13 @@ public class EgressLedgerTests : IDisposable
         var clock = new DateTime(2026, 9, 11, 12, 0, 0, DateTimeKind.Utc);
         var ledger = New(cap: 1000, () => clock);
 
-        ledger.Record(900);
+        ledger.Record(900, App);
         Assert.Equal(900L, ledger.CurrentBytes);
 
         clock = clock.AddDays(1); // cross UTC midnight
         Assert.Equal(0L, ledger.CurrentBytes);      // reads roll the day over
         Assert.False(ledger.ShouldReject());
-        ledger.Record(50);
+        ledger.Record(50, App);
         Assert.Equal(50L, ledger.CurrentBytes);     // new day counts from zero
     }
 
@@ -103,7 +163,6 @@ public class EgressLedgerTests : IDisposable
     [Fact]
     public void SecondsToNextUtcMidnight_FlooredAtOne()
     {
-        // A hair before midnight must never advertise Retry-After: 0 (a hot-loop invitation).
         var clock = new DateTime(2026, 9, 11, 23, 59, 59, 900, DateTimeKind.Utc);
         var ledger = New(cap: 0, () => clock);
         Assert.Equal(1, ledger.SecondsToNextUtcMidnight());
@@ -125,10 +184,9 @@ public class EgressLedgerTests : IDisposable
         var clock = new DateTime(2026, 9, 11, 6, 0, 0, DateTimeKind.Utc);
 
         var first = New(cap: 5000, () => clock);
-        first.Record(1234);
+        first.Record(1234, App);
         first.Flush();
 
-        // A "restart": a brand-new ledger over the same file, same UTC day.
         var restarted = New(cap: 5000, () => clock);
         Assert.Equal(1234L, restarted.CurrentBytes);
     }
@@ -138,12 +196,22 @@ public class EgressLedgerTests : IDisposable
     {
         var day1 = new DateTime(2026, 9, 11, 6, 0, 0, DateTimeKind.Utc);
         var first = New(cap: 5000, () => day1);
-        first.Record(1234);
+        first.Record(1234, App);
         first.Flush();
 
         var day2 = day1.AddDays(1);
         var restarted = New(cap: 5000, () => day2);
         Assert.Equal(0L, restarted.CurrentBytes);   // yesterday's total is not carried into today
+    }
+
+    [Fact]
+    public void Load_V1File_RestoresBytes()
+    {
+        // A pre-per-client (v1) file has only dateUtc + bytes. It must still load.
+        var today = DateTime.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        File.WriteAllText(FilePath, $"{{\"dateUtc\":\"{today}\",\"bytes\":4242}}");
+        var ledger = New(cap: 0);
+        Assert.Equal(4242L, ledger.CurrentBytes);
     }
 
     [Fact]
@@ -158,7 +226,7 @@ public class EgressLedgerTests : IDisposable
     public void Flush_LeavesNoTempFileBehind()
     {
         var ledger = New(cap: 1000);
-        ledger.Record(10);
+        ledger.Record(10, App);
         ledger.Flush();
         Assert.True(File.Exists(FilePath));
         Assert.False(File.Exists(FilePath + ".tmp"));   // temp+rename completed cleanly
@@ -192,7 +260,7 @@ public class EgressLedgerTests : IDisposable
 
         await Task.WhenAll(Enumerable.Range(0, threads).Select(_ => Task.Run(() =>
         {
-            for (var i = 0; i < perThread; i++) ledger.Record(7);
+            for (var i = 0; i < perThread; i++) ledger.Record(7, App);
         })));
 
         Assert.Equal((long)threads * perThread * 7, ledger.CurrentBytes);
@@ -201,11 +269,9 @@ public class EgressLedgerTests : IDisposable
     [Fact]
     public async Task HostedService_FlushesOnShutdown()
     {
-        // The user's explicit requirement: a graceful stop must persist the day's total. Start the
-        // background service, record, stop it — the final flush on shutdown must write the counter.
         var clock = new DateTime(2026, 9, 11, 10, 0, 0, DateTimeKind.Utc);
         var ledger = New(cap: 5000, () => clock);
-        ledger.Record(2222);
+        ledger.Record(2222, App);
 
         await ((IHostedService)ledger).StartAsync(CancellationToken.None);
         await ((IHostedService)ledger).StopAsync(CancellationToken.None); // triggers the final flush
@@ -213,4 +279,6 @@ public class EgressLedgerTests : IDisposable
         var reloaded = New(cap: 5000, () => clock);
         Assert.Equal(2222L, reloaded.CurrentBytes);
     }
+
+    private JsonDocument ReadFile() => JsonDocument.Parse(File.ReadAllText(FilePath));
 }

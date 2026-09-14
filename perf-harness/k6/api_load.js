@@ -10,6 +10,11 @@
 //   CPU_MS    ?ms for PerfCpu   (default 20)
 //   SLEEP_MS  ?ms for PerfSleep (default 100)
 //   JSON_N    ?n  for PerfJson  (default 1000)
+//   ENC       Accept-Encoding to negotiate: 'gzip' | 'br' | '' (default '' = identity, no header).
+//             Sent as the Accept-Encoding request HEADER (NOT k6's `compression` param, which compresses
+//             the request BODY and does nothing for a GET). k6 counts data_received as the on-the-wire
+//             (compressed) size and still decompresses the body for the checks. Used by
+//             run-compression.ps1 to A/B encodings.
 //
 // Output: --summary-export /out/<label>.k6.json (written by run-api.ps1)
 
@@ -25,6 +30,7 @@ const ONLY = __ENV.ONLY || '';
 const CPU_MS = __ENV.CPU_MS || '20';
 const SLEEP_MS = __ENV.SLEEP_MS || '100';
 const JSON_N = __ENV.JSON_N || '1000';
+const ENC = (__ENV.ENC || '').trim();   // '' = identity; 'gzip' / 'br' negotiate that encoding
 
 // Endpoint catalogue with mix weights (higher weight = requested more often in the default mix).
 const endpoints = [
@@ -78,7 +84,13 @@ export const options = {
 
 export default function () {
   const e = pick[Math.floor(Math.random() * pick.length)];
-  const res = http.get(BASE + e.url, { tags: { name: e.name } });
+  // ENC set → send Accept-Encoding so the server negotiates that content-encoding. k6 counts
+  // data_received as the on-the-wire (compressed) bytes and still decompresses the body so the
+  // "ok":true check below holds. ENC unset → no Accept-Encoding, identity response — the baseline.
+  const params = ENC
+    ? { tags: { name: e.name }, headers: { 'Accept-Encoding': ENC } }
+    : { tags: { name: e.name } };
+  const res = http.get(BASE + e.url, params);
   check(res, {
     'status 200': (r) => r.status === 200,
     'ok body': (r) => typeof r.body === 'string' && r.body.indexOf('"ok":true') !== -1,

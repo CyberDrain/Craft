@@ -144,11 +144,12 @@ results/                outputs (gitignored)
 
 ── HTTP API mode (below) ──
 docker-compose.api.yml  http-only SUT (CRAFT_SERVE_API=true) + PerfApi module mount
-docker-compose.egress.yml  overlay: egress accounting on (fast flush, known log dir) for run-egress.ps1
+docker-compose.egress.yml  overlay: egress accounting on (fast flush, known log dir) for run-egress.ps1 / run-compression.ps1
 api-harness/API/Modules/PerfApi/  synthetic PS HTTP endpoints (dependency-free; not for prod)
-k6/api_load.js          API load test (weighted endpoint mix or single-endpoint focus)
+k6/api_load.js          API load test (weighted endpoint mix or single-endpoint focus; ENC= to negotiate gzip/br)
 scripts/run-api.ps1     API orchestrator (up → /healthz → warm → sample → k6 → report → down)
 scripts/run-egress.ps1  e2e for the per-instance API egress cap (drive traffic → flush → read ledger → assert)
+scripts/run-compression.ps1  /api compression: correctness + accounting proof (curl) then CPU-vs-bandwidth per encoding (k6)
 scripts/compare-api.ps1 before/after diff of two API result JSONs (incl. per-endpoint p95)
 ```
 
@@ -215,3 +216,38 @@ Exits non-zero on any failed check (CI-friendly). The ledger file is copied to
 `results/egress-ledger-<timestamp>.json`. This covers what the xunit suite can't: the real file location
 and serialization, real byte counting through the actual response stream, and the real
 auth→classify→count path.
+
+---
+
+## /api compression (CPU vs bandwidth + accounting) (e2e)
+
+Verifies dynamic `/api` response compression end to end and measures its CPU cost. It layers
+`docker-compose.egress.yml` on the API harness (so the egress ledger is live) and runs two phases:
+
+**Phase 1 — correctness + accounting (curl, exact bytes, two isolated cases).** It reads the ledger file
+around each case to get a per-case byte delta, and measures each response's on-the-wire size
+(`curl %{size_download}`, no `--compressed`) and `Content-Encoding` (`%{header_json}`):
+
+- **without** `Accept-Encoding` → asserts the response is **not** compressed (no `Content-Encoding`), and
+  the ledger delta equals the bytes curl received;
+- **with** `Accept-Encoding: gzip` → asserts the response **is** compressed (`Content-Encoding: gzip`) and
+  materially smaller, and the ledger delta equals the bytes curl received.
+
+So the origin compresses only when asked, and the cap bills exactly the bytes that went over the wire in
+**both** cases — proving the accounting sits on the compressed side (a pre-compression counter would have
+read ≈ `Requests × identity-size` for the gzip case).
+
+**Phase 2 — CPU / ratio under load (k6 + docker stats).** Runs the same `PerfJson` payload at a fixed
+arrival rate three times — identity, gzip, br — sampling container CPU during each, and reports CPU%,
+per-response wire bytes, compression ratio, throughput and p95 side by side. This is the CPU-hit number
+to weigh against the bytes saved on a small (1–2 vCPU) container.
+
+```powershell
+docker build -f ..\build\Dockerfile -t craft:local ..    # image must include the /api compression + wire counter
+
+pwsh scripts\run-compression.ps1                          # 30 reqs/case proof + k6 identity/gzip/br @ rate 150
+pwsh scripts\run-compression.ps1 -JsonN 4000 -Rate 200 -Duration 30s
+pwsh scripts\run-compression.ps1 -Requests 60 -KeepUp
+```
+
+Exits non-zero if any Phase-1 assertion fails. Results go to `results/compression-<timestamp>.{json,md}`.

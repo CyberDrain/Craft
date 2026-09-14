@@ -140,4 +140,91 @@ public class CraftRolesTests
         // null vs false is load-bearing: null falls back to App: configuration, false overrides it.
         Assert.Equal(expected, EnvFlag.Parse(raw));
     }
+
+    // ── compression toggles: static and /api are independent ──────────────────────────────────────────
+
+    [Fact]
+    public void Compression_BothOnByDefault()
+    {
+        var roles = CraftRoles.Resolve(new CraftSettings(), NoEnv);
+
+        Assert.True(roles.CompressionEnabled);      // static (Frontend)
+        Assert.True(roles.ApiCompressionEnabled);   // dynamic /api
+    }
+
+    [Fact]
+    public void StaticCompressionOff_DoesNotDisableApiCompression()
+    {
+        // The whole point of the split: a CDN compressing the static bundle (CRAFT_COMPRESSION=false)
+        // must not stop the origin compressing its API JSON.
+        var roles = CraftRoles.Resolve(new CraftSettings(), Env(("CRAFT_COMPRESSION", "false")));
+
+        Assert.False(roles.CompressionEnabled);
+        Assert.True(roles.ApiCompressionEnabled);
+    }
+
+    [Fact]
+    public void ApiCompression_CanBeDisabledIndependently()
+    {
+        var roles = CraftRoles.Resolve(new CraftSettings(), Env(("CRAFT_API_COMPRESSION", "false")));
+
+        Assert.True(roles.CompressionEnabled);       // static untouched
+        Assert.False(roles.ApiCompressionEnabled);   // /api off
+    }
+
+    [Fact]
+    public void ApiCompression_EnvOverridesAppSetting()
+    {
+        // App:Api:Compression=false, but the env var wins (true).
+        var settings = new CraftSettings();
+        settings.Api.Compression = false;
+
+        var roles = CraftRoles.Resolve(settings, Env(("CRAFT_API_COMPRESSION", "true")));
+
+        Assert.True(roles.ApiCompressionEnabled);
+    }
+
+    // ── compression LEVEL resolution ──────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void CompressionLevel_DefaultsToOptimal()
+    {
+        // Optimal is a near-free win over Fastest (measured ~8.4x vs ~4.9x at the same CPU); see
+        // ApiSettings.CompressionLevel. SmallestSize is deliberately not the default (Brotli q11 is
+        // catastrophic on a small container).
+        var level = CraftHostBuilderExtensions.ResolveCompressionLevel(new CraftSettings(), NoEnv);
+        Assert.Equal(System.IO.Compression.CompressionLevel.Optimal, level);
+    }
+
+    [Theory]
+    [InlineData("Optimal")]
+    [InlineData("optimal")]     // case-insensitive
+    [InlineData("SmallestSize")]
+    [InlineData("NoCompression")]
+    public void CompressionLevel_ParsesConfiguredName(string name)
+    {
+        var settings = new CraftSettings();
+        settings.Api.CompressionLevel = name;
+        var level = CraftHostBuilderExtensions.ResolveCompressionLevel(settings, NoEnv);
+        Assert.Equal(Enum.Parse<System.IO.Compression.CompressionLevel>(name, ignoreCase: true), level);
+    }
+
+    [Fact]
+    public void CompressionLevel_EnvWinsOverAppSetting()
+    {
+        var settings = new CraftSettings();
+        settings.Api.CompressionLevel = "Fastest";
+        var level = CraftHostBuilderExtensions.ResolveCompressionLevel(
+            settings, Env(("CRAFT_API_COMPRESSION_LEVEL", "SmallestSize")));
+        Assert.Equal(System.IO.Compression.CompressionLevel.SmallestSize, level);
+    }
+
+    [Fact]
+    public void CompressionLevel_UnrecognisedFallsBackToFastest()
+    {
+        var settings = new CraftSettings();
+        settings.Api.CompressionLevel = "banana";
+        var level = CraftHostBuilderExtensions.ResolveCompressionLevel(settings, NoEnv);
+        Assert.Equal(System.IO.Compression.CompressionLevel.Fastest, level);
+    }
 }

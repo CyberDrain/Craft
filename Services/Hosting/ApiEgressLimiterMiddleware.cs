@@ -3,15 +3,24 @@ using System.Globalization;
 namespace Craft.Hosting;
 
 /// <summary>
-/// Sheds app-only API traffic once the instance has served its daily egress budget, and records the
-/// outbound bytes of the responses it lets through. Runs only for API clients (client-credentials
-/// callers); every interactive request passes straight through after a single header check.
+/// Sheds app-only API traffic once the instance has served its daily egress budget, and marks the
+/// requests it lets through for billing. Runs only for API clients (client-credentials callers); every
+/// interactive request passes straight through after a single header check.
+/// <para>
+/// This is the <i>policy</i> half of the egress feature: it classifies the caller and decides whether
+/// to reject. It no longer counts bytes itself — the outbound size is measured post-compression by
+/// <see cref="ApiEgressWireCounterMiddleware"/>, which runs outside the response compressor. When this
+/// middleware lets an API request through it sets <see cref="ApiEgressWireCounterMiddleware.ChargeItemKey"/>
+/// on the request, and the wire counter records the response's on-the-wire bytes for exactly those
+/// requests. Splitting it this way keeps the cap billing what actually transits the network (the
+/// compressed body) while the shed decision stays here, after auth, where the caller is known.
+/// </para>
 /// <para>
 /// Registered only when egress accounting is enabled (hosted env, or forced) — see
 /// <c>CraftHostBuilderExtensions.AddCraftEgressLimiter</c>. Placement mirrors the rate limiter: after
 /// the auth middleware (so an app-only caller's AppId is resolved) and after static file serving (so a
 /// page load's assets are never charged). Enforcement (the 429) only bites once a budget is configured;
-/// with no budget it counts silently, which is the accounting-only rollout phase.
+/// with no budget it flags silently, which is the accounting-only rollout phase.
 /// </para>
 /// </summary>
 public sealed class ApiEgressLimiterMiddleware
@@ -40,31 +49,27 @@ public sealed class ApiEgressLimiterMiddleware
             return;
         }
 
+        // The AppId (GUID) is the per-client accounting key — the same principal name the concurrency
+        // limiter partitions on. Carried on the charge flag below and recorded on a shed.
+        var appId = context.Request.Headers["x-ms-client-principal-name"].ToString();
+
         // Already over budget for today → shed before running the (often minute-long) downstream call,
         // saving both the compute and the egress. Accounting is post-hoc, so the request that tips the
         // total over still completes; the NEXT one is the first to be refused. Combined with the API
         // concurrency cap, the overshoot is bounded to (concurrency × largest response).
         if (_ledger.ShouldReject())
         {
+            _ledger.RecordShed(appId);
             await RejectAsync(context);
             return;
         }
 
-        // Count the body this request writes. Swapping Response.Body captures both a direct
-        // Body.WriteAsync and Response.WriteAsync(string), since the response writer is re-adapted onto
-        // our stream — see CountingStream.
-        var original = context.Response.Body;
-        var counting = new CountingStream(original);
-        context.Response.Body = counting;
-        try
-        {
-            await _next(context);
-        }
-        finally
-        {
-            context.Response.Body = original;
-            _ledger.Record(counting.BytesWritten);
-        }
+        // Greenlit: carry the AppId so ApiEgressWireCounterMiddleware (running outside the response
+        // compressor) bills its on-the-wire bytes against this client. We don't count here — a counter at
+        // this position would see the pre-compression body and miss the compressor's final flush, which
+        // unwinds further out. The shed body above is left unflagged, so it is never charged.
+        context.Items[ApiEgressWireCounterMiddleware.ChargeItemKey] = appId;
+        await _next(context);
     }
 
     private async Task RejectAsync(HttpContext context)

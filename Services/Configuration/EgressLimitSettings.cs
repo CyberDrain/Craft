@@ -51,9 +51,35 @@ public class EgressLimitSettings
     /// </summary>
     public int FlushSeconds { get; set; } = 60;
 
+    /// <summary>
+    /// Table into which per-flush accounting is mirrored as time-bucketed rows (in addition to the local
+    /// file), so the product can show usage history. Written by Craft's own table store — the same
+    /// storage account the hosted app reads with Get-CIPPTable — so CIPP can query it directly. Default
+    /// <c>CraftEgressAccounting</c>. Env override: <c>CRAFT_API_EGRESS_TABLE</c>. Blank disables the table
+    /// mirror (file-only).
+    /// </summary>
+    public string TableName { get; set; } = "CraftEgressAccounting";
+
+    /// <summary>
+    /// Width in minutes of each accounting bucket written to the table. Default 15 (→ 96 buckets/day),
+    /// which is the granularity the product surfaces. The local file keeps only running daily totals; the
+    /// bucketed time-series lives in the table. Floored at 1. Env override: <c>CRAFT_API_EGRESS_BUCKET_MINUTES</c>.
+    /// </summary>
+    public int BucketMinutes { get; set; } = 15;
+
+    /// <summary>
+    /// Days of bucketed rows to retain in the table before a periodic purge deletes them. Default 7.
+    /// Floored at 1. Env override: <c>CRAFT_API_EGRESS_RETENTION_DAYS</c>. Does not affect the local file,
+    /// which only ever holds the current UTC day.
+    /// </summary>
+    public int RetentionDays { get; set; } = 7;
+
     internal const string EnabledEnv = "CRAFT_API_EGRESS_LIMIT_ENABLED";
     internal const string BytesEnv = "CRAFT_API_EGRESS_LIMIT_BYTES";
     internal const string FlushEnv = "CRAFT_API_EGRESS_FLUSH_SECONDS";
+    internal const string TableEnv = "CRAFT_API_EGRESS_TABLE";
+    internal const string BucketEnv = "CRAFT_API_EGRESS_BUCKET_MINUTES";
+    internal const string RetentionEnv = "CRAFT_API_EGRESS_RETENTION_DAYS";
 
     /// <summary>
     /// Whether egress accounting (and therefore the middleware) should be active, resolved through
@@ -93,6 +119,32 @@ public class EgressLimitSettings
             CultureInfo.InvariantCulture, out var fromEnv) && fromEnv > 0
             ? fromEnv
             : Math.Max(1, FlushSeconds);
+
+    /// <summary>Resolved table name, honouring <c>CRAFT_API_EGRESS_TABLE</c>. Blank/whitespace = the table
+    /// mirror is off (file-only accounting).</summary>
+    public string ResolvedTableName
+    {
+        get
+        {
+            var fromEnv = Environment.GetEnvironmentVariable(TableEnv);
+            var name = string.IsNullOrWhiteSpace(fromEnv) ? TableName : fromEnv;
+            return (name ?? string.Empty).Trim();
+        }
+    }
+
+    /// <summary>Resolved bucket width in minutes, honouring <c>CRAFT_API_EGRESS_BUCKET_MINUTES</c>. Floored at 1.</summary>
+    public int ResolvedBucketMinutes =>
+        int.TryParse(Environment.GetEnvironmentVariable(BucketEnv), NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var fromEnv) && fromEnv > 0
+            ? fromEnv
+            : Math.Max(1, BucketMinutes);
+
+    /// <summary>Resolved retention in days, honouring <c>CRAFT_API_EGRESS_RETENTION_DAYS</c>. Floored at 1.</summary>
+    public int ResolvedRetentionDays =>
+        int.TryParse(Environment.GetEnvironmentVariable(RetentionEnv), NumberStyles.Integer,
+            CultureInfo.InvariantCulture, out var fromEnv) && fromEnv > 0
+            ? fromEnv
+            : Math.Max(1, RetentionDays);
 
     // Tri-state flag parse (mirrors Craft.Hosting.EnvFlag, inlined to keep Configuration free of a
     // dependency on Hosting): null when unset/blank, true for "true"/"1" (any casing), false otherwise.
