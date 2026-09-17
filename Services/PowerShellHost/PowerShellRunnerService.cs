@@ -228,10 +228,17 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpScript(string route, HttpContext httpContext)
     {
+        // Only reads honour client-disconnect cancellation. A write (POST/PUT/DELETE/PATCH) runs to
+        // completion even if the client hangs up — a half-applied mutation with nobody listening is
+        // worse than one that finished. Reads mutate nothing, so aborting them mid-flight is safe.
+        var clientAborted = HttpMethods.IsGet(httpContext.Request.Method)
+            ? httpContext.RequestAborted
+            : CancellationToken.None;
+
         if (!DispatchProfiler.Enabled)
         {
             var req = await BuildRequestObject(httpContext);
-            return await ExecuteHttpScriptInternal(route, req, isHttp: true, clientAborted: httpContext.RequestAborted);
+            return await ExecuteHttpScriptInternal(route, req, isHttp: true, clientAborted: clientAborted);
         }
 
         // Profiling path: time request marshaling + the runner-side segments (checkout/invoke/extract).
@@ -242,7 +249,7 @@ public class PowerShellRunnerService : IDisposable
         var marshalTicks = Stopwatch.GetTimestamp() - mStart;
         var timing = new DispatchTiming();
         var result = await ExecuteHttpScriptInternal(route, request, isHttp: true, timing,
-            clientAborted: httpContext.RequestAborted);
+            clientAborted: clientAborted);
         DispatchProfiler.Record(marshalTicks, timing.CheckoutTicks, timing.InvokeTicks, timing.ExtractTicks,
             Stopwatch.GetTimestamp() - totalStart);
         return result;
