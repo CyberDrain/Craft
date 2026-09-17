@@ -231,7 +231,7 @@ public class PowerShellRunnerService : IDisposable
         if (!DispatchProfiler.Enabled)
         {
             var req = await BuildRequestObject(httpContext);
-            return await ExecuteHttpScriptInternal(route, req, isHttp: true);
+            return await ExecuteHttpScriptInternal(route, req, isHttp: true, clientAborted: httpContext.RequestAborted);
         }
 
         // Profiling path: time request marshaling + the runner-side segments (checkout/invoke/extract).
@@ -241,7 +241,8 @@ public class PowerShellRunnerService : IDisposable
         var request = await BuildRequestObject(httpContext);
         var marshalTicks = Stopwatch.GetTimestamp() - mStart;
         var timing = new DispatchTiming();
-        var result = await ExecuteHttpScriptInternal(route, request, isHttp: true, timing);
+        var result = await ExecuteHttpScriptInternal(route, request, isHttp: true, timing,
+            clientAborted: httpContext.RequestAborted);
         DispatchProfiler.Record(marshalTicks, timing.CheckoutTicks, timing.InvokeTicks, timing.ExtractTicks,
             Stopwatch.GetTimestamp() - totalStart);
         return result;
@@ -258,7 +259,7 @@ public class PowerShellRunnerService : IDisposable
     }
 
     private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp,
-        DispatchTiming? timing = null)
+        DispatchTiming? timing = null, CancellationToken clientAborted = default)
     {
         var sw = Stopwatch.StartNew();
         var entry = _repo.GetByRoute(route);
@@ -365,9 +366,16 @@ public class PowerShellRunnerService : IDisposable
             worker.Streams.Verbose.DataAdded += onVerbose;
 
             var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
-            using var cts = timeoutSeconds > 0
+            using var timeoutCts = timeoutSeconds > 0
                 ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds))
                 : null;
+            // Link the client-disconnect token (present on live HTTP requests) with the timeout so
+            // either one stops the pipeline. When the client hangs up — navigated away or hit Cancel —
+            // RequestAborted fires, InvokeAsync calls PowerShell.Stop(), and the worker is freed instead
+            // of paging on for a response nobody is waiting for. Background cache refresh passes default
+            // (no live client), so only the timeout applies there.
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                timeoutCts?.Token ?? CancellationToken.None, clientAborted);
 
             // When Scripts.HttpHandler is set, ALL HTTP routes dispatch through that single
             // function instead of invoking the route's function directly. The endpoint name
@@ -378,7 +386,7 @@ public class PowerShellRunnerService : IDisposable
                 ? _scriptsSettings.HttpHandler
                 : entry.FunctionName;
             var invokeStart = timing != null ? Stopwatch.GetTimestamp() : 0;
-            var results = await worker.InvokeAsync(targetFunction, parameters, cts?.Token ?? default);
+            var results = await worker.InvokeAsync(targetFunction, parameters, linkedCts.Token);
             if (timing != null) timing.InvokeTicks = Stopwatch.GetTimestamp() - invokeStart;
 
             var extractStart = timing != null ? Stopwatch.GetTimestamp() : 0;
@@ -397,6 +405,17 @@ public class PowerShellRunnerService : IDisposable
         catch (OperationCanceledException) when (sw.ElapsedMilliseconds > 0)
         {
             sw.Stop();
+
+            // Client hung up (navigated away / hit Cancel) vs the request exceeding its time budget.
+            // A cancel is normal and expected — log it quietly and return 499 (never actually written;
+            // the connection is gone) so the dispatcher skips caching this partial result.
+            if (clientAborted.IsCancellationRequested)
+            {
+                _logger.LogInformation("[{Pool}] {Function} cancelled by client after {Ms}ms",
+                    poolLabel, entry?.FunctionName ?? route, sw.ElapsedMilliseconds);
+                return new ScriptResult { StatusCode = 499, Body = string.Empty };
+            }
+
             var timeoutSeconds = isHttp ? _workerSettings.HttpTimeoutSeconds : _workerSettings.BgTimeoutSeconds;
             _logger.LogWarning("[{Pool}] {Function} timed out after {Ms}ms (limit: {Limit}s)",
                 poolLabel, entry?.FunctionName ?? route, sw.ElapsedMilliseconds, timeoutSeconds);

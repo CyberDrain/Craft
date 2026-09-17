@@ -100,7 +100,18 @@ public static class PowerShellDispatchEndpoint
                 var result = await psRunner.ExecuteHttpScript(endpoint, context);
 
                 // Writes can invalidate anything, so they clear the cache regardless of endpoint name.
+                // Do this even on a client abort: a write may have partially applied before the
+                // connection dropped, so dropping the possibly-stale cache is the safe choice.
                 if (context.Request.Method != "GET") InvalidateForWrite(context, cache);
+
+                // Client hung up mid-request (navigated away / hit Cancel). The pipeline was already
+                // stopped and the worker reclaimed; there is no live connection to write to, and a
+                // partial result must not be cached. Bail before the cache write and response write.
+                if (context.RequestAborted.IsCancellationRequested)
+                {
+                    logger.LogInformation("[HTTP] /API/{Endpoint} cancelled by client", endpoint);
+                    return;
+                }
 
                 if (useCache && cacheKey is not null && result.StatusCode is >= 200 and < 400)
                     await cache.Set(cacheKey, result);
