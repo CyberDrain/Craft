@@ -1,6 +1,6 @@
-using Azure.Data.Tables;
 using System.Text;
 using System.Text.Json;
+using Azure.Data.Tables;
 
 namespace Craft.Storage;
 
