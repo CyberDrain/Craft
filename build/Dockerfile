@@ -102,6 +102,26 @@ RUN set -eux; \
   esac; \
   install -D /usr/lib/${TRIPLET}/libmimalloc.so.2 /mimalloc/libmimalloc.so.2
 
+# zlib-ng built in zlib-compat mode, dropped in over the runtime's libz.so.1. .NET 8 on Linux does gzip
+# through the system zlib (libSystem.IO.Compression.Native links libz.so.1), so this is what /api gzip
+# runs on. Measured on this runtime, 2 vCPU, at the default level (Optimal = zlib 6): a 10 MB ListLogs
+# body 165 -> 84 ms and 4% smaller; 32 KB 296 -> 187 us; <=2 KB unchanged. Fastest (level 1) gets ~3x
+# faster but ~24% bigger (zlib-ng's quick strategy). Same drop-in Fedora ships as its system zlib.
+# Built from a pinned, checksummed release (not packaged for Azure Linux or bookworm); runtime CPU
+# dispatch picks SIMD paths per host. Bump ZLIBNG_VERSION + ZLIBNG_SHA256 together.
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-bookworm-slim AS zlibng-src
+ARG ZLIBNG_VERSION=2.3.3
+ARG ZLIBNG_SHA256=f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
+RUN set -eux; \
+  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl cmake gcc make libc6-dev; \
+  curl -fsSL -o /tmp/zlib-ng.tar.gz "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/${ZLIBNG_VERSION}.tar.gz"; \
+  echo "${ZLIBNG_SHA256}  /tmp/zlib-ng.tar.gz" | sha256sum -c -; \
+  tar -xzf /tmp/zlib-ng.tar.gz -C /tmp; \
+  cmake -S /tmp/zlib-ng-${ZLIBNG_VERSION} -B /tmp/zlib-ng-build \
+    -DZLIB_COMPAT=ON -DBUILD_TESTING=OFF -DZLIB_ENABLE_TESTS=OFF -DCMAKE_BUILD_TYPE=Release; \
+  cmake --build /tmp/zlib-ng-build -j"$(nproc)"; \
+  install -D "$(readlink -f /tmp/zlib-ng-build/libz.so.1)" /zlibng/libz.so.1
+
 # distroless-extra = distroless + icu/tzdata. PowerShell needs globalization, so
 # the plain -distroless tag (no ICU) would break it — the -extra tag is required.
 FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runtime
@@ -119,6 +139,9 @@ FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runt
 #   ENV PATH="/usr/share/powershell:${PATH}"
 
 COPY --from=mimalloc-src /mimalloc/libmimalloc.so.2 /usr/lib/libmimalloc.so.2
+# Onto the soname path the loader resolves, not the versioned file behind it: the base tag floats, so a
+# zlib bump renaming libz.so.1.3.x must not silently strand this copy.
+COPY --from=zlibng-src /zlibng/libz.so.1 /usr/lib/libz.so.1
 
 # Create /app owned by the non-root user. COPYing with NO preceding WORKDIR makes Docker CREATE the
 # destination /app with this ownership; a `WORKDIR /app` first would pre-create it root-owned, leaving
