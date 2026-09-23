@@ -223,14 +223,18 @@ public static class CraftHostBuilderExtensions
         services.AddResponseCompression(options =>
         {
             options.EnableForHttps = true;
-            options.Providers.Add<BrotliCompressionProvider>();
-            options.Providers.Add<GzipCompressionProvider>();
+            // Order is preference: equal-q ties go to the earliest provider, so br wins over gzip.
+            // Every provider is coalesced — see CoalescingCompressionProvider.
+            ICompressionProvider[] providers =
+            [
+                new BrotliCompressionProvider(Options.Create(new BrotliCompressionProviderOptions { Level = level })),
+                new GzipCompressionProvider(Options.Create(new GzipCompressionProviderOptions { Level = level })),
+            ];
+            foreach (var provider in providers)
+                options.Providers.Add(new CoalescingCompressionProvider(provider));
             options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
                 second);
         });
-
-        services.Configure<BrotliCompressionProviderOptions>(o => o.Level = level);
-        services.Configure<GzipCompressionProviderOptions>(o => o.Level = level);
 
         return services;
     }

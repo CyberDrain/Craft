@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using Craft.Hosting;
@@ -55,6 +56,15 @@ public class ApiCompressionPipelineTests : IDisposable
     private async Task<(string encoding, long bytes)> Request(
         Action<WebApplication> configure, string contentType = "application/json", bool routed = false)
     {
+        var (enc, body) = await RequestBody(configure, contentType, routed);
+        return (enc, body.LongLength);
+    }
+
+    private async Task<(string encoding, byte[] body)> RequestBody(
+        Action<WebApplication> configure, string contentType = "application/json", bool routed = false,
+        string acceptEncoding = "gzip", string? payload = null)
+    {
+        payload ??= Payload;
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, 0)); // dynamic port
         builder.Logging.ClearProviders();
@@ -70,7 +80,7 @@ public class ApiCompressionPipelineTests : IDisposable
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = contentType;
             ctx.Response.Headers["X-Cache"] = "MISS";
-            await ctx.Response.WriteAsync(Payload);
+            await ctx.Response.WriteAsync(payload);
         }
 
         // routed = the real shape: a mapped endpoint (MapMethods) executed by the endpoint middleware,
@@ -87,14 +97,62 @@ public class ApiCompressionPipelineTests : IDisposable
             using var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.None };
             using var client = new HttpClient(handler);
             var req = new HttpRequestMessage(HttpMethod.Get, $"{addr}/API/thing");
-            req.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip");
+            req.Headers.TryAddWithoutValidation("Accept-Encoding", acceptEncoding);
 
             var resp = await client.SendAsync(req);
             var enc = resp.Content.Headers.ContentEncoding.FirstOrDefault() ?? "";
-            var bytes = (await resp.Content.ReadAsByteArrayAsync()).LongLength;
-            return (enc, bytes);
+            return (enc, await resp.Content.ReadAsByteArrayAsync());
         }
         finally { await app.StopAsync(); }
+    }
+
+    [Theory]
+    [InlineData("br")]
+    [InlineData("gzip")]
+    public async Task EachEncoding_NegotiatesAlone_AndRoundTrips(string encoding)
+    {
+        var (enc, body) = await RequestBody(app => app.UseResponseCompression(), acceptEncoding: encoding);
+        Assert.Equal(encoding, enc);
+        Assert.True(body.LongLength < RawLength, $"expected compressed < {RawLength}, got {body.LongLength}");
+
+        using var input = new MemoryStream(body);
+        using Stream decoder = encoding switch
+        {
+            "br" => new BrotliStream(input, CompressionMode.Decompress),
+            _ => new GZipStream(input, CompressionMode.Decompress),
+        };
+        using var reader = new StreamReader(decoder, Encoding.UTF8);
+        Assert.Equal(Payload, await reader.ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task StringBody_ReachesEncoderCoalesced_NotAsPipeFragments()
+    {
+        // Response.WriteAsync(string) arrives at the encoder as ~4 KiB pipe segments. Brotli Fastest
+        // compresses each write as an isolated fragment, which made a real 300 KB body ~2.9x the size of
+        // compressing it in one go. Coalescing keeps it close to one-shot. Varied JSON, not a repeated
+        // string, so the fragment penalty would actually show.
+        var varied = "[" + string.Join(",", Enumerable.Range(0, 6000).Select(i =>
+            $"{{\"id\":{i},\"tenant\":\"t{i % 97}.onmicrosoft.com\",\"msg\":\"event {i * 7919 % 10007} on {i % 13}\"}}")) + "]";
+        var raw = Encoding.UTF8.GetBytes(varied);
+        var oneShot = new byte[BrotliEncoder.GetMaxCompressedLength(raw.Length)];
+        Assert.True(BrotliEncoder.TryCompress(raw, oneShot, out var oneShotLength, quality: 1, window: 22));
+
+        var (enc, body) = await RequestBody(app => app.UseResponseCompression(), acceptEncoding: "br", payload: varied);
+
+        Assert.Equal("br", enc);
+        Assert.True(body.Length < oneShotLength * 1.35,
+            $"br Fastest wire {body.Length} B vs one-shot {oneShotLength} B — encoder is being fed fragments");
+        using var decoded = new StreamReader(new BrotliStream(new MemoryStream(body), CompressionMode.Decompress));
+        Assert.Equal(varied, await decoded.ReadToEndAsync());
+    }
+
+    [Fact]
+    public async Task BrowserAcceptEncoding_StillPrefersBrotli()
+    {
+        // Chrome/Firefox send all four at equal q; br must win the tie.
+        var (enc, _) = await RequestBody(app => app.UseResponseCompression(), acceptEncoding: "gzip, deflate, br, zstd");
+        Assert.Equal("br", enc);
     }
 
     // ── pipeline shapes, outer→inner, that isolate where compression is lost ──────────────────────────

@@ -10,7 +10,8 @@
 //   CPU_MS    ?ms for PerfCpu   (default 20)
 //   SLEEP_MS  ?ms for PerfSleep (default 100)
 //   JSON_N    ?n  for PerfJson  (default 1000)
-//   ENC       Accept-Encoding to negotiate: 'gzip' | 'br' | '' (default '' = identity, no header).
+//   URL       drive this one path instead of the catalogue (e.g. /API/PerfFile?name=listlogs.json)
+//   ENC       Accept-Encoding to negotiate: 'gzip' | 'br' | '' (default '' = identity).
 //             Sent as the Accept-Encoding request HEADER (NOT k6's `compression` param, which compresses
 //             the request BODY and does nothing for a GET). k6 counts data_received as the on-the-wire
 //             (compressed) size and still decompresses the body for the checks. Used by
@@ -41,13 +42,15 @@ const endpoints = [
   { name: 'PerfJson', url: `/API/PerfJson?n=${JSON_N}`, weight: 2 },
 ];
 
-const active = ONLY ? endpoints.filter((e) => e.name === ONLY) : endpoints;
+if (__ENV.URL) endpoints.push({ name: 'Custom', url: __ENV.URL, weight: 1 });
+const ONLY_EFF = __ENV.URL ? 'Custom' : ONLY;
+const active = ONLY_EFF ? endpoints.filter((e) => e.name === ONLY_EFF) : endpoints;
 if (active.length === 0) throw new Error(`ONLY=${ONLY} matched no endpoint`);
 
 // Weighted pick list (each endpoint repeated `weight` times); single-endpoint mode picks it every time.
 const pick = [];
 for (const e of active) {
-  const n = ONLY ? 1 : e.weight;
+  const n = ONLY_EFF ? 1 : e.weight;
   for (let i = 0; i < n; i++) pick.push(e);
 }
 

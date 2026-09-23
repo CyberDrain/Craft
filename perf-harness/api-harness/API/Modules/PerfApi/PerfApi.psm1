@@ -539,6 +539,15 @@ function Invoke-PerfJson {
     return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfJson'; count = $n; items = @($items) } }
 }
 
+# Serves a captured real API response verbatim (?name=<file> under /payloads, mounted by the compose file
+# from PAYLOAD_DIR). A string body that parses as JSON goes out byte-for-byte, so compression sweeps run
+# against real production-shaped JSON rather than the synthetic PerfJson rows.
+function Invoke-PerfFile {
+    param($Request, $TriggerMetadata)
+    $name = [IO.Path]::GetFileName([string]$Request.Query.name)
+    return @{ StatusCode = 200; Body = [IO.File]::ReadAllText("/payloads/$name") }
+}
+
 # Realtime bridge driver: publishes a job event via the C# RealtimeBridge so an SSE consumer of
 # /.craft/events can observe it. userId is taken from the caller's identity so it is delivered back to
 # the same principal. Query: ?jobId=<guid>&mode=start|update|end&size=<bytes of filler data>.
