@@ -21,6 +21,9 @@
   pwsh scripts\run-compression-levels.ps1 -Build
   pwsh scripts\run-compression-levels.ps1 -Levels Fastest,Optimal,SmallestSize -Encodings gzip,br
   pwsh scripts\run-compression-levels.ps1 -JsonN 8000 -Rate 20 -Pool 4
+  # A captured real response (served verbatim by PerfFile from -PayloadDir), all four encodings:
+  pwsh scripts\run-compression-levels.ps1 -PayloadDir C:\captures -Url '/API/PerfFile?name=listlogs.json' `
+    -Encodings br,gzip,identity
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +36,8 @@ param(
   [int]$Rate          = 10,
   [string]$Duration   = '20s',
   [int]$JsonN         = 2000,
+  [string]$Url        = '',      # path to drive instead of PerfJson, e.g. /API/PerfFile?name=listlogs.json
+  [string]$PayloadDir = '',      # host folder mounted at /payloads for PerfFile
   [int]$ReadyTimeoutSec = 120,
   [switch]$Build,
   [switch]$KeepUp
@@ -60,6 +65,8 @@ if($Build){
   if($LASTEXITCODE -ne 0){ throw "docker build failed" }
 }
 
+if(-not $Url){ $Url = "/API/PerfJson?n=$JsonN" }
+if($PayloadDir){ $env:PAYLOAD_DIR = (Resolve-Path $PayloadDir).Path }
 $env:SUT_IMAGE = $SutImage; $env:SUT_PORT = "$Port"; $env:SUT_CPUS = "$Cpus"; $env:POOL = "$Pool"
 
 # One curl to /API/PerfJson at the given encoding ('' = identity). Returns the on-the-wire body size
@@ -67,7 +74,7 @@ $env:SUT_IMAGE = $SutImage; $env:SUT_PORT = "$Port"; $env:SUT_CPUS = "$Cpus"; $e
 function WireBytes([string]$Enc){
   $a = @('-s','-o','NUL','--max-time','30','-w','%{size_download}')
   if($Enc){ $a += @('-H', "Accept-Encoding: $Enc") }
-  $a += "$base/API/PerfJson?n=$JsonN"
+  $a += "$base$Url"
   [long](& curl.exe @a 2>$null)
 }
 
@@ -96,7 +103,7 @@ function LoadOne([string]$Enc, [string]$tag){
   $summary = Join-Path $resultsDir "levels-$tag-$stamp.k6.json"
   & docker run --rm --network $network `
       -e BASE="http://sut:8080" -e RATE="$Rate" -e DURATION="$Duration" `
-      -e ONLY='PerfJson' -e JSON_N="$JsonN" -e ENC="$Enc" `
+      -e URL="$Url" -e ENC="$Enc" `
       -v "${k6DirD}:/scripts:ro" -v "${resultsDirD}:/out" `
       grafana/k6 run /scripts/api_load.js --summary-export "/out/$(Split-Path $summary -Leaf)" 2>&1 | Out-Null
 
@@ -112,6 +119,7 @@ function LoadOne([string]$Enc, [string]$tag){
     cpuAvgPct = if($cpu){ [math]::Round(($cpu|Measure-Object -Average).Average,1) } else { $null }
     cpuMaxPct = if($cpu){ [math]::Round(($cpu|Measure-Object -Maximum).Maximum,1) } else { $null }
     reqPerSec = [math]::Round(([double](MetricVal $k6 'http_reqs' 'rate')),1)
+    p50Ms     = [math]::Round(([double](MetricVal $k6 'http_req_duration' 'med')),2)
     p95Ms     = [math]::Round(([double](MetricVal $k6 'http_req_duration' 'p(95)')),2)
     wirePerResp = if($reqs -gt 0){ [long]($recv/$reqs) } else { 0 }
   }
@@ -133,6 +141,10 @@ try {
 
     # Warm once, capture the identity baseline once (level-independent).
     [void](WireBytes '')
+    # Discarded load pass over every encoding: a fresh container JITs its compressors and grows its
+    # runspace pool under the first load, which otherwise lands on whichever encoding is measured first.
+    Info "  warm-up pass (discarded) ..."
+    foreach($enc in $Encodings){ [void](LoadOne $enc "$level-warm-$enc") }
     if($rawBytes -eq 0){ $rawBytes = WireBytes '' }
 
     foreach($enc in $Encodings){
@@ -142,7 +154,7 @@ try {
       $load = LoadOne $enc "$level-$enc"
       $rows.Add([ordered]@{
         level=$level; encoding=$enc; wireBytes=$wire; ratio=$ratio
-        cpuAvgPct=$load.cpuAvgPct; cpuMaxPct=$load.cpuMaxPct; p95Ms=$load.p95Ms; reqPerSec=$load.reqPerSec
+        cpuAvgPct=$load.cpuAvgPct; cpuMaxPct=$load.cpuMaxPct; p50Ms=$load.p50Ms; p95Ms=$load.p95Ms; reqPerSec=$load.reqPerSec
       })
     }
   }
@@ -150,7 +162,7 @@ try {
   # ── report ────────────────────────────────────────────────────────────────────
   $result = [ordered]@{
     label='compression-levels'; timestamp=$stamp; sutImage=$SutImage
-    config=@{ pool=$Pool; cpus=$Cpus; jsonN=$JsonN; rate=$Rate; duration=$Duration; levels=$Levels; encodings=$Encodings }
+    config=@{ pool=$Pool; cpus=$Cpus; url=$Url; rate=$Rate; duration=$Duration; levels=$Levels; encodings=$Encodings }
     identityBytes=$rawBytes
     rows=$rows
   }
@@ -161,13 +173,13 @@ try {
   $sb = [System.Text.StringBuilder]::new()
   [void]$sb.AppendLine("# /api compression level sweep ($stamp)")
   [void]$sb.AppendLine("")
-  [void]$sb.AppendLine("- **SUT:** ``$SutImage``   **CPUs:** $Cpus   **Pool:** $Pool   **Payload:** PerfJson n=$JsonN ($rawBytes B raw)")
+  [void]$sb.AppendLine("- **SUT:** ``$SutImage``   **CPUs:** $Cpus   **Pool:** $Pool   **Payload:** ``$Url`` ($rawBytes B raw)")
   [void]$sb.AppendLine("- **Load:** rate=$Rate for $Duration per (level x encoding)")
   [void]$sb.AppendLine("")
-  [void]$sb.AppendLine("| level | encoding | wire B/resp | ratio | CPU% avg | CPU% max | p95 ms | req/s |")
-  [void]$sb.AppendLine("|---|---|---:|---:|---:|---:|---:|---:|")
+  [void]$sb.AppendLine("| level | encoding | wire B/resp | ratio | CPU% avg | CPU% max | p50 ms | p95 ms | req/s |")
+  [void]$sb.AppendLine("|---|---|---:|---:|---:|---:|---:|---:|---:|")
   foreach($r in $rows){
-    [void]$sb.AppendLine("| $($r.level) | $($r.encoding) | $($r.wireBytes) | $($r.ratio)x | $($r.cpuAvgPct) | $($r.cpuMaxPct) | $($r.p95Ms) | $($r.reqPerSec) |")
+    [void]$sb.AppendLine("| $($r.level) | $($r.encoding) | $($r.wireBytes) | $($r.ratio)x | $($r.cpuAvgPct) | $($r.cpuMaxPct) | $($r.p50Ms) | $($r.p95Ms) | $($r.reqPerSec) |")
   }
   $sb.ToString() | Set-Content $mdOut -Encoding utf8
 
@@ -177,7 +189,7 @@ try {
   Get-Content $mdOut | Write-Host
 }
 finally {
-  Remove-Item Env:\API_COMPRESSION_LEVEL -ErrorAction SilentlyContinue
+  Remove-Item Env:\API_COMPRESSION_LEVEL, Env:\PAYLOAD_DIR -ErrorAction SilentlyContinue
   if($KeepUp){ Warn "leaving containers up (-KeepUp). Tear down: docker compose -f `"$composeApi`" down -v" }
   else { Info "tearing down ..."; docker compose -f $composeApi down -v 2>&1 | Out-Null }
 }

@@ -19,6 +19,9 @@ services:
     volumes:
       # Overlay the synthetic API module onto the base image's empty /app/API. Read-only; live-editable.
       - ./api-harness/API:/app/API:ro
+      # Captured real API responses for PerfFile (?name=<file>). Default is an empty in-repo dir; point
+      # PAYLOAD_DIR at a folder of captured JSON (kept out of git - it is real tenant data).
+      - ${PAYLOAD_DIR:-./api-harness/payloads}:/payloads:ro
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - ASPNETCORE_URLS=http://+:8080
