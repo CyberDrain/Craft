@@ -16,8 +16,8 @@ namespace Craft.Orchestration;
 ///   BG scale-down: when queue drains to 0 active + 0 waiting, scales back to baseline.
 ///
 ///   HTTP pressure throttle: if the number of busy HTTP workers meets or exceeds
-///     HttpPressureThreshold for a sustained period, BG concurrency is reduced to 2
-///     to give HTTP maximum CPU headroom. When HTTP pressure drops, BG concurrency
+///     HttpPressureThreshold for a sustained period, BG concurrency is reduced to
+///     HttpPressureConcurrency (default half the ceiling) to give HTTP CPU headroom. When HTTP pressure drops, BG concurrency
 ///     restores to baseline.
 ///
 ///   - Ceiling is capped to BgPoolSize (the real bottleneck).
@@ -97,11 +97,17 @@ public class BackgroundTaskLimiter : IDisposable
     /// <summary>
     /// Number of busy HTTP workers that triggers BG throttling.
     /// When HttpPoolSize - HttpAvailable >= this value for HttpPressureSeconds,
-    /// BG concurrency drops to 2.
-    /// Default: half of HttpPoolSize (e.g. 2 on a 4-worker pool).
+    /// BG concurrency drops to <see cref="HttpPressureConcurrency"/>.
+    /// Default: two thirds of HttpPoolSize (e.g. 4 on a 6-worker pool). Half the pool tripped on routine
+    /// API-client traffic and held BG at 2 for hours, starving the scheduled cache runs.
     /// Set to 0 to disable HTTP pressure throttling.
     /// </summary>
     public int HttpPressureThreshold { get; }
+
+    /// <summary>
+    /// BG concurrency while HTTP-throttled. Default: half the ceiling, minimum 2.
+    /// </summary>
+    public int HttpPressureConcurrency { get; }
 
     /// <summary>
     /// How long HTTP pressure must be sustained before throttling BG tasks.
@@ -132,10 +138,13 @@ public class BackgroundTaskLimiter : IDisposable
         ScaleUpAfter = TimeSpan.FromSeconds(
             configuration.GetValue("BackgroundScaleUpAfterSeconds", 15));
 
-        // HTTP pressure: when this many HTTP workers are busy, throttle BG to 1
+        // HTTP pressure: when this many HTTP workers are busy, throttle BG to HttpPressureConcurrency
         var httpPoolSize = Math.Max(1, settings.Worker.HttpPoolSize);
         HttpPressureThreshold = configuration.GetValue("BackgroundHttpPressureThreshold",
-            Math.Max(1, httpPoolSize / 2));
+            Math.Max(1, httpPoolSize * 2 / 3));
+        HttpPressureConcurrency = Math.Clamp(
+            configuration.GetValue("BackgroundHttpPressureConcurrency", CeilingConcurrency / 2),
+            Math.Min(2, CeilingConcurrency), CeilingConcurrency);
 
         // How long HTTP pressure must persist before throttling
         HttpPressureAfter = TimeSpan.FromSeconds(
@@ -164,9 +173,9 @@ public class BackgroundTaskLimiter : IDisposable
         _monitorTimer = new Timer(MonitorCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
 
         _logger.LogInformation("[System] Limiter init: baseline={Base} ceiling={Ceiling} scaleAfter={ScaleAfter}s " +
-            "burstToCeiling={Burst} overSubscribe={Over} httpPressureThreshold={HttpThreshold} httpPressureAfter={HttpAfter}s cpus={Cpus}",
+            "burstToCeiling={Burst} overSubscribe={Over} httpPressureThreshold={HttpThreshold} httpPressureConcurrency={HttpConc} httpPressureAfter={HttpAfter}s cpus={Cpus}",
             BaseConcurrency, CeilingConcurrency, ScaleUpAfter.TotalSeconds, _burstToCeiling, _overSubscribe,
-            HttpPressureThreshold, HttpPressureAfter.TotalSeconds, Environment.ProcessorCount);
+            HttpPressureThreshold, HttpPressureConcurrency, HttpPressureAfter.TotalSeconds, Environment.ProcessorCount);
     }
 
     /// <summary>
@@ -459,12 +468,12 @@ public class BackgroundTaskLimiter : IDisposable
             var duration = DateTime.UtcNow - _httpPressureSince.Value;
             if (duration >= HttpPressureAfter)
             {
-                // Sustained HTTP pressure — throttle BG to minimum (2)
+                // Sustained HTTP pressure — throttle BG to HttpPressureConcurrency
                 _logger.LogInformation("[System] Limiter: HTTP pressure detected ({Busy}/{Total} workers busy for {Sec}s), " +
-                    "throttling BG to 2", httpBusy, _pool.HttpPoolSize, duration.TotalSeconds);
+                    "throttling BG to {Target}", httpBusy, _pool.HttpPoolSize, duration.TotalSeconds, HttpPressureConcurrency);
                 _httpThrottled = true;
                 _queuePressureSince = null; // reset BG scale-up tracking
-                ScaleDown(2, "HTTP pressure");
+                ScaleDown(HttpPressureConcurrency, "HTTP pressure");
             }
         }
         else if (!underPressure && _httpThrottled)
