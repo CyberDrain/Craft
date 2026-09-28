@@ -1094,7 +1094,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         lock (_lock) { task.Parameters ??= rehydrated; }
                     }
 
-                    lock (_lock) { task.Status = "Running"; }
+                    lock (_lock) { task.Status = "Running"; task.OwnedHere = true; }
                     // Durable "Running" marker — awaited before the invoke, same as the parallel path.
                     try
                     {
@@ -1402,11 +1402,32 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // Intune collection that was re-claimed four minutes in and ran twice. This does not block crash
         // recovery: ResumeInterruptedRunsAsync flips interrupted tasks from Running back to Pending
         // before re-dispatching them, so a task that genuinely needs re-running never reaches here as
-        // Running. Within a live process, Running means a worker has it.
+        // Running.
+        //
+        // Running only means "a worker HERE has it" when this process wrote it (OwnedHere). A Running read
+        // from storage is another process's pre-invoke marker, and it reaches the live graph whenever a run
+        // is rehydrated — by this resolver, or by the pump winning the _activeRuns race with recovery at
+        // startup, or from a container that outlived this one's recovery. Dropping those left the task
+        // Running forever: nothing re-drives Running, so the run never finalized. Reaching here means this
+        // process holds the task's queue claim (only the pump enqueues descriptors, only for rows it
+        // claimed), so the previous owner is gone: count the interrupted attempt exactly as recovery does,
+        // and run it.
+        var poisoned = false;
         lock (_lock)
         {
-            if (task.Status is "Completed" or "Failed" or "Cancelled" or "Running")
+            if (task.Status is "Completed" or "Failed" or "Cancelled")
                 return null;
+            if (task.Status == "Running")
+            {
+                if (task.OwnedHere) return null;
+                poisoned = ++task.AttemptCount >= 3;
+                if (!poisoned) task.Status = "Pending";
+            }
+        }
+        if (poisoned)
+        {
+            FailTaskTerminally(run, task, $"Cancelled {task.AttemptCount} times by host interruption");
+            return null;
         }
 
         // Sequential runs are dispatched as a single entry row; that one claim drives the WHOLE run on one
@@ -1471,6 +1492,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 lock (_lock)
                 {
                     task.Status = "Running";
+                    task.OwnedHere = true;
                 }
                 // Pre-script "Running" write is awaited — the durability marker for crash recovery. Batched
                 // across concurrently-starting tasks by the status writer, but still durable before the invoke.

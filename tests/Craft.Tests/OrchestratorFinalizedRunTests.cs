@@ -290,7 +290,8 @@ public class OrchestratorFinalizedRunTests
             Status = "Running",
             Priority = 4,
             StartedUtc = DateTime.UtcNow,
-            Tasks = [new OrchestratorTaskItem { Id = "task-0", Status = "Running" }]
+            // OwnedHere: a worker in THIS process is executing it — the state dispatch leaves behind.
+            Tasks = [new OrchestratorTaskItem { Id = "task-0", Status = "Running", OwnedHere = true }]
         };
         await store.UpsertRunAsync(run);
         await store.UpsertTaskAsync("live-run", run.Tasks[0]);

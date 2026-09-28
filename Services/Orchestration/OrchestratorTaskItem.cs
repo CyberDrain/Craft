@@ -26,4 +26,11 @@ public class OrchestratorTaskItem
     /// Sequence order. Non-sequential runs leave it 0 and ignore it.
     /// </summary>
     public int Sequence { get; set; }
+
+    /// <summary>
+    /// Set when a worker in THIS process marks the task Running. Never persisted, so a Running status
+    /// rehydrated from storage (another process's pre-invoke marker) reads false: it is not proof that
+    /// anything here is executing the task. See <c>OrchestratorService.ResolveTaskWorkAsync</c>.
+    /// </summary>
+    internal bool OwnedHere;
 }
