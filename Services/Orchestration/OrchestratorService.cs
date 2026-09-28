@@ -155,6 +155,19 @@ public class OrchestratorService : IJobDescriptorStateWriter
             ?.Name;
     }
 
+    /// <summary>
+    /// Completes once startup recovery has finished — or been abandoned, see <see cref="MarkRecoveryDone"/>.
+    /// <see cref="JobQueuePump"/> claims nothing before it. A claim taken earlier rehydrates the run into
+    /// <c>_activeRuns</c> ahead of recovery, recovery's own copy then loses the TryAdd, and the live graph
+    /// keeps the dead process's stale Running markers instead of recovery's reset.
+    /// </summary>
+    public Task RecoveryDone => _recoveryDone.Task;
+    private readonly TaskCompletionSource _recoveryDone = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Open the claim gate. Called from a finally, so a recovery that throws or never runs
+    /// (shutdown mid-startup, storage down) still releases the pump rather than wedging it.</summary>
+    public void MarkRecoveryDone() => _recoveryDone.TrySetResult();
+
     private static readonly JsonSerializerOptions s_jsonOptions = new()
     {
         WriteIndented = true,

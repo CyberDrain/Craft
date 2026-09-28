@@ -58,40 +58,49 @@ public class SchedulerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[Scheduler] Waiting for worker pool to be ready");
+        // Every exit from startup — recovery done, recovery threw, storage never came up, shutdown mid-way —
+        // opens the claim gate, so the pump can never be left waiting on a recovery that is not coming.
         try
         {
-            await Task.Run(() => _pool.WaitForBgReady(Timeout.InfiniteTimeSpan), stoppingToken);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            return;
-        }
-        _logger.LogInformation("[Scheduler] Worker pool ready — service starting");
+            _logger.LogInformation("[Scheduler] Waiting for worker pool to be ready");
+            try
+            {
+                await Task.Run(() => _pool.WaitForBgReady(Timeout.InfiniteTimeSpan), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            _logger.LogInformation("[Scheduler] Worker pool ready — service starting");
 
-        LoadConfig();
-        ResolveTimezone();
+            LoadConfig();
+            ResolveTimezone();
 
-        // Seed all tasks with "now" so we never catch up on missed runs from before startup.
-        // Only cron ticks that occur AFTER this moment will fire.
-        var startup = DateTimeOffset.UtcNow;
-        foreach (var task in _tasks)
-        {
-            _lastRun[task.Id] = startup;
+            // Seed all tasks with "now" so we never catch up on missed runs from before startup.
+            // Only cron ticks that occur AFTER this moment will fire.
+            var startup = DateTimeOffset.UtcNow;
+            foreach (var task in _tasks)
+            {
+                _lastRun[task.Id] = startup;
+            }
+
+            // Wait for the storage backend to accept connections before the first orchestrator store access.
+            // Avoids a startup error when storage becomes reachable a moment after the app.
+            await _storageHealth.WaitUntilReadyAsync(TimeSpan.FromSeconds(60), stoppingToken);
+
+            // Resume any orchestrator runs that were interrupted by a previous crash
+            try
+            {
+                await _orchestrator.ResumeInterruptedRunsAsync(stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Scheduler] Failed to resume interrupted orchestrator runs");
+            }
         }
-
-        // Wait for the storage backend to accept connections before the first orchestrator store access.
-        // Avoids a startup error when storage becomes reachable a moment after the app.
-        await _storageHealth.WaitUntilReadyAsync(TimeSpan.FromSeconds(60), stoppingToken);
-
-        // Resume any orchestrator runs that were interrupted by a previous crash
-        try
+        finally
         {
-            await _orchestrator.ResumeInterruptedRunsAsync(stoppingToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[Scheduler] Failed to resume interrupted orchestrator runs");
+            _orchestrator.MarkRecoveryDone();
         }
 
         // Retention sweeps for the rest of the process lifetime; recovery ran the first one. Fire and
