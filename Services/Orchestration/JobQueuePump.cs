@@ -43,12 +43,17 @@ public class JobQueuePump : BackgroundService
     /// left instead of re-reading every row every tick.</summary>
     private readonly Dictionary<string, DateTime> _leaseExpiry = new(StringComparer.Ordinal);
 
+    /// <summary>Completes when startup recovery is done; nothing is claimed before it. Null (tests, a host
+    /// without an orchestrator) claims immediately.</summary>
+    private readonly Task? _claimGate;
+
     public JobQueuePump(ILogger<JobQueuePump> logger, JobQueueStore queue, JobManager jobs,
-        IConfiguration configuration, CraftSettings settings)
+        IConfiguration configuration, CraftSettings settings, OrchestratorService? orchestrator = null)
     {
         _logger = logger;
         _queue = queue;
         _jobs = jobs;
+        _claimGate = orchestrator?.RecoveryDone;
 
         // Identifies this instance's claims. The container id is stable for the life of the process and
         // distinct per instance, which is exactly the scope a lease needs.
@@ -85,6 +90,18 @@ public class JobQueuePump : BackgroundService
             "[JobQueuePump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s poll={Poll}ms idlePoll={IdlePoll}ms",
             _owner, _batchSize, _lowWater, _lease.TotalSeconds,
             _pollInterval.TotalMilliseconds, _idlePollInterval.TotalMilliseconds);
+
+        // No claim before startup recovery has run. A row claimed earlier rehydrates its run from storage —
+        // stale Running markers from the previous process included — into the live graph ahead of recovery,
+        // whose reset then lands on a copy that loses the _activeRuns race. Rows enqueued meanwhile (timer or
+        // HTTP-started runs) just wait in the table and are claimed on the first cycle after.
+        if (_claimGate is { IsCompleted: false })
+        {
+            _logger.LogInformation("[JobQueuePump] Waiting for startup recovery before claiming");
+            try { await _claimGate.WaitAsync(stoppingToken); }
+            catch (OperationCanceledException) { return; }
+            _logger.LogInformation("[JobQueuePump] Startup recovery done — claiming");
+        }
 
         var idleTicks = 0;
 
