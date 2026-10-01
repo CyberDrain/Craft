@@ -7,7 +7,7 @@ namespace Craft.PowerShellHost;
 
 public class PowerShellWorkerPool : IDisposable
 {
-    private readonly BlockingCollection<PowerShellWorker> _httpPool;
+    private readonly TieredHandoff<PowerShellWorker> _httpPool = new();
     private readonly BlockingCollection<PowerShellWorker> _bgPool;
     private readonly ILogger<PowerShellWorkerPool> _logger;
     private readonly ScriptRepository _repo;
@@ -49,9 +49,6 @@ public class PowerShellWorkerPool : IDisposable
         _httpPoolSize = Math.Max(0, settings.Worker.HttpPoolSize);
         _bgPoolSize = Math.Max(1, settings.Worker.BgPoolSize);
 
-        // BlockingCollection rejects a bounded capacity of 0. The pool is never populated in that case,
-        // so the capacity is arbitrary — it just has to be legal.
-        _httpPool = new BlockingCollection<PowerShellWorker>(Math.Max(1, _httpPoolSize));
         _bgPool = new BlockingCollection<PowerShellWorker>(_bgPoolSize);
     }
 
@@ -456,12 +453,16 @@ public class PowerShellWorkerPool : IDisposable
     /// </summary>
     public bool WaitForBgReady(TimeSpan timeout) => _bgReady.Wait(timeout);
 
-    public PowerShellWorker? CheckoutHttp(TimeSpan timeout)
+    /// <summary>
+    /// Check out an HTTP worker. <paramref name="lowPriority"/> callers (API clients, background cache
+    /// refreshes) only get a worker when no interactive request is waiting for one.
+    /// </summary>
+    public PowerShellWorker? CheckoutHttp(TimeSpan timeout, bool lowPriority = false)
     {
         // Wait for HTTP pool initialization before attempting checkout
         if (!_httpReady.IsSet)
             _httpReady.Wait(timeout);
-        if (_httpPool.TryTake(out var w, timeout))
+        if (_httpPool.TryTake(lowPriority, timeout) is { } w)
         {
             w.CheckoutTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
             WorkerMetricsBridge.RecordCheckout(w.Id, isHttp: true);
@@ -956,9 +957,8 @@ public class PowerShellWorkerPool : IDisposable
         // Nothing here owns unmanaged resources directly, but suppressing finalization keeps a
         // derived type that adds a finalizer from having to re-implement IDisposable to do it.
         GC.SuppressFinalize(this);
-        try { while (_httpPool.TryTake(out var w)) w.Dispose(); } catch (ObjectDisposedException) { }
+        while (_httpPool.TryTake(lowPriority: false, TimeSpan.Zero) is { } h) h.Dispose();
         try { while (_bgPool.TryTake(out var w)) w.Dispose(); } catch (ObjectDisposedException) { }
-        _httpPool.Dispose();
         _bgPool.Dispose();
     }
 }
