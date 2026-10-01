@@ -135,6 +135,8 @@ public sealed class FileLoggerProvider : ILoggerProvider
         try
         {
             if (_writer == null) return;
+            line = LogRedactor.Redact(line);
+            if (exceptionLine != null) exceptionLine = LogRedactor.Redact(exceptionLine);
             _writer.WriteLine(line);
             _currentFileSize += line.Length + Environment.NewLine.Length;
 

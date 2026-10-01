@@ -102,6 +102,15 @@ app.Lifetime.ApplicationStopping.Register(() => httpListener.Dispose());
 var repo = app.Services.GetRequiredService<ScriptRepository>();
 var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+try
+{
+    using var keyTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+    await LogRedactor.LoadKeyAsync(app.Services.GetRequiredService<ICraftTableStore>(), keyTimeout.Token);
+}
+catch (Exception ex)
+{
+    logger.LogWarning("[System] Log redaction key unavailable, masked values from this run cannot be revealed: {Error}", ex.Message);
+}
 var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
 var cache = app.Services.GetRequiredService<CacheService>();
 var CraftSettings = app.Services.GetRequiredService<CraftSettings>();

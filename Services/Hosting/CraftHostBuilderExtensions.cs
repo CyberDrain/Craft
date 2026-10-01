@@ -160,6 +160,11 @@ public static class CraftHostBuilderExtensions
         builder.Configuration.GetSection("App:FileLogging").Bind(fileLoggingSettings);
         var level = fileLoggingSettings.ParsedLogLevel;
 
+        var redactEnv = Environment.GetEnvironmentVariable("CRAFT_LOG_REDACTION");
+        LogRedactor.Configure(
+            fileLoggingSettings.Redact && redactEnv is not ("0" or "false" or "False" or "FALSE"),
+            fileLoggingSettings.RedactAllowDomains);
+
         var fileLoggerProvider = new FileLoggerProvider(fileLoggingSettings, level);
         builder.Logging.AddProvider(fileLoggerProvider);
         LogBridge.Initialize(fileLoggerProvider);
@@ -169,10 +174,16 @@ public static class CraftHostBuilderExtensions
             options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
             options.SingleLine = true;
         });
+        var services = builder.Logging.Services;
+        services.Remove(services.Single(d =>
+            d.ServiceType == typeof(ILoggerProvider) && d.ImplementationType == typeof(ConsoleLoggerProvider)));
+        services.AddSingleton<ConsoleLoggerProvider>();
+        services.AddSingleton<ILoggerProvider>(sp =>
+            new RedactingConsoleLoggerProvider(sp.GetRequiredService<ConsoleLoggerProvider>()));
 
         if (level > LogLevel.Debug)
         {
-            builder.Logging.AddFilter<ConsoleLoggerProvider>(l => l >= LogLevel.Information);
+            builder.Logging.AddFilter<RedactingConsoleLoggerProvider>(l => l >= LogLevel.Information);
 
             // Framework logging is noise at Information and above.
             builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
