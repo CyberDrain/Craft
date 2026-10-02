@@ -294,6 +294,23 @@ public sealed class EgressLedger : BackgroundService
             // Host shutting down — fall through to the final flush/sync.
         }
 
+        await FinalFlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Also flush on shutdown here, not only in <see cref="ExecuteAsync"/>'s post-loop tail. On .NET 10
+    /// <see cref="BackgroundService"/> starts <see cref="ExecuteAsync"/> via <c>Task.Run</c>, so a stop that
+    /// lands before it is scheduled skips it entirely and would drop the day's totals. <see cref="Flush"/>
+    /// is idempotent, so flushing from both places is harmless.
+    /// </summary>
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        await FinalFlushAsync().ConfigureAwait(false);
+    }
+
+    private async Task FinalFlushAsync()
+    {
         Flush();
         if (TableEnabled)
         {

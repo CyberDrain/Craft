@@ -44,7 +44,7 @@ dotnet run
 docker build --pull -f build/Dockerfile -t craft .
 ```
 
-Use `--pull`. The base image tags float on the `8.0-*` minor so .NET runtime security patches are
+Use `--pull`. The base image tags float on the `10.0-*` minor so .NET runtime security patches are
 picked up automatically, but only if the tag is re-resolved — without it Docker will happily reuse a
 months-old local base image. Those CVEs live in the shared runtime the base image ships, so no package
 bump fixes them and `dotnet list package --vulnerable` will never report them. CI sets `pull: true`.
