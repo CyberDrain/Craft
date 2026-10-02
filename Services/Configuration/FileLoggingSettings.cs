@@ -46,6 +46,15 @@ public class FileLoggingSettings
     /// </summary>
     public string LogLevel { get; set; } = "Information";
 
+    /// <summary>
+    /// Mask UPNs and customer domains in file and console output, keeping them readable at a glance
+    /// (see <c>LogRedactor</c>). <c>LogBridge</c> reveals them again. Env override: <c>CRAFT_LOG_REDACTION=false</c>.
+    /// </summary>
+    public bool Redact { get; set; } = true;
+
+    /// <summary>Extra domains (and their subdomains) left readable, e.g. the app's own.</summary>
+    public List<string> RedactAllowDomains { get; set; } = new();
+
     /// <summary>Resolved directory path, applying platform defaults when Directory is empty.</summary>
     internal string ResolvedDirectory => !string.IsNullOrEmpty(Directory)
         ? Directory

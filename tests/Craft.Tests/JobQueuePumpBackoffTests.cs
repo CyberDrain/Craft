@@ -7,6 +7,12 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public class PumpTiming
+{
+    public const string Name = "job-queue-pump-timing";
+}
+
 /// <summary>
 /// The pump polls storage for work, so an idle instance was scanning the queue table once a second
 /// forever. Backing off fixes that, but the interval is also a hard throughput ceiling — a refill hands
@@ -18,7 +24,10 @@ namespace Craft.Tests;
 /// busy run is about to need its next batch. Idle means claimed nothing AND holding nothing.
 ///
 /// These tests pin both directions — that a quiet pump slows down, and that a working one does not.
+/// They count scans in sub-second wall-clock windows, so they run alone: sharing a small CI runner with
+/// parallel collections starved the 100ms ticks enough to read as a backoff.
 /// </summary>
+[Collection(PumpTiming.Name)]
 public class JobQueuePumpBackoffTests
 {
     private static (JobQueuePump Pump, JobQueueStore Queue, JobManager Jobs) NewPump(
@@ -194,14 +203,25 @@ public class JobQueuePumpBackoffTests
 
         // A consumer, so the buffer actually draws down and refills are needed — without one the pump
         // fills once and correctly never scans again.
-        jobs.SetWorkResolver((_, _) => Task.FromResult<Func<CancellationToken, Task>?>(_ => Task.CompletedTask));
+        // The window opens once the consumer has run a job, so its startup is not billed to the pump.
+        var draining = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        jobs.SetWorkResolver((_, _) =>
+        {
+            draining.TrySetResult();
+            return Task.FromResult<Func<CancellationToken, Task>?>(_ => Task.CompletedTask);
+        });
         _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
 
-        await PumpFor(pump, 900);
+        await pump.StartAsync(CancellationToken.None);
+        await draining.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var before = backing.Scans;
+        await Task.Delay(900);
+        var scans = backing.Scans - before;
+        await Task.WhenAny(pump.StopAsync(CancellationToken.None), Task.Delay(3000));
         await jobs.StopAsync(CancellationToken.None);
 
-        Assert.True(backing.Scans >= 6,
-            $"a draining buffer was only refilled {backing.Scans} times in 900ms — the pump backed off " +
+        Assert.True(scans >= 6,
+            $"a draining buffer was only refilled {scans} times in 900ms — the pump backed off " +
             "while work was flowing, which caps throughput at batchSize per idle interval");
     }
 

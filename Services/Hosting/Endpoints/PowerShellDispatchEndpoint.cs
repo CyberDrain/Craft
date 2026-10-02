@@ -119,6 +119,7 @@ public static class PowerShellDispatchEndpoint
                 context.Response.StatusCode = result.StatusCode;
                 context.Response.ContentType = HandlerHeaders.ResolveContentType(result.ContentType);
                 HandlerHeaders.Apply(context.Response, result.Headers);
+                ApiEgressWireCounterMiddleware.TagEndpoint(context, endpoint);
                 // BYPASS vs MISS matters when someone asks why an endpoint never caches: MISS means it
                 // was eligible and simply had no entry, BYPASS means the policy kept it out.
                 context.Response.Headers["X-Cache"] = cacheBypassReason is null ? "MISS" : "BYPASS";
@@ -221,6 +222,7 @@ public static class PowerShellDispatchEndpoint
         context.Response.StatusCode = cached.Result.StatusCode;
         context.Response.ContentType = HandlerHeaders.ResolveContentType(cached.Result.ContentType);
         HandlerHeaders.Apply(context.Response, cached.Result.Headers);
+        ApiEgressWireCounterMiddleware.TagEndpoint(context, endpoint);
         context.Response.Headers["X-Cache"] = cached.IsStale ? "HIT-STALE" : "HIT";
         context.Response.Headers["X-Cache-Age"] = $"{cached.Age.TotalSeconds:F0}s";
         context.Response.Headers["X-Cache-TTL"] = $"{ttl.TotalSeconds:F0}s";

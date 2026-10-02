@@ -233,7 +233,8 @@
       // shed with 503 "Server busy, please retry". A load-shedding bound, NOT a capacity knob — it
       // does not add throughput, it only decides how long callers wait before a spurious 503. Widen
       // it to absorb brief bursts; raise HttpPoolSize/MinThreads for steady saturation. Distinct from
-      // HttpTimeoutSeconds (which bounds execution once a worker is held).
+      // HttpTimeoutSeconds (which bounds execution once a worker is held). Waiters are served in two
+      // FIFO tiers: interactive users first, then API clients and background cache refreshes.
       // 0 = built-in default of 30s. Env override: CRAFT_HTTP_QUEUE_TIMEOUT (seconds).
       // "HttpQueueTimeoutSeconds": 30,
 

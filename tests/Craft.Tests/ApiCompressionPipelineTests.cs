@@ -240,4 +240,68 @@ public class ApiCompressionPipelineTests : IDisposable
         Assert.Equal("gzip", enc);
         Assert.True(bytes < RawLength, $"expected compressed < {RawLength}, got {bytes}");
     }
+
+    [Fact]
+    public async Task RealPipeline_LabelsDispatchedAndLiteralRoutes_AndHidesTagHeader()
+    {
+        // Dispatched endpoints are tagged by the dispatcher (with the handler's X-Craft-Endpoint suffix);
+        // a literal route (a native endpoint) is labelled from its route pattern. Real routing, real
+        // compression, wire bytes billed to the routed label.
+        var store = new FakeTableStore();
+        var ledger = new EgressLedger(NullLogger<EgressLedger>.Instance, 0, 60,
+            Path.Combine(_dir, Guid.NewGuid().ToString("N")[..8] + ".json"), store: store, tableName: "T");
+
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, 0));
+        builder.Logging.ClearProviders();
+        builder.Services.AddCraftResponseCompression();
+        builder.Services.AddSingleton(ledger);
+        var app = builder.Build();
+        app.UseWhen(IsApiPath, api =>
+        {
+            api.UseMiddleware<ApiEgressWireCounterMiddleware>();
+            api.UseResponseCompression();
+        });
+        app.UseMiddleware<ApiEgressLimiterMiddleware>();
+        app.MapMethods("/API/{endpoint}", GetOnly, async (HttpContext ctx, string endpoint) =>
+        {
+            ctx.Response.ContentType = "application/json";
+            ctx.Response.Headers[ApiEgressWireCounterMiddleware.EndpointHeader] = "users";
+            ApiEgressWireCounterMiddleware.TagEndpoint(ctx, endpoint);
+            await ctx.Response.WriteAsync(Payload);
+        });
+        app.MapMethods("/API/Literal", GetOnly, async ctx =>
+        {
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(Payload);
+        });
+
+        await app.StartAsync();
+        try
+        {
+            var addr = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
+            using var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.None };
+            using var client = new HttpClient(handler);
+            async Task<HttpResponseMessage> Get(string path)
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, $"{addr}{path}");
+                req.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip");
+                req.Headers.TryAddWithoutValidation("x-ms-client-principal-idp", "aad");
+                req.Headers.TryAddWithoutValidation("x-ms-client-principal-name", "11111111-2222-3333-4444-555555555555");
+                return await client.SendAsync(req);
+            }
+
+            var dispatched = await Get("/API/ListGraphRequest");
+            Assert.False(dispatched.Headers.Contains(ApiEgressWireCounterMiddleware.EndpointHeader));
+            Assert.Equal("gzip", dispatched.Content.Headers.ContentEncoding.Single());
+            await Get("/API/Literal");
+        }
+        finally { await app.StopAsync(); }
+
+        await ledger.SyncToTableAsync(CancellationToken.None);
+        var row = store.All("T").Single(r => r.PartitionKey == "11111111-2222-3333-4444-555555555555" && r.RowKey.StartsWith(EgressTableSchema.DailyPrefix, StringComparison.Ordinal));
+        var endpoints = EgressTableSchema.ParseEndpoints(row.GetString(EgressTableSchema.PropEndpoints));
+        Assert.Equal(["ListGraphRequest:users", "Literal"], endpoints.Keys.Order().ToArray());
+        Assert.True(endpoints["ListGraphRequest:users"].Bytes < RawLength);   // compressed wire bytes, not the raw body
+    }
 }

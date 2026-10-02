@@ -41,10 +41,12 @@ public sealed class ApiEgressLimiterMiddleware
     {
         ArgumentNullException.ThrowIfNull(context);
 
-        // UI and anonymous callers are never counted or capped — the feature is only about app-only
-        // automation. One header check and out, so interactive traffic pays essentially nothing.
+        // UI and anonymous callers are never capped — the cap is only about app-only automation. A
+        // signed-in user's traffic is still flagged so it is reported (never billed); anonymous is not.
         if (!CallerClassifier.IsApiClient(context))
         {
+            if (!string.IsNullOrEmpty(context.Request.Headers["x-ms-client-principal-name"].ToString()))
+                context.Items[ApiEgressWireCounterMiddleware.InteractiveItemKey] = true;
             await _next(context);
             return;
         }
@@ -59,7 +61,7 @@ public sealed class ApiEgressLimiterMiddleware
         // concurrency cap, the overshoot is bounded to (concurrency × largest response).
         if (_ledger.ShouldReject())
         {
-            _ledger.RecordShed(appId);
+            _ledger.RecordShed(appId, context.GetRouteValue("endpoint") as string);
             await RejectAsync(context);
             return;
         }

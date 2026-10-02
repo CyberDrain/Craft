@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using Craft.Storage;
 
 namespace Craft.Hosting;
@@ -30,6 +31,9 @@ internal static class EgressTableSchema
     /// <summary>Partition holding the instance aggregate. Not a GUID, so it never collides with an AppId.</summary>
     public const string SystemPartition = "instance-total";
 
+    /// <summary>Partition holding interactive (user) traffic: tracked for reporting, never billed against the cap.</summary>
+    public const string InteractivePartition = "interactive";
+
     public const string BucketPrefix = "bkt_";
     public const string DailyPrefix = "day_";
     // Upper bound of the bkt_ prefix range: 'u' is the next char after 't', so any bkt_* RowKey is < this.
@@ -46,6 +50,15 @@ internal static class EgressTableSchema
     public const string PropCapReachedUtc = "CapReachedUtc";
     public const string PropEnforcing = "Enforcing";
     public const string PropAppId = "AppId";
+    // JSON object of endpoint label -> [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed]. Arrays rather
+    // than named fields keep a full map under the 32K-char property limit; CIPP can't reassemble Craft splits.
+    public const string PropEndpoints = "Endpoints";
+
+    /// <summary>Endpoints kept per map; the rest fold into <see cref="OtherEndpoint"/>.</summary>
+    public const int MaxEndpoints = 100;
+    public const int MaxEndpointLabelLength = 96;
+    public const string OtherEndpoint = "_other";
+    public const string UnmatchedEndpoint = "_unmatched";
 
     /// <summary>The UTC start of the bucket <paramref name="utc"/> falls in, floored to
     /// <paramref name="bucketMinutes"/>.</summary>
@@ -79,50 +92,146 @@ internal static class EgressTableSchema
         DailyPrefix + DayStamp(DateOnly.FromDateTime(nowUtc.AddDays(-Math.Max(1, retentionDays))));
 
     public static StoreRow ClientBucketRow(string appId, DateTime bucketStartUtc,
-        long bytes, long requests, long shed, long capBytes)
+        long bytes, long requests, long shed, long capBytes, IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
     {
         var row = new StoreRow(appId, BucketRowKey(bucketStartUtc));
-        FillCounts(row, bytes, requests, shed, capBytes);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
         row[PropBucketStart] = bucketStartUtc;
         row[PropAppId] = appId;
         return row;
     }
 
     public static StoreRow SystemBucketRow(DateTime bucketStartUtc,
-        long bytes, long requests, long shed, long capBytes)
+        long bytes, long requests, long shed, long capBytes, IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
     {
         var row = new StoreRow(SystemPartition, BucketRowKey(bucketStartUtc));
-        FillCounts(row, bytes, requests, shed, capBytes);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
         row[PropBucketStart] = bucketStartUtc;
         return row;
     }
 
     public static StoreRow ClientDailyRow(string appId, DateOnly dayUtc,
-        long bytes, long requests, long shed, long capBytes)
+        long bytes, long requests, long shed, long capBytes, IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
     {
         var row = new StoreRow(appId, DailyRowKey(dayUtc));
-        FillCounts(row, bytes, requests, shed, capBytes);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
         row[PropDateUtc] = dayUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         row[PropAppId] = appId;
         return row;
     }
 
     public static StoreRow SystemDailyRow(DateOnly dayUtc,
-        long bytes, long requests, long shed, long capBytes, DateTime? capReachedUtc, bool enforcing)
+        long bytes, long requests, long shed, long capBytes, DateTime? capReachedUtc, bool enforcing,
+        IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
     {
         var row = new StoreRow(SystemPartition, DailyRowKey(dayUtc));
-        FillCounts(row, bytes, requests, shed, capBytes);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
         row[PropDateUtc] = dayUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         row[PropEnforcing] = enforcing;
         if (capReachedUtc.HasValue) row[PropCapReachedUtc] = capReachedUtc.Value;
         return row;
     }
 
-    private static void FillCounts(StoreRow row, long bytes, long requests, long shed, long capBytes)
+    private static void FillCounts(StoreRow row, long bytes, long requests, long shed, long capBytes,
+        IReadOnlyDictionary<string, EndpointStats>? endpoints)
     {
         row[PropBytes] = bytes;
         row[PropRequests] = requests;
         row[PropShed] = shed;
         row[PropCapBytes] = capBytes;
+        if (endpoints is { Count: > 0 }) row[PropEndpoints] = SerializeEndpoints(endpoints);
+    }
+
+    /// <summary>Clamps an endpoint label to a bounded, table-safe form; blank is <see cref="UnmatchedEndpoint"/>.</summary>
+    public static string EndpointLabel(string? label)
+    {
+        var trimmed = label?.Trim();
+        if (string.IsNullOrEmpty(trimmed)) return UnmatchedEndpoint;
+        if (trimmed.Length > MaxEndpointLabelLength) trimmed = trimmed[..MaxEndpointLabelLength];
+        return string.Create(trimmed.Length, trimmed, static (dst, src) =>
+        {
+            for (var i = 0; i < src.Length; i++)
+            {
+                var c = src[i];
+                dst[i] = char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or ':' or '/' or '{' or '}' or '(' or ')' or '$' or '-' ? c : '_';
+            }
+        });
+    }
+
+    /// <summary>The top <see cref="MaxEndpoints"/> endpoints by bytes, the remainder folded into
+    /// <see cref="OtherEndpoint"/>, as the compact JSON stored in <see cref="PropEndpoints"/>.</summary>
+    public static string SerializeEndpoints(IReadOnlyDictionary<string, EndpointStats> endpoints)
+    {
+        var ordered = endpoints.Where(kv => kv.Key != OtherEndpoint).OrderByDescending(kv => kv.Value.Bytes).ToList();
+        var other = endpoints.TryGetValue(OtherEndpoint, out var o) ? o.Clone() : null;
+        foreach (var (_, stats) in ordered.Skip(MaxEndpoints))
+            (other ??= new EndpointStats()).Merge(stats);
+
+        var map = new Dictionary<string, long[]>(StringComparer.Ordinal);
+        foreach (var (label, stats) in ordered.Take(MaxEndpoints)) map[label] = stats.ToArray();
+        if (other is not null) map[OtherEndpoint] = other.ToArray();
+        return JsonSerializer.Serialize(map);
+    }
+
+    /// <summary>Parses <see cref="PropEndpoints"/>; anything unreadable is an empty map.</summary>
+    public static Dictionary<string, EndpointStats> ParseEndpoints(string? json)
+    {
+        var result = new Dictionary<string, EndpointStats>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(json)) return result;
+        try
+        {
+            foreach (var (label, values) in JsonSerializer.Deserialize<Dictionary<string, long[]>>(json) ?? [])
+                result[label] = EndpointStats.FromArray(values);
+        }
+        catch (JsonException) { }
+        return result;
+    }
+}
+
+/// <summary>Per-endpoint counters within one client-day or one bucket.</summary>
+internal sealed class EndpointStats
+{
+    public long Bytes, Requests, MaxBytes, CacheHits, Errors, Shed;
+
+    public void Add(long bytes, bool cacheHit, int statusCode)
+    {
+        Bytes += bytes;
+        Requests += 1;
+        if (bytes > MaxBytes) MaxBytes = bytes;
+        if (cacheHit) CacheHits += 1;
+        if (statusCode >= 400) Errors += 1;
+    }
+
+    public void Merge(EndpointStats other)
+    {
+        Bytes += other.Bytes;
+        Requests += other.Requests;
+        MaxBytes = Math.Max(MaxBytes, other.MaxBytes);
+        CacheHits += other.CacheHits;
+        Errors += other.Errors;
+        Shed += other.Shed;
+    }
+
+    public EndpointStats Clone() => (EndpointStats)MemberwiseClone();
+
+    /// <summary>The entry for <paramref name="label"/>, created on first use; once the map is full, new
+    /// labels share <see cref="EgressTableSchema.OtherEndpoint"/> so a caller can't grow it unbounded.</summary>
+    public static EndpointStats In(Dictionary<string, EndpointStats> map, string label)
+    {
+        if (map.TryGetValue(label, out var stats)) return stats;
+        if (map.Count >= EgressTableSchema.MaxEndpoints) label = EgressTableSchema.OtherEndpoint;
+        if (!map.TryGetValue(label, out stats)) map[label] = stats = new EndpointStats();
+        return stats;
+    }
+
+    public static Dictionary<string, EndpointStats> CloneMap(Dictionary<string, EndpointStats> map) =>
+        map.ToDictionary(kv => kv.Key, kv => kv.Value.Clone(), StringComparer.OrdinalIgnoreCase);
+
+    public long[] ToArray() => [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed];
+
+    public static EndpointStats FromArray(long[]? v)
+    {
+        long At(int i) => v is not null && i < v.Length ? v[i] : 0;
+        return new EndpointStats { Bytes = At(0), Requests = At(1), MaxBytes = At(2), CacheHits = At(3), Errors = At(4), Shed = At(5) };
     }
 }

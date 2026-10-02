@@ -238,7 +238,8 @@ public class PowerShellRunnerService : IDisposable
         if (!DispatchProfiler.Enabled)
         {
             var req = await BuildRequestObject(httpContext);
-            return await ExecuteHttpScriptInternal(route, req, isHttp: true, clientAborted: clientAborted);
+            return await ExecuteHttpScriptInternal(route, req, isHttp: true, clientAborted: clientAborted,
+                lowPriority: CallerClassifier.IsApiClient(httpContext));
         }
 
         // Profiling path: time request marshaling + the runner-side segments (checkout/invoke/extract).
@@ -249,7 +250,7 @@ public class PowerShellRunnerService : IDisposable
         var marshalTicks = Stopwatch.GetTimestamp() - mStart;
         var timing = new DispatchTiming();
         var result = await ExecuteHttpScriptInternal(route, request, isHttp: true, timing,
-            clientAborted: clientAborted);
+            clientAborted: clientAborted, lowPriority: CallerClassifier.IsApiClient(httpContext));
         DispatchProfiler.Record(marshalTicks, timing.CheckoutTicks, timing.InvokeTicks, timing.ExtractTicks,
             Stopwatch.GetTimestamp() - totalStart);
         return result;
@@ -262,11 +263,11 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public async Task<ScriptResult> ExecuteHttpScript(string route, Hashtable requestSnapshot)
     {
-        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: true);
+        return await ExecuteHttpScriptInternal(route, requestSnapshot, isHttp: true, lowPriority: true);
     }
 
     private async Task<ScriptResult> ExecuteHttpScriptInternal(string route, Hashtable request, bool isHttp,
-        DispatchTiming? timing = null, CancellationToken clientAborted = default)
+        DispatchTiming? timing = null, bool lowPriority = false, CancellationToken clientAborted = default)
     {
         var sw = Stopwatch.StartNew();
         var entry = _repo.GetByRoute(route);
@@ -291,12 +292,12 @@ public class PowerShellRunnerService : IDisposable
             var checkoutStart = timing != null ? Stopwatch.GetTimestamp() : 0;
             if (isHttp)
             {
-                worker = _pool.CheckoutHttp(_httpQueueTimeout);
+                worker = _pool.CheckoutHttp(_httpQueueTimeout, lowPriority);
                 if (timing != null) timing.CheckoutTicks = Stopwatch.GetTimestamp() - checkoutStart;
                 if (worker == null)
                 {
-                    _logger.LogWarning("HTTP pool exhausted — no worker available within {Timeout:0}s for {Route}",
-                        _httpQueueTimeout.TotalSeconds, route);
+                    _logger.LogWarning("HTTP pool exhausted — no worker available within {Timeout:0}s for {Route} ({Tier})",
+                        _httpQueueTimeout.TotalSeconds, route, lowPriority ? "low" : "priority");
                     return new ScriptResult
                     {
                         StatusCode = 503,

@@ -99,6 +99,9 @@ public static class LogBridge
             return Array.Empty<string>();
         }
 
+        for (var i = 0; i < allLines.Length; i++)
+            allLines[i] = LogRedactor.Reveal(allLines[i]);
+
         // Parse multi-level filter once
         string[]? levels = null;
         if (!string.IsNullOrEmpty(level))

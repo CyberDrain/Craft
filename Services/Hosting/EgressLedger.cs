@@ -10,6 +10,9 @@ namespace Craft.Hosting;
 /// daily totals are the source of truth for the cap and are persisted to a small local file so a restart
 /// does not reset the day; the time-bucketed history and a durable daily audit are additionally mirrored
 /// to a table so the product can show usage over time and whether/when/how often the cap was hit.
+/// Each response is also attributed to its endpoint (daily per client, and per instance bucket), and
+/// interactive user traffic is tracked the same way under its own partition without ever counting
+/// toward the cap.
 /// <para>
 /// <b>Request path</b> (<see cref="Record"/> / <see cref="RecordShed"/>) only touches memory under a short
 /// lock — no IO. A background timer flushes the daily totals to disk and mirrors the current 15-minute
@@ -50,13 +53,28 @@ public sealed class EgressLedger : BackgroundService
     private bool _tableDirty;    // something changed since the last table sync
 
     private readonly Dictionary<string, ClientTotals> _clients = new(StringComparer.OrdinalIgnoreCase);
-    // Pending table buckets not yet finalised: bucketRowKey -> (appId -> accum).
+    // Interactive (user) traffic: reported in its own partition, never part of _bytes or the cap.
+    private ClientTotals _interactive = new();
+    // Pending table buckets not yet finalised: bucketRowKey -> (partition -> accum). Partitions are the
+    // API clients' AppIds, the instance-total aggregate and the interactive partition; only the latter
+    // two carry an endpoint breakdown.
     private readonly Dictionary<string, Dictionary<string, BucketAccum>> _buckets = new(StringComparer.Ordinal);
 
     private bool _tableReady;
 
-    private sealed class ClientTotals { public long Bytes; public long Requests; public long Shed; public DateTime LastSeenUtc; }
-    private sealed class BucketAccum { public long Bytes; public long Requests; public long Shed; }
+    private sealed class ClientTotals
+    {
+        public long Bytes; public long Requests; public long Shed; public DateTime LastSeenUtc;
+        public Dictionary<string, EndpointStats> Endpoints = new(StringComparer.OrdinalIgnoreCase);
+        public ClientTotals Clone() => new() { Bytes = Bytes, Requests = Requests, Shed = Shed, LastSeenUtc = LastSeenUtc, Endpoints = EndpointStats.CloneMap(Endpoints) };
+    }
+
+    private sealed class BucketAccum
+    {
+        public long Bytes; public long Requests; public long Shed;
+        public Dictionary<string, EndpointStats> Endpoints = new(StringComparer.OrdinalIgnoreCase);
+        public BucketAccum Clone() => new() { Bytes = Bytes, Requests = Requests, Shed = Shed, Endpoints = EndpointStats.CloneMap(Endpoints) };
+    }
 
     private static readonly JsonSerializerOptions s_json = new()
     {
@@ -114,20 +132,51 @@ public sealed class EgressLedger : BackgroundService
         }
     }
 
-    /// <summary>Add the outbound bytes of one response to today's running totals, attributed to a client.</summary>
-    public void Record(long bytes, string appId)
+    /// <summary>Add the outbound bytes of one API-client response to today's running totals, attributed to
+    /// the client and, in its daily and the instance bucket breakdowns, to <paramref name="endpoint"/>.</summary>
+    public void Record(long bytes, string appId, string? endpoint = null, bool cacheHit = false, int statusCode = 200)
     {
         if (bytes <= 0) return;
         appId = Normalize(appId);
+        var label = EgressTableSchema.EndpointLabel(endpoint);
         lock (_lock)
         {
             RolloverIfNeeded();
             _bytes += bytes;
-            Client(appId).Bytes += bytes;
-            Client(appId).Requests += 1;
-            Client(appId).LastSeenUtc = _utcNow();
-            Bucket(appId).Bytes += bytes;
-            Bucket(appId).Requests += 1;
+            var client = Client(appId);
+            client.Bytes += bytes;
+            client.Requests += 1;
+            client.LastSeenUtc = _utcNow();
+            EndpointStats.In(client.Endpoints, label).Add(bytes, cacheHit, statusCode);
+            var bucket = Bucket(appId);
+            bucket.Bytes += bytes;
+            bucket.Requests += 1;
+            var system = Bucket(EgressTableSchema.SystemPartition);
+            system.Bytes += bytes;
+            system.Requests += 1;
+            EndpointStats.In(system.Endpoints, label).Add(bytes, cacheHit, statusCode);
+            _dirty = true;
+            _tableDirty = true;
+        }
+    }
+
+    /// <summary>Add the outbound bytes of one interactive (user) response. Reported under
+    /// <see cref="EgressTableSchema.InteractivePartition"/>; never counts toward the cap.</summary>
+    public void RecordInteractive(long bytes, string? endpoint = null, bool cacheHit = false, int statusCode = 200)
+    {
+        if (bytes <= 0) return;
+        var label = EgressTableSchema.EndpointLabel(endpoint);
+        lock (_lock)
+        {
+            RolloverIfNeeded();
+            _interactive.Bytes += bytes;
+            _interactive.Requests += 1;
+            _interactive.LastSeenUtc = _utcNow();
+            EndpointStats.In(_interactive.Endpoints, label).Add(bytes, cacheHit, statusCode);
+            var bucket = Bucket(EgressTableSchema.InteractivePartition);
+            bucket.Bytes += bytes;
+            bucket.Requests += 1;
+            EndpointStats.In(bucket.Endpoints, label).Add(bytes, cacheHit, statusCode);
             _dirty = true;
             _tableDirty = true;
         }
@@ -135,16 +184,22 @@ public sealed class EgressLedger : BackgroundService
 
     /// <summary>Record that a request from <paramref name="appId"/> was shed (429) once over budget. The
     /// shed response body is deliberately not counted as bytes; this tracks the cap-hit count.</summary>
-    public void RecordShed(string appId)
+    public void RecordShed(string appId, string? endpoint = null)
     {
         appId = Normalize(appId);
+        var label = EgressTableSchema.EndpointLabel(endpoint);
         lock (_lock)
         {
             RolloverIfNeeded();
             _shedRequests += 1;
             _capReachedUtc ??= _utcNow();
-            Client(appId).Shed += 1;
+            var client = Client(appId);
+            client.Shed += 1;
+            EndpointStats.In(client.Endpoints, label).Shed += 1;
             Bucket(appId).Shed += 1;
+            var system = Bucket(EgressTableSchema.SystemPartition);
+            system.Shed += 1;
+            EndpointStats.In(system.Endpoints, label).Shed += 1;
             _dirty = true;
             _tableDirty = true;
         }
@@ -201,6 +256,7 @@ public sealed class EgressLedger : BackgroundService
         _shedRequests = 0;
         _capReachedUtc = null;
         _clients.Clear();
+        _interactive = new ClientTotals();
         _buckets.Clear();       // yesterday's bucket rows stay in the table until retention purges them
         _dirty = true;
         _tableDirty = true;
@@ -262,7 +318,7 @@ public sealed class EgressLedger : BackgroundService
     }
 
     /// <summary>Load the persisted daily totals. Restores only when the file is stamped with today's UTC
-    /// date; a stale or unreadable file leaves today starting from zero. Tolerates the v1 format.</summary>
+    /// date; a stale or unreadable file leaves today starting from zero. Tolerates the v1 and v2 formats.</summary>
     internal void Load()
     {
         try
@@ -291,8 +347,9 @@ public sealed class EgressLedger : BackgroundService
                 if (state.Clients is not null)
                 {
                     foreach (var (appId, c) in state.Clients)
-                        _clients[appId] = new ClientTotals { Bytes = c.Bytes, Requests = c.Requests, Shed = c.Shed, LastSeenUtc = c.LastSeenUtc };
+                        _clients[appId] = c.ToTotals();
                 }
+                _interactive = state.Interactive?.ToTotals() ?? new ClientTotals();
                 _dirty = false;
             }
             _logger.LogInformation("[Egress] Restored {Bytes} bytes across {Clients} client(s) already served today from {File}",
@@ -316,16 +373,15 @@ public sealed class EgressLedger : BackgroundService
                 RolloverIfNeeded();
                 snapshot = new LedgerState
                 {
-                    Version = 2,
+                    Version = 3,
                     DateUtc = _dateUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                     Bytes = _bytes,
                     CapBytes = _capBytes,
                     CapReachedUtc = _capReachedUtc,
                     ShedRequests = _shedRequests,
                     UpdatedUtc = _utcNow(),
-                    Clients = _clients.ToDictionary(
-                        kv => kv.Key,
-                        kv => new ClientState { Bytes = kv.Value.Bytes, Requests = kv.Value.Requests, Shed = kv.Value.Shed, LastSeenUtc = kv.Value.LastSeenUtc }),
+                    Clients = _clients.ToDictionary(kv => kv.Key, kv => ClientState.From(kv.Value)),
+                    Interactive = _interactive.Requests > 0 ? ClientState.From(_interactive) : null,
                 };
                 _dirty = false;
             }
@@ -354,41 +410,54 @@ public sealed class EgressLedger : BackgroundService
         if (!_tableReady) { try { await _store!.EnsureTableAsync(_tableName, ct).ConfigureAwait(false); _tableReady = true; } catch { return; } }
 
         // Snapshot under the lock.
-        DateOnly day; long dayBytes, dayShed; DateTime? capReached; bool enforcing;
+        DateOnly day; long dayBytes, dayRequests, dayShed; DateTime? capReached; bool enforcing;
         string currentBucketKey;
-        List<(string bucketKey, Dictionary<string, BucketAccum> clients)> buckets;
+        List<(string bucketKey, Dictionary<string, BucketAccum> partitions)> buckets;
         Dictionary<string, ClientTotals> clientDaily;
+        ClientTotals? interactiveDaily;
+        var instanceEndpoints = new Dictionary<string, EndpointStats>(StringComparer.OrdinalIgnoreCase);
         lock (_lock)
         {
             if (!_tableDirty && !_buckets.Keys.Any(k => k != CurrentBucketKey())) return;
             RolloverIfNeeded();
             currentBucketKey = CurrentBucketKey();
-            buckets = _buckets.Select(kv => (kv.Key, kv.Value.ToDictionary(c => c.Key, c => new BucketAccum { Bytes = c.Value.Bytes, Requests = c.Value.Requests, Shed = c.Value.Shed }, StringComparer.OrdinalIgnoreCase))).ToList();
-            var active = new HashSet<string>(buckets.SelectMany(b => b.clients.Keys), StringComparer.OrdinalIgnoreCase);
-            clientDaily = active.Where(a => _clients.ContainsKey(a)).ToDictionary(a => a, a => new ClientTotals { Bytes = _clients[a].Bytes, Requests = _clients[a].Requests, Shed = _clients[a].Shed, LastSeenUtc = _clients[a].LastSeenUtc }, StringComparer.OrdinalIgnoreCase);
-            day = _dateUtc; dayBytes = _bytes; dayShed = _shedRequests; capReached = _capReachedUtc; enforcing = _capBytes > 0;
+            buckets = _buckets.Select(kv => (kv.Key, kv.Value.ToDictionary(c => c.Key, c => c.Value.Clone(), StringComparer.OrdinalIgnoreCase))).ToList();
+            var active = new HashSet<string>(buckets.SelectMany(b => b.partitions.Keys), StringComparer.OrdinalIgnoreCase);
+            clientDaily = active.Where(a => _clients.ContainsKey(a)).ToDictionary(a => a, a => _clients[a].Clone(), StringComparer.OrdinalIgnoreCase);
+            interactiveDaily = active.Contains(EgressTableSchema.InteractivePartition) ? _interactive.Clone() : null;
+            foreach (var client in _clients.Values)
+                foreach (var (label, stats) in client.Endpoints)
+                {
+                    if (!instanceEndpoints.TryGetValue(label, out var sum)) instanceEndpoints[label] = sum = new EndpointStats();
+                    sum.Merge(stats);
+                }
+            day = _dateUtc; dayBytes = _bytes; dayRequests = _clients.Values.Sum(c => c.Requests); dayShed = _shedRequests;
+            capReached = _capReachedUtc; enforcing = _capBytes > 0;
             _tableDirty = false;
         }
 
         try
         {
-            // Bucket rows — per client + a per-bucket instance aggregate.
-            foreach (var (bucketKey, clients) in buckets)
+            // Bucket rows — per client, the instance aggregate and interactive; the latter two carry endpoints.
+            foreach (var (bucketKey, partitions) in buckets)
             {
                 var bucketStart = ParseBucketStart(bucketKey);
-                long bBytes = 0, bReq = 0, bShed = 0;
-                foreach (var (appId, a) in clients)
+                foreach (var (partition, a) in partitions)
                 {
-                    await _store!.UpsertAsync(_tableName, EgressTableSchema.ClientBucketRow(appId, bucketStart, a.Bytes, a.Requests, a.Shed, _capBytes), ct).ConfigureAwait(false);
-                    bBytes += a.Bytes; bReq += a.Requests; bShed += a.Shed;
+                    var row = partition == EgressTableSchema.SystemPartition
+                        ? EgressTableSchema.SystemBucketRow(bucketStart, a.Bytes, a.Requests, a.Shed, _capBytes, a.Endpoints)
+                        : EgressTableSchema.ClientBucketRow(partition, bucketStart, a.Bytes, a.Requests, a.Shed, _capBytes, a.Endpoints);
+                    await _store!.UpsertAsync(_tableName, row, ct).ConfigureAwait(false);
                 }
-                await _store!.UpsertAsync(_tableName, EgressTableSchema.SystemBucketRow(bucketStart, bBytes, bReq, bShed, _capBytes), ct).ConfigureAwait(false);
             }
 
-            // Daily audit rows — per active client + the instance summary (cap, when hit, how many shed).
+            // Daily audit rows — per active client, interactive, and the instance summary (cap, when hit, how many shed).
             foreach (var (appId, c) in clientDaily)
-                await _store!.UpsertAsync(_tableName, EgressTableSchema.ClientDailyRow(appId, day, c.Bytes, c.Requests, c.Shed, _capBytes), ct).ConfigureAwait(false);
-            await _store!.UpsertAsync(_tableName, EgressTableSchema.SystemDailyRow(day, dayBytes, clientDaily.Values.Sum(c => c.Requests), dayShed, _capBytes, capReached, enforcing), ct).ConfigureAwait(false);
+                await _store!.UpsertAsync(_tableName, EgressTableSchema.ClientDailyRow(appId, day, c.Bytes, c.Requests, c.Shed, _capBytes, c.Endpoints), ct).ConfigureAwait(false);
+            if (interactiveDaily is not null)
+                await _store!.UpsertAsync(_tableName, EgressTableSchema.ClientDailyRow(EgressTableSchema.InteractivePartition, day,
+                    interactiveDaily.Bytes, interactiveDaily.Requests, 0, _capBytes, interactiveDaily.Endpoints), ct).ConfigureAwait(false);
+            await _store!.UpsertAsync(_tableName, EgressTableSchema.SystemDailyRow(day, dayBytes, dayRequests, dayShed, _capBytes, capReached, enforcing, instanceEndpoints), ct).ConfigureAwait(false);
 
             // Drop finalised buckets we just wrote (strictly older than the current one).
             lock (_lock)
@@ -416,15 +485,20 @@ public sealed class EgressLedger : BackgroundService
             var seeded = 0;
             await foreach (var row in _store!.QueryTableAsync(_tableName, filter, ct).ConfigureAwait(false))
             {
-                if (row.RowKey != key || row.PartitionKey == EgressTableSchema.SystemPartition) continue;  // re-apply filter; skip aggregate
+                if (row.RowKey != key) continue;  // re-apply the filter — the store may ignore it
                 lock (_lock)
                 {
-                    if (!_buckets.TryGetValue(key, out var b)) { b = new Dictionary<string, BucketAccum>(StringComparer.OrdinalIgnoreCase); _buckets[key] = b; }
-                    b[row.PartitionKey] = new BucketAccum { Bytes = AsLong(row[EgressTableSchema.PropBytes]), Requests = AsLong(row[EgressTableSchema.PropRequests]), Shed = AsLong(row[EgressTableSchema.PropShed]) };
+                    // Added onto, not replacing, anything this process already recorded before the seed ran.
+                    var a = Bucket(row.PartitionKey);
+                    a.Bytes += AsLong(row[EgressTableSchema.PropBytes]);
+                    a.Requests += AsLong(row[EgressTableSchema.PropRequests]);
+                    a.Shed += AsLong(row[EgressTableSchema.PropShed]);
+                    foreach (var (label, stats) in EgressTableSchema.ParseEndpoints(row.GetString(EgressTableSchema.PropEndpoints)))
+                        EndpointStats.In(a.Endpoints, label).Merge(stats);
                 }
                 seeded++;
             }
-            if (seeded > 0) _logger.LogInformation("[Egress] Reseeded current bucket from table ({Count} client rows)", seeded);
+            if (seeded > 0) _logger.LogInformation("[Egress] Reseeded current bucket from table ({Count} rows)", seeded);
         }
         catch (Exception ex)
         {
@@ -498,6 +572,7 @@ public sealed class EgressLedger : BackgroundService
         public long ShedRequests { get; set; }
         public DateTime? UpdatedUtc { get; set; }
         public Dictionary<string, ClientState>? Clients { get; set; }
+        public ClientState? Interactive { get; set; }
     }
 
     private sealed class ClientState
@@ -506,5 +581,24 @@ public sealed class EgressLedger : BackgroundService
         public long Requests { get; set; }
         public long Shed { get; set; }
         public DateTime LastSeenUtc { get; set; }
+        // Same [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed] layout as the table column.
+        public Dictionary<string, long[]>? Endpoints { get; set; }
+
+        public static ClientState From(ClientTotals t) => new()
+        {
+            Bytes = t.Bytes,
+            Requests = t.Requests,
+            Shed = t.Shed,
+            LastSeenUtc = t.LastSeenUtc,
+            Endpoints = t.Endpoints.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
+        };
+
+        public ClientTotals ToTotals()
+        {
+            var t = new ClientTotals { Bytes = Bytes, Requests = Requests, Shed = Shed, LastSeenUtc = LastSeenUtc };
+            foreach (var (label, values) in Endpoints ?? [])
+                t.Endpoints[label] = EndpointStats.FromArray(values);
+            return t;
+        }
     }
 }

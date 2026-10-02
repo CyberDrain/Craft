@@ -34,6 +34,22 @@ public sealed class ApiEgressWireCounterMiddleware
     /// </summary>
     public const string ChargeItemKey = "Craft.Egress.Charge";
 
+    /// <summary>
+    /// Request item set by <see cref="ApiEgressLimiterMiddleware"/> on a request from an interactive
+    /// (signed-in user) caller: its bytes are recorded for reporting but never billed against the cap.
+    /// </summary>
+    public const string InteractiveItemKey = "Craft.Egress.Interactive";
+
+    /// <summary>Request item carrying the accounting label of a dispatched endpoint — see <see cref="TagEndpoint"/>.</summary>
+    public const string EndpointItemKey = "Craft.Egress.Endpoint";
+
+    /// <summary>
+    /// Optional response header a handler sets to sub-label its traffic (e.g. the Graph resource behind a
+    /// generic proxy endpoint, or the tool behind an MCP call). Consumed by <see cref="TagEndpoint"/> and
+    /// never sent to the client.
+    /// </summary>
+    public const string EndpointHeader = "X-Craft-Endpoint";
+
     private readonly RequestDelegate _next;
     private readonly EgressLedger _ledger;
 
@@ -62,7 +78,36 @@ public sealed class ApiEgressWireCounterMiddleware
         {
             context.Response.Body = original;
             if (context.Items.TryGetValue(ChargeItemKey, out var charge) && charge is string appId && appId.Length > 0)
-                _ledger.Record(counting.BytesWritten, appId);
+                _ledger.Record(counting.BytesWritten, appId, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode);
+            else if (context.Items.ContainsKey(InteractiveItemKey))
+                _ledger.RecordInteractive(counting.BytesWritten, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode);
         }
     }
+
+    /// <summary>
+    /// Labels a dispatched request for accounting: the endpoint name, suffixed with the handler's
+    /// <see cref="EndpointHeader"/> value when it set one (<c>ListGraphRequest:users</c>). The header is
+    /// removed so it never reaches the client. Call once the endpoint is known to exist and after the
+    /// handler's headers are applied — both the executed and the cache-hit paths.
+    /// </summary>
+    public static void TagEndpoint(HttpContext context, string endpoint)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        var tag = context.Response.Headers[EndpointHeader].ToString();
+        if (tag.Length > 0) context.Response.Headers.Remove(EndpointHeader);
+        context.Items[EndpointItemKey] = tag.Length > 0 ? $"{endpoint}:{tag}" : endpoint;
+    }
+
+    // Dispatched endpoints are tagged explicitly; any other matched /api route is a literal (native or
+    // built-in) path, labelled by its last segment. Unmatched requests stay unlabelled.
+    private static string? ResolveEndpoint(HttpContext context)
+    {
+        if (context.Items.TryGetValue(EndpointItemKey, out var tagged) && tagged is string label) return label;
+        if (context.GetEndpoint() is RouteEndpoint { RoutePattern: { Parameters.Count: 0, RawText: { } raw } })
+            return raw.TrimEnd('/').Split('/')[^1];
+        return null;
+    }
+
+    private static bool IsCacheHit(HttpContext context) =>
+        context.Response.Headers["X-Cache"].ToString().StartsWith("HIT", StringComparison.Ordinal);
 }
