@@ -5,30 +5,33 @@
 #   - dev builds pass --build-arg BUILD_CONFIGURATION=Debug (default: Release)
 #   - distroless = no shell, no package manager, non-root (APP_UID=1654)
 #   - no SSH server; layer one on downstream if a deployment needs it
-# The SDK / build stage stays on Debian; only the runtime is Azure Linux.
+# The SDK / build stage is Ubuntu (noble); only the runtime is Azure Linux.
 #
 # Default the .NET base images to the GHCR mirror (CyberDrain/Containers) so
 # builds survive an mcr.microsoft.com / Azure Container Registry outage. Build
-# against upstream until the mirror carries the azurelinux tags:
+# against upstream until the mirror carries the tags:
 #   docker build -f build/Dockerfile --build-arg DOTNET_REGISTRY=mcr.microsoft.com -t craft:local .
 #
+# .NET 10 dropped the Debian (bookworm) images: the SDK/build and mimalloc stages are Ubuntu
+# (noble), the glibc + apt line; the runtime stays Azure Linux distroless.
+#
 # ── Base image patching ──────────────────────────────────────────────────
-# The tags below deliberately float on the `8.0-*` minor, so .NET runtime security patches are picked
+# The tags below deliberately float on the `10.0-*` minor, so .NET runtime security patches are picked
 # up automatically. That only works if the tag is actually re-resolved on each build:
 #
 #   docker build --pull -f build/Dockerfile -t craft:local .
 #
-# WITHOUT --pull, Docker reuses whatever `8.0-...` it already has locally, potentially for months. The
+# WITHOUT --pull, Docker reuses whatever `10.0-...` it already has locally, potentially for months. The
 # CVEs this matters for live in /usr/share/dotnet/shared/Microsoft.NETCore.App/ — the shared runtime
 # shipped by the base image, NOT anything referenced from Craft.csproj. No package bump can fix them
 # and `dotnet list package --vulnerable` will never report them; only rebuilding on a newer base does.
 # CI passes `pull: true` for the same reason (.github/workflows/*-container.yml).
 #
-# Do NOT pin these to an exact patch (e.g. 8.0.29) unless you also own the job that bumps the pin —
+# Do NOT pin these to an exact patch (e.g. 10.0.1) unless you also own the job that bumps the pin —
 # a stale pin is strictly worse than a floating tag, because it looks deliberate.
 ARG DOTNET_REGISTRY=ghcr.io/cyberdrain
 
-FROM ${DOTNET_REGISTRY}/dotnet/sdk:8.0-bookworm-slim AS build
+FROM ${DOTNET_REGISTRY}/dotnet/sdk:10.0-noble AS build
 ARG BUILD_CONFIGURATION=Release
 # Supplied automatically by buildx (amd64 / arm64). Mapped to a .NET RID below.
 ARG TARGETARCH
@@ -89,9 +92,9 @@ RUN dotnet publish Craft.csproj -c ${BUILD_CONFIGURATION} \
   /app/publish/pt-BR /app/publish/ru /app/publish/tr \
   /app/publish/zh-Hans /app/publish/zh-Hant
 
-# mimalloc staged from Debian (glibc) — not reliably packaged in Azure Linux's
+# mimalloc staged from Ubuntu (glibc) — not reliably packaged in Azure Linux's
 # tdnf repos, and glibc→glibc so it loads cleanly on the Azure Linux runtime.
-FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-bookworm-slim AS mimalloc-src
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:10.0-noble AS mimalloc-src
 ARG TARGETARCH
 RUN set -eux; \
   apt-get update && apt-get install -y --no-install-recommends libmimalloc2.0; \
@@ -102,29 +105,9 @@ RUN set -eux; \
   esac; \
   install -D /usr/lib/${TRIPLET}/libmimalloc.so.2 /mimalloc/libmimalloc.so.2
 
-# zlib-ng built in zlib-compat mode, dropped in over the runtime's libz.so.1. .NET 8 on Linux does gzip
-# through the system zlib (libSystem.IO.Compression.Native links libz.so.1), so this is what /api gzip
-# runs on. Measured on this runtime, 2 vCPU, at the default level (Optimal = zlib 6): a 10 MB ListLogs
-# body 165 -> 84 ms and 4% smaller; 32 KB 296 -> 187 us; <=2 KB unchanged. Fastest (level 1) gets ~3x
-# faster but ~24% bigger (zlib-ng's quick strategy). Same drop-in Fedora ships as its system zlib.
-# Built from a pinned, checksummed release (not packaged for Azure Linux or bookworm); runtime CPU
-# dispatch picks SIMD paths per host. Bump ZLIBNG_VERSION + ZLIBNG_SHA256 together.
-FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-bookworm-slim AS zlibng-src
-ARG ZLIBNG_VERSION=2.3.3
-ARG ZLIBNG_SHA256=f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
-RUN set -eux; \
-  apt-get update && apt-get install -y --no-install-recommends ca-certificates curl cmake gcc make libc6-dev; \
-  curl -fsSL -o /tmp/zlib-ng.tar.gz "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/${ZLIBNG_VERSION}.tar.gz"; \
-  echo "${ZLIBNG_SHA256}  /tmp/zlib-ng.tar.gz" | sha256sum -c -; \
-  tar -xzf /tmp/zlib-ng.tar.gz -C /tmp; \
-  cmake -S /tmp/zlib-ng-${ZLIBNG_VERSION} -B /tmp/zlib-ng-build \
-    -DZLIB_COMPAT=ON -DBUILD_TESTING=OFF -DZLIB_ENABLE_TESTS=OFF -DCMAKE_BUILD_TYPE=Release; \
-  cmake --build /tmp/zlib-ng-build -j"$(nproc)"; \
-  install -D "$(readlink -f /tmp/zlib-ng-build/libz.so.1)" /zlibng/libz.so.1
-
 # distroless-extra = distroless + icu/tzdata. PowerShell needs globalization, so
 # the plain -distroless tag (no ICU) would break it — the -extra tag is required.
-FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runtime
+FROM ${DOTNET_REGISTRY}/dotnet/aspnet:10.0-azurelinux3.0-distroless-extra AS runtime
 # IMPORTANT: the app lives in /app, NOT under /home. Azure App Service mounts persistent storage over
 # /home when WEBSITES_ENABLE_APP_SERVICE_STORAGE=true, which shadows anything the image ships there —
 # an app under /home/app loses its binaries at runtime ("Craft.dll does not exist"). So we keep the app
@@ -139,9 +122,6 @@ FROM ${DOTNET_REGISTRY}/dotnet/aspnet:8.0-azurelinux3.0-distroless-extra AS runt
 #   ENV PATH="/usr/share/powershell:${PATH}"
 
 COPY --from=mimalloc-src /mimalloc/libmimalloc.so.2 /usr/lib/libmimalloc.so.2
-# Onto the soname path the loader resolves, not the versioned file behind it: the base tag floats, so a
-# zlib bump renaming libz.so.1.3.x must not silently strand this copy.
-COPY --from=zlibng-src /zlibng/libz.so.1 /usr/lib/libz.so.1
 
 # Create /app owned by the non-root user. COPYing with NO preceding WORKDIR makes Docker CREATE the
 # destination /app with this ownership; a `WORKDIR /app` first would pre-create it root-owned, leaving
