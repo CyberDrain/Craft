@@ -207,4 +207,77 @@ public class ApiEgressWireCounterMiddlewareTests : IDisposable
         Assert.Equal(StatusCodes.Status429TooManyRequests, ctx.Response.StatusCode);
         Assert.Equal(before, ledger.CurrentBytes); // the shed 429 body is never billed
     }
+
+    // ── endpoint labels + interactive callers ─────────────────────────────────────────────────────────
+
+    private (EgressLedger Ledger, FakeTableStore Store) TableLedger()
+    {
+        var store = new FakeTableStore();
+        var ledger = new EgressLedger(NullLogger<EgressLedger>.Instance, 1_000_000, 60,
+            Path.Combine(_dir, Guid.NewGuid().ToString("N")[..8] + ".json"), store: store, tableName: "T");
+        return (ledger, store);
+    }
+
+    private static async Task<Dictionary<string, EndpointStats>> DailyEndpoints(EgressLedger ledger, FakeTableStore store, string partition)
+    {
+        await ledger.SyncToTableAsync(CancellationToken.None);
+        var row = store.All("T").Single(r => r.PartitionKey == partition && r.RowKey.StartsWith(EgressTableSchema.DailyPrefix, StringComparison.Ordinal));
+        return EgressTableSchema.ParseEndpoints(row.GetString(EgressTableSchema.PropEndpoints));
+    }
+
+    [Fact]
+    public async Task TagEndpoint_SuffixesHandlerHeader_StripsIt_AndCountsCacheHits()
+    {
+        var (ledger, store) = TableLedger();
+        var mw = WireCounter(async ctx =>
+        {
+            Flag(ctx);
+            ctx.Response.Headers[ApiEgressWireCounterMiddleware.EndpointHeader] = "users";
+            ApiEgressWireCounterMiddleware.TagEndpoint(ctx, "ListGraphRequest");
+            ctx.Response.Headers["X-Cache"] = "HIT";
+            await ctx.Response.Body.WriteAsync(new byte[64]);
+        }, ledger);
+
+        var ctx = Context();
+        await mw.InvokeAsync(ctx);
+
+        Assert.False(ctx.Response.Headers.ContainsKey(ApiEgressWireCounterMiddleware.EndpointHeader));
+        var stats = (await DailyEndpoints(ledger, store, App))["ListGraphRequest:users"];
+        Assert.Equal(64L, stats.Bytes);
+        Assert.Equal(1L, stats.CacheHits);
+    }
+
+    [Fact]
+    public async Task InteractiveCaller_IsRecordedForReporting_ButNeverBilled()
+    {
+        var (ledger, store) = TableLedger();
+        var limiter = new ApiEgressLimiterMiddleware(async ctx =>
+        {
+            ApiEgressWireCounterMiddleware.TagEndpoint(ctx, "ListLogs");
+            await ctx.Response.Body.WriteAsync(new byte[256]);
+        }, ledger, NullLoggerFactory.Instance);
+        var mw = WireCounter(ctx => limiter.InvokeAsync(ctx), ledger);
+
+        var ctx = Context();
+        ctx.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
+        ctx.Request.Headers["x-ms-client-principal-name"] = "user@contoso.com";
+        await mw.InvokeAsync(ctx);
+
+        Assert.Equal(0L, ledger.CurrentBytes);
+        Assert.Equal(256L, (await DailyEndpoints(ledger, store, EgressTableSchema.InteractivePartition))["ListLogs"].Bytes);
+    }
+
+    [Fact]
+    public async Task AnonymousCaller_IsNotRecorded()
+    {
+        var (ledger, store) = TableLedger();
+        var limiter = new ApiEgressLimiterMiddleware(
+            async ctx => await ctx.Response.Body.WriteAsync(new byte[256]), ledger, NullLoggerFactory.Instance);
+        var mw = WireCounter(ctx => limiter.InvokeAsync(ctx), ledger);
+
+        await mw.InvokeAsync(Context());
+        await ledger.SyncToTableAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(store.All("T"), r => r.PartitionKey == EgressTableSchema.InteractivePartition);
+    }
 }
