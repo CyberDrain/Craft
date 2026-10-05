@@ -71,6 +71,13 @@ function Start-CraftOrchestrator {
 
     $OrchestratorName = $InputObject.OrchestratorName ?? 'UnnamedOrchestrator'
 
+    # Collisions off: a run of this name that is still going wins, and this one is skipped up front.
+    $AllowCollision = $InputObject.AllowCollision -ne $false
+    if (-not $AllowCollision -and [Craft.Services.OrchestratorBridge]::IsRunActive($OrchestratorName)) {
+        Write-Warning "Craft: Skipped orchestrator '$OrchestratorName' - a run with this name is still active"
+        return "Craft-$OrchestratorName-Skipped"
+    }
+
     # QueueFunction pattern: call the function first to generate batch items
     if (-not $InputObject.Batch -and $InputObject.QueueFunction) {
         $QueueFuncName = "Push-$($InputObject.QueueFunction.FunctionName)"
@@ -149,7 +156,6 @@ function Start-CraftOrchestrator {
     # Sequential mode: PowerShell marshals absent/$false to $false. When set, the orchestrator queues the
     # batch one task at a time in payload order rather than fanning out.
     $Sequential = [bool]($InputObject.Sequential)
-    $AllowCollision = $InputObject.AllowCollision -ne $false
 
     Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(

@@ -177,24 +177,8 @@ public class OrchestratorBridgeLineageTests
     {
         // The deadlock-avoidance guarantee: a child registered at enqueue that then fails to start (here an
         // empty batch) must stop holding its parent, or the parent never reaches its barrier.
-        var settings = new Craft.Configuration.CraftSettings();
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
-        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
-        var jobs = new Craft.Orchestration.JobManager(NullLogger<Craft.Orchestration.JobManager>.Instance, settings, limiter);
-        var mem = new MemoryTableStore();
-        var store = new Craft.Storage.WorkStore(NullLogger<Craft.Storage.WorkStore>.Instance, settings, mem);
-        var svc = new OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, limiter, jobs, store,
-            new Craft.Storage.ResultStore(NullLogger<Craft.Storage.ResultStore>.Instance, settings, mem), config, settings);
-        var started = DateTime.UtcNow;
-        var parent = await store.CreateRunAsync(new Craft.Storage.RunHeader
-        {
-            RunKey = Craft.Storage.WorkStore.RunKeyFor("LineageDrainParent", started),
-            Name = "LineageDrainParent",
-            StartedUtc = started,
-            TaskScriptName = "Invoke-CraftTask",
-        }, [new Craft.Storage.WorkStore.NewTask("t0", new())]);
+        var (svc, store) = NewStoreBackedService();
+        var parent = await CreateRunAsync(store, "LineageDrainParent");
 
         var previousService = s_serviceField.GetValue(null);
         try
@@ -218,5 +202,55 @@ public class OrchestratorBridgeLineageTests
             // test cannot redirect other tests' drains into this one.
             s_serviceField.SetValue(null, previousService);
         }
+    }
+
+    [Fact]
+    public async Task IsRunActive_SeesUnfinishedRunsAndRunsQueuedToStart_SoACallerCanSkipAndSaySo()
+    {
+        var (svc, store) = NewStoreBackedService();
+        await CreateRunAsync(store, "LineageActiveRun");
+
+        var previousService = s_serviceField.GetValue(null);
+        try
+        {
+            OrchestratorBridge.Initialize(svc);
+            Assert.True(OrchestratorBridge.IsRunActive("LineageActiveRun"));
+            Assert.False(OrchestratorBridge.IsRunActive("LineageNoSuchRun"));
+
+            OrchestratorBridge.QueueOrchestration("LineageQueuedRun", "[]", 4);
+            Assert.True(OrchestratorBridge.IsRunActive("LineageQueuedRun"));
+            Assert.NotNull(TakePending("LineageQueuedRun"));
+        }
+        finally
+        {
+            s_serviceField.SetValue(null, previousService);
+        }
+    }
+
+    private static (OrchestratorService Service, Craft.Storage.WorkStore Store) NewStoreBackedService()
+    {
+        var settings = new Craft.Configuration.CraftSettings();
+        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var jobs = new Craft.Orchestration.JobManager(NullLogger<Craft.Orchestration.JobManager>.Instance, settings, limiter);
+        var mem = new MemoryTableStore();
+        var store = new Craft.Storage.WorkStore(NullLogger<Craft.Storage.WorkStore>.Instance, settings, mem);
+        var svc = new OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, limiter, jobs, store,
+            new Craft.Storage.ResultStore(NullLogger<Craft.Storage.ResultStore>.Instance, settings, mem), config, settings);
+        return (svc, store);
+    }
+
+    private static Task<Craft.Storage.RunHeader> CreateRunAsync(Craft.Storage.WorkStore store, string name)
+    {
+        var started = DateTime.UtcNow;
+        return store.CreateRunAsync(new Craft.Storage.RunHeader
+        {
+            RunKey = Craft.Storage.WorkStore.RunKeyFor(name, started),
+            Name = name,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+        }, [new Craft.Storage.WorkStore.NewTask("t0", new())]);
     }
 }

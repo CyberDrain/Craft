@@ -169,7 +169,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 gated = _activePlanners.TryAdd(name, true);
                 if (!gated || await IsActiveAsync(name, ct))
                 {
-                    _logger.LogInformation("[Orchestrator] Run {Name} already active, skipping", name);
+                    _logger.LogWarning("[Orchestrator] Run {Name} skipped: a run of that name is still active and collisions are off", name);
                     return false;
                 }
             }
@@ -209,6 +209,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     private async Task<bool> IsActiveAsync(string name, CancellationToken ct) =>
         (await _store.GetActiveRunsAsync(name, ct)).Count > 0;
+
+    /// <summary>Whether any run with this name is unfinished.</summary>
+    public Task<bool> IsRunActiveAsync(string name, CancellationToken ct = default) => IsActiveAsync(TableKeys.Sanitize(name), ct);
 
     /// <summary>The runs an operator action names: the run with that key, or every unfinished run of that name.</summary>
     private async Task<List<RunHeader>> TargetRunsAsync(string keyOrName)
