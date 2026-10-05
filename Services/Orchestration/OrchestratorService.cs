@@ -711,7 +711,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         catch (OperationCanceledException) { }
     }
 
-    private async Task LogRunStatusAsync(CancellationToken ct)
+    internal async Task LogRunStatusAsync(CancellationToken ct)
     {
         if (!_logger.IsEnabled(LogLevel.Information)) return;
         // Running jobs are counted per run name, so runs sharing a name take them oldest first.

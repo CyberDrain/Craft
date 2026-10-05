@@ -20,6 +20,19 @@ internal sealed class MemoryTableStore : ICraftTableStore
 
     public int Submits { get; private set; }
 
+    /// <summary>Tables deleted through <see cref="DeleteTableAsync"/>, in order.</summary>
+    public List<string> DroppedTables { get; } = [];
+
+    public Task DeleteTableAsync(string table, CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            DroppedTables.Add(table);
+            _tables.Remove(table);
+        }
+        return Task.CompletedTask;
+    }
+
     private static readonly Comparer<(string, string)> Order = Comparer<(string, string)>.Create((a, b) =>
     {
         var c = string.CompareOrdinal(a.Item1, b.Item1);

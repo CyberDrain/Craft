@@ -5,6 +5,7 @@ using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Storage;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -15,8 +16,8 @@ namespace Craft.Tests;
 /// Tracks the start order and the peak number of tasks running at once.
 /// </summary>
 internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultStore results, IConfiguration config,
-    CraftSettings settings)
-    : OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, null!, jobs, store, results, config, settings)
+    CraftSettings settings, ILogger<OrchestratorService> logger)
+    : OrchestratorService(logger, null!, null!, jobs, store, results, config, settings)
 {
     public const string PostExecScript = "Invoke-CraftPostExecution";
 
@@ -82,6 +83,7 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
     public required WorkPump Pump { get; init; }
     public required JobManager Jobs { get; init; }
     public required ICraftTableStore Tables { get; init; }
+    public required CapturingLogger<OrchestratorService> Log { get; init; }
 
     public static async Task<OrchestrationHarness> CreateAsync(int poolSize = 4, ICraftTableStore? tables = null,
         Action<CraftSettings>? configure = null)
@@ -101,11 +103,12 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
         tables ??= new MemoryTableStore();
         var store = new WorkStore(NullLogger<WorkStore>.Instance, settings, tables);
         var results = new ResultStore(NullLogger<ResultStore>.Instance, settings, tables);
-        var svc = new FakeOrchestrator(jobs, store, results, config, settings);
+        var log = new CapturingLogger<OrchestratorService>();
+        var svc = new FakeOrchestrator(jobs, store, results, config, settings, log);
         await svc.ResumeInterruptedRunsAsync(CancellationToken.None);
         var pump = new WorkPump(NullLogger<WorkPump>.Instance, store, jobs, config, settings, svc);
         _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
-        return new OrchestrationHarness { Svc = svc, Store = store, Pump = pump, Jobs = jobs, Tables = tables };
+        return new OrchestrationHarness { Svc = svc, Store = store, Pump = pump, Jobs = jobs, Tables = tables, Log = log };
     }
 
     public static string Batch(int n, string prefix = "t") =>
@@ -142,4 +145,16 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
     }
 
     public async ValueTask DisposeAsync() => await Jobs.StopAsync(CancellationToken.None);
+}
+
+/// <summary>Keeps every rendered log line (at any level) for tests that pin what operators and tooling read.</summary>
+internal sealed class CapturingLogger<T> : ILogger<T>
+{
+    public readonly ConcurrentQueue<(LogLevel Level, string Message)> Lines = new();
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+        Func<TState, Exception?, string> formatter) => Lines.Enqueue((logLevel, formatter(state, exception)));
 }

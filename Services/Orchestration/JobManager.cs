@@ -57,6 +57,12 @@ public class JobManager : BackgroundService
 
     // ── Tracking ──
     private readonly ConcurrentDictionary<string, JobRecord> _jobs = new();
+    /// <summary>
+    /// Jobs cancelled while queued, with whether the state writer was told. A cancel that finds the job still
+    /// in the queue tells it straight away; one that lands after the dispatcher has dequeued the job cannot see
+    /// its descriptor, so the dispatcher (or the job's start) tells it instead. Without that, the claim behind
+    /// the job was never finished, lapsed half an hour later, and ran after all.
+    /// </summary>
     private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
     private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
 
@@ -275,9 +281,11 @@ public class JobManager : BackgroundService
                 // The work ref must go too: CancelJob only marks the id, so leaving the entry here
                 // stranded the captured closure (and everything it captured) in _pendingWork forever —
                 // nothing else ever removes it, not even CleanupOldJobs.
-                if (_cancelledJobIds.TryRemove(job.Record.Id, out _))
+                if (_cancelledJobIds.TryRemove(job.Record.Id, out var notified))
                 {
                     _pendingWork.TryRemove(job.Record.Id, out _);
+                    if (!notified && job.Descriptor is { } cancelled)
+                        NotifyStateWriter(w => w.Cancelled(cancelled), "cancellation", job.Record.Name);
                     _limiter.ReleaseSlot();
                     slotHeld = false;
                     continue;
@@ -360,6 +368,14 @@ public class JobManager : BackgroundService
                 Category = "Job"
             };
             opScope = OperationContext.Set(parentInvocation);
+
+            // Cancelled after the dispatcher's own check but before the job got going.
+            if (_cancelledJobIds.TryRemove(job.Record.Id, out var notified))
+            {
+                if (!notified && job.Descriptor is { } cancelled)
+                    NotifyStateWriter(w => w.Cancelled(cancelled), "cancellation", job.Record.Name);
+                return;
+            }
 
             job.Record.Status = "Running";
             job.Record.StartedUtc = DateTime.UtcNow;
@@ -536,10 +552,15 @@ public class JobManager : BackgroundService
         record.Status = "Cancelled";
         record.CompletedUtc = DateTime.UtcNow;
         record.LastError = "Cancelled by user";
-        _cancelledJobIds.TryAdd(jobId, true);
 
+        // Under the queue lock, so the dispatcher either still finds the entry (and we tell the state writer
+        // here) or has already dequeued it (and tells it when it skips the job).
         JobDescriptor? descriptor;
-        lock (_queueLock) descriptor = FindLiveEntry(record)?.Descriptor;
+        lock (_queueLock)
+        {
+            descriptor = FindLiveEntry(record)?.Descriptor;
+            _cancelledJobIds[jobId] = descriptor != null;
+        }
         if (descriptor is { } d)
             NotifyStateWriter(w => w.Cancelled(d), "cancellation", record.Name);
 
@@ -558,6 +579,8 @@ public class JobManager : BackgroundService
         var descriptors = new List<JobDescriptor>(toCancel.Count);
         lock (_queueLock)
         {
+            // Marked under the lock for the same reason as CancelJob: found here means told here.
+            foreach (var record in toCancel) _cancelledJobIds[record.Id] = false;
             var wanted = toCancel.ToDictionary(r => r.Id, r => r);
             foreach (var (entry, _) in _pendingQueue.UnorderedItems)
             {
@@ -566,6 +589,7 @@ public class JobManager : BackgroundService
                 if (!ReferenceEquals(entry.Record, rec)) continue;
                 if (_reprioritized.TryGetValue(rec.Id, out var live) && entry.Epoch != live) continue;
                 descriptors.Add(d);
+                _cancelledJobIds[rec.Id] = true;
             }
         }
 
@@ -574,7 +598,6 @@ public class JobManager : BackgroundService
             record.Status = "Cancelled";
             record.CompletedUtc = DateTime.UtcNow;
             record.LastError = "Run cancelled by user";
-            _cancelledJobIds.TryAdd(record.Id, true);
         }
 
         foreach (var d in descriptors)

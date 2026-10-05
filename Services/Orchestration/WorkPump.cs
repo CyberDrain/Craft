@@ -213,7 +213,7 @@ public class WorkPump : BackgroundService
     }
 
     /// <summary>Renew claims in their last third, so a long buffer wait or a long task never loses its lease.</summary>
-    private async Task RenewAsync(CancellationToken ct)
+    internal async Task RenewAsync(CancellationToken ct)
     {
         var now = Clock();
         var due = _inFlight.Where(kv => kv.Value.LeaseUntil - now < _lease / 3).ToList();
