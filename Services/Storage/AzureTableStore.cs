@@ -270,6 +270,45 @@ public sealed class AzureTableStore : ICraftTableStore
         return true;
     }
 
+    public async Task DeleteTableAsync(string table, CancellationToken ct = default)
+    {
+        try { await Service.DeleteTableAsync(table, ct); }
+        catch (RequestFailedException ex) when (ex.Status == 404) { }
+    }
+
+    public async Task<bool> TrySubmitAsync(string table, string partitionKey, IReadOnlyList<StoreOp> ops,
+        CancellationToken ct = default)
+    {
+        if (ops.Count == 0) return true;
+        if (ops.Count > MaxBatch)
+            throw new ArgumentException($"A transaction is limited to {MaxBatch} ops, got {ops.Count}.", nameof(ops));
+
+        var actions = ops.Select(op => op.Kind switch
+        {
+            StoreOpKind.Insert => new TableTransactionAction(TableTransactionActionType.Add, ToEntity(op.Row)),
+            StoreOpKind.Replace => new TableTransactionAction(TableTransactionActionType.UpdateReplace, ToEntity(op.Row),
+                new ETag(op.Row.ETag ?? throw new ArgumentException($"Replace of {op.Row.RowKey} needs an ETag.", nameof(ops)))),
+            StoreOpKind.Delete => new TableTransactionAction(TableTransactionActionType.Delete,
+                new TableEntity(op.Row.PartitionKey, op.Row.RowKey), op.Row.ETag is { } etag ? new ETag(etag) : ETag.All),
+            _ => new TableTransactionAction(TableTransactionActionType.UpsertReplace, ToEntity(op.Row)),
+        }).ToList();
+
+        try
+        {
+            await Client(table).SubmitTransactionAsync(actions, ct);
+            return true;
+        }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            await RecreateTableAsync(table, ct);
+            return false;
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 404 or 409)
+        {
+            return false;
+        }
+    }
+
     private async Task SubmitAsync(string table, TableClient client, List<TableTransactionAction> batch, CancellationToken ct)
     {
         try

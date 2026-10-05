@@ -1,73 +1,15 @@
 namespace Craft.Configuration;
 
 /// <summary>
-/// Orchestrator settings — fan-out/fan-in task execution with crash recovery.
+/// Orchestrator settings — fan-out/fan-in task execution, with all state in storage.
 /// </summary>
 public class OrchestratorSettings
 {
     /// <summary>
-    /// Prefix for the three Azure Tables used by the orchestrator.
-    /// Tables created: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results.
+    /// Prefix for the orchestrator's Azure Tables.
+    /// Tables created: {Prefix}Work, {Prefix}Ready, {Prefix}Names, {Prefix}Finished, {Prefix}TaskResults.
     /// </summary>
     public string TablePrefix { get; set; } = "Orchestrator";
-
-    /// <summary>
-    /// Batch and coalesce per-task/run status writes through OrchestratorStatusWriter instead of writing each
-    /// individually. Removes the per-task Azure Table write from the fan-out critical path (the throughput
-    /// ceiling — see docs/orch-analysis.md). Default true. Results are never batched (their chunking path is
-    /// untouched). Set false to fall back to the original per-task writes (for A/B).
-    /// </summary>
-    public bool BatchStatusWrites { get; set; } = true;
-
-    /// <summary>
-    /// Coalesce SMALL task results (those that fit one Azure Table property) through the batched status
-    /// writer instead of a per-task upsert on the fan-out critical path. Each result is written BEFORE
-    /// its task's terminal marker in the same flush, so a result is always durable before the task is
-    /// counted done (and therefore before finalize/post-execution reads it). Large results keep the
-    /// directly-awaited chunked path. Default true; only applies when <see cref="BatchStatusWrites"/> is
-    /// also true. Set false to fall back to the original per-task awaited result write.
-    /// </summary>
-    public bool BatchResultWrites { get; set; } = true;
-
-    /// <summary>
-    /// When batching status writes, write the pre-invoke "Running" marker under a synchronous barrier so it
-    /// is durable BEFORE the task invokes (batched with other concurrently-starting tasks). Preserves the
-    /// AttemptCount/MaxRetries poison-task guarantee. Default true. False = eventual (faster, weaker: the
-    /// marker rides the periodic flush, so a host crash within the flush window may not advance AttemptCount).
-    /// </summary>
-    public bool DurableRunningBarrier { get; set; } = true;
-
-    /// <summary>How often (ms) the status writer flushes coalesced writes. Also the barrier latency ceiling.
-    /// Default 25.</summary>
-    public int StatusFlushIntervalMs { get; set; } = 25;
-
-    /// <summary>
-    /// How long a task will wait for its durable "Running" marker before giving up (seconds, default 90).
-    ///
-    /// This wait sits between the JobManager dispatching a task and that task checking out a worker, so
-    /// an unbounded one is a whole-host outage: production wedged for 101 and 75 minutes with all 8
-    /// limiter slots held by tasks blocked here, every BG worker idle, and the heap at 24% of its cap.
-    /// On timeout the task is deferred, NOT failed — the marker never landed, so storage still has it
-    /// Pending and it is retried. Must exceed <see cref="StatusFlushTimeoutSeconds"/>, since a waiter
-    /// may need the in-flight flush to finish plus one more.
-    /// </summary>
-    public int RunningBarrierTimeoutSeconds { get; set; } = 90;
-
-    /// <summary>
-    /// Ceiling on one flush of coalesced status writes (seconds, default 30). The drain loop is a single
-    /// loop, so an unbounded storage call inside a flush stops every status write and every barrier
-    /// waiter in the process. Writes that do not complete are put back and retried on the next flush.
-    /// </summary>
-    public int StatusFlushTimeoutSeconds { get; set; } = 30;
-
-    /// <summary>
-    /// How many per-run status writes may be in flight within one flush (default 8).
-    ///
-    /// Writes are grouped by run because a batch must share a partition key. The workload that broke
-    /// this was ~600 runs of ONE task each (one per tenant), which turned a "batch" into hundreds of
-    /// sequential round-trips inside a single flush. 1 restores the old sequential behaviour.
-    /// </summary>
-    public int StatusFlushConcurrency { get; set; } = 8;
 
     /// <summary>
     /// PowerShell function used to execute individual orchestrator tasks.
@@ -87,44 +29,25 @@ public class OrchestratorSettings
     /// </summary>
     public string PostExecFunction { get; set; } = "Invoke-CraftPostExecution";
 
-    /// <summary>Maximum number of times a task can be interrupted before being marked Failed.</summary>
+    /// <summary>Maximum number of times a task can be interrupted before being marked Failed, and how many
+    /// times a run's PostExecution is attempted.</summary>
     public int MaxRetries { get; set; } = 3;
 
     /// <summary>
-    /// How long a run's rows outlive it (hours, default 48). A run that finished — or that nothing is
-    /// driving and that last wrote to storage — longer ago than this is removed from all three tables,
-    /// together with any Tasks/Results partition whose Run row is already gone. Craft itself needs the
-    /// rows only while a run is live; they stay this long for operators reading recent history.
+    /// How long a finished run's rows outlive it (hours, default 48). Craft needs them only while the run
+    /// is live; they stay this long for operators reading recent history.
     /// </summary>
     public int RetentionHours { get; set; } = 48;
 
     /// <summary>
     /// How often the retention sweep runs after the one at startup (hours, default 4). 0 disables the
-    /// periodic sweep; the startup pass, which follows crash recovery, still runs.
+    /// periodic sweep; the startup pass still runs.
     /// </summary>
     public int CleanupIntervalHours { get; set; } = 4;
 
     /// <summary>
-    /// The per-run status/re-drive tick cadence (seconds, default 60). Each live run has a timer firing at
-    /// this interval to log status, re-drive orphaned tasks, and re-check completion. It is also the floor
-    /// of the re-drive backoff. Raising it cuts per-run overhead at high live-run counts; the perf harness
-    /// lowers it to exercise the backoff in compressed time. Minimum 1s.
+    /// How often each active run's status line is considered for logging (seconds, default 60). A line is
+    /// written when the run's counts change, or every ten minutes when they do not. Minimum 1s.
     /// </summary>
     public int StatusTimerIntervalSeconds { get; set; } = 60;
-
-    /// <summary>
-    /// Whether the per-run re-drive backs off geometrically once it has verified a run has no orphaned
-    /// tasks (default true). When false the re-drive verifies against storage on every tick — the old
-    /// behaviour, retained as a safety switch and for A/B measurement of the backoff's effect.
-    /// </summary>
-    public bool RedriveBackoff { get; set; } = true;
-
-    /// <summary>
-    /// Whether a task sheds its <c>Parameters</c> payload from the in-memory run graph once it is durably
-    /// persisted and enqueued, rehydrating it from the Tasks table at dispatch (default true). This bounds
-    /// the retained memory of a large pending backlog — thousands of runs each holding every task's payload
-    /// is what drives the live-set toward the GC heap ceiling — at the cost of one point read per task at
-    /// dispatch. False keeps the payload resident the whole time (the old behaviour), for A/B or safety.
-    /// </summary>
-    public bool ShedPendingParameters { get; set; } = true;
 }

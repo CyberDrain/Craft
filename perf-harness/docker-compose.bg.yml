@@ -55,15 +55,10 @@ services:
       - BackgroundBurstToCeiling=${BG_BURST:-false}
       - BackgroundOverSubscribe=${BG_OVERSUB:-0}
       # Batched status writer (#3). run-orch.ps1 -NoBatch sets false to A/B the per-task-write "before".
-      - App__Orchestrator__BatchStatusWrites=${BATCH_WRITES:-true}
-      - App__Orchestrator__DurableRunningBarrier=${DURABLE_BARRIER:-true}
-      - App__Orchestrator__StatusFlushIntervalMs=${FLUSH_MS:-25}
       # Per-run status/re-drive tick cadence. run-manyruns.ps1 lowers it to compress the re-drive backoff.
       - App__Orchestrator__StatusTimerIntervalSeconds=${STATUS_INTERVAL:-60}
       # Re-drive backoff (② ). run-manyruns.ps1 flips it to A/B the backoff's effect at a fixed interval.
-      - App__Orchestrator__RedriveBackoff=${REDRIVE_BACKOFF:-true}
       # Pending-Parameters shedding (retained-memory fix). run-manyruns.ps1 flips it to A/B the memory effect.
-      - App__Orchestrator__ShedPendingParameters=${SHED_PARAMS:-true}
       # Default Warning keeps the other bg-harness runs quiet; run-manyruns.ps1 sets LOG_LEVEL=Information
       # to reproduce production's Info-level per-run status logging (the log flood is part of the cost under test).
       - CRAFT_LOG_LEVEL=${LOG_LEVEL:-Warning}

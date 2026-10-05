@@ -4,14 +4,24 @@ namespace Craft.Orchestration;
 /// The identity of a queued orchestrator task — everything the queue needs to hold, and nothing more.
 ///
 /// Orchestrator fan-out is where queue depth comes from (production peaked at 783 queued with 3.7-hour
-/// waits), and it used to enqueue a closure capturing the whole <see cref="OrchestratorRun"/> graph, the
+/// waits), and it used to enqueue a closure capturing the whole run graph, the
 /// task, the script path and the service. A descriptor replaces all of that with two string references
 /// and an int; <see cref="JobWorkResolver"/> turns it back into runnable work at dispatch time.
 /// </summary>
 /// <param name="RunName">Run this task belongs to — the storage partition key.</param>
 /// <param name="TaskId">Task id within the run — the storage row key.</param>
 /// <param name="Priority">Dispatch priority (lower = higher).</param>
-public readonly record struct JobDescriptor(string RunName, string TaskId, int Priority);
+public readonly record struct JobDescriptor(string RunName, string TaskId, int Priority)
+{
+    /// <summary>The run's storage key (its partition); null for a descriptor that names a run only.</summary>
+    public string? RunKey { get; init; }
+
+    /// <summary>The task's position in its run, which addresses its row.</summary>
+    public int Seq { get; init; }
+
+    /// <summary>Which execution of the task this is (1 for the first).</summary>
+    public int Attempt { get; init; }
+}
 
 /// <summary>
 /// Rehydrates a <see cref="JobDescriptor"/> into runnable work. Returns null when the descriptor is

@@ -275,15 +275,15 @@ public static class CraftHostBuilderExtensions
 
         services.AddSingleton<BackgroundTaskLimiter>();
         services.AddSingleton<JobManager>();
-        services.AddSingleton<OrchestratorTableStore>();
-        // The durable job queue. Registered alongside the orchestrator store because it shares the
-        // same ICraftTableStore and therefore the same bounded connection pool.
-        services.AddSingleton<JobQueueStore>();
+        // Durable orchestration state and task results, over the shared ICraftTableStore (and its
+        // bounded connection pool).
+        services.AddSingleton(_ => new PartitionRateLimiter());
+        services.AddSingleton<WorkStore>();
+        services.AddSingleton<ResultStore>();
         // Table-backed queue view for the status APIs — the JobManager only buffers a worker-pool-sized
         // slice of the backlog, so status must read the tables. All roles: an HTTP-only node serves the
         // worker-health endpoint for work that runs elsewhere.
         services.AddSingleton<JobQueueStatusReader>();
-        services.AddSingleton<OrchestratorStatusWriter>();
         services.AddSingleton<OrchestratorService>();
         services.AddSingleton<AuthService>();
         services.AddSingleton<SetupService>();
@@ -297,10 +297,10 @@ public static class CraftHostBuilderExtensions
         if (roles.Background)
         {
             services.AddHostedService(sp => sp.GetRequiredService<JobManager>());
-            // Feeds the JobManager from the durable queue a batch at a time, so the backlog lives
-            // in storage rather than in this process.
-            services.AddSingleton<JobQueuePump>();
-            services.AddHostedService(sp => sp.GetRequiredService<JobQueuePump>());
+            // Feeds the JobManager from storage a batch at a time, so the backlog lives in storage
+            // rather than in this process.
+            services.AddSingleton<WorkPump>();
+            services.AddHostedService(sp => sp.GetRequiredService<WorkPump>());
             services.AddHostedService(sp => sp.GetRequiredService<SchedulerService>());
             services.AddHostedService(sp => sp.GetRequiredService<StatsHistoryService>());
         }

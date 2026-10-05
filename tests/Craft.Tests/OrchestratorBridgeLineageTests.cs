@@ -2,11 +2,11 @@ using System.Collections.Concurrent;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -173,23 +173,28 @@ public class OrchestratorBridgeLineageTests
     }
 
     [Fact]
-    public void Drain_ReleasesTheGate_WhenStartFails()
+    public async Task Drain_ReleasesTheParent_WhenTheChildIsNeverCreated()
     {
-        // The deadlock-avoidance guarantee: a child whose start attempt throws must stop gating
-        // its parent. The service here is deliberately missing its storage fields, so
-        // StartFromBatchAsync fails immediately — the finally in DrainPending must still release.
-        var svc = (OrchestratorService)RuntimeHelpers.GetUninitializedObject(typeof(OrchestratorService));
-        void Set(string field, object value) =>
-            typeof(OrchestratorService).GetField(field, BindingFlags.NonPublic | BindingFlags.Instance)!
-                .SetValue(svc, value);
-        Set("_logger", NullLogger<OrchestratorService>.Instance);
-        var activeRuns = new ConcurrentDictionary<string, OrchestratorRun>();
-        Set("_activeRuns", activeRuns);
-        Set("_childRuns", new ConcurrentDictionary<string, ConcurrentBag<string>>());
-        Set("_recoveringChildren", new ConcurrentDictionary<string, bool>());
-        var pendingChildRuns = new ConcurrentDictionary<string, int>();
-        Set("_pendingChildRuns", pendingChildRuns);
-        activeRuns.TryAdd("LineageDrainParent", new OrchestratorRun { Name = "LineageDrainParent", Status = "Running" });
+        // The deadlock-avoidance guarantee: a child registered at enqueue that then fails to start (here an
+        // empty batch) must stop holding its parent, or the parent never reaches its barrier.
+        var settings = new Craft.Configuration.CraftSettings();
+        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var jobs = new Craft.Orchestration.JobManager(NullLogger<Craft.Orchestration.JobManager>.Instance, settings, limiter);
+        var mem = new MemoryTableStore();
+        var store = new Craft.Storage.WorkStore(NullLogger<Craft.Storage.WorkStore>.Instance, settings, mem);
+        var svc = new OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, limiter, jobs, store,
+            new Craft.Storage.ResultStore(NullLogger<Craft.Storage.ResultStore>.Instance, settings, mem), config, settings);
+        var started = DateTime.UtcNow;
+        var parent = await store.CreateRunAsync(new Craft.Storage.RunHeader
+        {
+            RunKey = Craft.Storage.WorkStore.RunKeyFor("LineageDrainParent", started),
+            Name = "LineageDrainParent",
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+        }, [new Craft.Storage.WorkStore.NewTask("t0", new())]);
 
         var previousService = s_serviceField.GetValue(null);
         try
@@ -198,17 +203,19 @@ public class OrchestratorBridgeLineageTests
 
             OrchestratorBridge.QueueOrchestration("LineageDrainChild", "[]", 4,
                 null, null, null, parentRunName: "LineageDrainParent");
-            Assert.True(pendingChildRuns.ContainsKey("LineageDrainChild"));
+            Assert.Equal(2, (await store.GetRunAsync(parent.RunKey))!.Total);
 
             OrchestratorBridge.DrainPending();
 
-            Assert.False(pendingChildRuns.ContainsKey("LineageDrainChild"));
-            Assert.False(activeRuns.ContainsKey("LineageDrainChild"));
+            var after = (await store.GetRunAsync(parent.RunKey))!;
+            Assert.Equal(1, after.Done);
+            Assert.Equal(2, after.Total);
+            Assert.Null(await store.GetRunByNameAsync("LineageDrainChild"));
         }
         finally
         {
             // The bridge service is static process state — put back whatever was there so this
-            // test cannot redirect other tests' drains into the crippled service.
+            // test cannot redirect other tests' drains into this one.
             s_serviceField.SetValue(null, previousService);
         }
     }

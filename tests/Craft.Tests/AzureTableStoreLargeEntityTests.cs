@@ -7,10 +7,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Craft.Tests;
 
 /// <summary>
-/// Tests here allocate multi-MB strings to force the storage size limits, and heap-delta measurement
-/// tests (see <see cref="RetentionMeasurement"/>) cannot share a process with concurrent allocation.
-/// Marking this collection non-parallel puts it in the same sequential phase as those, so the two never
-/// run at once. See the note on <see cref="RetentionMeasurement"/> for the failure mode this avoids.
+/// Tests here allocate multi-MB strings to force the storage size limits, so they run alone rather than
+/// alongside tests that are sensitive to heap pressure.
 /// </summary>
 [CollectionDefinition(LargeAllocationSerialTests.Name, DisableParallelization = true)]
 public class LargeAllocationSerialTests

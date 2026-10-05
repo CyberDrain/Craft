@@ -32,10 +32,10 @@ public static class OrchestratorBridge
         // character would register a child link no live run ever matches.
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
-        var gated = RegisterPendingChild(parentRunName, name);
+        var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference,
-            PendingChildRegistered: gated, Sequential: sequential));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey));
     }
 
     /// <summary>
@@ -55,10 +55,10 @@ public static class OrchestratorBridge
     {
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
-        var gated = RegisterPendingChild(parentRunName, name);
+        var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
-            PendingChildRegistered: gated, Sequential: sequential));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey));
     }
 
     /// <summary>
@@ -88,76 +88,51 @@ public static class OrchestratorBridge
     }
 
     /// <summary>
-    /// Register the child link at ENQUEUE time — while the parent task's script is still executing,
-    /// so the parent cannot pass its completion check before the gate exists. Registering after
-    /// StartFromBatchAsync (the old shape) loses that race for the parent's LAST task: the drain
-    /// runs in a background Task.Run while the enqueuing task is marked terminal immediately, so
-    /// the parent would finalize — and dispatch PostExecution — before its child was visible.
-    /// Returns whether a gate was taken, so the drain releases exactly what was registered.
+    /// Make the parent wait for this child, at ENQUEUE time — while the parent's task is still executing, so
+    /// the parent cannot reach its barrier first. The returned keys travel with the queued run: the child
+    /// fills the placeholder when it finishes, and a child that is never created releases it on the drain.
     /// </summary>
-    private static bool RegisterPendingChild(string? parentRunName, string childName) =>
-        !string.IsNullOrEmpty(parentRunName) &&
-        s_service?.TryRegisterPendingChildRun(parentRunName, childName) == true;
+    private static (string ParentRunKey, string ChildKey)? RegisterPendingChild(string? parentRunName, string childName) =>
+        string.IsNullOrEmpty(parentRunName) ? null : s_service?.RegisterPendingChild(parentRunName, childName);
 
-    /// <summary>
-    /// Synchronous drain — blocks until all pending orchestrations are started.
-    /// Safe to call from any context (no SynchronizationContext on background workers).
-    /// </summary>
+    /// <summary>Synchronous drain — blocks until all pending orchestrations are started.</summary>
     public static void DrainPending()
     {
         while (s_pending.TryDequeue(out var p))
-        {
-            try
-            {
-                if (s_service == null) { DiscardUndispatchable(p); continue; }
-                s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential)
-                    .GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
-            }
-            finally
-            {
-                // The enqueue-time gate lifts on EVERY path once the start attempt is over: a
-                // started child is in _activeRuns by now (which takes over blocking the parent),
-                // and one that failed to start must stop blocking — a leaked gate would defer the
-                // parent's finalize forever, re-checked every 60s for the process lifetime.
-                if (p.PendingChildRegistered)
-                    s_service?.ReleasePendingChildRun(p.Name);
-            }
-        }
+            Task.Run(() => StartAsync(p)).GetAwaiter().GetResult();
         DrainPendingPlanners();
     }
 
-    /// <summary>
-    /// Async drain — preferred from async call sites (PostExec lambdas, ExecuteScript).
-    /// </summary>
+    /// <summary>Async drain — preferred from async call sites (PostExec, ExecuteScript).</summary>
     public static async Task DrainPendingAsync()
     {
         while (s_pending.TryDequeue(out var p))
+            await StartAsync(p);
+        await DrainPendingPlannersAsync();
+    }
+
+    private static async Task StartAsync(PendingOrchestration p)
+    {
+        var created = false;
+        try
         {
-            try
+            if (s_service == null) { DiscardUndispatchable(p); return; }
+            created = await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
+                p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
+                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey);
+        }
+        catch (Exception ex)
+        {
+            s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
+        }
+        finally
+        {
+            if (!created && p.ParentRunKey != null && p.ChildKey != null && s_service != null)
             {
-                if (s_service == null) { DiscardUndispatchable(p); continue; }
-                await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential);
-            }
-            catch (Exception ex)
-            {
-                s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
-            }
-            finally
-            {
-                // See DrainPending: the gate lifts whatever the outcome of the start attempt.
-                if (p.PendingChildRegistered)
-                    s_service?.ReleasePendingChildRun(p.Name);
+                try { await s_service.AbandonPendingChildAsync(p.ParentRunKey, p.ChildKey); }
+                catch (Exception ex) { s_service._logger.LogWarning(ex, "[Orchestrator] Could not release {Name} from its parent", p.Name); }
             }
         }
-        await DrainPendingPlannersAsync();
     }
 
     /// <summary>
@@ -179,15 +154,16 @@ public static class OrchestratorBridge
 
     /// <summary>
     /// A queued run. Exactly one of <paramref name="BatchJson"/> and <paramref name="BatchFilePath"/>
-    /// carries the batch; the file path wins when both are set.
-    /// <paramref name="PendingChildRegistered"/> records whether enqueue took a pending-child gate on
-    /// the orchestrator, so the drain releases exactly the gates that were taken — releasing on a
-    /// refused registration could lift a gate held by ANOTHER queued entry of the same child name.
+    /// carries the batch; the file path wins when both are set. <paramref name="ParentRunKey"/> and
+    /// <paramref name="ChildKey"/> are set when the parent was made to wait for this run.
     /// </summary>
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
-        string? Reference = null, string? BatchFilePath = null,
-        bool PendingChildRegistered = false, bool Sequential = false);
+        string? Reference = null, string? BatchFilePath = null, bool Sequential = false,
+        string? ParentRunKey = null, string? ChildKey = null)
+    {
+        public bool PendingChildRegistered => ChildKey != null;
+    }
 
     private static readonly ConcurrentQueue<PendingPlannerRun> s_pendingPlanners = new();
 

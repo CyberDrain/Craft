@@ -200,11 +200,9 @@ public class JobManager : BackgroundService
         // writes status onto the queue item's own record), so the TRACKED record sat frozen at the
         // previous outing's "Completed" while a live copy of the job was queued or running.
         //
-        // IsQueuedOrRunning reads this dictionary, and JobQueuePump.ReleaseFinishedAsync treats a "no"
-        // as permission to DELETE that task's durable queue row. A stale record therefore had the pump
-        // dropping rows out from under running work — observed live releasing 7-9 "finished" jobs per
-        // second against 8 slots. RedrivePendingTasks consults the same predicate, so it was misreading
-        // task state for the same reason.
+        // IsQueuedOrRunning reads this dictionary, and WorkPump treats a "no" as the job being done and stops
+        // renewing its claim. A stale record once had the pump dropping work out from under running jobs —
+        // observed live releasing 7-9 "finished" jobs per second against 8 slots.
         _jobs[jobId] = record;
 
         lock (_queueLock)

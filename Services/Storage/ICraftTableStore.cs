@@ -103,6 +103,40 @@ public interface ICraftTableStore
                 yield return row;
     }
 
+    /// <summary>
+    /// Apply <paramref name="ops"/> to one partition as a single all-or-nothing transaction (at most 100
+    /// ops, rows never split). Insert fails if the row exists; Replace and a Delete carrying an ETag fail if
+    /// the row changed or is gone. Returns false, with nothing written, when any guard fails.
+    ///
+    /// This default checks every guard and then applies the ops one by one, which is atomic only for a
+    /// single-threaded caller; <see cref="AzureTableStore"/> submits a real transaction.
+    /// </summary>
+    async Task<bool> TrySubmitAsync(string table, string partitionKey, IReadOnlyList<StoreOp> ops,
+        CancellationToken ct = default)
+    {
+        foreach (var op in ops)
+        {
+            var current = await GetAsync(table, op.Row.PartitionKey, op.Row.RowKey, ct);
+            var ok = op.Kind switch
+            {
+                StoreOpKind.Insert => current == null,
+                StoreOpKind.Replace => current != null && current.ETag == op.Row.ETag,
+                StoreOpKind.Delete => op.Row.ETag == null || (current != null && current.ETag == op.Row.ETag),
+                _ => true,
+            };
+            if (!ok) return false;
+        }
+        foreach (var op in ops)
+        {
+            if (op.Kind == StoreOpKind.Delete) await DeleteAsync(table, op.Row.PartitionKey, op.Row.RowKey, ct);
+            else await UpsertAsync(table, op.Row, ct);
+        }
+        return true;
+    }
+
+    /// <summary>Delete a whole table if it exists. The default does nothing.</summary>
+    Task DeleteTableAsync(string table, CancellationToken ct = default) => Task.CompletedTask;
+
     /// <summary>Delete a single row. A missing row is not an error.</summary>
     Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 
@@ -123,4 +157,16 @@ public interface ICraftTableStore
 
     /// <summary>Delete every row in a partition.</summary>
     Task DeletePartitionAsync(string table, string partitionKey, CancellationToken ct = default);
+}
+
+public enum StoreOpKind { Insert, Replace, Delete, Upsert }
+
+/// <summary>One write in a <see cref="ICraftTableStore.TrySubmitAsync"/> transaction. Replace and Delete are
+/// guarded by <see cref="StoreRow.ETag"/> (a Delete without one is unconditional).</summary>
+public readonly record struct StoreOp(StoreOpKind Kind, StoreRow Row)
+{
+    public static StoreOp Insert(StoreRow row) => new(StoreOpKind.Insert, row);
+    public static StoreOp Replace(StoreRow row) => new(StoreOpKind.Replace, row);
+    public static StoreOp Upsert(StoreRow row) => new(StoreOpKind.Upsert, row);
+    public static StoreOp Delete(StoreRow row) => new(StoreOpKind.Delete, row);
 }

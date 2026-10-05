@@ -693,10 +693,8 @@ public static class WorkerMetricsBridge
         => s_jobManager?.DeleteJob(jobId) ?? false;
 
     /// <summary>
-    /// Empty the durable job queue — a maintenance/reset primitive. Returns the number of queue rows
-    /// removed, or -1 if the orchestrator is unavailable or the clear failed. In-flight work is
-    /// unaffected and Pending tasks may be re-driven, so pair with <see cref="CancelRun"/> when the
-    /// intent is to STOP work rather than clear a wedged or corrupted queue.
+    /// Empty the durable job queue — cancel every task still waiting in storage. Returns how many were
+    /// cancelled, or -1 if the orchestrator is unavailable or the clear failed. Running tasks finish.
     /// PS usage: <c>[Craft.Services.WorkerMetricsBridge]::ClearQueue()</c>.
     /// </summary>
     public static int ClearQueue()
@@ -714,28 +712,20 @@ public static class WorkerMetricsBridge
     }
 
     /// <summary>
-    /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for an
-    /// unclaimed durable row it moves the row to the new priority bucket (keeping its age) and records
-    /// the override on the task so a restart re-queues it at the operator's priority.
+    /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for a task
+    /// still in storage it moves the task's whole run to the new priority band, since a run's tasks share
+    /// one queue position.
     /// </summary>
     public static bool ChangePriority(string jobId, int newPriority)
     {
         if (s_jobManager?.ChangePriority(jobId, newPriority) == true) return true;
-        if (s_queueReader == null) return false;
+        if (s_queueReader == null || s_orchestrator == null) return false;
 
         return RunBridged(async ct =>
         {
             var snap = await s_queueReader.GetAsync(TimeSpan.FromSeconds(2), ct);
             var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
-            if (row == null) return false;
-
-            var moved = await s_queueReader.Queue.ReprioritizeTaskAsync(row.RunName, row.TaskId, newPriority, ct);
-            if (moved == 0) return false;
-
-            // Best-effort durability of the override itself: only effective where the run is live,
-            // which on the dispatching node it is. The row move above is what changes dispatch order.
-            s_orchestrator?.PriorityChanged(new JobDescriptor(row.RunName, row.TaskId, row.Priority), newPriority);
-            return true;
+            return row != null && await s_orchestrator.ReprioritizeRunAsync(row.RunName, newPriority);
         });
     }
 
