@@ -55,11 +55,11 @@ public class JobQueueStoreTests
         var (queue, _) = NewQueue();
         await queue.InitializeAsync();
 
-        // The re-dispatch case (crash recovery, orphan re-drive). Schema v2 keys deterministically per
-        // (run, task), so the second enqueue UPDATES the first row instead of adding a duplicate — the
-        // duplicate that used to get claimed and executed a second time.
+        // The re-dispatch case (crash recovery, orphan re-drive). The key is the run's start plus the task,
+        // so the second enqueue UPDATES the first row instead of adding a duplicate — the duplicate that
+        // used to get claimed and executed a second time.
         await queue.EnqueueAsync("run", "task-0", 4, At(1));
-        await queue.EnqueueAsync("run", "task-0", 4, At(10));
+        await queue.EnqueueAsync("run", "task-0", 4, At(1));
 
         Assert.Single(await queue.GetQueuedTaskIdsAsync("run"));
 

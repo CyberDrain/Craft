@@ -463,6 +463,22 @@ public sealed class AzureTableStore : ICraftTableStore
             yield return ToRow(entity);
     }
 
+    public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, int maxPerPage,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var entity in StreamReassembledAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, maxPerPage: maxPerPage, cancellationToken: ct), ct))
+            yield return ToRow(entity);
+    }
+
+    public async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
+        string toRowKey, IReadOnlyList<string>? properties = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and RowKey ge '{Escape(fromRowKey)}' and RowKey lt '{Escape(toRowKey)}'";
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, select: properties, cancellationToken: ct), ct))
+            yield return ToRow(entity);
+    }
+
     public async Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
     {
         try

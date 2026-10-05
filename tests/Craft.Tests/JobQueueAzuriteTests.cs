@@ -119,6 +119,85 @@ public class JobQueueAzuriteTests
         Assert.Equal(["b1"], await queue.GetQueuedTaskIdsAsync("run-b"));
     }
 
+    /// <summary>
+    /// A large run's queue rows are read as one RowKey range, built from the run's key prefix. The fakes
+    /// filter ranges in memory, so only here is the service's own range filter — and the page-sized claim
+    /// beside it — evaluated. A wrong bound is silent: the run's work reads as gone, or a neighbour's rows
+    /// leak in.
+    /// </summary>
+    [Fact]
+    public async Task RunKeyRange_ScopesToOneRun_AndAPageSizedClaimStillTakesTheHead()
+    {
+        var queue = await TryConnectAsync();
+        if (queue == null) return;
+
+        var ids = Enumerable.Range(0, 40).Select(i => $"t{i:D2}").ToList();
+        await queue.EnqueueBatchAsync("Big", ids.Select(i => (i, 4)).ToList(), At(1));
+        await queue.EnqueueBatchAsync("Bigger", [("x", 4)], At(2));
+        await queue.EnqueueBatchAsync("Early", [("e", 4)], At(0));
+
+        Assert.Equal(ids, (await queue.GetDispatchableTaskIdsAsync("Big", ids)).Order());
+
+        var claimed = await queue.ClaimBatchAsync("dead", 3, TimeSpan.FromMinutes(30));
+        Assert.Equal(["e", "t00", "t01"], claimed.Select(c => c.TaskId));
+
+        var head = await queue.ListQueuedAsync();
+        Assert.Equal(42, head.Count);
+        Assert.All(head, r => Assert.StartsWith("P04", r.Bucket));
+        Assert.Equal(3, head.Count(r => r.Claimed));
+
+        Assert.Equal(2, await queue.ReleaseRunClaimsAsync("Big"));
+        await queue.RemoveRunAsync("Big", At(1));
+        Assert.Empty(await queue.GetQueuedTaskIdsAsync("Big"));
+        Assert.Equal(["x"], await queue.GetQueuedTaskIdsAsync("Bigger"));
+    }
+
+    /// <summary>
+    /// The v3 migration keys each run by the StartedUtc on its Run row, read with a projection. A projection
+    /// returns only the columns it names, so a missing key column here reads every run as unknown and keys
+    /// it off its queue rows instead — silently, since the fakes return whole rows.
+    /// </summary>
+    [Fact]
+    public async Task Migration_KeysARunByItsRunRowsStartTime()
+    {
+        var settings = new CraftSettings { Storage = { AllowDevelopmentStorage = true } };
+        var connection = Environment.GetEnvironmentVariable("CRAFT_TEST_TABLE_CONNECTION");
+        if (!string.IsNullOrWhiteSpace(connection)) settings.Auth.UserStorageConnection = connection;
+        settings.Orchestrator.TablePrefix = "azqm" + Guid.NewGuid().ToString("N")[..8];
+        var store = new AzureTableStore(settings);
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            await store.PingAsync(cts.Token);
+        }
+        catch { return; }
+
+        var prefix = settings.Orchestrator.TablePrefix;
+        var started = At(0).AddDays(-3);
+        await store.EnsureTableAsync($"{prefix}Runs");
+        await store.EnsureTableAsync($"{prefix}Queue");
+        await store.EnsureTableAsync($"{prefix}QueueIndex");
+        await store.UpsertAsync($"{prefix}Runs", new StoreRow("Run", "MailboxRules_t1")
+        {
+            Properties = { ["StartedUtc"] = new DateTimeOffset(started) }
+        });
+        await store.UpsertAsync($"{prefix}Queue", new StoreRow("P04", "MailboxRules_t1|b1")
+        {
+            Properties =
+            {
+                ["RunName"] = "MailboxRules_t1", ["TaskId"] = "b1", ["Priority"] = 4, ["Owner"] = "",
+                ["QueuedUtc"] = new DateTimeOffset(At(0)),
+            }
+        });
+        await store.UpsertAsync($"{prefix}QueueIndex", new StoreRow("$schema", "queue-index") { Properties = { ["Version"] = 2 } });
+
+        var queue = new JobQueueStore(NullLogger<JobQueueStore>.Instance, settings, store);
+        await queue.InitializeAsync();
+
+        var row = Assert.Single(await queue.ListQueuedAsync());
+        Assert.Equal(JobQueueStore.BuildRowKey(started, "MailboxRules_t1", "b1"), row.RowKey);
+    }
+
     /// <summary>A run name containing a quote must not break the filter or leak into it.</summary>
     [Fact]
     public async Task ServerSideRunFilter_HandlesAQuoteInTheRunName()

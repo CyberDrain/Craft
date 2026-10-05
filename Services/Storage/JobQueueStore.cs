@@ -13,13 +13,13 @@ namespace Craft.Storage;
 /// Key design, and it is doing real work:
 ///
 ///   PartitionKey "P04"                        — the priority bucket, zero-padded so it sorts numerically.
-///   RowKey "{runEpochTicks:D19}|{run}|{task}" — oldest run first within a bucket, one row per task.
+///   RowKey "{runEpochTicks:D19}|{run}|{task}" — the run's start time first, so a bucket drains oldest run
+///                                               first, and one row per task because a run's start never
+///                                               changes. A run's rows in a bucket are also contiguous, so
+///                                               run-scoped queue reads are one RowKey range.
 ///
-/// Azure Table returns rows ordered by partition key then row key, so a single unfiltered read yields
-/// the highest-priority, oldest-first work FIRST, across every run. That is the cross-run priority
-/// ordering the in-memory PriorityQueue provides today, for one round-trip and without probing each
-/// bucket in turn — probing 16 buckets per refill would have cost more round-trips than the whole
-/// batching exercise saves.
+/// Azure Table returns rows ordered by partition key then row key, so a single read yields the
+/// highest-priority, oldest-run work FIRST, across every run, for one round-trip.
 ///
 /// A claim is one conditional transaction over rows sharing a bucket: one round-trip per BATCH, not per
 /// task. Guarded by each row's ETag, so an external edit — or another instance claiming first — makes
@@ -56,6 +56,7 @@ public sealed class JobQueueStore : IDisposable
     private readonly ICraftTableStore _store;
     private readonly string _queueTable;
     private readonly string _indexTable;
+    private readonly string _runsTable;
     private bool _initialized;
 
     /// <summary>
@@ -99,21 +100,13 @@ public sealed class JobQueueStore : IDisposable
     private const string SchemaRowKey = "queue-index";
 
     /// <summary>
-    /// The row in a run's index partition holding the run's queue epoch: the time its first task was queued,
-    /// in whole seconds. Every queue key for the run is prefixed with it, so a bucket drains oldest run
-    /// first, and a re-enqueue of a task builds the same key however much later it happens.
-    /// </summary>
-    private const string EpochRowKey = "$epoch";
-
-    /// <summary>
     /// Current on-disk schema version, applied once per storage account by <see cref="MigrateSchemaAsync"/>:
     ///   1 — the run index exists (see the RUN INDEX note above).
     ///   2 — queue RowKeys are deterministic per (run, task) — <c>{run}|{task}</c> — instead of
     ///       time-prefixed, so re-dispatching a task UPDATES its row instead of writing a second one
     ///       (the duplicate-execution class). Enqueue time moves to the <c>QueuedUtc</c> property.
-    ///   3 — the key gains the run's epoch as a prefix — <c>{epoch}|{run}|{task}</c> — so a bucket drains
-    ///       oldest run first instead of alphabetically by run name, which starved late-sorting runs.
-    ///       Still deterministic per (run, task), because the epoch is stored once per run.
+    ///   3 — the key gains the run's start time as a prefix — <c>{epoch}|{run}|{task}</c> — so a bucket
+    ///       drains oldest run first instead of alphabetically by run name, which starved late-sorting runs.
     /// A single forward migration takes any older account straight to this version; there is no
     /// backward-compatible dual-read — after the migration only the new key scheme is used.
     /// </summary>
@@ -136,6 +129,7 @@ public sealed class JobQueueStore : IDisposable
         _store = store;
         _queueTable = $"{settings.Orchestrator.TablePrefix}Queue";
         _indexTable = $"{settings.Orchestrator.TablePrefix}QueueIndex";
+        _runsTable = $"{settings.Orchestrator.TablePrefix}Runs";
     }
 
     public async Task InitializeAsync(CancellationToken ct = default)
@@ -151,16 +145,26 @@ public sealed class JobQueueStore : IDisposable
         "P" + Math.Clamp(priority, 0, MaxPriorityBucket).ToString("D2", CultureInfo.InvariantCulture);
 
     /// <summary>
-    /// The queue RowKey: the run's epoch, then the run and task. Deterministic per (run, task) for a given
-    /// run epoch, so re-dispatching a task upserts its one row instead of writing a second (schema v2), and
-    /// ordered oldest run first within a bucket (schema v3). v2's bare <c>{run}|{task}</c> ordered a bucket
-    /// alphabetically, so a run whose name sorted late never ran while earlier-sorting runs kept arriving.
-    ///
-    /// Both components are escaped so the key is legal and the '|' separator is unambiguous; the row
-    /// itself carries RunName/TaskId as properties, so nothing needs to parse the key back apart.
+    /// The queue RowKey. The epoch is the run's start time, which every caller reads off the run, so the
+    /// key is the same on every enqueue of a task and a re-dispatch upserts its one row.
     /// </summary>
-    internal static string BuildRowKey(DateTime runEpochUtc, string runName, string taskId) =>
-        $"{runEpochUtc.Ticks.ToString("D19", CultureInfo.InvariantCulture)}|{EscapeKeyComponent(runName)}|{EscapeKeyComponent(taskId)}";
+    internal static string BuildRowKey(DateTime runStartedUtc, string runName, string taskId) =>
+        $"{RunKeyPrefix(runStartedUtc, runName)}{EscapeKeyComponent(taskId)}";
+
+    /// <summary>The shared start of every queue key of one run: <c>{epoch}|{run}|</c>.</summary>
+    private static string RunKeyPrefix(DateTime runStartedUtc, string runName) =>
+        $"{EpochOf(runStartedUtc).Ticks.ToString("D19", CultureInfo.InvariantCulture)}|{EscapeKeyComponent(runName)}|";
+
+    /// <summary>The run prefix of a v3 queue key, or null for an older key.</summary>
+    private static string? RunKeyPrefixOf(string rowKey)
+    {
+        if (ParseEpoch(rowKey) == null) return null;
+        var end = rowKey.IndexOf('|', 20);
+        return end < 0 ? null : rowKey[..(end + 1)];
+    }
+
+    /// <summary>Everything that starts with <paramref name="prefix"/>: '|' is followed by '}' in ordinal order.</summary>
+    private static string PrefixUpperBound(string prefix) => prefix[..^1] + '}';
 
     /// <summary>Whole seconds, so an epoch builds the same key before and after a storage round trip.</summary>
     internal static DateTime EpochOf(DateTime utc) =>
@@ -175,29 +179,6 @@ public sealed class JobQueueStore : IDisposable
         if (ticks <= 0 || ticks > DateTime.MaxValue.Ticks) return null;
         return new DateTime(ticks, DateTimeKind.Utc);
     }
-
-    /// <summary>
-    /// The run's stored epoch, or <paramref name="queuedUtc"/> recorded as it on the run's first enqueue.
-    /// ponytail: read-then-write rather than insert-if-absent, so two concurrent FIRST enqueues of one run
-    /// could record different epochs. A run is dispatched from one place and both dispatch and re-drive
-    /// check the index before enqueuing, so this is a narrow window, not a duplicate path.
-    /// </summary>
-    private async Task<DateTime> RunEpochAsync(string runName, DateTime queuedUtc, CancellationToken ct)
-    {
-        var stored = (await _store.GetAsync(_indexTable, IndexPartition(runName), EpochRowKey, ct))
-            ?.GetDateTimeOffset("EpochUtc");
-        if (stored != null) return EpochOf(stored.Value.UtcDateTime);
-
-        var epoch = EpochOf(queuedUtc);
-        await _store.UpsertAsync(_indexTable, EpochRow(runName, epoch), ct);
-        return epoch;
-    }
-
-    private static StoreRow EpochRow(string runName, DateTime epoch) =>
-        new(IndexPartition(runName), EpochRowKey)
-        {
-            Properties = { ["RunName"] = runName, ["EpochUtc"] = new DateTimeOffset(epoch, TimeSpan.Zero) }
-        };
 
     /// <summary>
     /// Escape a run or task id for use inside a queue RowKey: the Azure-illegal key characters plus '|'
@@ -281,58 +262,31 @@ public sealed class JobQueueStore : IDisposable
             Properties = { ["TaskId"] = taskId, ["RunName"] = runName }
         };
 
-    /// <summary>Add one task to the queue. Idempotent per (run, task): the key comes from the run's stored epoch.</summary>
+    /// <summary>Add one task to the queue. Idempotent per (run, task).</summary>
+    public Task EnqueueAsync(string runName, string taskId, int priority, DateTime runStartedUtc,
+        CancellationToken ct = default) =>
+        EnqueueBatchAsync(runName, [(taskId, priority)], runStartedUtc, ct);
+
+    /// <summary>Queue tasks of one run, keyed by the run's start time and grouped into per-bucket batches.</summary>
     /// <remarks>
-    /// Queue row first, index row second. The queue row is what makes the task actually run; the index
+    /// Queue rows first, index rows second. The queue row is what makes the task actually run; the index
     /// only accelerates lookups. If the process dies between the two the task still executes, and the
-    /// missing index entry is repaired by the next enqueue of the same (queuedUtc, run, task), which
-    /// rewrites both keys unchanged. The other order would leave the index claiming a task is queued
-    /// when no row exists — the orphan re-drive trusts the index, would decline to re-queue, and the
-    /// run would sit Pending with nothing running.
-    /// </remarks>
-    public async Task EnqueueAsync(string runName, string taskId, int priority, DateTime queuedUtc,
-        CancellationToken ct = default)
-    {
-        var bucket = Bucket(priority);
-        var rowKey = BuildRowKey(await RunEpochAsync(runName, queuedUtc, ct), runName, taskId);
-
-        await _store.UpsertAsync(_queueTable, new StoreRow(bucket, rowKey)
-        {
-            Properties =
-            {
-                ["RunName"] = runName,
-                ["TaskId"] = taskId,
-                ["Priority"] = priority,
-                ["Owner"] = "",
-                ["LeaseUntil"] = (DateTimeOffset?)null,
-                // Enqueue time is a property now that it is no longer in the key (schema v2), so age and
-                // status reporting keep working while the key stays deterministic per (run, task).
-                ["QueuedUtc"] = new DateTimeOffset(queuedUtc, TimeSpan.Zero),
-            }
-        }, ct);
-
-        await _store.UpsertAsync(_indexTable, IndexRow(runName, taskId, bucket, rowKey), ct);
-
-        WakePump();
-    }
-
-    /// <summary>Queue many tasks for one run. Chunked by the caller's priority into per-bucket batches.</summary>
-    /// <remarks>
-    /// The index rows for one run all share a partition, so however many buckets the tasks span the
-    /// index costs exactly one transaction. Ordering is as <see cref="EnqueueAsync"/>.
+    /// missing index entry is repaired by the next enqueue of the same task, which rewrites both keys
+    /// unchanged. The other order would leave the index claiming a task is queued when no row exists — the
+    /// orphan re-drive trusts the index, would decline to re-queue, and the run would sit Pending with
+    /// nothing running. The index rows share the run's partition, so they cost one transaction.
     /// </remarks>
     public async Task EnqueueBatchAsync(string runName, IReadOnlyList<(string TaskId, int Priority)> tasks,
-        DateTime queuedUtc, CancellationToken ct = default)
+        DateTime runStartedUtc, CancellationToken ct = default)
     {
         if (tasks.Count == 0) return;
 
         var indexRows = new List<StoreRow>(tasks.Count);
-        var epoch = await RunEpochAsync(runName, queuedUtc, ct);
+        var queuedOffset = new DateTimeOffset(DateTime.SpecifyKind(runStartedUtc, DateTimeKind.Utc));
 
         foreach (var byBucket in tasks.GroupBy(t => Bucket(t.Priority)))
         {
-            var queuedOffset = new DateTimeOffset(queuedUtc, TimeSpan.Zero);
-            var rows = byBucket.Select(t => new StoreRow(byBucket.Key, BuildRowKey(epoch, runName, t.TaskId))
+            var rows = byBucket.Select(t => new StoreRow(byBucket.Key, BuildRowKey(runStartedUtc, runName, t.TaskId))
             {
                 Properties =
                 {
@@ -347,12 +301,10 @@ public sealed class JobQueueStore : IDisposable
 
             await _store.UpsertBatchAsync(_queueTable, byBucket.Key, rows, ct);
 
-            indexRows.AddRange(byBucket.Select(t =>
-                IndexRow(runName, t.TaskId, byBucket.Key, BuildRowKey(epoch, runName, t.TaskId))));
+            indexRows.AddRange(rows.Select(r => IndexRow(runName, r.GetString("TaskId")!, byBucket.Key, r.RowKey)));
         }
 
-        if (indexRows.Count > 0)
-            await _store.UpsertBatchAsync(_indexTable, IndexPartition(runName), indexRows, ct);
+        await _store.UpsertBatchAsync(_indexTable, IndexPartition(runName), indexRows, ct);
 
         WakePump();
     }
@@ -387,7 +339,7 @@ public sealed class JobQueueStore : IDisposable
         // paged to the client on every pump tick just to find the few free rows at its head. It is an
         // optimisation ONLY — a store that ignores it still returns everything — so IsClaimable below
         // stays as the authority. Nothing here may assume the filter was applied.
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ClaimableFilter(now), ct))
+        await foreach (var row in _store.QueryTableAsync(_queueTable, ClaimableFilter(now), max, ct))
         {
             if (!IsClaimable(row, now)) continue;
 
@@ -548,14 +500,27 @@ public sealed class JobQueueStore : IDisposable
         return ok;
     }
 
-    /// <summary>Drop every queued row for a run — used when a run is cancelled or cleaned up.</summary>
-    public async Task RemoveRunAsync(string runName, CancellationToken ct = default)
+    /// <summary>
+    /// Drop a run's queued rows. With <paramref name="runStartedUtc"/>, only that outing's rows: a recurring
+    /// run name shares one index partition across outings, and a late removal of the previous outing must
+    /// not take the next one's rows with it.
+    /// </summary>
+    public async Task RemoveRunAsync(string runName, DateTime? runStartedUtc = null, CancellationToken ct = default)
     {
-        foreach (var e in await ReadIndexAsync(runName, ct))
-            await _store.DeleteAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
+        var entries = await ReadIndexAsync(runName, ct);
+        if (runStartedUtc is { } started)
+        {
+            var prefix = RunKeyPrefix(started, runName);
+            entries = entries.Where(e => e.QueueRowKey.StartsWith(prefix, StringComparison.Ordinal)).ToList();
+        }
 
-        // One call, and it also takes any entry whose queue row was already gone.
-        await _store.DeletePartitionAsync(_indexTable, IndexPartition(runName), ct);
+        foreach (var byBucket in entries.GroupBy(e => e.Bucket))
+            await _store.DeleteBatchAsync(_queueTable, byBucket.Key, byBucket.Select(e => e.QueueRowKey).ToList(), ct);
+
+        if (runStartedUtc == null)
+            await _store.DeletePartitionAsync(_indexTable, IndexPartition(runName), ct);
+        else if (entries.Count > 0)
+            await _store.DeleteBatchAsync(_indexTable, IndexPartition(runName), entries.Select(e => e.IndexRowKey).ToList(), ct);
     }
 
     /// <summary>
@@ -625,16 +590,17 @@ public sealed class JobQueueStore : IDisposable
     {
         var released = 0;
 
-        foreach (var e in await ReadIndexAsync(runName, ct))
+        foreach (var (bucket, rows) in await ReadRunQueueRowsAsync(await ReadIndexAsync(runName, ct), null, ct))
         {
-            var row = await _store.GetAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
-            if (row == null) continue;                                     // finished and removed
-            if (string.IsNullOrEmpty(row.GetString("Owner"))) continue;    // already free
-
-            row["Owner"] = "";
-            row["LeaseUntil"] = (DateTimeOffset?)null;
-            await _store.UpsertAsync(_queueTable, row, ct);
-            released++;
+            var owned = rows.Where(r => !string.IsNullOrEmpty(r.GetString("Owner"))).ToList();
+            foreach (var row in owned)
+            {
+                row["Owner"] = "";
+                row["LeaseUntil"] = (DateTimeOffset?)null;
+            }
+            if (owned.Count == 0) continue;
+            await _store.UpsertBatchAsync(_queueTable, bucket, owned, ct);
+            released += owned.Count;
         }
 
         // Freed claims are claimable again — wake the pump to pick them up rather than waiting for the
@@ -642,6 +608,42 @@ public sealed class JobQueueStore : IDisposable
         if (released > 0) WakePump();
 
         return released;
+    }
+
+    /// <summary>Above this many tasks a run's queue rows are read as one key range rather than one GET each.</summary>
+    private const int PointReadLimit = 32;
+
+    /// <summary>
+    /// The queue rows behind <paramref name="entries"/>, per bucket. A few are point reads; more are one
+    /// range read over the run's contiguous keys, so the cost follows the run's size, never the queue's.
+    /// </summary>
+    private async Task<List<(string Bucket, List<StoreRow> Rows)>> ReadRunQueueRowsAsync(
+        List<(string TaskId, string Bucket, string QueueRowKey, string IndexRowKey)> entries,
+        IReadOnlyList<string>? properties, CancellationToken ct)
+    {
+        var result = new List<(string, List<StoreRow>)>();
+        foreach (var byBucket in entries.GroupBy(e => e.Bucket))
+        {
+            var rows = new List<StoreRow>();
+            var keys = byBucket.Select(e => e.QueueRowKey).ToHashSet(StringComparer.Ordinal);
+            var prefixes = keys.Select(RunKeyPrefixOf).Distinct().ToList();
+
+            if (keys.Count <= PointReadLimit || prefixes.Contains(null))
+            {
+                foreach (var key in keys)
+                    if (await _store.GetAsync(_queueTable, byBucket.Key, key, ct) is { } row) rows.Add(row);
+            }
+            else
+            {
+                foreach (var prefix in prefixes)
+                    await foreach (var row in _store.QueryRowKeyRangeAsync(_queueTable, byBucket.Key, prefix!,
+                                       PrefixUpperBound(prefix!), properties, ct))
+                        if (keys.Contains(row.RowKey)) rows.Add(row);
+            }
+
+            result.Add((byBucket.Key, rows));
+        }
+        return result;
     }
 
     /// <summary>A queued row as the status APIs see it: identity, priority, age and claim state.</summary>
@@ -657,23 +659,23 @@ public sealed class JobQueueStore : IDisposable
         ?? ParseLegacyQueuedUtc(row.RowKey)
         ?? DateTime.UtcNow;
 
+    /// <summary>A queue row's columns. Keys are named because a projection returns only what it lists.</summary>
+    private static readonly string[] s_queuedRowProperties =
+        ["PartitionKey", "RowKey", "RunName", "TaskId", "Priority", "Owner", "LeaseUntil", "QueuedUtc"];
+
     /// <summary>
-    /// Every row currently in the queue, in storage order (highest priority bucket first, oldest first
-    /// within it). This is the durable backlog the status APIs report — the in-memory JobManager only
-    /// ever holds a worker-pool-sized buffer of it.
-    ///
-    /// Claimed means owned under a live lease, i.e. buffered or running on some instance; everything
-    /// else is waiting for a pump to take it. One unfiltered scan, so the cost is proportional to the
-    /// backlog — callers are expected to cache the result rather than call this per poll.
+    /// Every row currently in the queue, streamed in storage order (highest priority bucket first, oldest
+    /// run first within it) and projected to what the status APIs read. Claimed means owned under a live
+    /// lease. One scan, proportional to the backlog, so callers aggregate as it streams and cache the
+    /// result rather than holding the rows or calling this per poll.
     /// </summary>
-    public async Task<IReadOnlyList<QueuedRow>> ListQueuedAsync(CancellationToken ct = default)
+    public async IAsyncEnumerable<QueuedRow> StreamQueuedAsync(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var now = DateTimeOffset.UtcNow;
-        var rows = new List<QueuedRow>();
-
-        await foreach (var row in _store.QueryTableAsync(_queueTable, ct))
+        await foreach (var row in _store.QueryTableAsync(_queueTable, null, s_queuedRowProperties, ct))
         {
-            rows.Add(new QueuedRow(
+            yield return new QueuedRow(
                 row.GetString("RunName") ?? "",
                 row.GetString("TaskId") ?? "",
                 row.GetInt32("Priority") ?? 0,
@@ -681,9 +683,15 @@ public sealed class JobQueueStore : IDisposable
                 !IsClaimable(row, now),
                 row.GetString("Owner") ?? "",
                 row.PartitionKey,
-                row.RowKey));
+                row.RowKey);
         }
+    }
 
+    /// <summary><see cref="StreamQueuedAsync"/> materialized, for small queues and tests.</summary>
+    public async Task<IReadOnlyList<QueuedRow>> ListQueuedAsync(CancellationToken ct = default)
+    {
+        var rows = new List<QueuedRow>();
+        await foreach (var row in StreamQueuedAsync(ct)) rows.Add(row);
         return rows;
     }
 
@@ -710,8 +718,8 @@ public sealed class JobQueueStore : IDisposable
     }
 
     /// <summary>
-    /// Move a task's queue rows to a new priority bucket, keeping their enqueue timestamp so the task
-    /// keeps its place in line within the new priority. Returns how many rows moved.
+    /// Move a task's queue rows to a new priority bucket, keeping the run's epoch so the task keeps its
+    /// place in line within the new priority. Returns how many rows moved.
     ///
     /// Delete-then-add, in that order: a crash in between loses the row, which the orphan re-drive
     /// repairs by re-queueing the task. The other order leaves TWO claimable rows for one task, and a
@@ -745,8 +753,7 @@ public sealed class JobQueueStore : IDisposable
             await _store.DeleteAsync(_indexTable, partition, IndexRowKey(row.PartitionKey, row.RowKey), ct);
             await _store.DeleteAsync(_queueTable, row.PartitionKey, row.RowKey, ct);
 
-            var queuedUtc = QueuedUtcOf(row);
-            await EnqueueAsync(runName, taskId, newPriority, queuedUtc, ct);
+            await EnqueueAsync(runName, taskId, newPriority, ParseEpoch(row.RowKey) ?? QueuedUtcOf(row), ct);
             moved++;
         }
 
@@ -760,9 +767,7 @@ public sealed class JobQueueStore : IDisposable
     /// the run graph, sitting in this queue, not yet claimed by the pump — and one whose row is
     /// genuinely gone. Under the pump, waiting is the normal state of a backlog: a 124-task run against
     /// eight workers has most of its tasks Pending and absent from the JobManager for minutes at a time.
-    /// Treating that as orphaned re-queues the whole backlog on a timer, and because a RowKey is
-    /// prefixed with the enqueue timestamp, each pass adds a SECOND row for the same task rather than
-    /// updating the first — so the task is claimed and executed once per copy.
+    /// Treating that as orphaned re-queues the whole backlog on a timer.
     /// </summary>
     public async Task<HashSet<string>> GetQueuedTaskIdsAsync(string runName, CancellationToken ct = default)
     {
@@ -799,8 +804,8 @@ public sealed class JobQueueStore : IDisposable
     /// </list>
     /// A task in any of those states is invisible to the pump AND reported "queued" by the index, so the
     /// re-drive that trusts the index never re-enqueues it and the run stalls indefinitely with it, its
-    /// watchdog never firing. Verifying against the queue table costs one point read per id, so the caller
-    /// passes a SMALL candidate set (the re-drive's aged-Pending tasks), never the whole run.
+    /// watchdog never firing. One index read plus <see cref="ReadRunQueueRowsAsync"/>, so the cost follows
+    /// the run's size.
     /// </summary>
     public async Task<HashSet<string>> GetDispatchableTaskIdsAsync(
         string runName, IReadOnlyCollection<string> taskIds, CancellationToken ct = default)
@@ -809,25 +814,19 @@ public sealed class JobQueueStore : IDisposable
         if (taskIds.Count == 0) return result;
 
         var wanted = taskIds as HashSet<string> ?? new HashSet<string>(taskIds, StringComparer.Ordinal);
-        var now = DateTimeOffset.UtcNow;
+        var entries = (await ReadIndexAsync(runName, ct)).Where(e => wanted.Contains(e.TaskId)).ToList();
 
-        // The index carries the bucket + queue row key to address each row directly — one partition read,
-        // then a point read only for the ids the caller asked about.
-        foreach (var e in await ReadIndexAsync(runName, ct))
+        foreach (var (_, rows) in await ReadRunQueueRowsAsync(entries, s_queuedRowProperties, ct))
         {
-            if (!wanted.Contains(e.TaskId)) continue;
-
-            var row = await _store.GetAsync(_queueTable, e.Bucket, e.QueueRowKey, ct);
-            if (row == null) continue;   // index points at a queue row that is gone — a ghost
-
-            // Owned with no lease is what the server-side claim filter cannot match (it is neither
-            // Owner eq '' nor LeaseUntil lt now), so the pump would never dispatch it however long it
-            // waits — a ghost as surely as a missing row. A free row, or one under a lease live or
-            // lapsed, the pump will get.
-            if (!string.IsNullOrEmpty(row.GetString("Owner")) && row.GetDateTimeOffset("LeaseUntil") == null)
-                continue;
-
-            result.Add(e.TaskId);
+            foreach (var row in rows)
+            {
+                // Owned with no lease is what the server-side claim filter cannot match (it is neither
+                // Owner eq '' nor LeaseUntil lt now), so the pump would never dispatch it — a ghost as
+                // surely as a missing row.
+                if (!string.IsNullOrEmpty(row.GetString("Owner")) && row.GetDateTimeOffset("LeaseUntil") == null)
+                    continue;
+                if (row.GetString("TaskId") is { } taskId) result.Add(taskId);
+            }
         }
 
         return result;
@@ -837,14 +836,12 @@ public sealed class JobQueueStore : IDisposable
     /// Bring the queue tables up to <see cref="SchemaVersion"/>, once per storage account. The marker row
     /// written at the end is checked first, so every later start is a single point read.
     ///
-    /// v1 built the run index; v2 additionally re-keys every queue row to the deterministic
-    /// <c>{run}|{task}</c> scheme (<see cref="BuildRowKey"/>) and moves the enqueue timestamp into the
-    /// <c>QueuedUtc</c> property. One forward pass takes any older account straight to the current
-    /// version — there is no dual-read, and after the pass only the new key scheme is used.
+    /// Re-keys every queue row to <see cref="BuildRowKey"/>, taking each run's start time from the Runs
+    /// table, and rebuilds the index entries. One forward pass takes any older account straight to the
+    /// current version — there is no dual-read, and after the pass only the new key scheme is used.
     ///
     /// Rows are rewritten new-key-first, old-key-deleted-after, so a crash mid-pass leaves the marker
-    /// unset and the next start finishes the job (a row already in the new scheme is re-written harmlessly
-    /// and not deleted). The pump awaits <see cref="InitializeAsync"/> before it claims — and every
+    /// unset and the next start finishes the job, skipping rows already on their key. The pump awaits <see cref="InitializeAsync"/> before it claims — and every
     /// enqueue path calls it too — so no row is ever claimed or written while the migration is only
     /// half-applied.
     ///
@@ -869,6 +866,9 @@ public sealed class JobQueueStore : IDisposable
         var rekeyed = 0;
         var skipped = 0;
         var epochs = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        await foreach (var run in _store.QueryTableAsync(_runsTable, "PartitionKey eq 'Run'", ["PartitionKey", "RowKey", "StartedUtc"], ct))
+            if (run.PartitionKey == "Run" && run.GetDateTimeOffset("StartedUtc") is { } runStarted)
+                epochs[run.RowKey] = runStarted.UtcDateTime;
 
         static void AddRow(Dictionary<string, List<StoreRow>> map, string key, StoreRow row)
         {
@@ -912,15 +912,19 @@ public sealed class JobQueueStore : IDisposable
             var bucket = row.PartitionKey;
             var runPartition = IndexPartition(runName);
 
-            // One epoch per run. Rows already on a v3 key (a re-run after a crash) sort ahead of the run's
-            // unmigrated rows in the scan, so their epoch is seen first and the rest follow it.
+            // The run's start time, as every later enqueue will key it. A run with no Run row falls back to
+            // the first of its rows the scan meets, and keeps that for the rest of them.
             if (!epochs.TryGetValue(runName, out var epoch))
-            {
-                epoch = ParseEpoch(row.RowKey) ?? EpochOf(QueuedUtcOf(row));
-                epochs[runName] = epoch;
-                AddRow(newIndex, runPartition, EpochRow(runName, epoch));
-            }
+                epochs[runName] = epoch = ParseEpoch(row.RowKey) ?? QueuedUtcOf(row);
             var newKey = BuildRowKey(epoch, runName, taskId);
+            buffered++;
+
+            // Already on its key (a re-run after a crash): only make sure the index points at it.
+            if (row.RowKey == newKey)
+            {
+                AddRow(newIndex, runPartition, IndexRow(runName, taskId, bucket, newKey));
+                continue;
+            }
 
             // The new-scheme row: same bucket + claim state + priority, key deterministic, enqueue time as
             // a property (from the row, or the legacy key, or now).
@@ -937,16 +941,9 @@ public sealed class JobQueueStore : IDisposable
                 }
             });
             AddRow(newIndex, runPartition, IndexRow(runName, taskId, bucket, newKey));
-
-            // Delete the legacy row + index entry, UNLESS its key is already the new scheme (a re-run over
-            // already-migrated rows just re-writes them — deleting would drop what we just wrote).
-            if (row.RowKey != newKey)
-            {
-                rekeyed++;
-                AddKey(oldQueue, bucket, row.RowKey);
-                AddKey(oldIndex, runPartition, IndexRowKey(bucket, row.RowKey));
-            }
-            buffered++;
+            rekeyed++;
+            AddKey(oldQueue, bucket, row.RowKey);
+            AddKey(oldIndex, runPartition, IndexRowKey(bucket, row.RowKey));
 
             if (buffered >= BackfillFlushThreshold)
             {

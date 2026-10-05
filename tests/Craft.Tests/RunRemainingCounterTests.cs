@@ -105,8 +105,12 @@ public class RunRemainingCounterTests
             return Task.FromResult(true);
         }
 
+        /// <summary>Point reads served, by table.</summary>
+        public System.Collections.Concurrent.ConcurrentDictionary<string, int> Gets { get; } = new();
+
         public Task<StoreRow?> GetAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
         {
+            Gets.AddOrUpdate(table, 1, (_, n) => n + 1);
             // Hand back a copy: a caller mutating what it read must not mutate the store in place.
             if (!Table(table).TryGetValue((partitionKey, rowKey), out var r)) return Task.FromResult<StoreRow?>(null);
             return Task.FromResult<StoreRow?>(new StoreRow(r.PartitionKey, r.RowKey)

@@ -16,14 +16,16 @@ public class JobQueueFifoTests
     private static readonly TimeSpan Lease = TimeSpan.FromMinutes(20);
     private static DateTime At(int minute) => new(2026, 10, 5, 2, minute, 0, DateTimeKind.Utc);
 
-    private sealed record Q(JobQueueStore Queue, RunRemainingCounterTests.ConditionalStore Store, string QueueTable, string IndexTable);
+    private sealed record Q(JobQueueStore Queue, RunRemainingCounterTests.ConditionalStore Store, string QueueTable,
+        string IndexTable, string RunsTable);
 
     private static Q NewQueue()
     {
         var settings = new CraftSettings();
         var store = new RunRemainingCounterTests.ConditionalStore();
         var queue = new JobQueueStore(NullLogger<JobQueueStore>.Instance, settings, store);
-        return new Q(queue, store, $"{settings.Orchestrator.TablePrefix}Queue", $"{settings.Orchestrator.TablePrefix}QueueIndex");
+        var prefix = settings.Orchestrator.TablePrefix;
+        return new Q(queue, store, $"{prefix}Queue", $"{prefix}QueueIndex", $"{prefix}Runs");
     }
 
     private static async Task<List<string>> DrainOrderAsync(JobQueueStore queue)
@@ -79,28 +81,69 @@ public class JobQueueFifoTests
 
         await q.Queue.EnqueueBatchAsync("Zeta", [("z0", 4), ("z1", 4)], At(0));
         await q.Queue.EnqueueBatchAsync("Alpha", [("a0", 4)], At(10));
-        // The re-drive re-queues a task with the time it noticed, long after the run started.
-        await q.Queue.EnqueueAsync("Zeta", "z1", 4, At(59));
+        // The re-drive re-queues with the run's start time, however long after the run started.
+        await q.Queue.EnqueueAsync("Zeta", "z1", 4, At(0));
 
         Assert.Equal(3, (await RowsAsync(q, q.QueueTable)).Count);
         Assert.Equal(["Zeta/z0", "Zeta/z1", "Alpha/a0"], await DrainOrderAsync(q.Queue));
     }
 
     [Fact]
-    public async Task TheEpochRowIsInvisibleToIndexReaders_AndGoesWithTheRun()
+    public async Task RemovingOneOutingOfARecurringRun_LeavesTheNextOutingsRows()
     {
         var q = NewQueue();
         await q.Queue.InitializeAsync();
-        await q.Queue.EnqueueBatchAsync("R", [("a", 4)], At(0));
+        await q.Queue.EnqueueBatchAsync("CIPPDBCacheOrchestrator", [("old", 4)], At(0));
+        await q.Queue.EnqueueBatchAsync("CIPPDBCacheOrchestrator", [("new", 4)], At(30));
 
-        Assert.Equal(["a"], await q.Queue.GetQueuedTaskIdsAsync("R"));
-        Assert.Equal(["a"], await q.Queue.GetDispatchableTaskIdsAsync("R", ["a"]));
-        Assert.Equal(0, await q.Queue.ReleaseRunClaimsAsync("R"));
+        // The previous outing's finalize removes its rows after the next outing has enqueued.
+        await q.Queue.RemoveRunAsync("CIPPDBCacheOrchestrator", At(0));
 
-        await q.Queue.RemoveRunAsync("R");
+        Assert.Equal(["new"], await q.Queue.GetQueuedTaskIdsAsync("CIPPDBCacheOrchestrator"));
+        Assert.Equal("new", Assert.Single(await RowsAsync(q, q.QueueTable)).GetString("TaskId"));
 
+        await q.Queue.RemoveRunAsync("CIPPDBCacheOrchestrator");
         Assert.Empty(await RowsAsync(q, q.QueueTable));
-        Assert.DoesNotContain(await RowsAsync(q, q.IndexTable), r => r.PartitionKey == "R");
+        Assert.DoesNotContain(await RowsAsync(q, q.IndexTable), r => r.PartitionKey == "CIPPDBCacheOrchestrator");
+    }
+
+    [Fact]
+    public async Task ALargeRunsDispatchCheck_ReadsItsKeyRange_NotOneRowAtATime()
+    {
+        var q = NewQueue();
+        await q.Queue.InitializeAsync();
+        var ids = Enumerable.Range(0, 40).Select(i => $"t{i:D2}").ToList();
+        await q.Queue.EnqueueBatchAsync("Big", ids.Select(i => (i, 4)).ToList(), At(0));
+        await q.Queue.EnqueueBatchAsync("Other", [("o", 4)], At(1));
+
+        var rows = await RowsAsync(q, q.QueueTable);
+        // A ghost (index entry, no queue row) and an owned row with no lease, which the pump never claims.
+        await q.Store.DeleteAsync(q.QueueTable, "P04", rows.Single(r => r.GetString("TaskId") == "t00").RowKey);
+        var stuck = rows.Single(r => r.GetString("TaskId") == "t01");
+        stuck["Owner"] = "gone";
+        await q.Store.UpsertAsync(q.QueueTable, stuck);
+
+        q.Store.Gets.Clear();
+        var dispatchable = await q.Queue.GetDispatchableTaskIdsAsync("Big", ids);
+
+        Assert.Equal(ids.Skip(2), dispatchable.Order());
+        Assert.False(q.Store.Gets.ContainsKey(q.QueueTable));
+    }
+
+    [Fact]
+    public async Task ReleasingALargeRunsClaims_FreesEveryRowOfThatRunOnly()
+    {
+        var q = NewQueue();
+        await q.Queue.InitializeAsync();
+        await q.Queue.EnqueueBatchAsync("Big", Enumerable.Range(0, 40).Select(i => ($"t{i:D2}", 4)).ToList(), At(0));
+        await q.Queue.EnqueueBatchAsync("Other", [("o", 4)], At(1));
+        Assert.Equal(41, (await q.Queue.ClaimBatchAsync("dead", 100, Lease)).Count);
+
+        q.Store.Gets.Clear();
+        Assert.Equal(40, await q.Queue.ReleaseRunClaimsAsync("Big"));
+
+        Assert.False(q.Store.Gets.ContainsKey(q.QueueTable));
+        Assert.Equal(40, (await q.Queue.ClaimBatchAsync("next", 100, Lease)).Count);
     }
 
     [Fact]
@@ -144,7 +187,13 @@ public class JobQueueFifoTests
     public async Task MigratesAV2Backlog_ToOldestRunFirst_KeepingClaimsAndTheIndex()
     {
         var q = NewQueue();
-        // Alphabetically the v2 order was AuditLog, MailboxRules; by age MailboxRules is 16 days older.
+        // Alphabetically the v2 order was AuditLog, MailboxRules; by age MailboxRules is 16 days older. Its
+        // Run row holds the start time later enqueues key by; AuditLog has none and falls back to its rows.
+        var mailboxStarted = At(0).AddDays(-17);
+        await q.Store.UpsertAsync(q.RunsTable, new StoreRow("Run", "MailboxRules_t1")
+        {
+            Properties = { ["StartedUtc"] = new DateTimeOffset(mailboxStarted) }
+        });
         await SeedV2Async(q, "MailboxRules_t1", "b1", At(0).AddDays(-16));
         await SeedV2Async(q, "MailboxRules_t1", "b2", At(0).AddDays(-16));
         await SeedV2Async(q, "AuditLog_t1", "s1", At(0));
@@ -163,10 +212,10 @@ public class JobQueueFifoTests
         // Index entries point at the new keys: every run-scoped read still sees its tasks as dispatchable.
         Assert.Equal(["b1", "b2"], (await q.Queue.GetDispatchableTaskIdsAsync("MailboxRules_t1", ["b1", "b2"])).Order());
         Assert.Equal(["s1", "s2"], (await q.Queue.GetDispatchableTaskIdsAsync("AuditLog_t1", ["s1", "s2"])).Order());
-        Assert.Equal(6, (await RowsAsync(q, q.IndexTable)).Count(r => r.PartitionKey != "$schema"));
+        Assert.Equal(4, (await RowsAsync(q, q.IndexTable)).Count(r => r.PartitionKey != "$schema"));
 
-        // A later enqueue of a migrated task lands on its existing row, not a second one.
-        await q.Queue.EnqueueAsync("MailboxRules_t1", "b2", 4, DateTime.UtcNow);
+        // A later enqueue of a migrated task, keyed by the run's start, lands on its existing row.
+        await q.Queue.EnqueueAsync("MailboxRules_t1", "b2", 4, mailboxStarted);
         Assert.Equal(4, (await RowsAsync(q, q.QueueTable)).Count);
 
         Assert.Equal(["MailboxRules_t1/b1", "MailboxRules_t1/b2", "AuditLog_t1/s1"], await DrainOrderAsync(q.Queue));

@@ -29,7 +29,9 @@ namespace Craft.Orchestration;
 /// each (see BuildSnapshotAsync). A customer reporting sluggishness had "kept the Worker Health page
 /// open" — which is what was driving it.
 ///
-/// So: stamp on completion, and never re-scan more often than the last scan took.
+/// So: stamp on completion, and keep the scan to a fifth of the time — the next one waits at least four
+/// times as long as the last one took. The scan also streams: only aggregates and the head of the queue are
+/// kept, so a snapshot's memory does not grow with the backlog.
 /// </summary>
 public class JobQueueStatusReader : IDisposable
 {
@@ -47,6 +49,9 @@ public class JobQueueStatusReader : IDisposable
     /// correctness. Truncation is logged rather than silent.
     /// </summary>
     private const int MaxCounterLookups = 200;
+
+    /// <summary>Rows kept from the head of the queue (claim order) for the job listings; the rest are only counted.</summary>
+    internal const int HeadRows = 2_000;
 
     private volatile QueueSnapshot? _cached;
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
@@ -82,12 +87,14 @@ public class JobQueueStatusReader : IDisposable
     public sealed record RunQueueInfo(int Unclaimed, int Claimed, int MinPriority,
         DateTime? OldestQueuedUtc);
 
-    /// <summary>One scan of the queue table, aggregated the way the status APIs consume it.</summary>
+    /// <summary>
+    /// One scan of the queue table, aggregated the way the status APIs consume it. <see cref="Rows"/> is the
+    /// head of the queue only (up to <see cref="HeadRows"/>, in claim order); the counts cover every row.
+    /// </summary>
     public sealed record QueueSnapshot(DateTime TakenUtc, IReadOnlyList<JobQueueStore.QueuedRow> Rows,
-        int Unclaimed, int Claimed, DateTime? OldestUnclaimedUtc,
+        int Total, int Unclaimed, int Claimed, DateTime? OldestUnclaimedUtc,
         IReadOnlyDictionary<string, RunQueueInfo> ByRun)
     {
-        public int Total => Rows.Count;
         public double AgeSeconds => (DateTime.UtcNow - TakenUtc).TotalSeconds;
     }
 
@@ -99,14 +106,14 @@ public class JobQueueStatusReader : IDisposable
     /// </summary>
     /// <summary>
     /// The shortest interval we will re-scan at: never less than the requested age, and never less than
-    /// the last scan took. On a healthy instance the scan is milliseconds and this is just the 5s TTL;
-    /// on a degraded one it is what stops the refresh loop from consuming the storage account.
+    /// four times the last scan took. On a healthy instance the scan is milliseconds and this is just the
+    /// 5s TTL; on a degraded one it is what stops the refresh loop from consuming the storage account.
     /// </summary>
     private TimeSpan EffectiveTtl(TimeSpan? maxAge)
     {
         var requested = maxAge ?? DefaultTtl;
-        var lastBuild = TimeSpan.FromTicks(Interlocked.Read(ref _lastBuildTicks));
-        return lastBuild > requested ? lastBuild : requested;
+        var floor = TimeSpan.FromTicks(Interlocked.Read(ref _lastBuildTicks) * 4);
+        return floor > requested ? floor : requested;
     }
 
     public QueueSnapshot? GetCached(TimeSpan? maxAge = null)
@@ -159,47 +166,47 @@ public class JobQueueStatusReader : IDisposable
     }
 
     /// <summary>
-    /// One scan of the queue table, aggregated. No per-run storage reads: everything here comes from
-    /// the rows the scan already returned, so the cost is one scan regardless of how many runs the
-    /// backlog spans.
+    /// One scan of the queue table, aggregated as it streams. No per-run storage reads, and only the head
+    /// rows are held, so the cost is one scan and the memory is bounded by the number of runs.
     /// </summary>
     private async Task<QueueSnapshot> BuildSnapshotAsync(CancellationToken ct)
     {
-        var rows = await _queue.ListQueuedAsync(ct);
-
+        var head = new List<JobQueueStore.QueuedRow>();
+        var total = 0;
         var unclaimed = 0;
         DateTime? oldestUnclaimed = null;
         var byRun = new Dictionary<string, RunQueueInfo>(StringComparer.Ordinal);
 
-        foreach (var group in rows.GroupBy(r => r.RunName))
+        await foreach (var row in _queue.StreamQueuedAsync(ct))
         {
-            var runUnclaimed = 0;
-            var runClaimed = 0;
-            var minPriority = int.MaxValue;
-            DateTime? oldest = null;
+            total++;
+            if (head.Count < HeadRows) head.Add(row);
 
-            foreach (var row in group)
+            var info = byRun.TryGetValue(row.RunName, out var existing)
+                ? existing
+                : new RunQueueInfo(0, 0, row.Priority, null);
+
+            if (row.Claimed)
             {
-                if (row.Claimed) runClaimed++;
-                else
-                {
-                    runUnclaimed++;
-                    if (oldest == null || row.QueuedUtc < oldest) oldest = row.QueuedUtc;
-                }
-                if (row.Priority < minPriority) minPriority = row.Priority;
+                info = info with { Claimed = info.Claimed + 1 };
             }
-
-            unclaimed += runUnclaimed;
-            if (oldest != null && (oldestUnclaimed == null || oldest < oldestUnclaimed))
-                oldestUnclaimed = oldest;
-
-            byRun[group.Key] = new RunQueueInfo(runUnclaimed, runClaimed,
-                minPriority == int.MaxValue ? 0 : minPriority, oldest);
+            else
+            {
+                unclaimed++;
+                if (oldestUnclaimed == null || row.QueuedUtc < oldestUnclaimed) oldestUnclaimed = row.QueuedUtc;
+                info = info with
+                {
+                    Unclaimed = info.Unclaimed + 1,
+                    OldestQueuedUtc = info.OldestQueuedUtc is { } o && o <= row.QueuedUtc ? o : row.QueuedUtc,
+                };
+            }
+            if (row.Priority < info.MinPriority) info = info with { MinPriority = row.Priority };
+            byRun[row.RunName] = info;
         }
 
         // Stamped on COMPLETION, not on entry. A scan that took longer than the TTL would otherwise
         // return a snapshot that is already expired, and the next poll would start another immediately.
-        return new QueueSnapshot(DateTime.UtcNow, rows, unclaimed, rows.Count - unclaimed,
+        return new QueueSnapshot(DateTime.UtcNow, head, total, unclaimed, total - unclaimed,
             oldestUnclaimed, byRun);
     }
 

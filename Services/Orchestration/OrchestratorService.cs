@@ -33,8 +33,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
     private readonly JobManager _jobManager;
     private readonly OrchestratorTableStore _store;
 
-    /// <summary>The durable job queue. Its table is created alongside the orchestrator's; nothing
-    /// dispatches from it yet, so an existing deployment gains an empty table and nothing else.</summary>
+    /// <summary>The durable job queue: every task is enqueued here and dispatched by the pump.</summary>
     private readonly JobQueueStore _queue;
     private readonly OrchestratorStatusWriter _writer;
     private readonly CraftSettings _settings;
@@ -546,7 +545,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
                         run.PostExecStatus = "Abandoned";
                         await _store.UpsertRunAsync(run);
                         await _store.CleanupRunAsync(run.Name);
-                        await _queue.RemoveRunAsync(run.Name, ct);
+                        await _queue.RemoveRunAsync(run.Name, run.StartedUtc, ct);
                         postExecGaveUp++;
                         continue;
                     }
@@ -688,7 +687,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
         {
             try
             {
-                await _queue.RemoveRunAsync(name, ct);
+                await _queue.RemoveRunAsync(name, ct: ct);
             }
             catch (Exception ex)
             {
@@ -959,21 +958,9 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
 
         var pending = run.Tasks.Where(t => t.Status == "Pending").ToList();
 
-        // Skip anything that already has a queue row.
-        //
-        // A queue RowKey is BuildRowKey(queuedUtc, run, task), so it is idempotent only for a GIVEN
-        // timestamp — re-dispatching the same task later writes a SECOND row rather than updating the
-        // first. That is exactly what crash recovery does: ResumeInterruptedRunsAsync flips interrupted
-        // tasks back to Pending and calls this, while every pre-crash row for those tasks is still in the
-        // queue. Measured on a killed 140-task fanout: 102 tasks re-dispatched on top of 102 survivors.
-        //
-        // Most duplicates are harmless — the second row resolves to a task that has since finished and is
-        // dropped as a stale descriptor. But if both rows are claimed while the task is still RUNNING,
-        // the resolver's terminal-status guard does not apply and the task runs twice. That happened:
-        // Intune_dev.mspadvisors.com was claimed again 5 minutes into its own execution and ran a second
-        // time. Not writing the duplicate is the fix; the resolver check below is the backstop.
-        //
-        // A read of the run's rows costs one table scan per dispatch, against a write per task avoided.
+        // Skip anything that already has a queue row. Re-writing it would reset a live claim (Owner and
+        // LeaseUntil) on a task another worker may be running, which is how a task ran twice. One index
+        // partition read per dispatch.
         HashSet<string> alreadyQueued;
         try
         {
@@ -1028,7 +1015,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
         // the JobManager only ever sees the batch JobQueuePump claims from it.
         await _queue.EnqueueBatchAsync(run.Name,
             toQueue.Select(t => (t.Id, t.Priority ?? priority)).ToList(),
-            DateTime.UtcNow, ct);
+            run.StartedUtc, ct);
 
         // quiet = called from crash recovery, where a per-run line per resumed run is the flood the
         // aggregate summary replaces — drop to Debug. A normal orchestration start logs it at Info (one line).
@@ -1269,20 +1256,19 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
     }
 
     /// <summary>
-    /// Put one task back on the durable queue. Fire-and-forget because every caller is on a lock or a
-    /// timer callback, and a failure is recoverable: the task is still Pending in storage, so the next
-    /// re-drive finds it again.
+    /// Put tasks of one run back on the durable queue, in one batch. Fire-and-forget because every caller
+    /// is on a lock or a timer callback, and a failure is recoverable: the tasks are still Pending in
+    /// storage, so the next re-drive finds them again.
     /// </summary>
-    private void RequeueToTable(OrchestratorRun run, OrchestratorTaskItem task)
+    private void RequeueToTable(OrchestratorRun run, IReadOnlyList<OrchestratorTaskItem> tasks)
     {
-        var priority = task.Priority ?? run.Priority;
         _ = Task.Run(async () =>
         {
-            var key = DeferralKey(run.Name, task.Id);
             try
             {
-                await _queue.EnqueueAsync(run.Name, task.Id, priority, DateTime.UtcNow);
-                _requeueFailures.TryRemove(key, out _);
+                await _queue.EnqueueBatchAsync(run.Name,
+                    tasks.Select(t => (t.Id, t.Priority ?? run.Priority)).ToList(), run.StartedUtc);
+                foreach (var task in tasks) _requeueFailures.TryRemove(DeferralKey(run.Name, task.Id), out _);
             }
             catch (Exception ex)
             {
@@ -1290,17 +1276,18 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
                 // oversized property), and the re-drive resets the deferral counter on every pass —
                 // without this cap the retry loop is infinite and the run it belongs to can never
                 // finalize. Consecutive failures only: a success above clears the count.
-                var failures = _requeueFailures.AddOrUpdate(key, 1, (_, c) => c + 1);
-                if (failures >= MaxRequeueFailures)
+                foreach (var task in tasks)
                 {
+                    var key = DeferralKey(run.Name, task.Id);
+                    var failures = _requeueFailures.AddOrUpdate(key, 1, (_, c) => c + 1);
+                    if (failures < MaxRequeueFailures) continue;
                     _requeueFailures.TryRemove(key, out _);
                     FailTaskTerminally(run, task,
                         $"Could not re-queue after {failures} consecutive attempts: {ex.Message}");
-                    return;
                 }
                 _logger.LogWarning(ex,
-                    "[Scheduler] Could not re-queue {Task} in {Run} (attempt {Count}/{Max}) — the re-drive will retry",
-                    task.Id, run.Name, failures, MaxRequeueFailures);
+                    "[Scheduler] Could not re-queue {Count} task(s) in {Run} — the re-drive will retry",
+                    tasks.Count, run.Name);
             }
         });
     }
@@ -1706,7 +1693,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
         // Back to the QUEUE, not to memory. The pump drops a claimed row once the JobManager is done with
         // the job, so an in-memory re-queue here would leave the retry with no durable row behind it — and
         // nothing to pick it up again if this instance went away.
-        RequeueToTable(run, task);
+        RequeueToTable(run, [task]);
     }
 
     /// <summary>
@@ -1751,11 +1738,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
     /// worker-pool-sized buffer and leaves the rest in storage, so a 124-task run against eight workers
     /// has most of its tasks Pending and absent from the JobManager for minutes.
     ///
-    /// The consequence was severe and silent. Every 60 seconds this re-queued the entire un-started
-    /// backlog — measured live at 92, then 60, 60, 52, 44, 36 tasks on consecutive ticks — and because
-    /// RequeueToTable stamps UtcNow into the RowKey, each pass created an ADDITIONAL row for the same
-    /// task instead of updating the existing one. Every copy was independently claimable, so tasks ran
-    /// once per copy: one Intune collection executed six times, from six rows exactly 60s apart.
+    /// Treating that as orphaned re-queued the entire un-started backlog every 60 seconds.
     /// </summary>
     private async Task RedrivePendingTasksAsync(OrchestratorRun run)
     {
@@ -1813,14 +1796,8 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
             return;
         }
 
-        // Storage decides — but the queue TABLE decides, not the index. Asking the index (the old
-        // GetQueuedTaskIdsAsync here) reports a task queued whenever its index row exists, and an index
-        // row can outlive the queue row it points at. Such a task is invisible to the pump yet looks
-        // "queued" to this check, so it is never re-driven and its run stalls indefinitely with the task
-        // Pending — this watchdog keeps ticking and finds nothing orphaned. GetDispatchableTaskIdsAsync
-        // verifies each candidate against the queue table (one point read apiece; the candidate set is
-        // small), returning only tasks the pump can actually still claim. Anything else is a ghost to
-        // re-enqueue.
+        // Storage decides — the queue TABLE, not the index, which can outlive the rows it points at (see
+        // GetDispatchableTaskIdsAsync). Anything the pump cannot still claim is a ghost to re-enqueue.
         // The sweep starts this for every live run each tick without awaiting it, so unguarded a slow
         // verification overlapped the next tick's for the same run and the reads piled up in-process.
         if (!_redriveInFlight.TryAdd(run.Name, 0)) return;
@@ -1876,12 +1853,9 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
         // re-drive them.
         if (_redriveBackoffEnabled)
             _redriveBackoff[run.Name] = (now + _redriveBase, _redriveBase);
-        foreach (var task in orphaned)
-        {
-            // Clear the exhausted counter, or DeferTask would abandon it again on its first attempt.
-            _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
-            RequeueToTable(run, task);
-        }
+        // Clear the exhausted counters, or DeferTask would abandon them again on their first attempt.
+        foreach (var task in orphaned) _deferrals.TryRemove(DeferralKey(run.Name, task.Id), out _);
+        RequeueToTable(run, orphaned);
 
         _logger.LogWarning(
             "[Scheduler] Re-drove {Count} orphaned Pending task(s) in {Run} — no runnable queue row and not queued or running",
@@ -2157,7 +2131,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
         // individual tasks up to 4 times each. The durable queue only ever carries TASKS — the
         // post-execution job is enqueued in-memory on the JobManager and, after a crash, is re-derived
         // from PostExecStatus — so dropping these rows here cannot cost the post-execution its retry.
-        _ = _queue.RemoveRunAsync(run.Name);
+        _ = _queue.RemoveRunAsync(run.Name, run.StartedUtc);
 
         // Dispatch PostExecution if configured
         if (!string.IsNullOrEmpty(run.PostExecFunctionName))
@@ -2249,7 +2223,7 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
 
                     // Cleanup after successful PostExec
                     await _store.CleanupRunAsync(run.Name);
-                    await _queue.RemoveRunAsync(run.Name, jobCt);
+                    await _queue.RemoveRunAsync(run.Name, run.StartedUtc, jobCt);
                 }
                 catch (Exception ex)
                 {
@@ -2517,7 +2491,9 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
     /// </summary>
     public async Task<(bool found, int cancelledCount)> CancelRunAsync(string name)
     {
-        var run = await _store.GetRunAsync(name);
+        // The live graph when this node holds the run: cancelling a copy left the live tasks Pending, so
+        // the re-drive kept re-queueing them and the live run never finalized.
+        var run = _activeRuns.TryGetValue(name, out var live) ? live : await _store.GetRunAsync(name);
         if (run == null) return (false, 0);
 
         // Mark this run as cancelled so dispatched-but-not-yet-started tasks skip execution
@@ -2558,6 +2534,8 @@ public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
                 t.CompletedUtc = null;
             }
         }
+
+        await _queue.RemoveRunAsync(run.Name, run.StartedUtc);
 
         // Check if the run is now fully done (Running tasks will finalize themselves)
         var remaining = run.Tasks.Count(t => t.Status is "Running");

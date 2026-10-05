@@ -83,6 +83,26 @@ public interface ICraftTableStore
         CancellationToken ct = default)
         => QueryTableAsync(table, filter, ct);
 
+    /// <summary>The filtered scan, fetched <paramref name="maxPerPage"/> rows per request, for callers that
+    /// stop after the first few matches. Same contract as the filter: a backend may ignore both.</summary>
+    IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, int maxPerPage,
+        CancellationToken ct = default)
+        => QueryTableAsync(table, filter, ct);
+
+    /// <summary>
+    /// Rows of one partition with <paramref name="fromRowKey"/> &lt;= RowKey &lt; <paramref name="toRowKey"/>
+    /// (ordinal), optionally projected (name the keys too if you read them). Split entities are not
+    /// reassembled, so use it only on tables whose rows are never split.
+    /// </summary>
+    async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
+        string toRowKey, IReadOnlyList<string>? properties = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var row in QueryPartitionAsync(table, partitionKey, ct))
+            if (string.CompareOrdinal(row.RowKey, fromRowKey) >= 0 && string.CompareOrdinal(row.RowKey, toRowKey) < 0)
+                yield return row;
+    }
+
     /// <summary>Delete a single row. A missing row is not an error.</summary>
     Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default);
 

@@ -73,6 +73,25 @@ public class JobQueueStatusReaderTests
     }
 
     [Fact]
+    public async Task ASnapshotHoldsOnlyTheHeadOfABigQueue_ButCountsAllOfIt()
+    {
+        var f = await NewFixtureAsync();
+        var total = JobQueueStatusReader.HeadRows + 500;
+        await f.Queue.EnqueueBatchAsync("Late", [("l", 4)], At(9));
+        await f.Queue.EnqueueBatchAsync("Big",
+            Enumerable.Range(0, total - 1).Select(i => ($"b{i:D5}", 4)).ToList(), At(1));
+
+        var snap = await f.Reader.GetAsync(Fresh);
+
+        Assert.Equal(JobQueueStatusReader.HeadRows, snap!.Rows.Count);
+        Assert.All(snap.Rows, r => Assert.Equal("Big", r.RunName));
+        Assert.Equal(total, snap.Total);
+        Assert.Equal(total, snap.Unclaimed);
+        Assert.Equal(total - 1, snap.ByRun["Big"].Unclaimed);
+        Assert.Equal(1, snap.ByRun["Late"].Unclaimed);
+    }
+
+    [Fact]
     public async Task ClaimedRowsAreNotCountedAsQueued()
     {
         var f = await NewFixtureAsync();
