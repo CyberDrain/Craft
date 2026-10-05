@@ -152,54 +152,53 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// <summary>
     /// Start a run from a pre-built batch (OrchestratorBridge). The batch is a JSON Lines file
     /// (<paramref name="batchFilePath"/>, deleted on every path) or a JSON array string. Returns whether a run
-    /// was created: false when the batch is empty or a run of this name is still going.
+    /// was created: false when the batch is empty, or when <paramref name="allowCollision"/> is false and a
+    /// run of this name is still going. By default runs of one name stack up side by side.
     /// </summary>
     public async Task<bool> StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
         string? parentRunName = null, string? reference = null, string? batchFilePath = null,
-        bool sequential = false, string? parentRunKey = null, string? childKey = null)
+        bool sequential = false, string? parentRunKey = null, string? childKey = null, bool allowCollision = true)
     {
+        var gated = false;
         try
         {
             name = TableKeys.Sanitize(name);
-            if (!_activePlanners.TryAdd(name, true) || await IsActiveAsync(name, ct))
+            if (!allowCollision)
             {
-                _activePlanners.TryRemove(name, out _);
-                _logger.LogInformation("[Orchestrator] Run {Name} already active, skipping", name);
+                gated = _activePlanners.TryAdd(name, true);
+                if (!gated || await IsActiveAsync(name, ct))
+                {
+                    _logger.LogInformation("[Orchestrator] Run {Name} already active, skipping", name);
+                    return false;
+                }
+            }
+
+            var tasks = !string.IsNullOrEmpty(batchFilePath)
+                ? ParseTasksFromJsonLinesFile(batchFilePath, name)
+                : ParseTasksFromJson(batchJson, name);
+            if (tasks.Count == 0)
+            {
+                _logger.LogWarning("[Orchestrator] Batch for {Name} produced 0 tasks", name);
                 return false;
             }
 
-            try
+            var genericTaskFunc = _settings.Orchestrator.GenericTaskFunction;
+            if (string.IsNullOrEmpty(genericTaskFunc) || Script(genericTaskFunc) == null)
             {
-                var tasks = !string.IsNullOrEmpty(batchFilePath)
-                    ? ParseTasksFromJsonLinesFile(batchFilePath, name)
-                    : ParseTasksFromJson(batchJson, name);
-                if (tasks.Count == 0)
-                {
-                    _logger.LogWarning("[Orchestrator] Batch for {Name} produced 0 tasks", name);
-                    return false;
-                }
-
-                var genericTaskFunc = _settings.Orchestrator.GenericTaskFunction;
-                if (string.IsNullOrEmpty(genericTaskFunc) || Script(genericTaskFunc) == null)
-                {
-                    _logger.LogError("[Orchestrator] Cannot start {Name}: task function {Func} not found", name, genericTaskFunc);
-                    return false;
-                }
-
-                if (string.IsNullOrEmpty(postExecFunctionName)) postExecFunctionName = null;
-                if (string.IsNullOrEmpty(postExecParametersJson)) postExecParametersJson = null;
-                await CreateAsync(name, tasks, priority, genericTaskFunc, postExecFunctionName, postExecParametersJson,
-                    reference, parentRunKey, childKey, sequential, ct);
-                return true;
+                _logger.LogError("[Orchestrator] Cannot start {Name}: task function {Func} not found", name, genericTaskFunc);
+                return false;
             }
-            finally
-            {
-                _activePlanners.TryRemove(name, out _);
-            }
+
+            if (string.IsNullOrEmpty(postExecFunctionName)) postExecFunctionName = null;
+            if (string.IsNullOrEmpty(postExecParametersJson)) postExecParametersJson = null;
+            await CreateAsync(name, tasks, priority, genericTaskFunc, postExecFunctionName, postExecParametersJson,
+                reference, parentRunKey, childKey, sequential, ct);
+            return true;
         }
         finally
         {
+            if (gated) _activePlanners.TryRemove(name, out _);
             if (!string.IsNullOrEmpty(batchFilePath))
             {
                 try { if (File.Exists(batchFilePath)) File.Delete(batchFilePath); }
@@ -209,13 +208,21 @@ public class OrchestratorService : IJobDescriptorStateWriter
     }
 
     private async Task<bool> IsActiveAsync(string name, CancellationToken ct) =>
-        await _store.GetRunByNameAsync(name, ct) is { IsFinished: false };
+        (await _store.GetActiveRunsAsync(name, ct)).Count > 0;
+
+    /// <summary>The runs an operator action names: the run with that key, or every unfinished run of that name.</summary>
+    private async Task<List<RunHeader>> TargetRunsAsync(string keyOrName)
+    {
+        keyOrName = TableKeys.Sanitize(keyOrName);
+        if (keyOrName.Contains('~') && await _store.GetRunAsync(keyOrName) is { IsFinished: false } run) return [run];
+        return await _store.GetActiveRunsAsync(keyOrName);
+    }
 
     private async Task CreateAsync(string name, List<OrchestratorTaskItem> tasks, int priority, string taskScriptName,
         string? postExecFunctionName, string? postExecParametersJson, string? reference, string? parentRunKey,
         string? childKey, bool sequential, CancellationToken ct)
     {
-        var started = DateTime.UtcNow;
+        var started = NextStartTime();
         var header = new RunHeader
         {
             RunKey = WorkStore.RunKeyFor(name, started),
@@ -237,24 +244,39 @@ public class OrchestratorService : IJobDescriptorStateWriter
             sequential ? " (sequential)" : "");
     }
 
+    private static long s_lastStartTicks;
+
+    /// <summary>Strictly increasing start times, so runs of one name started together still get distinct keys.</summary>
+    private static DateTime NextStartTime()
+    {
+        while (true)
+        {
+            var last = Interlocked.Read(ref s_lastStartTicks);
+            var next = Math.Max(DateTime.UtcNow.Ticks, last + 1);
+            if (Interlocked.CompareExchange(ref s_lastStartTicks, next, last) == last) return new DateTime(next, DateTimeKind.Utc);
+        }
+    }
+
     // ── child runs ──
 
     /// <summary>
-    /// Make <paramref name="parentRunName"/> wait for a child that is about to be queued. Called at enqueue time,
-    /// inside the parent's task, so the parent cannot finish first. Returns the parent's run key and the
-    /// placeholder key the child completes, or null when the parent is not running tasks (a run queued from an
-    /// aggregation is not a child) or is the child itself.
+    /// Make <paramref name="parentRun"/> wait for a child that is about to be queued. Called at enqueue time,
+    /// inside the parent's task, so the parent cannot finish first. <paramref name="parentRun"/> is the parent's
+    /// run key (exact, from the stamped context's RunKey) or, from older callers, its name (the newest outing).
+    /// Returns the parent's run key and the placeholder key the child completes, or null when the parent is
+    /// not running tasks (a run queued from an aggregation is not a child) or has the child's name (a run
+    /// re-queueing itself for its next cycle).
     /// </summary>
-    internal (string ParentRunKey, string ChildKey)? RegisterPendingChild(string parentRunName, string childRunName)
+    internal (string ParentRunKey, string ChildKey)? RegisterPendingChild(string parentRun, string childRunName)
     {
-        if (parentRunName == childRunName) return null;
+        if (parentRun == childRunName) return null;
         return Task.Run(async () =>
         {
-            var parent = await _store.GetRunByNameAsync(parentRunName);
-            if (parent is not { Phase: RunPhase.Tasks }) return ((string, string)?)null;
+            var parent = await _store.ResolveRunAsync(parentRun);
+            if (parent is not { Phase: RunPhase.Tasks } || parent.Name == childRunName) return ((string, string)?)null;
             var childKey = $"{childRunName}|{Guid.NewGuid():N}";
             if (!await _store.AddChildAsync(parent.RunKey, childKey)) return null;
-            _logger.LogInformation("[Orchestrator] Registered child run {Child} under parent {Parent}", childRunName, parentRunName);
+            _logger.LogInformation("[Orchestrator] Registered child run {Child} under parent {Parent}", childRunName, parent.Name);
             return (parent.RunKey, childKey);
         }).GetAwaiter().GetResult();
     }
@@ -512,34 +534,45 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     // ── operator actions ──
 
-    /// <summary>Cancel a run's pending tasks; running ones finish. Returns whether the run exists and how many were cancelled.</summary>
+    /// <summary>
+    /// Cancel the pending tasks of a run (by key) or of every unfinished run of a name; running ones finish.
+    /// Returns whether any run was found and how many tasks were cancelled.
+    /// </summary>
     public async Task<(bool found, int cancelledCount)> CancelRunAsync(string name)
     {
-        var header = await _store.GetRunByNameAsync(TableKeys.Sanitize(name));
-        if (header == null || header.IsFinished) return (false, 0);
-
-        await _store.RequestCancelAsync(header.RunKey);
-        var (cancelled, _) = await _store.CancelPendingAsync(header.RunKey);
-        _logger.LogInformation("[Scheduler] Run {Name} cancelled: {Cancelled} pending tasks cancelled", header.Name, cancelled);
-        return (true, cancelled);
+        var runs = await TargetRunsAsync(name);
+        var total = 0;
+        foreach (var header in runs)
+        {
+            await _store.RequestCancelAsync(header.RunKey);
+            var (cancelled, _) = await _store.CancelPendingAsync(header.RunKey);
+            total += cancelled;
+            _logger.LogInformation("[Scheduler] Run {Name} cancelled: {Cancelled} pending tasks cancelled", header.Name, cancelled);
+        }
+        return (runs.Count > 0, total);
     }
 
     /// <summary>Cancel one task that is still pending in storage. False when it is not pending (or not found).</summary>
     public async Task<bool> TryCancelQueuedTaskAsync(string runName, string taskId)
     {
-        var header = await _store.GetRunByNameAsync(runName);
-        if (header == null || header.IsFinished) return false;
-        var task = (await _store.GetTasksAsync(header.RunKey, 'P')).FirstOrDefault(t => t.TaskId == taskId);
-        if (task == null) return false;
-        var outcome = await _store.FinishAsync(header.RunKey, [new WorkStore.Finish(task.Seq, "Cancelled", "Cancelled by user")], 'P');
-        return outcome?.Applied > 0;
+        foreach (var header in await TargetRunsAsync(runName))
+        {
+            var task = (await _store.GetTasksAsync(header.RunKey, 'P')).FirstOrDefault(t => t.TaskId == taskId);
+            if (task == null) continue;
+            var outcome = await _store.FinishAsync(header.RunKey, [new WorkStore.Finish(task.Seq, "Cancelled", "Cancelled by user")], 'P');
+            if (outcome?.Applied > 0) return true;
+        }
+        return false;
     }
 
-    /// <summary>Move a run to another priority band. Applies to the whole run: its tasks share one queue position.</summary>
+    /// <summary>Move a run (or every unfinished run of a name) to another priority band. Applies to whole runs:
+    /// a run's tasks share one queue position.</summary>
     public async Task<bool> ReprioritizeRunAsync(string runName, int priority)
     {
-        var header = await _store.GetRunByNameAsync(runName);
-        return header is { IsFinished: false } && await _store.SetPriorityAsync(header.RunKey, Math.Clamp(priority, 0, 99));
+        var moved = false;
+        foreach (var header in await TargetRunsAsync(runName))
+            moved |= await _store.SetPriorityAsync(header.RunKey, Math.Clamp(priority, 0, 99));
+        return moved;
     }
 
     /// <summary>Cancel every pending task of every run — the whole backlog. Returns how many were cancelled.</summary>
@@ -569,8 +602,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     // ── lookups ──
 
-    public string? GetRunReference(string runName) =>
-        Task.Run(() => _store.GetRunByNameAsync(runName)).GetAwaiter().GetResult()?.Reference;
+    public string? GetRunReference(string runName) => Task.Run(async () =>
+        (await _store.ResolveRunAsync(runName) ?? await _store.GetRunByNameAsync(runName))?.Reference).GetAwaiter().GetResult();
 
     public string? FindRunByReference(string reference) => Task.Run(async () =>
     {
@@ -644,12 +677,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private async Task LogRunStatusAsync(CancellationToken ct)
     {
         if (!_logger.IsEnabled(LogLevel.Information)) return;
+        // Running jobs are counted per run name, so runs sharing a name take them oldest first.
         var running = _jobManager.GetJobs(status: "Running").Where(j => j.RunName != null)
             .GroupBy(j => j.RunName!).ToDictionary(g => g.Key, g => g.Count());
         var now = DateTime.UtcNow;
         await foreach (var e in _store.ReadReadyAsync(200, ct))
         {
-            var r = running.GetValueOrDefault(e.Name);
+            var r = Math.Min(Math.Max(0, e.Total - e.Done), running.GetValueOrDefault(e.Name));
+            running[e.Name] = running.GetValueOrDefault(e.Name) - r;
             var p = Math.Max(0, e.Total - e.Done - r);
             if (_lastStatusLog.TryGetValue(e.RunKey, out var prev) && prev.C == e.Done && prev.R == r && prev.P == p
                 && now - prev.LoggedUtc < StatusHeartbeat) continue;

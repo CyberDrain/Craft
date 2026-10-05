@@ -59,6 +59,12 @@ public static class OperationContext
         public string? RunName { get; init; }
 
         /// <summary>
+        /// Storage key of the enclosing run. Runs of one name can overlap, so this — not
+        /// <see cref="RunName"/> — is what identifies the parent exactly when a task queues a child.
+        /// </summary>
+        public string? RunKey { get; init; }
+
+        /// <summary>
         /// Queue priority of the enclosing run, exposed so nested enqueues can inherit it.
         /// PowerShell cannot read this statically — the pipeline thread never sees the AsyncLocal
         /// (see PowerShellWorker.StampOperationContext) — so the worker stamps the whole Invocation

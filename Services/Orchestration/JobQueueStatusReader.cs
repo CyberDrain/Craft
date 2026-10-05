@@ -89,6 +89,7 @@ public class JobQueueStatusReader : IDisposable
 
     private async Task<QueueSnapshot> BuildSnapshotAsync(CancellationToken ct)
     {
+        // Local jobs are counted per run name; runs sharing a name take them oldest first.
         var local = _jobs.GetJobs().Where(j => j.RunName != null && j.Status is "Queued" or "Running")
             .GroupBy(j => j.RunName!).ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
 
@@ -101,10 +102,14 @@ public class JobQueueStatusReader : IDisposable
         {
             var outstanding = Math.Max(0, e.Total - e.Done);
             var claimed = Math.Min(outstanding, local.GetValueOrDefault(e.Name));
+            local[e.Name] = local.GetValueOrDefault(e.Name) - claimed;
             total += outstanding;
             unclaimed += outstanding - claimed;
             if (outstanding > claimed && (oldest == null || e.StartedUtc < oldest)) oldest = e.StartedUtc;
-            byRun[e.Name] = new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference);
+            byRun[e.Name] = byRun.TryGetValue(e.Name, out var same)
+                ? new RunQueueInfo(same.Unclaimed + outstanding - claimed, same.Claimed + claimed, Math.Min(same.MinPriority, e.Band),
+                    same.OldestQueuedUtc, same.Total + e.Total, same.Done + e.Done, same.Reference ?? e.Reference)
+                : new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference);
 
             if (head.Count < HeadRows && runsListed < HeadRuns && outstanding > claimed)
             {
@@ -149,11 +154,12 @@ public class JobQueueStatusReader : IDisposable
 
         var now = DateTime.UtcNow;
         var merged = new List<JobDetail>(local);
+        var held = _jobs.GetJobs().Where(j => j.Status is "Queued" or "Running").Select(j => j.Name).ToHashSet(StringComparer.Ordinal);
         foreach (var row in snap.Rows)
         {
             if (!string.IsNullOrEmpty(runName) && !string.Equals(row.RunName, runName, StringComparison.OrdinalIgnoreCase)) continue;
             var id = $"{row.RunName}-{row.TaskId}";
-            if (_jobs.IsQueuedOrRunning(id)) continue;
+            if (held.Contains(id)) continue;
             merged.Add(new JobDetail
             {
                 Id = id,

@@ -23,9 +23,11 @@ public static class OrchestratorBridge
 
     public static void Initialize(OrchestratorService service) => s_service = service;
 
+    /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
+    /// while another run of the same name is unfinished.</param>
     public static void QueueOrchestration(string name, string batchJson, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true)
     {
         // Sanitized here as well as at run creation so the child-run registration below
         // records the SAME name the service ends up creating — a raw name with a table-illegal
@@ -35,7 +37,8 @@ public static class OrchestratorBridge
         var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference,
-            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
+            AllowCollision: allowCollision));
     }
 
     /// <summary>
@@ -49,20 +52,24 @@ public static class OrchestratorBridge
     ///
     /// The file is owned by the orchestrator from this point: it is deleted once parsed.
     /// </summary>
+    /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
+    /// while another run of the same name is unfinished.</param>
     public static void QueueOrchestrationFromFile(string name, string batchFilePath, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true)
     {
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
         var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
-            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
+            AllowCollision: allowCollision));
     }
 
     /// <summary>
-    /// Resolve the parent run of a queued orchestration. The explicit argument wins — PowerShell
+    /// Resolve the parent run of a queued orchestration: a run key (exact — runs of one name can overlap) or a
+    /// run name (the newest outing). The explicit argument wins — PowerShell
     /// callers MUST pass it (read from the stamped $global:CraftOperationContext), because the
     /// ambient fallback cannot work for them: the pipeline runs on the runspace's reused thread,
     /// whose frozen ExecutionContext never sees the per-invocation AsyncLocal (see
@@ -75,7 +82,7 @@ public static class OrchestratorBridge
     private static string? ResolveParentRunName(string name, string? parentRunName)
     {
         if (string.IsNullOrEmpty(parentRunName))
-            parentRunName = OperationContext.Current?.RunName;
+            parentRunName = OperationContext.Current?.RunKey ?? OperationContext.Current?.RunName;
         if (string.IsNullOrEmpty(parentRunName))
             return null;
         // Sanitized like the child name: the parent was created under its sanitized name, and the
@@ -119,7 +126,7 @@ public static class OrchestratorBridge
             if (s_service == null) { DiscardUndispatchable(p); return; }
             created = await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                 p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey);
+                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey, p.AllowCollision);
         }
         catch (Exception ex)
         {
@@ -160,7 +167,7 @@ public static class OrchestratorBridge
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
         string? Reference = null, string? BatchFilePath = null, bool Sequential = false,
-        string? ParentRunKey = null, string? ChildKey = null)
+        string? ParentRunKey = null, string? ChildKey = null, bool AllowCollision = true)
     {
         public bool PendingChildRegistered => ChildKey != null;
     }

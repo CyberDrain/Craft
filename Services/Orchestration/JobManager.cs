@@ -355,6 +355,7 @@ public class JobManager : BackgroundService
             var parentInvocation = new OperationContext.Invocation(job.Record.Name)
             {
                 RunName = job.Record.RunName,
+                RunKey = job.Descriptor?.RunKey,
                 Priority = job.Descriptor != null ? job.Record.Priority : job.InheritPriority,
                 Category = "Job"
             };

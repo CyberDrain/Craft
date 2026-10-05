@@ -70,6 +70,19 @@ public class JobQueueStatusReaderTests
     }
 
     [Fact]
+    public async Task RunsSharingAName_AreSummedUnderThatName()
+    {
+        var (reader, store, _) = New();
+        await Create(store, "Twin", 3, 0);
+        await Create(store, "Twin", 4, 1);
+
+        var info = (await reader.GetAsync())!.ByRun["Twin"];
+
+        Assert.Equal(7, info.Total);
+        Assert.Equal(7, info.Unclaimed);
+    }
+
+    [Fact]
     public async Task AFinishedRun_LeavesTheBacklog()
     {
         var (reader, store, _) = New();

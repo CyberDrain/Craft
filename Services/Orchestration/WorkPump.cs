@@ -151,7 +151,7 @@ public class WorkPump : BackgroundService
             {
                 var name = c.Seq == WorkStore.AggregateSeq ? $"{header.Name}-PostExec" : $"{header.Name}-{c.TaskId}";
                 var descriptor = new JobDescriptor(header.Name, c.TaskId, header.Priority) { RunKey = c.RunKey, Seq = c.Seq, Attempt = c.Attempt };
-                var jobId = _jobs.Enqueue(descriptor, name);
+                var jobId = _jobs.Enqueue(descriptor, name, id: $"{c.RunKey}|{c.Seq}");
                 _inFlight[jobId] = (c, now + _lease);
             }
             need -= claims.Count;

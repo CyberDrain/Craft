@@ -19,7 +19,8 @@ namespace Craft.Storage;
 /// whose lease lapses, and the next claim takes it back.
 ///
 /// Three small tables sit beside it: Ready (one row per run with work, ordered by band then start time,
-/// read by the scheduler), Names (latest run per name) and Finished (completion order, for retention).
+/// read by the scheduler), Names (latest run per name, and every unfinished run by name, since runs of one
+/// name may overlap) and Finished (completion order, for retention).
 /// All three are hints derived from the Work rows: a stale one costs a read, never a wrong answer.
 /// </summary>
 public sealed class WorkStore
@@ -131,6 +132,7 @@ public sealed class WorkStore
         await _store.UpsertAsync(_work, header.ToRow(), ct);
 
         await _store.UpsertAsync(_names, new StoreRow("N", header.Name) { Properties = { ["RunKey"] = header.RunKey } }, ct);
+        await _store.UpsertAsync(_names, new StoreRow(ActivePartition, header.RunKey) { Properties = { ["Name"] = header.Name } }, ct);
         await PublishReadyAsync(header, ct);
         return (await GetRunAsync(header.RunKey, ct))!;
     }
@@ -157,6 +159,32 @@ public sealed class WorkStore
         var row = await _store.GetAsync(_work, runKey, HeaderKey, ct);
         return row == null ? null : RunHeader.FromRow(row);
     }
+
+    private const string ActivePartition = "A";
+
+    /// <summary>
+    /// Every unfinished run with this name, oldest first. Run keys are <c>{name}~{hex ticks}</c>, so one name's
+    /// outings share a key prefix and sort by start; the Name check drops a different name that merely
+    /// starts with this one and a tilde.
+    /// </summary>
+    public async Task<List<RunHeader>> GetActiveRunsAsync(string name, CancellationToken ct = default)
+    {
+        var runs = new List<RunHeader>();
+        var stale = new List<string>();
+        await foreach (var row in _store.QueryRowKeyRangeAsync(_names, ActivePartition, $"{name}~", $"{name}~g", null, ct))
+        {
+            if (row.GetString("Name") != name) continue;
+            if (await GetRunAsync(row.RowKey, ct) is { IsFinished: false } run) runs.Add(run);
+            else stale.Add(row.RowKey);
+        }
+        foreach (var key in stale) await _store.DeleteAsync(_names, ActivePartition, key, ct);
+        return runs;
+    }
+
+    /// <summary>A run by its key, or else the newest unfinished run with that name.</summary>
+    public async Task<RunHeader?> ResolveRunAsync(string keyOrName, CancellationToken ct = default) =>
+        (keyOrName.Contains('~') ? await GetRunAsync(keyOrName, ct) : null)
+        ?? (await GetActiveRunsAsync(keyOrName, ct)).LastOrDefault();
 
     /// <summary>The latest run with this name, active or finished.</summary>
     public async Task<RunHeader?> GetRunByNameAsync(string name, CancellationToken ct = default)
@@ -517,6 +545,7 @@ public sealed class WorkStore
     {
         _rate.Forget(h.RunKey);
         await _store.DeleteAsync(_ready, ReadyPartition(h.Priority), ReadyKey(h), ct);
+        await _store.DeleteAsync(_names, ActivePartition, h.RunKey, ct);
         var done = (h.CompletedUtc ?? DateTime.UtcNow).Ticks.ToString("D19", CultureInfo.InvariantCulture);
         await _store.UpsertAsync(_finished, new StoreRow("F", $"{done}|{h.RunKey}") { Properties = { ["RunKey"] = h.RunKey } }, ct);
     }
@@ -596,6 +625,7 @@ public sealed class WorkStore
         var header = await GetRunAsync(runKey, ct);
         await _store.DeletePartitionAsync(_work, runKey, ct);
         await _store.DeletePartitionAsync(_results, runKey, ct);
+        await _store.DeleteAsync(_names, ActivePartition, runKey, ct);
         if (header == null) return;
         var name = await _store.GetAsync(_names, "N", header.Name, ct);
         if (name?.GetString("RunKey") == runKey) await _store.DeleteAsync(_names, "N", header.Name, ct);

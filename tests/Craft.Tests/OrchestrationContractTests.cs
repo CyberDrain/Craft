@@ -13,7 +13,8 @@ namespace Craft.Tests;
 /// The orchestration contract as CIPP sees it, end to end through the real store, pump and JobManager with
 /// only the PowerShell calls faked: a batch becomes tasks invoked with <c>TaskJson</c>; their output reaches
 /// the PostExecution script as one JSON line each, with <c>FunctionName</c> and <c>ParametersJson</c>; a run
-/// queued by a task holds its parent until it finishes; a name still running is not started twice.
+/// queued by a task holds its parent until it finishes; runs of one name stack up unless the caller asks
+/// for no collisions.
 /// </summary>
 public class OrchestrationContractTests
 {
@@ -93,8 +94,9 @@ public class OrchestrationContractTests
         JsonSerializer.Serialize(Enumerable.Range(0, n).Select(i => new { Name = "Job", TenantFilter = $"{prefix}{i}", N = i }));
 
     private static Task<bool> Start(Harness h, string name, string batch, string? postExec = null, string? postParams = null,
-        bool sequential = false, int priority = 4) =>
-        h.Svc.StartFromBatchAsync(name, batch, priority, postExec, postParams, CancellationToken.None, sequential: sequential);
+        bool sequential = false, int priority = 4, bool allowCollision = true) =>
+        h.Svc.StartFromBatchAsync(name, batch, priority, postExec, postParams, CancellationToken.None, sequential: sequential,
+            allowCollision: allowCollision);
 
     [Fact]
     public async Task EveryTaskRunsOnce_WithItsBatchItemAsTaskJson_AndTheRunCompletes()
@@ -163,19 +165,80 @@ public class OrchestrationContractTests
     }
 
     [Fact]
-    public async Task ARunNameStillGoing_IsNotStartedAgain_AndItsBatchFileIsStillDeleted()
+    public async Task WithoutCollisions_ARunNameStillGoing_IsNotStartedAgain_AndItsBatchFileIsStillDeleted()
     {
         await using var h = await NewAsync();
-        Assert.True(await Start(h, "Recurring", Batch(2)));
+        Assert.True(await Start(h, "Recurring", Batch(2), allowCollision: false));
 
         var file = Path.Combine(Path.GetTempPath(), $"craft-test-{Guid.NewGuid():N}.jsonl");
         await File.WriteAllTextAsync(file, "{\"Name\":\"Job\",\"TenantFilter\":\"x\"}\n");
-        Assert.False(await h.Svc.StartFromBatchAsync("Recurring", "", 4, null, null, CancellationToken.None, batchFilePath: file));
+        Assert.False(await h.Svc.StartFromBatchAsync("Recurring", "", 4, null, null, CancellationToken.None, batchFilePath: file,
+            allowCollision: false));
         Assert.False(File.Exists(file));
         Assert.Single(await ReadyNames(h));
 
         Assert.True(await h.DriveUntilFinished("Recurring"));
-        Assert.True(await Start(h, "Recurring", Batch(1)));
+        Assert.True(await Start(h, "Recurring", Batch(1), allowCollision: false));
+    }
+
+    [Fact]
+    public async Task ByDefault_RunsOfOneNameStackUp_AndEachRunsEveryTask()
+    {
+        await using var h = await NewAsync();
+        Assert.True(await Start(h, "Stacked", Batch(3), "Agg"));
+        Assert.True(await Start(h, "Stacked", Batch(3), "Agg"));
+        Assert.Equal(["Stacked", "Stacked"], await ReadyNames(h));
+
+        Assert.True(await h.DriveUntil(async () => (await ReadyNames(h)).Count == 0));
+        Assert.Equal(6, h.Svc.Tasks.Count);
+        Assert.Equal(2, h.Svc.PostExecs.Count);
+        Assert.All(h.Svc.PostExecs, p => Assert.Equal(3, p.Lines.Length));
+        // Same task ids in both runs, so the jobs share a display name; each must still be its own job, or
+        // the pump would track (and renew the lease of) only one of the two claims.
+        Assert.Equal(2, h.Jobs.GetJobs().Count(j => j.Name == "Stacked-Job_t0"));
+    }
+
+    [Fact]
+    public async Task ACollisionFreeStart_IsSkippedWhileAStackedRunOfThatNameIsGoing()
+    {
+        await using var h = await NewAsync();
+        Assert.True(await Start(h, "Mixed", Batch(1)));
+        Assert.True(await Start(h, "Mixed", Batch(1)));
+        Assert.False(await Start(h, "Mixed", Batch(1), allowCollision: false));
+    }
+
+    [Fact]
+    public async Task AChildFindsItsExactParent_ByRunKey_WhenRunsOfThatNameOverlap()
+    {
+        await using var h = await NewAsync();
+        Assert.True(await Start(h, "Parent", Batch(1, "older"), "Agg"));
+        Assert.True(await Start(h, "Parent", Batch(1, "newer"), "Agg"));
+        var outings = await h.Store.GetActiveRunsAsync("Parent");
+        var (older, newest) = (outings[0], outings[1]);
+
+        var link = h.Svc.RegisterPendingChild(older.RunKey, "Child");
+        Assert.Equal(older.RunKey, link!.Value.ParentRunKey);
+        Assert.Equal(2, (await h.Store.GetRunAsync(older.RunKey))!.Total);
+        Assert.Equal(1, (await h.Store.GetRunAsync(newest.RunKey))!.Total);
+
+        // An older caller passing only the name gets the newest outing.
+        Assert.Equal(newest.RunKey, h.Svc.RegisterPendingChild("Parent", "Other")!.Value.ParentRunKey);
+        // A run re-queueing itself is never its own child, by key or by name.
+        Assert.Null(h.Svc.RegisterPendingChild(older.RunKey, "Parent"));
+    }
+
+    [Fact]
+    public async Task CancellingByName_CancelsEveryRunOfThatName()
+    {
+        await using var h = await NewAsync();
+        Assert.True(await Start(h, "Twin", Batch(4)));
+        Assert.True(await Start(h, "Twin", Batch(4)));
+
+        var (found, cancelled) = await h.Svc.CancelRunAsync("Twin");
+
+        Assert.True(found);
+        Assert.Equal(8, cancelled);
+        Assert.Empty(await h.Store.GetActiveRunsAsync("Twin"));
     }
 
     [Fact]

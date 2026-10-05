@@ -175,8 +175,8 @@ public class OrchestratorBatchStreamingTests
     /// <summary>
     /// Cleanup is the caller's, on every path — including the ones that never parse.
     ///
-    /// StartFromBatchAsync returns early when a run of the same name is already in progress or already
-    /// active, and neither return looks at the batch. Those are the common outcome for a duplicate
+    /// StartFromBatchAsync returns early when collisions are off and a run of the same name is already in
+    /// progress or active, and neither return looks at the batch. Those are the common outcome for a duplicate
     /// enqueue, so cleanup living at the parse site would leave the container's temp directory
     /// accumulating the batches of every run that was skipped rather than started. This pins the
     /// deletion to the outer method by driving it through those early returns.
@@ -201,7 +201,7 @@ public class OrchestratorBatchStreamingTests
         var path = WriteLines(["""{"FunctionName":"A","TenantFilter":"a.com"}"""]);
 
         await svc.StartFromBatchAsync("busy-run", string.Empty, 4, null, null,
-            CancellationToken.None, null, null, path);
+            CancellationToken.None, null, null, path, allowCollision: false);
 
         Assert.False(File.Exists(path),
             "the batch file outlived a skipped run — every enqueue that is skipped now leaks a temp file");
