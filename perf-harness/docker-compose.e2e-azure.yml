@@ -40,6 +40,12 @@ services:
       # Realtime SSE is opt-in (off by default) — turn it on so the realtime bridge test can run.
       - CRAFT_REALTIME_ENABLED=true
       - App__Orchestrator__TablePrefix=E2EOrch
+      # Orchestration checks: a 60s claim lease (the minimum) so the restart check reclaims interrupted tasks in
+      # minutes, and a fixed BG concurrency of the full pool (no ramp-up, no HTTP-pressure throttle from the
+      # harness's own polling) so concurrency and ordering assertions are deterministic.
+      - JobQueueLeaseSeconds=60
+      - BackgroundBaseConcurrency=4
+      - BackgroundHttpPressureThreshold=0
       - App__RateLimit__Enabled=false
       # Scheduler: fast tick so the timer test doesn't wait long
       - App__Scheduler__ConfigFile=e2e-timers.json

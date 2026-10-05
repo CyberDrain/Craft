@@ -562,3 +562,293 @@ function Invoke-PerfPublish {
     [Craft.Services.RealtimeBridge]::Publish($userId, $jobId, $mode, $data, "/perf/$jobId", "View job")
     return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfPublish'; jobId = $jobId; mode = $mode; userId = $userId } }
 }
+
+# -- Orchestration e2e probes (scripts/run-e2e-orchestration.ps1) -----------------------------------------
+# Each check gets its own namespace (ns). Tasks and PostExecutions record what they saw under that ns, in the
+# shared cache by default or in the E2EProbe table (sink=table) when the record has to survive a restart.
+# Records are hashtables: kind T (task: run label, idx, start/end ticks, worker, stamped priority/run),
+# kind P (PostExecution: what Results and Parameters held) and kind Q (what a child enqueue returned).
+
+function Get-PerfE2ECache([string]$Ns) { [Craft.Services.PowerShellRunnerService]::GetSharedCache("E2E:$Ns") }
+
+function Get-PerfE2ETable {
+    $Tc = [Azure.Data.Tables.TableClient]::new($env:AzureWebJobsStorage, 'E2EProbe')
+    $Flags = [Craft.Services.PowerShellRunnerService]::GetSharedCache('E2EProbeInit')
+    if (-not $Flags['created']) { $Tc.CreateIfNotExists() | Out-Null; $Flags['created'] = $true }
+    $Tc
+}
+
+function Write-PerfE2ERecord([string]$Ns, [string]$Sink, [string]$Key, [hashtable]$Fields) {
+    if ($Sink -eq 'table') {
+        $E = [Azure.Data.Tables.TableEntity]::new($Ns, $Key)
+        foreach ($K in $Fields.Keys) { $E[$K] = $Fields[$K] }
+        (Get-PerfE2ETable).UpsertEntity[Azure.Data.Tables.TableEntity]($E, [Azure.Data.Tables.TableUpdateMode]::Replace, [System.Threading.CancellationToken]::None) | Out-Null
+    } else {
+        (Get-PerfE2ECache $Ns)[$Key] = $Fields
+    }
+}
+
+# Deterministic >64 KB payload; the harness recomputes it to compare length and hash.
+function Get-PerfE2EBig([int]$Kb) { ('0123456789abcdef' * ($Kb * 64)) + 'END' }
+
+function Get-PerfE2EBatch([string]$Ns, [string]$Sink, [string]$Label, $Spec) {
+    $Count = [int]$Spec.tasks
+    @(for ($I = 0; $I -lt $Count; $I++) {
+        $T = @{ FunctionName = 'PerfE2E'; ns = $Ns; sink = $Sink; run = $Label; idx = $I; TenantFilter = "t$I" }
+        if ($Spec.holdms) { $T.holdms = [int]$Spec.holdms }
+        if ($Spec.task) { foreach ($K in $Spec.task.Keys) { $T[$K] = $Spec.task[$K] } }
+        if ($Spec.overrides -and $Spec.overrides["$I"]) { foreach ($K in $Spec.overrides["$I"].Keys) { $T[$K] = $Spec.overrides["$I"][$K] } }
+        $T
+    })
+}
+
+# Queue a child run from inside a task. via=start goes through Start-CraftOrchestrator; via=bridge calls
+# QueueOrchestrationFromFile directly, so a 0-task batch or a collision-off skip reaches the bridge, which
+# registers the child with its parent before the run is ever created.
+function Start-PerfE2EChild($Item, $Ctx) {
+    $C = $Item.child
+    $Label = if ($C.label) { [string]$C.label } else { [string]$C.name }
+    $Batch = Get-PerfE2EBatch -Ns $Item.ns -Sink $Item.sink -Label $Label -Spec $C
+    if ([string]$C.via -eq 'bridge') {
+        $Path = Join-Path ([IO.Path]::GetTempPath()) "e2e-child-$([guid]::NewGuid().ToString('N')).jsonl"
+        [IO.File]::WriteAllLines($Path, [string[]]@(foreach ($B in $Batch) { ConvertTo-Json -InputObject $B -Compress -Depth 10 }))
+        $Parent = if ($Ctx.RunKey) { [string]$Ctx.RunKey } else { [string]$Ctx.RunName }
+        $Prio = if ($null -ne $C.priority) { [int]$C.priority } elseif ($null -ne $Ctx.Priority) { [int]$Ctx.Priority } else { 4 }
+        [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile([string]$C.name, $Path, $Prio, $null, $null, $null,
+            $Parent, $false, ($C.allowCollision -ne $false))
+        $Result = 'bridge'
+    } else {
+        $In = @{ OrchestratorName = [string]$C.name; Batch = $Batch }
+        foreach ($K in 'priority', 'sequential', 'allowCollision') { if ($C.ContainsKey($K)) { $In[$K] = $C[$K] } }
+        $Result = [string](Start-CraftOrchestrator -InputObject $In -WarningAction SilentlyContinue)
+    }
+    Write-PerfE2ERecord $Item.ns $Item.sink "Q|$Label|$([guid]::NewGuid().ToString('N').Substring(0, 8))" @{
+        kind = 'Q'; run = $Label; parent = [string]$Item.run; result = $Result; ticks = [DateTime]::UtcNow.Ticks }
+}
+
+# The task. Records start (and, unless it dies, end), optionally queues a child, holds, emits output, or throws.
+function Push-PerfE2E {
+    param($Item)
+    $Start = [DateTime]::UtcNow.Ticks
+    $Ctx = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    $Key = "T|$($Item.run)|$($Item.idx)|$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $Rec = @{
+        kind = 'T'; run = [string]$Item.run; idx = [int]$Item.idx; start = $Start; end = [long]0
+        worker = [string]$Ctx.WorkerId; runName = [string]$Ctx.RunName; runKey = [string]$Ctx.RunKey
+        prio = $(if ($null -ne $Ctx.Priority) { [int]$Ctx.Priority } else { -1 })
+    }
+    Write-PerfE2ERecord $Item.ns $Item.sink $Key $Rec
+    if ($Item.child) { Start-PerfE2EChild -Item $Item -Ctx $Ctx }
+    if ($Item.holdms -and [int]$Item.holdms -gt 0) { Start-Sleep -Milliseconds ([int]$Item.holdms) }
+    $Done = $Rec.Clone()
+    $Done['end'] = [DateTime]::UtcNow.Ticks
+    if ($Item.fail) {
+        $Done['failed'] = $true
+        Write-PerfE2ERecord $Item.ns $Item.sink $Key $Done
+        throw "e2e: task $($Item.run)/$($Item.idx) failed on purpose"
+    }
+    Write-PerfE2ERecord $Item.ns $Item.sink $Key $Done
+    $Out = if ($Item.outKb) { 'o' * ([int]$Item.outKb * 1024) } else { [string]$Item.out }
+    return @{ run = [string]$Item.run; idx = [int]$Item.idx; out = $Out }
+}
+
+# The PostExecution. Records what arrived: the raw line count, each entry's run/idx and output length, and
+# the Parameters (big payload length + hash, marker, nested object). followOn queues a run from here.
+function Push-PerfE2EPost {
+    param($Item)
+    $Ticks = [DateTime]::UtcNow.Ticks
+    $P = $Item.Parameters
+    $Entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($R in @($Item.Results)) {
+        if ($R -is [System.Collections.IList]) { foreach ($X in $R) { $Entries.Add($X) } } else { $Entries.Add($R) }
+    }
+    $Idxs = @(foreach ($E in $Entries) { if ($E -is [System.Collections.IDictionary]) { "$($E['run'])/$($E['idx'])" } else { "?$E" } })
+    $Lens = @(foreach ($E in $Entries) { if ($E -is [System.Collections.IDictionary]) { ([string]$E['out']).Length } })
+    $Big = [string]$P.big
+    $Sha = if ($Big) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Big))) } else { '' }
+    $First = @($Item.Results)[0]
+    Write-PerfE2ERecord ([string]$P.ns) ([string]$P.sink) "P|$($P.run)|$([guid]::NewGuid().ToString('N').Substring(0, 8))" @{
+        kind = 'P'; run = [string]$P.run; ticks = $Ticks; lines = @($Item.Results).Count; entries = $Entries.Count
+        idxs = ($Idxs -join ','); outLens = ($Lens -join ','); bigLen = $Big.Length; bigSha = $Sha
+        marker = [string]$P.marker; nested = $(if ($P.nested) { ConvertTo-Json -InputObject $P.nested -Compress -Depth 5 } else { '' })
+        firstType = $(if ($null -ne $First) { $First.GetType().Name } else { '' })
+    }
+    if ($P.followOn) {
+        $F = $P.followOn
+        $Batch = @(for ($I = 0; $I -lt [int]$F.tasks; $I++) {
+            @{ FunctionName = 'PerfE2E'; ns = [string]$P.ns; sink = [string]$P.sink; run = [string]$F.label; idx = $I; holdms = [int]$F.holdms; TenantFilter = "t$I" } })
+        Start-CraftOrchestrator -InputObject @{ OrchestratorName = [string]$F.name; Batch = $Batch } | Out-Null
+    }
+}
+
+# POST { ns, sink, runs: [ { name, label, tasks, task{}, overrides{idx:{}}, post{marker,bigKb,nested,followOn},
+#   Priority, Sequential, AllowCollision, MaxConcurrency, StopOnFailure } ] }. Runs are queued in order in one
+# invocation. Returns each Start-CraftOrchestrator result, its warnings, and the server tick it was called at.
+function Invoke-PerfE2EStart {
+    param($Request, $TriggerMetadata)
+    $Spec = $Request.Body | ConvertTo-Json -Depth 30 -Compress | ConvertFrom-Json -AsHashtable
+    $Ns = [string]$Spec.ns
+    $Sink = [string]$Spec.sink
+    $Out = [System.Collections.Generic.List[object]]::new()
+    foreach ($R in @($Spec.runs)) {
+        $Label = if ($R.label) { [string]$R.label } else { [string]$R.name }
+        $In = @{ OrchestratorName = [string]$R.name; Batch = (Get-PerfE2EBatch -Ns $Ns -Sink $Sink -Label $Label -Spec $R) }
+        foreach ($K in 'Priority', 'Sequential', 'AllowCollision', 'MaxConcurrency', 'StopOnFailure', 'Reference') {
+            if ($R.ContainsKey($K)) { $In[$K] = $R[$K] }
+        }
+        if ($R.post) {
+            $Params = @{ ns = $Ns; sink = $Sink; run = $Label; marker = [string]$R.post.marker }
+            if ($R.post.nested) { $Params.nested = $R.post.nested }
+            if ($R.post.followOn) { $Params.followOn = $R.post.followOn }
+            if ($R.post.bigKb) { $Params.big = Get-PerfE2EBig ([int]$R.post.bigKb) }
+            $In.PostExecution = @{ FunctionName = 'PerfE2EPost'; Parameters = $Params }
+        }
+        $Ticks = [DateTime]::UtcNow.Ticks
+        $Warn = $null
+        $Res = Start-CraftOrchestrator -InputObject $In -WarningVariable Warn -WarningAction SilentlyContinue
+        $Out.Add(@{ name = [string]$R.name; label = $Label; result = [string]$Res; warning = (@($Warn) -join ' | '); enqueueTicks = $Ticks })
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; ns = $Ns; runs = @($Out) } }
+}
+
+# GET ?ns=X[&source=table][&summary=1][&wipe=1] -> every record written under the namespace.
+function Invoke-PerfE2EState {
+    param($Request, $TriggerMetadata)
+    $Ns = [string]$Request.Query.ns
+    $Rows = [System.Collections.Generic.List[object]]::new()
+    if ([string]$Request.Query.source -eq 'table') {
+        foreach ($E in (Get-PerfE2ETable).Query[Azure.Data.Tables.TableEntity]("PartitionKey eq '$Ns'")) {
+            $H = @{}
+            foreach ($K in $E.Keys) { if ($K -notin 'odata.etag', 'PartitionKey', 'RowKey', 'Timestamp') { $H[$K] = $E[$K] } }
+            $Rows.Add($H)
+        }
+    } else {
+        $C = Get-PerfE2ECache $Ns
+        [System.Threading.Monitor]::Enter($C.SyncRoot)
+        try { foreach ($V in $C.Values) { $Rows.Add($V) } } finally { [System.Threading.Monitor]::Exit($C.SyncRoot) }
+        if ($Request.Query['wipe']) { $C.Clear() }
+    }
+    if ($Request.Query['summary']) {
+        $By = @{}
+        foreach ($R in $Rows) {
+            $S = $By[$R.run]
+            if (-not $S) { $S = @{ run = $R.run; tasks = 0; ended = 0; posts = 0; minStart = [long]0; maxEnd = [long]0 }; $By[$R.run] = $S }
+            if ($R.kind -eq 'P') { $S.posts = $S.posts + 1; continue }
+            if ($R.kind -ne 'T') { continue }
+            $S.tasks = $S.tasks + 1
+            if ($S.minStart -eq 0 -or $R.start -lt $S.minStart) { $S.minStart = $R.start }
+            if ($R.end -gt 0) { $S.ended = $S.ended + 1; if ($R.end -gt $S.maxEnd) { $S.maxEnd = $R.end } }
+        }
+        return @{ StatusCode = 200; Body = @{ ok = $true; ns = $Ns; count = $Rows.Count; runs = @($By.Values) } }
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; ns = $Ns; count = $Rows.Count; rows = @($Rows) } }
+}
+
+# GET ?name=X | ?prefix=X [&detail=1] -> run headers read straight from {TablePrefix}Work (the durable state);
+# detail adds each task's D row (status, attempt, error) and the count of P/R/C rows still open.
+function Invoke-PerfE2ERuns {
+    param($Request, $TriggerMetadata)
+    $Name = [string]$Request.Query.name
+    $Prefix = if ($Name) { "$Name~" } else { [string]$Request.Query.prefix }
+    $Upper = $Prefix.Substring(0, $Prefix.Length - 1) + [char]([int]$Prefix[-1] + 1)
+    $Tp = if ($env:App__Orchestrator__TablePrefix) { $env:App__Orchestrator__TablePrefix } else { 'E2EOrch' }
+    $Tc = [Azure.Data.Tables.TableClient]::new($env:AzureWebJobsStorage, "${Tp}Work")
+    $Runs = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($E in $Tc.Query[Azure.Data.Tables.TableEntity]("PartitionKey ge '$Prefix' and PartitionKey lt '$Upper' and RowKey eq '`$run'")) {
+            if ($Name -and [string]$E['Name'] -ne $Name) { continue }
+            $H = @{
+                runKey = $E.PartitionKey; name = [string]$E['Name']; status = [string]$E['Status']; phase = [string]$E['Phase']
+                priority = $E['Priority']; total = $E['Total']; done = $E['Done']; failed = $E['Failed']; cancelled = $E['Cancelled']
+                postExecStatus = [string]$E['PostExecStatus']; sequential = $E['Sequential']; parentRunKey = [string]$E['ParentRunKey']
+                startedTicks = $(if ($E['StartedUtc']) { ([DateTimeOffset]$E['StartedUtc']).UtcTicks } else { 0 })
+                completedTicks = $(if ($E['CompletedUtc']) { ([DateTimeOffset]$E['CompletedUtc']).UtcTicks } else { 0 })
+            }
+            if ([string]$Request.Query.detail -eq '1') {
+                $Tasks = [System.Collections.Generic.List[object]]::new()
+                $Open = @{ P = 0; R = 0; C = 0 }
+                foreach ($T in $Tc.Query[Azure.Data.Tables.TableEntity]("PartitionKey eq '$($E.PartitionKey)' and RowKey ge 'C|' and RowKey lt 'S'")) {
+                    $State = $T.RowKey.Substring(0, 1)
+                    if ($State -eq 'D') {
+                        $Tasks.Add(@{ seq = [int]$T.RowKey.Substring(2); taskId = [string]$T['TaskId']; status = [string]$T['Status']
+                                attempt = $T['Attempt']; error = [string]$T['LastError'] })
+                    } elseif ($Open.ContainsKey($State)) { $Open[$State] = $Open[$State] + 1 }
+                }
+                $H.tasks = @($Tasks | Sort-Object { $_.seq })
+                $H.open = $Open
+            }
+            $Runs.Add($H)
+        }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; count = $Runs.Count; runs = @($Runs | Sort-Object { $_.startedTicks }) } }
+}
+
+# GET ?op=caps|active|cancel|summaries|summary|jobs [&name=X][&status=S] -> the orchestration bridges.
+function Invoke-PerfE2EBridge {
+    param($Request, $TriggerMetadata)
+    $Name = [string]$Request.Query.name
+    try {
+        switch ([string]$Request.Query.op) {
+            'caps' {
+                $Longest = [Craft.Services.OrchestratorBridge].GetMethods() | Where-Object Name -eq 'QueueOrchestrationFromFile' |
+                    Sort-Object { $_.GetParameters().Count } | Select-Object -Last 1
+                $Names = @($Longest.GetParameters() | ForEach-Object Name)
+                $Def = (Get-Command Start-CraftOrchestrator).Definition
+                $Body = @{ queueFromFileParams = $Names.Count; paramNames = $Names
+                    startHasMaxConcurrency = ($Def -match 'MaxConcurrency'); startHasStopOnFailure = ($Def -match 'StopOnFailure') }
+            }
+            'active' { $Body = @{ active = [Craft.Services.OrchestratorBridge]::IsRunActive($Name) } }
+            'cancel' { $Body = @{ cancelled = [Craft.Services.WorkerMetricsBridge]::CancelRun($Name) } }
+            'summaries' {
+                $Body = @{ runs = @([Craft.Services.WorkerMetricsBridge]::GetRunSummaries() | Where-Object { -not $Name -or $_.Name -eq $Name } | ForEach-Object {
+                    @{ name = $_.Name; priority = $_.Priority; total = $_.Total; queued = $_.Queued; running = $_.Running
+                        completed = $_.Completed; failed = $_.Failed; completedUtc = $_.CompletedUtc } }) }
+            }
+            'summary' {
+                $S = [Craft.Services.WorkerMetricsBridge]::GetSummary()
+                $M = [Craft.Services.WorkerMetricsBridge]::GetSnapshot().Memory
+                $Body = @{ jobsQueued = $S.JobsQueued; jobsQueuedLocal = $S.JobsQueuedLocal; jobsQueuedDurable = $S.JobsQueuedDurable
+                    jobsActive = $S.JobsActive; bgBusy = $S.BgBusy; bgPoolSize = $S.BgPoolSize; limiterMax = $S.LimiterMax
+                    heapMB = $M.HeapMB; rssMB = $M.RssMB; committedMB = $M.CommittedMB
+                    workingSetMB = [math]::Round([System.Diagnostics.Process]::GetCurrentProcess().WorkingSet64 / 1MB, 1) }
+            }
+            'jobs' {
+                $St = if ($Request.Query.status) { [string]$Request.Query.status } else { $null }
+                $Rn = if ($Name) { $Name } else { $null }
+                $Body = @{ jobs = @([Craft.Services.WorkerMetricsBridge]::GetJobDetails($Rn, $St, 500) | ForEach-Object {
+                    @{ id = $_.Id; runName = $_.RunName; priority = $_.Priority; status = $_.Status } }) }
+            }
+            default { return @{ StatusCode = 400; Body = @{ ok = $false; error = 'unknown op' } } }
+        }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
+    }
+    $Body.ok = $true
+    return @{ StatusCode = 200; Body = $Body }
+}
+
+# GET ?op=seed|list -> create (one row each) or list the previous orchestration design's tables, which the
+# engine must drop at startup.
+function Invoke-PerfE2ELegacy {
+    param($Request, $TriggerMetadata)
+    $Tp = if ($env:App__Orchestrator__TablePrefix) { $env:App__Orchestrator__TablePrefix } else { 'E2EOrch' }
+    $Legacy = @('Queue', 'QueueIndex', 'Tasks', 'Runs', 'Results' | ForEach-Object { "$Tp$_" })
+    try {
+        $Svc = [Azure.Data.Tables.TableServiceClient]::new($env:AzureWebJobsStorage)
+        if ([string]$Request.Query.op -eq 'seed') {
+            foreach ($T in $Legacy) {
+                $Tc = $Svc.GetTableClient($T)
+                $Tc.CreateIfNotExists() | Out-Null
+                $E = [Azure.Data.Tables.TableEntity]::new('seed', 'row1')
+                $E['Note'] = 'legacy row seeded by the e2e'
+                $Tc.UpsertEntity[Azure.Data.Tables.TableEntity]($E, [Azure.Data.Tables.TableUpdateMode]::Replace, [System.Threading.CancellationToken]::None) | Out-Null
+            }
+        }
+        $Present = @($Svc.Query() | ForEach-Object Name | Where-Object { $_ -in $Legacy })
+        return @{ StatusCode = 200; Body = @{ ok = $true; legacy = $Legacy; present = $Present } }
+    } catch {
+        return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
+    }
+}
