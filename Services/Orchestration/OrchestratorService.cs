@@ -30,8 +30,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private readonly ConcurrentDictionary<string, string?> _scripts = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, (int C, int R, int P, DateTime LoggedUtc)> _lastStatusLog = new();
 
-    /// <summary>Identifies this process's claims, and is what a lease is checked against.</summary>
+    /// <summary>Identifies this process's claims, and is what a lease is checked against. Unique per process start,
+    /// so a container restarted under the same host name never mistakes its predecessor's claims for its own.</summary>
     public string Owner { get; }
+
+    /// <summary><c>{host}/{pid}/{random}</c>: readable in a claim row, unique per process start.</summary>
+    public static string NewOwnerId() =>
+        $"{Environment.GetEnvironmentVariable("HOSTNAME") ?? Environment.MachineName}/{Environment.ProcessId}/{Guid.NewGuid():N}"[..^24];
 
     /// <summary>How long a claim is held before anyone may take it back. Longer than any task may run.</summary>
     public TimeSpan Lease { get; }
@@ -70,7 +75,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _store = store;
         _results = results;
         _settings = settings;
-        Owner = Environment.GetEnvironmentVariable("HOSTNAME") ?? $"instance-{Environment.ProcessId}";
+        Owner = NewOwnerId();
         Lease = TimeSpan.FromSeconds(Math.Max(60, configuration.GetValue("JobQueueLeaseSeconds", 1800)));
         _finisher = new FinishBatcher(store, logger);
         _store.AfterFinish = AfterFinishAsync;
@@ -536,7 +541,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", step.TaskId);
                     }
 
-                    if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, jobCt) is not { } next) break;
+                    if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, ct: jobCt) is not { } next) break;
                     step = next;
                 }
             }
@@ -589,7 +594,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
         return (runs.Count > 0, total);
     }
 
-    /// <summary>Cancel one task that is still pending in storage. False when it is not pending (or not found).</summary>
+    /// <summary>Cancel one pending task by its row (from a queue listing): a point read. False when it is not pending.</summary>
+    public async Task<bool> TryCancelQueuedTaskAsync(string runKey, int seq)
+    {
+        if (await _store.GetPendingAsync(runKey, seq) == null) return false;
+        var outcome = await _store.FinishAsync(runKey, [new WorkStore.Finish(seq, "Cancelled", "Cancelled by user")], 'P');
+        return outcome?.Applied > 0;
+    }
+
+    /// <summary>Cancel one task that is still pending in storage, found by run name and task id. Reads the run's
+    /// pending range to find it (task ids are not keys), so prefer the run-key overload when the row is known.</summary>
     public async Task<bool> TryCancelQueuedTaskAsync(string runName, string taskId)
     {
         foreach (var header in await TargetRunsAsync(runName))
@@ -636,6 +650,83 @@ public class OrchestratorService : IJobDescriptorStateWriter
         if (descriptor.RunKey is not { } runKey) return;
         _ = _finisher.FinishAsync(runKey, new WorkStore.Finish(descriptor.Seq, "Cancelled", "Cancelled by user", Owner));
     }
+
+    // ── diagnosis ──
+
+    public sealed record ClaimView(string TaskId, int Seq, string? Owner, DateTimeOffset? LeaseUntil, int Attempt, bool HeldHere);
+
+    public sealed record RunView(string RunKey, string Name, string Status, string Phase, int Priority, DateTime StartedUtc,
+        DateTime? CompletedUtc, string Mode, int Total, int Done, int Failed, int Cancelled, bool Listed, string Pending,
+        IReadOnlyList<ClaimView> Running, IReadOnlyList<string> WaitingOnChildren, string? PostExecStatus, string? Driver,
+        IReadOnlyList<string> Diagnosis);
+
+    public sealed record Inspection(string Query, string ThisProcess, string? LockHolder, DateTimeOffset? LockLeaseUntil,
+        IReadOnlyList<RunView> Runs);
+
+    /// <summary>
+    /// Everything needed to see why a run is (or is not) moving, from storage, in a few bounded reads per run:
+    /// its counts and mode, whether the scheduler can see it, its claims and who holds them, the child runs it
+    /// waits for, its aggregation, and the instance lock, plus a plain-language diagnosis. Looks a run up by key,
+    /// or every unfinished run of a name, or else the latest finished one.
+    /// </summary>
+    public async Task<Inspection> InspectRunAsync(string nameOrKey, CancellationToken ct = default)
+    {
+        var runs = await TargetRunsAsync(nameOrKey);
+        if (runs.Count == 0 && await _store.ResolveRunAsync(TableKeys.Sanitize(nameOrKey), ct) is { } byKey) runs = [byKey];
+        if (runs.Count == 0 && await _store.GetRunByNameAsync(TableKeys.Sanitize(nameOrKey), ct) is { } latest) runs = [latest];
+        var lockRow = await _store.GetInstanceLockAsync(ct);
+        var lockLive = lockRow != null && lockRow.LeaseUntil > DateTimeOffset.UtcNow;
+
+        var views = new List<RunView>();
+        foreach (var h in runs)
+        {
+            var pending = await _store.GetTasksAsync(h.RunKey, 'P', 1001, ct);
+            var running = (await _store.GetTasksAsync(h.RunKey, 'R', 500, ct))
+                .Select(t => new ClaimView(t.TaskId, t.Seq, t.Owner, t.LeaseUntil, t.Attempt, t.Owner == Owner)).ToList();
+            var children = await _store.GetChildWaitsAsync(h.RunKey, ct: ct);
+            var listed = h.IsFinished || await _store.IsListedAsync(h, ct);
+            var tasksPending = pending.Count(t => t.Seq != WorkStore.AggregateSeq);
+            var pendingText = tasksPending > 1000 ? "1000+" : tasksPending.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var mode = h.Sequential ? (h.StopOnFailure ? "sequential, stop on failure" : "sequential")
+                : h.MaxConcurrency > 0 ? $"at most {h.MaxConcurrency} at once" : "fan-out";
+
+            var why = new List<string>();
+            if (h.IsFinished)
+            {
+                why.Add($"Finished {h.Status} at {h.CompletedUtc:O}.");
+            }
+            else
+            {
+                if (!listed) why.Add("Not on the Ready list, so the scheduler cannot see it. RepairIndexes (or a restart) relists it.");
+                if (!lockLive) why.Add("Nobody holds the instance lock: no process is claiming work.");
+                else if (lockRow!.Owner != Owner) why.Add($"The instance lock is held by {lockRow.Owner}, not this process; that process is the one claiming.");
+                var stale = running.Where(r => !r.HeldHere).ToList();
+                var here = running.Count - stale.Count;
+                if (here > 0) why.Add($"{here} task(s) running in this process.");
+                if (stale.Count > 0)
+                    why.Add(lockLive && lockRow!.Owner == Owner
+                        ? $"{stale.Count} claim(s) held by a process that no longer works the queue ({string.Join(", ", stale.Select(s => s.Owner).Distinct())}); taken back the next time the run is read."
+                        : $"{stale.Count} claim(s) held by {string.Join(", ", stale.Select(s => s.Owner).Distinct())}.");
+                if (children.Count > 0) why.Add($"Waiting for {children.Count} child run(s): {string.Join(", ", children.Select(c => c.Split('|')[0]))}.");
+                if (h.MaxConcurrency > 0 && !h.Sequential && tasksPending > 0 && here >= h.MaxConcurrency)
+                    why.Add($"At its concurrency limit of {h.MaxConcurrency}; the next task starts when one finishes.");
+                else if (tasksPending > 0 && running.Count == 0)
+                    why.Add($"{pendingText} task(s) pending, waiting for a worker in band P{h.Priority} (lower bands, and older runs in this band, go first).");
+                if (h.Phase == RunPhase.Aggregate)
+                    why.Add($"Every task is done; its aggregation (Push-{h.PostExecFunctionName}) is {(running.Any(r => r.Seq == WorkStore.AggregateSeq) ? "running" : "waiting to be claimed")}.");
+                if (h.CancelRequested) why.Add("Cancel requested: pending tasks are cancelled and running ones finish.");
+            }
+
+            views.Add(new RunView(h.RunKey, h.Name, h.Status, h.Phase.ToString(), h.Priority, h.StartedUtc, h.CompletedUtc, mode,
+                h.Total, h.Done, h.Failed, h.Cancelled, listed, pendingText, running, children, h.PostExecStatus,
+                h.DriverOwner == null ? null : $"{h.DriverOwner} until {h.DriverLease:O}", why));
+        }
+        return new Inspection(nameOrKey, Owner, lockRow?.Owner, lockRow?.LeaseUntil, views);
+    }
+
+    /// <summary>Rebuild the Ready and Finished indexes from the active-run list now (the pump does this at startup).</summary>
+    public Task<WorkStore.RepairResult> RepairIndexesAsync(CancellationToken ct = default) =>
+        _store.RepairIndexesAsync(TimeSpan.FromMinutes(10), ct);
 
     // ── lookups ──
 

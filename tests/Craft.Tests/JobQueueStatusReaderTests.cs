@@ -69,6 +69,35 @@ public class JobQueueStatusReaderTests
         Assert.Equal(3, summary.QueuedDurable);
     }
 
+    /// <summary>
+    /// The snapshot is cached for seconds while this process keeps claiming. Merged views once added the live
+    /// local queue to the snapshot's own "unclaimed", which had already subtracted the claims held when it was
+    /// taken, so every claim made since was counted twice (seen live: 202 queued on a 200-task run).
+    /// </summary>
+    [Fact]
+    public async Task ClaimsMadeAfterTheSnapshot_AreNotCountedTwice()
+    {
+        var (reader, store, jobs) = New();
+        var run = await Create(store, "Busy", 5, 0);
+        void Hold(IEnumerable<WorkStore.ClaimedTask> claims)
+        {
+            foreach (var c in claims) jobs.Enqueue(new JobDescriptor("Busy", c.TaskId, 4) { RunKey = c.RunKey, Seq = c.Seq }, $"Busy-{c.TaskId}", $"{c.RunKey}|{c.Seq}");
+        }
+        Hold(await store.ClaimAsync(run.RunKey, 2, "me", TimeSpan.FromMinutes(5), false));
+        await reader.GetAsync(TimeSpan.FromMinutes(5));                     // cached with 2 held
+        Hold(await store.ClaimAsync(run.RunKey, 2, "me", TimeSpan.FromMinutes(5), false));
+
+        var summary = await reader.GetSummaryAsync();
+        Assert.Equal(1, summary.QueuedDurable);
+        Assert.Equal(5, summary.Queued + summary.Running);
+
+        var busy = Assert.Single(await reader.GetRunSummariesAsync(), r => r.Name == "Busy");
+        Assert.Equal(5, busy.Total);
+        Assert.True(busy.Queued + busy.Running + busy.Completed + busy.Failed <= busy.Total,
+            $"queued {busy.Queued} running {busy.Running} completed {busy.Completed} failed {busy.Failed} over total {busy.Total}");
+        Assert.Equal(5, busy.Queued + busy.Running);
+    }
+
     [Fact]
     public async Task RunsSharingAName_AreSummedUnderThatName()
     {

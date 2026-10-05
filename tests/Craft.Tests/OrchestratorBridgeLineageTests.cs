@@ -236,22 +236,25 @@ public class OrchestratorBridgeLineageTests
     }
 
     [Fact]
-    public async Task Wrapper_WithoutCollisions_SkipsAndSaysSo_WhileARunOfThatNameIsQueued()
+    public async Task Wrapper_WithoutCollisions_SkipsAndSaysSo_WhileARunOfThatNameIsActive()
     {
-        OrchestratorBridge.QueueOrchestration("WrapBusy", "[]", 4);
+        // Against a real active run rather than a queued entry: the bridge queue is process-wide and any
+        // test's PostExecution drains it.
+        var (svc, store) = NewStoreBackedService();
+        await CreateRunAsync(store, "WrapBusy");
+        var previousService = s_serviceField.GetValue(null);
         try
         {
+            OrchestratorBridge.Initialize(svc);
             var (pending, result) = await RunWrapperAsync("WrapBusy",
                 "@{ OrchestratorName = 'WrapBusy'; AllowCollision = $false; Batch = @(@{ FunctionName = 'X' }) }");
 
             Assert.Equal("Craft-WrapBusy-Skipped", result);
-            Assert.NotNull(pending);                 // the first, queued directly above
-            Assert.True(string.IsNullOrEmpty(pending!.BatchFilePath));
-            Assert.Null(TakePending("WrapBusy"));     // and no second one
+            Assert.Null(pending);
         }
         finally
         {
-            TakePending("WrapBusy");
+            s_serviceField.SetValue(null, previousService);
         }
     }
 

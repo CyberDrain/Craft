@@ -19,9 +19,12 @@ namespace Craft.Storage;
 /// whose lease lapses, and the next claim takes it back.
 ///
 /// Three small tables sit beside it: Ready (one row per run with work, ordered by band then start time,
-/// read by the scheduler), Names (latest run per name, and every unfinished run by name, since runs of one
-/// name may overlap) and Finished (completion order, for retention).
-/// All three are hints derived from the Work rows: a stale one costs a read, never a wrong answer.
+/// read by the scheduler), Names (latest run per name; every unfinished run, partition <c>A</c>; and the
+/// instance lock) and Finished (completion order, for retention).
+///
+/// The active-run row is written before anything else of a run and removed after everything else, so it is
+/// the authoritative list of runs that exist; Ready and Finished are indexes derived from the runs and can be
+/// rebuilt from it (<see cref="RepairIndexesAsync"/>). A stale index row costs a read, never a wrong answer.
 /// </summary>
 public sealed class WorkStore
 {
@@ -90,12 +93,14 @@ public sealed class WorkStore
     private static string ReadyPartition(int band) => "P" + Math.Clamp(band, 0, 99).ToString("D2", CultureInfo.InvariantCulture);
     private static string ReadyKey(RunHeader h) => $"{h.StartedUtc.Ticks.ToString("D19", CultureInfo.InvariantCulture)}|{h.RunKey}";
 
-    /// <summary>A run's rows in one state, in seq order; <paramref name="max"/> 0 means all.</summary>
+    /// <summary>A run's rows in one state, in seq order; <paramref name="max"/> 0 means all. A bounded read asks
+    /// the service for only that many rows a page.</summary>
     private async IAsyncEnumerable<StoreRow> Range(string runKey, char state, int max = 0,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var count = 0;
-        await foreach (var row in _store.QueryRowKeyRangeAsync(_work, runKey, $"{state}|", $"{state}}}", null, ct))
+        await foreach (var row in _store.QueryRowKeyRangeAsync(_work, runKey, $"{state}|", $"{state}}}",
+            maxPerPage: max > 0 ? Math.Min(max, 1000) : null, ct: ct))
         {
             yield return row;
             if (max > 0 && ++count >= max) yield break;
@@ -124,6 +129,11 @@ public sealed class WorkStore
             pending.Add(PendingRow(header.RunKey, i, tasks[i].TaskId, 0));
         }
 
+        // The active-run row first: from here on a crash leaves a run the startup repair can see, finish or remove.
+        await _store.UpsertAsync(_names, new StoreRow(ActivePartition, header.RunKey)
+        {
+            Properties = { ["Name"] = header.Name, ["StartedUtc"] = new DateTimeOffset(DateTime.SpecifyKind(header.StartedUtc, DateTimeKind.Utc)) }
+        }, ct);
         await _rate.TakeAsync(header.RunKey, tasks.Count * 2 + 1, ct);
         await _store.UpsertBatchAsync(_work, header.RunKey, payload, ct);
         await _store.UpsertBatchAsync(_work, header.RunKey, pending, ct);
@@ -132,9 +142,10 @@ public sealed class WorkStore
         header.Total = tasks.Count;
         await _store.UpsertAsync(_work, header.ToRow(), ct);
 
-        await _store.UpsertAsync(_names, new StoreRow("N", header.Name) { Properties = { ["RunKey"] = header.RunKey } }, ct);
-        await _store.UpsertAsync(_names, new StoreRow(ActivePartition, header.RunKey) { Properties = { ["Name"] = header.Name } }, ct);
-        await PublishReadyAsync(header, ct);
+        await IndexAsync("record the latest run of its name", header.RunKey,
+            () => _store.UpsertAsync(_names, new StoreRow("N", header.Name) { Properties = { ["RunKey"] = header.RunKey } }, ct), ct);
+        await IndexAsync("list it as ready", header.RunKey, () => PublishReadyAsync(header, ct), ct);
+        Changed(header.RunKey);
         return (await GetRunAsync(header.RunKey, ct))!;
     }
 
@@ -173,7 +184,7 @@ public sealed class WorkStore
     {
         var runs = new List<RunHeader>();
         var stale = new List<string>();
-        await foreach (var row in _store.QueryRowKeyRangeAsync(_names, ActivePartition, $"{name}~", $"{name}~g", null, ct))
+        await foreach (var row in _store.QueryRowKeyRangeAsync(_names, ActivePartition, $"{name}~", $"{name}~g", ct: ct))
         {
             if (row.GetString("Name") != name) continue;
             if (await GetRunAsync(row.RowKey, ct) is { IsFinished: false } run) runs.Add(run);
@@ -235,14 +246,19 @@ public sealed class WorkStore
         r.GetString("Status"), r.GetInt32("Attempt") ?? 0, r.GetString("Owner"), r.GetDateTimeOffset("LeaseUntil"),
         r.GetString("LastError"));
 
-    /// <summary>Every task row of a run (P, R and D), for status views and cancel lookups.</summary>
-    public async Task<List<TaskRow>> GetTasksAsync(string runKey, char? state = null, CancellationToken ct = default)
+    /// <summary>A run's task rows (P, R and D, or one state), in seq order. <paramref name="max"/> bounds the
+    /// rows read per state; 0 reads them all, which on a large run is a long read, so status views pass a bound.</summary>
+    public async Task<List<TaskRow>> GetTasksAsync(string runKey, char? state = null, int max = 0, CancellationToken ct = default)
     {
         var rows = new List<TaskRow>();
         foreach (var s in state is { } one ? [one] : new[] { 'P', 'R', 'D' })
-            await foreach (var r in Range(runKey, s, ct: ct)) rows.Add(ToTask(r));
+            await foreach (var r in Range(runKey, s, max, ct)) rows.Add(ToTask(r));
         return rows;
     }
+
+    /// <summary>One pending task by its position, or null when it is not pending. A point read.</summary>
+    public async Task<TaskRow?> GetPendingAsync(string runKey, int seq, CancellationToken ct = default) =>
+        await _store.GetAsync(_work, runKey, Key('P', seq), ct) is { } row ? ToTask(row) : null;
 
     // ── claim ──
 
@@ -256,9 +272,16 @@ public sealed class WorkStore
         public DateTimeOffset? EarliestLeaseUntil { get; internal set; }
     }
 
-    /// <summary>Raised with the run key when a claim is handed back to pending, so a scheduler that had written
-    /// the run off as drained looks at it again.</summary>
-    public event Action<string>? Released;
+    /// <summary>Raised in-process with the run key whenever a run's work may have changed (created, a task
+    /// finished or was handed back, a child added, moved band), so a scheduler that had written the run off
+    /// looks at it again without depending on the Ready index write having landed.</summary>
+    public event Action<string>? RunChanged;
+
+    private void Changed(string runKey)
+    {
+        try { RunChanged?.Invoke(runKey); }
+        catch (Exception ex) { _logger.LogWarning(ex, "[WorkStore] A run-changed listener failed for {Run}", runKey); }
+    }
 
     /// <summary>
     /// Move up to <paramref name="max"/> pending tasks to running under <paramref name="owner"/>, plus, with
@@ -267,7 +290,7 @@ public sealed class WorkStore
     /// race returns empty and the caller moves on.
     /// </summary>
     public async Task<IReadOnlyList<ClaimedTask>> ClaimAsync(string runKey, int max, string owner, TimeSpan lease,
-        bool reclaimExpired, ClaimProbe? probe = null, CancellationToken ct = default)
+        bool reclaimExpired, ClaimProbe? probe = null, bool othersAreDead = false, CancellationToken ct = default)
     {
         max = Math.Min(max, MaxPerTransaction);
         if (max <= 0) return [];
@@ -280,14 +303,17 @@ public sealed class WorkStore
             // lease from a partial scan only makes the scheduler look again sooner.
             await foreach (var r in Range(runKey, 'R', MaxRunningScan, ct))
             {
-                if (r.GetDateTimeOffset("LeaseUntil") is not { } until || until <= now)
+                var dead = r.GetDateTimeOffset("LeaseUntil") is not { } until || until <= now
+                    || (othersAreDead && r.GetString("Owner") != owner);
+                if (dead)
                 {
                     if (reclaimExpired && expired.Count < max) expired.Add(r);
                     else if (probe != null) probe.EarliestLeaseUntil = now;
                 }
-                else if (probe != null && (probe.EarliestLeaseUntil is not { } seen || until < seen))
+                else if (probe != null && r.GetDateTimeOffset("LeaseUntil") is { } live
+                    && (probe.EarliestLeaseUntil is not { } seen || live < seen))
                 {
-                    probe.EarliestLeaseUntil = until;
+                    probe.EarliestLeaseUntil = live;
                 }
                 if (probe == null && expired.Count >= max) break;
             }
@@ -343,14 +369,17 @@ public sealed class WorkStore
     /// drivers; a lapsed driver's step is reclaimed with it.
     /// </summary>
     /// <param name="continuing">True for the driver claiming its own next step; false (the pump) defers to any live driver.</param>
+    /// <param name="othersAreDead">The caller holds the instance lock, so a driver lease held by any other process
+    /// belongs to a process that has stopped, and its step is taken over at once.</param>
     public async Task<ClaimedTask?> ClaimSequentialAsync(string runKey, string owner, TimeSpan lease, bool continuing = false,
-        CancellationToken ct = default)
+        bool othersAreDead = false, CancellationToken ct = default)
     {
         var headerRow = await _store.GetAsync(_work, runKey, HeaderKey, ct);
         if (headerRow == null) return null;
         var header = RunHeader.FromRow(headerRow);
         var now = DateTimeOffset.UtcNow;
-        if (header.DriverOwner != null && header.DriverLease > now && !(continuing && header.DriverOwner == owner)) return null;
+        var driverLive = header.DriverOwner != null && header.DriverLease > now && !(othersAreDead && header.DriverOwner != owner);
+        if (driverLive && !(continuing && header.DriverOwner == owner)) return null;
 
         StoreRow? row = null;
         await foreach (var r in Range(runKey, 'R', ct: ct)) { row = r; break; }
@@ -368,7 +397,7 @@ public sealed class WorkStore
                 await CancelPendingAsync(runKey, StoppedReason(row.GetString("TaskId")), ct);
                 return null;
             }
-            return await ClaimSequentialAsync(runKey, owner, lease, continuing, ct);
+            return await ClaimSequentialAsync(runKey, owner, lease, continuing, othersAreDead, ct);
         }
 
         var until = now.Add(lease);
@@ -421,7 +450,7 @@ public sealed class WorkStore
         await _rate.TakeAsync(runKey, 2, ct);
         var released = await _store.TrySubmitAsync(_work, runKey,
             [StoreOp.Delete(row), StoreOp.Insert(PendingRow(runKey, seq, row.GetString("TaskId")!, attempt))], ct);
-        if (released) Released?.Invoke(runKey);
+        if (released) Changed(runKey);
         return released;
     }
 
@@ -489,8 +518,12 @@ public sealed class WorkStore
             var barrier = false;
             var completed = false;
 
+            // An entity may appear once in a transaction: a task finished twice in one batch (a cancel and a
+            // completion landing together, or a retried finish) is applied once.
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var f in chunk)
             {
+                if (!seen.Add(f.ChildKey is { } ck ? $"C|{ck}" : Seq(f.Seq))) continue;
                 if (f.ChildKey is { } child)
                 {
                     var placeholder = await _store.GetAsync(_work, runKey, $"C|{child}", ct);
@@ -563,7 +596,8 @@ public sealed class WorkStore
             {
                 var after = (await GetRunAsync(runKey, ct)) ?? header;
                 if (completed) await RetireAsync(after, ct);
-                else await PublishReadyAsync(after, ct);
+                else await IndexAsync("update its Ready counts", runKey, () => PublishReadyAsync(after, ct), ct);
+                Changed(runKey);
                 var outcome = new FinishOutcome(after, barrier, completed, applied);
                 if ((barrier || completed) && AfterFinish is { } hook)
                 {
@@ -574,18 +608,63 @@ public sealed class WorkStore
             }
         }
 
-        _logger.LogWarning("[WorkStore] Finishing {Count} task(s) of {Run} kept losing races; the next attempt retries", chunk.Count, runKey);
-        return null;
+        throw new InvalidOperationException($"Finishing {chunk.Count} task(s) of {runKey} kept losing races to other writers");
     }
 
     /// <summary>Take a finished run off the Ready list and record it for retention.</summary>
+    /// <summary>Retire a finished run: the Finished row first (so retention will always find it), then off the
+    /// Ready list, then off the active list last. Each step is idempotent, so the repair can redo any of them.</summary>
     private async Task RetireAsync(RunHeader h, CancellationToken ct)
     {
         _rate.Forget(h.RunKey);
-        await _store.DeleteAsync(_ready, ReadyPartition(h.Priority), ReadyKey(h), ct);
-        await _store.DeleteAsync(_names, ActivePartition, h.RunKey, ct);
+        await IndexAsync("record it for retention", h.RunKey, () => RecordFinishedAsync(h, ct), ct);
+        await IndexAsync("take it off the Ready list", h.RunKey, () => _store.DeleteAsync(_ready, ReadyPartition(h.Priority), ReadyKey(h), ct), ct);
+        await IndexAsync("take it off the active list", h.RunKey, () => _store.DeleteAsync(_names, ActivePartition, h.RunKey, ct), ct);
+    }
+
+    private Task RecordFinishedAsync(RunHeader h, CancellationToken ct)
+    {
         var done = (h.CompletedUtc ?? DateTime.UtcNow).Ticks.ToString("D19", CultureInfo.InvariantCulture);
-        await _store.UpsertAsync(_finished, new StoreRow("F", $"{done}|{h.RunKey}") { Properties = { ["RunKey"] = h.RunKey } }, ct);
+        return _store.UpsertAsync(_finished, new StoreRow("F", $"{done}|{h.RunKey}") { Properties = { ["RunKey"] = h.RunKey } }, ct);
+    }
+
+    private static readonly TimeSpan[] IndexRetryDelays =
+        [TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)];
+
+    /// <summary>Index writes that failed for good; a scheduler repairs the indexes when this moves.</summary>
+    public int IndexFailures => Volatile.Read(ref _indexFailures);
+    private int _indexFailures;
+
+    /// <summary>Delays between index-write retries; tests shorten them.</summary>
+    internal TimeSpan[] IndexRetries { get; set; } = IndexRetryDelays;
+
+    /// <summary>
+    /// An index write that follows a committed change to a run. Retried through a short storage blip; if it
+    /// still fails the change stands, the in-process <see cref="RunChanged"/> event keeps this instance
+    /// scheduling correctly, and <see cref="RepairIndexesAsync"/> (run at startup, or on demand) puts the
+    /// index right. Logged as an error naming the run, so a run missing from a listing has an explanation.
+    /// </summary>
+    private async Task IndexAsync(string what, string runKey, Func<Task> write, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await write();
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                if (attempt >= IndexRetries.Length)
+                {
+                    Interlocked.Increment(ref _indexFailures);
+                    _logger.LogError(ex, "[WorkStore] Could not {What} for run {Run}; the index repair (startup, or RepairIndexes) fixes it",
+                        what, runKey);
+                    return;
+                }
+                await Task.Delay(IndexRetries[attempt], ct);
+            }
+        }
     }
 
     /// <summary>Remove a stale Ready entry (its run is gone or finished).</summary>
@@ -612,7 +691,11 @@ public sealed class WorkStore
                 StoreOp.Insert(new StoreRow(parentKey, $"C|{childKey}") { Properties = { ["Child"] = childKey } }),
                 StoreOp.Replace(header.ToRow(headerRow.ETag)),
             };
-            if (await _store.TrySubmitAsync(_work, parentKey, ops, ct)) return true;
+            if (await _store.TrySubmitAsync(_work, parentKey, ops, ct))
+            {
+                Changed(parentKey);
+                return true;
+            }
         }
         return false;
     }
@@ -638,6 +721,121 @@ public sealed class WorkStore
         }
     }
 
+    // ── the instance lock ──
+
+    private const string LockPartition = "$instance", LockKey = "lock";
+
+    /// <summary>Who holds the instance lock, and until when (null when nobody does).</summary>
+    public sealed record InstanceLock(string Owner, DateTimeOffset LeaseUntil, DateTimeOffset AcquiredUtc);
+
+    public async Task<InstanceLock?> GetInstanceLockAsync(CancellationToken ct = default)
+    {
+        await InitializeAsync(ct);
+        var row = await _store.GetAsync(_names, LockPartition, LockKey, ct);
+        return row?.GetString("Owner") is { } owner
+            ? new InstanceLock(owner, row.GetDateTimeOffset("LeaseUntil") ?? DateTimeOffset.MinValue,
+                row.GetDateTimeOffset("AcquiredUtc") ?? DateTimeOffset.MinValue)
+            : null;
+    }
+
+    /// <summary>
+    /// Take or keep the instance lock: the one row that says which process works the queue. Succeeds when
+    /// nobody holds it, its lease has run out, or <paramref name="owner"/> already holds it (a renewal). Guarded
+    /// by the row's ETag, so two processes racing for it cannot both win. Returns the holder afterwards.
+    /// </summary>
+    public async Task<(bool Held, InstanceLock? Holder)> TryHoldInstanceLockAsync(string owner, TimeSpan lease,
+        CancellationToken ct = default)
+    {
+        await InitializeAsync(ct);
+        var now = DateTimeOffset.UtcNow;
+        var row = await _store.GetAsync(_names, LockPartition, LockKey, ct);
+        var holder = row?.GetString("Owner");
+        var until = row?.GetDateTimeOffset("LeaseUntil") ?? DateTimeOffset.MinValue;
+        if (row != null && holder != owner && until > now)
+            return (false, new InstanceLock(holder!, until, row.GetDateTimeOffset("AcquiredUtc") ?? DateTimeOffset.MinValue));
+
+        var acquired = holder == owner ? row!.GetDateTimeOffset("AcquiredUtc") ?? now : now;
+        var next = new StoreRow(LockPartition, LockKey)
+        {
+            ETag = row?.ETag,
+            Properties = { ["Owner"] = owner, ["LeaseUntil"] = now.Add(lease), ["AcquiredUtc"] = acquired },
+        };
+        var ok = await _store.TrySubmitAsync(_names, LockPartition, [row == null ? StoreOp.Insert(next) : StoreOp.Replace(next)], ct);
+        return ok ? (true, new InstanceLock(owner, now.Add(lease), acquired)) : (false, await GetInstanceLockAsync(ct));
+    }
+
+    /// <summary>Give the instance lock up, if <paramref name="owner"/> still holds it, so a successor starts at once.</summary>
+    public async Task ReleaseInstanceLockAsync(string owner, CancellationToken ct = default)
+    {
+        var row = await _store.GetAsync(_names, LockPartition, LockKey, ct);
+        if (row?.GetString("Owner") == owner)
+            await _store.TrySubmitAsync(_names, LockPartition, [StoreOp.Delete(row)], ct);
+    }
+
+    // ── index repair ──
+
+    /// <summary>What a repair pass found and did.</summary>
+    public sealed record RepairResult(int Active, int Relisted, int Retired, int Removed, int Young);
+
+    /// <summary>
+    /// Rebuild the indexes from the active-run list, which is written before a run's other rows and removed
+    /// after them. For each run on it: a run that finished is retired (Finished row, off Ready, off the list);
+    /// a run still going gets its Ready entry rewritten; a run whose header never landed (its creation was
+    /// interrupted) is removed once it is older than <paramref name="abandonAfter"/>. Every step is
+    /// idempotent, so this is safe while the queue is being worked. One point read per active run.
+    /// </summary>
+    public async Task<RepairResult> RepairIndexesAsync(TimeSpan abandonAfter, CancellationToken ct = default)
+    {
+        await InitializeAsync(ct);
+        var rows = new List<StoreRow>();
+        await foreach (var row in _store.QueryPartitionAsync(_names, ActivePartition, ct)) rows.Add(row);
+
+        int relisted = 0, retired = 0, removed = 0, young = 0;
+        var cutoff = DateTimeOffset.UtcNow - abandonAfter;
+        foreach (var row in rows)
+        {
+            var runKey = row.RowKey;
+            var header = await GetRunAsync(runKey, ct);
+            if (header == null)
+            {
+                if ((row.GetDateTimeOffset("StartedUtc") ?? DateTimeOffset.MinValue) > cutoff) { young++; continue; }
+                _logger.LogWarning("[WorkStore] Removing run {Run}: its creation never finished", runKey);
+                await _store.DeletePartitionAsync(_work, runKey, ct);
+                await _store.DeletePartitionAsync(_results, runKey, ct);
+                await _store.DeleteAsync(_names, ActivePartition, runKey, ct);
+                removed++;
+            }
+            else if (header.IsFinished)
+            {
+                await RecordFinishedAsync(header, ct);
+                await _store.DeleteAsync(_ready, ReadyPartition(header.Priority), ReadyKey(header), ct);
+                await _store.DeleteAsync(_names, ActivePartition, runKey, ct);
+                retired++;
+            }
+            else
+            {
+                await PublishReadyAsync(header, ct);
+                Changed(runKey);
+                relisted++;
+            }
+        }
+        return new RepairResult(rows.Count, relisted, retired, removed, young);
+    }
+
+    // ── inspection ──
+
+    /// <summary>Whether the run has its entry on the Ready list (the scheduler only sees runs that do).</summary>
+    public async Task<bool> IsListedAsync(RunHeader h, CancellationToken ct = default) =>
+        await _store.GetAsync(_ready, ReadyPartition(h.Priority), ReadyKey(h), ct) != null;
+
+    /// <summary>The run's child placeholders: runs it is waiting for (at most <paramref name="max"/>).</summary>
+    public async Task<List<string>> GetChildWaitsAsync(string runKey, int max = 1000, CancellationToken ct = default)
+    {
+        var children = new List<string>();
+        await foreach (var r in Range(runKey, 'C', max, ct)) children.Add(r.RowKey[2..]);
+        return children;
+    }
+
     // ── retention ──
 
     /// <summary>Delete runs that finished before the retention cutoff: their Work and Results partitions and
@@ -646,7 +844,7 @@ public sealed class WorkStore
     {
         var cutoff = (DateTime.UtcNow - retention).Ticks.ToString("D19", CultureInfo.InvariantCulture);
         var expired = new List<StoreRow>();
-        await foreach (var row in _store.QueryRowKeyRangeAsync(_finished, "F", "", cutoff, null, ct))
+        await foreach (var row in _store.QueryRowKeyRangeAsync(_finished, "F", "", cutoff, ct: ct))
             expired.Add(row);
 
         foreach (var row in expired)
@@ -700,6 +898,7 @@ public sealed class WorkStore
         if (!ok || before == null) return false;
         await _store.DeleteAsync(_ready, ReadyPartition(before.Priority), ReadyKey(before), ct);
         if (await GetRunAsync(runKey, ct) is { IsFinished: false } after) await PublishReadyAsync(after, ct);
+        Changed(runKey);
         return true;
     }
 

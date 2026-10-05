@@ -92,10 +92,12 @@ public interface ICraftTableStore
     /// <summary>
     /// Rows of one partition with <paramref name="fromRowKey"/> &lt;= RowKey &lt; <paramref name="toRowKey"/>
     /// (ordinal), optionally projected (name the keys too if you read them). Split entities are not
-    /// reassembled, so use it only on tables whose rows are never split.
+    /// reassembled, so use it only on tables whose rows are never split. <paramref name="maxPerPage"/> is
+    /// the page size asked of the service (<c>$top</c>); a caller that needs a few rows should pass it, or each
+    /// request returns up to 1,000.
     /// </summary>
     async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
-        string toRowKey, IReadOnlyList<string>? properties = null,
+        string toRowKey, IReadOnlyList<string>? properties = null, int? maxPerPage = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         await foreach (var row in QueryPartitionAsync(table, partitionKey, ct))

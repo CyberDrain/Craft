@@ -84,6 +84,7 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
     public required JobManager Jobs { get; init; }
     public required ICraftTableStore Tables { get; init; }
     public required CapturingLogger<OrchestratorService> Log { get; init; }
+    public required string Prefix { get; init; }
 
     public static async Task<OrchestrationHarness> CreateAsync(int poolSize = 4, ICraftTableStore? tables = null,
         Action<CraftSettings>? configure = null)
@@ -108,7 +109,16 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
         await svc.ResumeInterruptedRunsAsync(CancellationToken.None);
         var pump = new WorkPump(NullLogger<WorkPump>.Instance, store, jobs, config, settings, svc);
         _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
-        return new OrchestrationHarness { Svc = svc, Store = store, Pump = pump, Jobs = jobs, Tables = tables, Log = log };
+        return new OrchestrationHarness
+        {
+            Svc = svc,
+            Store = store,
+            Pump = pump,
+            Jobs = jobs,
+            Tables = tables,
+            Log = log,
+            Prefix = settings.Orchestrator.TablePrefix,
+        };
     }
 
     public static string Batch(int n, string prefix = "t") =>

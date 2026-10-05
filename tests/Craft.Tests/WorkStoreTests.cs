@@ -268,8 +268,8 @@ public class WorkStoreTests
 
     /// <summary>
     /// The header is rewritten in every finish transaction, and a transaction cannot split a row, so a
-    /// property over Azure's 64 KiB limit there would fail every finish of the run. Azurite does not enforce
-    /// the limit, so this is checked on the row itself.
+    /// property over Azure's 64 KiB limit there would fail every finish of the run. Checked on the row itself,
+    /// which catches it without needing a real backend or a run large enough to hit the limit.
     /// </summary>
     [Fact]
     public async Task TheHeaderStaysSmall_HoweverLargeThePostExecutionParameters()

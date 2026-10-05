@@ -33,10 +33,18 @@ public class JobQueueStatusReader : IDisposable
     }
 
     /// <summary>A task waiting in storage, as the job listings show it.</summary>
-    public sealed record QueuedRow(string RunName, string TaskId, int Priority, DateTime QueuedUtc, bool Claimed);
+    /// <summary>A task waiting in storage, as the job listings show it; <see cref="RunKey"/> and <see cref="Seq"/>
+    /// address its row, so acting on it is a point read.</summary>
+    public sealed record QueuedRow(string RunName, string TaskId, int Priority, DateTime QueuedUtc, bool Claimed,
+        string RunKey = "", int Seq = 0);
 
+    /// <summary>A run name's durable counts (summed over runs sharing the name). Merged views subtract what this
+    /// process holds right now, never the counts held when the snapshot was taken.</summary>
     public sealed record RunQueueInfo(int Unclaimed, int Claimed, int MinPriority, DateTime? OldestQueuedUtc,
-        int Total, int Done, string? Reference);
+        int Total, int Done, string? Reference, int Failed = 0)
+    {
+        public int Outstanding => Math.Max(0, Total - Done);
+    }
 
     /// <summary>One Ready scan. <see cref="Rows"/> is the head of the queue only; the counts cover every run.</summary>
     public sealed record QueueSnapshot(DateTime TakenUtc, IReadOnlyList<QueuedRow> Rows, int Total, int Unclaimed,
@@ -108,17 +116,14 @@ public class JobQueueStatusReader : IDisposable
             if (outstanding > claimed && (oldest == null || e.StartedUtc < oldest)) oldest = e.StartedUtc;
             byRun[e.Name] = byRun.TryGetValue(e.Name, out var same)
                 ? new RunQueueInfo(same.Unclaimed + outstanding - claimed, same.Claimed + claimed, Math.Min(same.MinPriority, e.Band),
-                    same.OldestQueuedUtc, same.Total + e.Total, same.Done + e.Done, same.Reference ?? e.Reference)
-                : new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference);
+                    same.OldestQueuedUtc, same.Total + e.Total, same.Done + e.Done, same.Reference ?? e.Reference, same.Failed + e.Failed)
+                : new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference, e.Failed);
 
             if (head.Count < HeadRows && runsListed < HeadRuns && outstanding > claimed)
             {
                 runsListed++;
-                foreach (var t in await _store.GetTasksAsync(e.RunKey, 'P', ct))
-                {
-                    if (head.Count >= HeadRows) break;
-                    head.Add(new QueuedRow(e.Name, t.TaskId, e.Band, e.StartedUtc, false));
-                }
+                foreach (var t in await _store.GetTasksAsync(e.RunKey, 'P', HeadRows - head.Count, ct))
+                    head.Add(new QueuedRow(e.Name, t.TaskId, e.Band, e.StartedUtc, false, e.RunKey, t.Seq));
             }
         }
 
@@ -135,8 +140,11 @@ public class JobQueueStatusReader : IDisposable
         var snap = await GetAsync(ct: ct);
         if (snap == null) return summary;
 
-        summary.QueuedDurable = snap.Unclaimed;
-        summary.Queued += snap.Unclaimed;
+        // Waiting in storage = everything outstanding less what this process holds now (its queued and running
+        // orchestrator jobs). Using the snapshot's own subtraction would count claims made since it was taken twice.
+        var held = _jobs.GetJobs().Count(j => j.RunName != null && j.Status is "Queued" or "Running");
+        summary.QueuedDurable = Math.Max(0, snap.Total - held);
+        summary.Queued += summary.QueuedDurable;
         if (snap.OldestUnclaimedUtc is { } oldest && (summary.OldestQueuedUtc == null || oldest < summary.OldestQueuedUtc))
             summary.OldestQueuedUtc = oldest;
         return summary;
@@ -190,10 +198,14 @@ public class JobQueueStatusReader : IDisposable
                 summaries.Add(summary);
                 byName[run] = summary;
             }
+            // Storage is the truth for a run still going: outstanding work is running here or waiting, and done
+            // splits into completed and failed. Local job history can include earlier outings of the name.
             summary.Reference ??= info.Reference;
-            summary.Queued += info.Unclaimed;
-            summary.Total = Math.Max(summary.Total, info.Total);
-            summary.Completed = Math.Max(summary.Completed, info.Done - summary.Failed);
+            summary.Total = info.Total;
+            summary.Running = Math.Min(summary.Running, info.Outstanding);
+            summary.Queued = info.Outstanding - summary.Running;
+            summary.Failed = info.Failed;
+            summary.Completed = Math.Max(0, info.Done - info.Failed);
             summary.CompletedUtc = null;
         }
 

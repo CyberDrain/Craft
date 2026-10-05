@@ -660,7 +660,7 @@ public static class WorkerMetricsBridge
             var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
             if (row == null) return false;
 
-            return await s_orchestrator.TryCancelQueuedTaskAsync(row.RunName, row.TaskId);
+            return await s_orchestrator.TryCancelQueuedTaskAsync(row.RunKey, row.Seq);
         });
     }
 

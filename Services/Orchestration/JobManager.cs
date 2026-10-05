@@ -85,6 +85,10 @@ public class JobManager : BackgroundService
     public int ActiveCount => _activeCount;
     public int QueuedCount { get { lock (_queueLock) return _pendingQueue.Count; } }
 
+    /// <summary>Raised each time a job leaves the queue for a worker, so a feeder can top the queue up at once
+    /// instead of waiting for its next poll.</summary>
+    public event Action? Dispatched;
+
     /// <summary>
     /// Is this job still in flight — queued or running?
     ///
@@ -260,6 +264,11 @@ public class JobManager : BackgroundService
                 lock (_queueLock)
                 {
                     _pendingQueue.TryDequeue(out job, out _);
+                }
+                if (job != null)
+                {
+                    try { Dispatched?.Invoke(); }
+                    catch (Exception ex) { _logger.LogDebug(ex, "[JobManager] A dispatch listener failed"); }
                 }
 
                 if (job == null)

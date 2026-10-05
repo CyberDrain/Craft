@@ -15,8 +15,11 @@ internal sealed class CountingTableStore(ICraftTableStore inner) : ICraftTableSt
     public sealed class Counts
     {
         public int PointReads, Queries, Rows, Pages, Submits, Upserts, BatchUpserts, Deletes;
+
+        /// <summary>Range queries that did not ask for a page size, so each request may return 1,000 rows.</summary>
+        public int UnboundedRanges;
         public override string ToString() =>
-            $"reads={PointReads} queries={Queries} rows={Rows} pages={Pages} submits={Submits} upserts={Upserts} batches={BatchUpserts} deletes={Deletes}";
+            $"reads={PointReads} queries={Queries} rows={Rows} pages={Pages} submits={Submits} upserts={Upserts} batches={BatchUpserts} deletes={Deletes} unboundedRanges={UnboundedRanges}";
     }
 
     private readonly ConcurrentDictionary<string, Counts> _byTable = new(StringComparer.Ordinal);
@@ -32,6 +35,7 @@ internal sealed class CountingTableStore(ICraftTableStore inner) : ICraftTableSt
         {
             t.PointReads += c.PointReads; t.Queries += c.Queries; t.Rows += c.Rows; t.Pages += c.Pages;
             t.Submits += c.Submits; t.Upserts += c.Upserts; t.BatchUpserts += c.BatchUpserts; t.Deletes += c.Deletes;
+            t.UnboundedRanges += c.UnboundedRanges;
         }
         return t;
     }
@@ -96,8 +100,12 @@ internal sealed class CountingTableStore(ICraftTableStore inner) : ICraftTableSt
         Count(table, inner.QueryTableAsync(table, filter, maxPerPage, ct), Math.Max(1, maxPerPage), ct);
 
     public IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey, string toRowKey,
-        IReadOnlyList<string>? properties = null, CancellationToken ct = default) =>
-        Count(table, inner.QueryRowKeyRangeAsync(table, partitionKey, fromRowKey, toRowKey, properties, ct), 1000, ct);
+        IReadOnlyList<string>? properties = null, int? maxPerPage = null, CancellationToken ct = default)
+    {
+        if (maxPerPage == null) Interlocked.Increment(ref For(table).UnboundedRanges);
+        return Count(table, inner.QueryRowKeyRangeAsync(table, partitionKey, fromRowKey, toRowKey, properties, maxPerPage, ct),
+            maxPerPage ?? 1000, ct);
+    }
 
     public Task<bool> TrySubmitAsync(string table, string partitionKey, IReadOnlyList<StoreOp> ops, CancellationToken ct = default)
     {

@@ -8,8 +8,10 @@ namespace Craft.Orchestration;
 /// oldest run first), claims from those runs' partitions until the batch is full, and hands the claims to the
 /// JobManager as descriptors. A run with nothing claimable is skipped for a while rather than read every tick.
 ///
-/// The pump holds no state that matters after a crash: claims it held lapse and are claimed again, by this
-/// process or any other.
+/// One process works the queue: the pump claims nothing until it holds the instance lock (a single row, renewed
+/// every few seconds and released on shutdown), so a recycle never has two processes claiming at once. While it
+/// holds the lock, any claim in storage owned by another process belongs to one that has stopped, and is taken
+/// back the first time its run is read. The pump holds no other state that matters after a crash.
 /// </summary>
 public class WorkPump : BackgroundService
 {
@@ -39,7 +41,7 @@ public class WorkPump : BackgroundService
     /// 30 s, doubling each time it is found empty again, up to 15 minutes, until its counts move.
     /// </summary>
     private readonly Dictionary<string, (int Done, int Total, DateTime Until, int Strikes)> _skip = new(StringComparer.Ordinal);
-    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _released = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _changed = new();
     private static readonly TimeSpan EmptyBackoff = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan MaxEmptyBackoff = TimeSpan.FromMinutes(15);
 
@@ -49,6 +51,18 @@ public class WorkPump : BackgroundService
     /// <summary>Ready rows per page: the whole list of a normal instance in one request, and few requests when a
     /// large backlog has to be scanned past.</summary>
     private const int ReadyPageSize = 1000;
+
+    /// <summary>The instance lock: how long it is held for without renewal, and how often it is renewed.</summary>
+    private readonly TimeSpan _lockLease;
+    private readonly TimeSpan _lockRenewEvery;
+    private DateTime _lockRenewedAt;
+    private volatile bool _holdsLock;
+
+    /// <summary>Whether this pump holds the instance lock (and so may treat other owners' claims as dead).</summary>
+    internal bool HoldsLock => _holdsLock;
+
+    /// <summary>How long a run may sit with its creation unfinished before the startup repair removes it.</summary>
+    private static readonly TimeSpan AbandonUnfinishedCreation = TimeSpan.FromMinutes(10);
 
     /// <summary>Claims handed to the JobManager, by job id, with when their lease runs out.</summary>
     private readonly Dictionary<string, (WorkStore.ClaimedTask Claim, DateTime LeaseUntil)> _inFlight = new(StringComparer.Ordinal);
@@ -61,26 +75,55 @@ public class WorkPump : BackgroundService
         _jobs = jobs;
         _orchestrator = orchestrator;
         _claimGate = orchestrator?.RecoveryDone;
-        _owner = orchestrator?.Owner ?? Environment.GetEnvironmentVariable("HOSTNAME") ?? $"instance-{Environment.ProcessId}";
+        _owner = orchestrator?.Owner ?? OrchestratorService.NewOwnerId();
         _batchSize = Math.Max(1, configuration.GetValue("JobQueueBatchSize", Math.Max(1, settings.Worker.BgPoolSize)));
         _lowWater = Math.Max(0, configuration.GetValue("JobQueueLowWaterMark", 2));
         _lease = orchestrator?.Lease ?? TimeSpan.FromSeconds(Math.Max(60, configuration.GetValue("JobQueueLeaseSeconds", 1800)));
         _pollInterval = TimeSpan.FromMilliseconds(Math.Max(100, configuration.GetValue("JobQueuePollIntervalMs", 1000)));
         _idlePollInterval = TimeSpan.FromMilliseconds(Math.Max(_pollInterval.TotalMilliseconds,
             configuration.GetValue("JobQueueIdlePollIntervalMs", 10_000)));
-        _store.Released += _released.Enqueue;
+        _lockLease = TimeSpan.FromSeconds(Math.Max(5, configuration.GetValue("InstanceLockSeconds", 30)));
+        _lockRenewEvery = _lockLease / 3;
+        _store.RunChanged += runKey =>
+        {
+            _changed.Enqueue(runKey);
+            Wake();
+        };
+        _jobs.Dispatched += () =>
+        {
+            if (_jobs.QueuedCount <= _lowWater) Wake();
+        };
     }
+
+    /// <summary>
+    /// Refill now rather than at the next poll: the JobManager's buffer has drained to the low-water mark, or a
+    /// run was created or moved on in this process. Wakes are coalesced to one refill per
+    /// <see cref="MinRefillGap"/>, so a burst of finishes does not re-read the Ready list for each one.
+    /// </summary>
+    private void Wake()
+    {
+        try
+        {
+            if (_wake.CurrentCount == 0) _wake.Release();
+        }
+        catch (SemaphoreFullException) { }
+    }
+
+    private readonly SemaphoreSlim _wake = new(0, 1);
+    private static readonly TimeSpan MinRefillGap = TimeSpan.FromMilliseconds(50);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("[WorkPump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s",
             _owner, _batchSize, _lowWater, _lease.TotalSeconds);
 
-        if (_claimGate is { IsCompleted: false })
+        try
         {
-            try { await _claimGate.WaitAsync(stoppingToken); }
-            catch (OperationCanceledException) { return; }
+            if (_claimGate is { IsCompleted: false }) await _claimGate.WaitAsync(stoppingToken);
+            await AcquireLockAsync(stoppingToken);
         }
+        catch (OperationCanceledException) { return; }
+        _ = RepairAsync(stoppingToken);
 
         var idleTicks = 0;
         while (!stoppingToken.IsCancellationRequested)
@@ -88,6 +131,7 @@ public class WorkPump : BackgroundService
             var claimed = 0;
             try
             {
+                if (!await KeepLockAsync(stoppingToken)) await AcquireLockAsync(stoppingToken);
                 claimed = await RefillAsync(stoppingToken);
                 await RenewAsync(stoppingToken);
             }
@@ -102,12 +146,108 @@ public class WorkPump : BackgroundService
                 ? _pollInterval
                 : TimeSpan.FromMilliseconds(Math.Min(_idlePollInterval.TotalMilliseconds,
                     _pollInterval.TotalMilliseconds * (1L << Math.Min(idleTicks, 20))));
-            try { await Task.Delay(delay, stoppingToken); }
+            if (delay > _lockRenewEvery) delay = _lockRenewEvery;
+            try
+            {
+                if (await _wake.WaitAsync(delay, stoppingToken))
+                {
+                    idleTicks = 0;
+                    await Task.Delay(MinRefillGap, stoppingToken);
+                }
+            }
             catch (OperationCanceledException) { break; }
         }
     }
 
     internal void ForgetBackoff() => _skip.Clear();
+
+    /// <summary>
+    /// Wait until this process holds the instance lock. A predecessor that shut down cleanly released it, so this
+    /// is immediate after a normal recycle; one that crashed holds it until its lease runs out.
+    /// </summary>
+    internal async Task AcquireLockAsync(CancellationToken ct)
+    {
+        string? waitingOn = null;
+        while (true)
+        {
+            var (held, holder) = await _store.TryHoldInstanceLockAsync(_owner, _lockLease, ct);
+            if (held)
+            {
+                _holdsLock = true;
+                _lockRenewedAt = DateTime.UtcNow;
+                _logger.LogInformation("[WorkPump] Holding the instance lock as {Owner}; claims of any other process are taken back on sight",
+                    _owner);
+                return;
+            }
+            if (holder?.Owner != waitingOn)
+            {
+                waitingOn = holder?.Owner;
+                _logger.LogInformation("[WorkPump] Waiting for the instance lock, held by {Holder} until {Until:O}",
+                    holder?.Owner, holder?.LeaseUntil);
+            }
+            var wait = (holder?.LeaseUntil ?? DateTimeOffset.UtcNow) - DateTimeOffset.UtcNow;
+            await Task.Delay(wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait > _lockRenewEvery ? _lockRenewEvery : wait, ct);
+        }
+    }
+
+    /// <summary>Renew the instance lock when due. False when it was lost (a renewal failed long enough for
+    /// another process to take it): claiming stops until it is held again.</summary>
+    internal async Task<bool> KeepLockAsync(CancellationToken ct)
+    {
+        if (!_holdsLock) return false;
+        if (DateTime.UtcNow - _lockRenewedAt < _lockRenewEvery) return true;
+        try
+        {
+            var (held, holder) = await _store.TryHoldInstanceLockAsync(_owner, _lockLease, ct);
+            if (held)
+            {
+                _lockRenewedAt = DateTime.UtcNow;
+                return true;
+            }
+            _holdsLock = false;
+            _logger.LogCritical("[WorkPump] Lost the instance lock to {Holder}; claiming stops until it is held again", holder?.Owner);
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A storage blip: keep claiming while the lease we hold is still good, and say so if it is not.
+            if (DateTime.UtcNow - _lockRenewedAt < _lockLease) return true;
+            _holdsLock = false;
+            _logger.LogCritical(ex, "[WorkPump] Could not renew the instance lock before it ran out; claiming stops until it is held again");
+            return false;
+        }
+    }
+
+    private int _repairing;
+    private int _indexFailuresSeen;
+
+    /// <summary>
+    /// Rebuild the indexes from the active-run list: once when the lock is first held, and again whenever an index
+    /// write has failed for good since the last pass (so a run whose Ready entry never landed is relisted now, not
+    /// at the next restart). Runs beside claiming; one pass at a time.
+    /// </summary>
+    private async Task RepairAsync(CancellationToken ct)
+    {
+        if (Interlocked.Exchange(ref _repairing, 1) == 1) return;
+        _indexFailuresSeen = _store.IndexFailures;
+        try
+        {
+            var r = await _store.RepairIndexesAsync(AbandonUnfinishedCreation, ct);
+            _logger.LogInformation("[WorkPump] Index repair: {Active} active run(s), {Relisted} relisted, {Retired} retired, {Removed} unfinished creation(s) removed, {Young} still being created",
+                r.Active, r.Relisted, r.Retired, r.Removed, r.Young);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "[WorkPump] Index repair failed; it runs again at the next start, or via RepairIndexes");
+        }
+        finally
+        {
+            Volatile.Write(ref _repairing, 0);
+        }
+    }
+
+    /// <summary>The background repair started by the last refill that saw a failed index write; tests await it.</summary>
+    internal Task? LastRepair { get; private set; }
 
     /// <summary>The pump's notion of now, for its backoff and renewal timing; tests replace it.</summary>
     internal Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
@@ -130,7 +270,8 @@ public class WorkPump : BackgroundService
     internal async Task<int> RefillAsync(CancellationToken ct)
     {
         Forget();
-        while (_released.TryDequeue(out var releasedRun)) _skip.Remove(releasedRun);
+        while (_changed.TryDequeue(out var changedRun)) _skip.Remove(changedRun);
+        if (_store.IndexFailures != _indexFailuresSeen && Volatile.Read(ref _repairing) == 0) LastRepair = RepairAsync(ct);
         if (_jobs.QueuedCount > _lowWater) return 0;
         var need = _batchSize - _jobs.QueuedCount;
         var claimed = 0;
@@ -168,12 +309,12 @@ public class WorkPump : BackgroundService
             var probe = new WorkStore.ClaimProbe();
             if (header.Sequential)
             {
-                var step = await _store.ClaimSequentialAsync(header.RunKey, _owner, _lease, ct: ct);
+                var step = await _store.ClaimSequentialAsync(header.RunKey, _owner, _lease, othersAreDead: _holdsLock, ct: ct);
                 claims = step == null ? [] : [step];
             }
             else
             {
-                claims = await _store.ClaimAsync(header.RunKey, want, _owner, _lease, reclaimExpired: true, probe, ct);
+                claims = await _store.ClaimAsync(header.RunKey, want, _owner, _lease, reclaimExpired: true, probe, othersAreDead: _holdsLock, ct);
             }
 
             if (probe.PendingExhausted)
@@ -234,6 +375,23 @@ public class WorkPump : BackgroundService
             if (_jobs.GetJobs().FirstOrDefault(j => j.Id == id) is not { Status: "Queued" }) continue;
             try { await _store.ReleaseAsync(v.Claim.RunKey, v.Claim.Seq, _owner, refundAttempt: true, cancellationToken); }
             catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release {Job} on shutdown", id); }
+        }
+        if (_holdsLock)
+        {
+            // Hold the lock while this process still runs claimed tasks: a successor holding it would take those
+            // claims back as dead and run them a second time. If shutdown is cut short, the lock simply lapses.
+            try
+            {
+                while (_jobs.GetJobs(status: "Running").Any(j => _inFlight.ContainsKey(j.Id)))
+                {
+                    await KeepLockAsync(cancellationToken);
+                    await Task.Delay(250, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException) { return; }
+            try { await _store.ReleaseInstanceLockAsync(_owner, cancellationToken); }
+            catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release the instance lock on shutdown"); }
+            _holdsLock = false;
         }
     }
 }

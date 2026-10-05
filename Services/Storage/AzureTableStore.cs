@@ -510,11 +510,12 @@ public sealed class AzureTableStore : ICraftTableStore
     }
 
     public async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
-        string toRowKey, IReadOnlyList<string>? properties = null,
+        string toRowKey, IReadOnlyList<string>? properties = null, int? maxPerPage = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         var filter = $"PartitionKey eq '{Escape(partitionKey)}' and RowKey ge '{Escape(fromRowKey)}' and RowKey lt '{Escape(toRowKey)}'";
-        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, select: properties, cancellationToken: ct), ct))
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, maxPerPage: maxPerPage,
+            select: properties, cancellationToken: ct), ct))
             yield return ToRow(entity);
     }
 

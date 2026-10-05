@@ -173,7 +173,7 @@ internal sealed class MemoryTableStore : ICraftTableStore
     }
 
     public async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
-        string toRowKey, IReadOnlyList<string>? properties = null,
+        string toRowKey, IReadOnlyList<string>? properties = null, int? maxPerPage = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         foreach (var r in Snapshot(table, t => t.Between((partitionKey, fromRowKey), (partitionKey, toRowKey))))

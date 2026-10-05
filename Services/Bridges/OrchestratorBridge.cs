@@ -125,6 +125,27 @@ public static class OrchestratorBridge
         return s_service != null && Task.Run(() => s_service.IsRunActiveAsync(name)).GetAwaiter().GetResult();
     }
 
+    private static readonly System.Text.Json.JsonSerializerOptions s_inspectJson = new() { WriteIndented = true };
+
+    /// <summary>
+    /// Why a run is or is not moving, as JSON: counts and mode, whether the scheduler can see it, its claims
+    /// and who holds them, child runs it waits for, its aggregation, the instance lock, and a diagnosis.
+    /// Takes a run key, or a run name (every unfinished run of it, else the latest).
+    /// PS usage: <c>[Craft.Services.OrchestratorBridge]::InspectRun('MailboxRules_contoso.com')</c>.
+    /// </summary>
+    public static string InspectRun(string nameOrKey) => s_service == null
+        ? "{\"error\":\"orchestrator not initialised\"}"
+        : System.Text.Json.JsonSerializer.Serialize(Task.Run(() => s_service.InspectRunAsync(nameOrKey)).GetAwaiter().GetResult(), s_inspectJson);
+
+    /// <summary>
+    /// Rebuild the Ready and Finished indexes from the active-run list now, as the pump does at startup: relists
+    /// unfinished runs, retires finished ones, removes runs whose creation never finished. Returns a JSON summary.
+    /// PS usage: <c>[Craft.Services.OrchestratorBridge]::RepairIndexes()</c>.
+    /// </summary>
+    public static string RepairIndexes() => s_service == null
+        ? "{\"error\":\"orchestrator not initialised\"}"
+        : System.Text.Json.JsonSerializer.Serialize(Task.Run(() => s_service.RepairIndexesAsync()).GetAwaiter().GetResult(), s_inspectJson);
+
     /// <summary>Synchronous drain — blocks until all pending orchestrations are started.</summary>
     public static void DrainPending()
     {
