@@ -37,6 +37,7 @@ public sealed class WorkStore
 
     private readonly int MaxAttempts;
     private const int ConflictRetries = 16;
+    private const int MaxRunningScan = 500;
 
     private readonly ICraftTableStore _store;
     private readonly ILogger<WorkStore> _logger;
@@ -148,7 +149,8 @@ public sealed class WorkStore
             Properties =
             {
                 ["RunKey"] = h.RunKey, ["Name"] = h.Name, ["Total"] = h.Total, ["Done"] = h.Done, ["Failed"] = h.Failed,
-                ["Cancelled"] = h.Cancelled, ["Reference"] = h.Reference,
+                ["Cancelled"] = h.Cancelled, ["Reference"] = h.Reference, ["Sequential"] = h.Sequential ? 1 : 0,
+                ["MaxConcurrency"] = h.MaxConcurrency,
             }
         }, ct);
 
@@ -205,8 +207,10 @@ public sealed class WorkStore
         catch (JsonException) { return []; }
     }
 
+    /// <summary>A run with work, as the scheduler sees it; its mode rides along so the pump can apply a
+    /// concurrency limit without reading the run.</summary>
     public sealed record ReadyEntry(int Band, string RunKey, string Name, int Total, int Done, DateTime StartedUtc,
-        string? Reference = null, int Failed = 0, int Cancelled = 0);
+        string? Reference = null, int Failed = 0, int Cancelled = 0, bool Sequential = false, int MaxConcurrency = 0);
 
     /// <summary>Runs with work, best band first and oldest first within it.</summary>
     public async IAsyncEnumerable<ReadyEntry> ReadReadyAsync(int pageSize = 32,
@@ -219,7 +223,8 @@ public sealed class WorkStore
             var ticks = long.TryParse(row.RowKey.AsSpan(0, Math.Min(19, row.RowKey.Length)), NumberStyles.None, CultureInfo.InvariantCulture, out var t) ? t : 0;
             yield return new ReadyEntry(band, key, row.GetString("Name") ?? key, row.GetInt32("Total") ?? 0,
                 row.GetInt32("Done") ?? 0, new DateTime(ticks, DateTimeKind.Utc), row.GetString("Reference"),
-                row.GetInt32("Failed") ?? 0, row.GetInt32("Cancelled") ?? 0);
+                row.GetInt32("Failed") ?? 0, row.GetInt32("Cancelled") ?? 0, row.GetInt32("Sequential") == 1,
+                row.GetInt32("MaxConcurrency") ?? 0);
         }
     }
 
@@ -243,6 +248,18 @@ public sealed class WorkStore
 
     public sealed record ClaimedTask(string RunKey, int Seq, string TaskId, int Attempt);
 
+    /// <summary>What a claim saw of the run, for the scheduler: whether its pending tasks ran out, and when its
+    /// earliest live claim lapses (if it is not renewed by then, there is work to take back).</summary>
+    public sealed class ClaimProbe
+    {
+        public bool PendingExhausted { get; internal set; }
+        public DateTimeOffset? EarliestLeaseUntil { get; internal set; }
+    }
+
+    /// <summary>Raised with the run key when a claim is handed back to pending, so a scheduler that had written
+    /// the run off as drained looks at it again.</summary>
+    public event Action<string>? Released;
+
     /// <summary>
     /// Move up to <paramref name="max"/> pending tasks to running under <paramref name="owner"/>, plus, with
     /// <paramref name="reclaimExpired"/>, running tasks whose lease lapsed. A task claimed for the
@@ -250,25 +267,36 @@ public sealed class WorkStore
     /// race returns empty and the caller moves on.
     /// </summary>
     public async Task<IReadOnlyList<ClaimedTask>> ClaimAsync(string runKey, int max, string owner, TimeSpan lease,
-        bool reclaimExpired, CancellationToken ct = default)
+        bool reclaimExpired, ClaimProbe? probe = null, CancellationToken ct = default)
     {
         max = Math.Min(max, MaxPerTransaction);
         if (max <= 0) return [];
 
         var now = DateTimeOffset.UtcNow;
         var expired = new List<StoreRow>();
-        if (reclaimExpired)
+        if (reclaimExpired || probe != null)
         {
-            await foreach (var r in Range(runKey, 'R', ct: ct))
+            // Bounded so a run left with thousands of lapsed claims costs a fixed read per claim; an earliest
+            // lease from a partial scan only makes the scheduler look again sooner.
+            await foreach (var r in Range(runKey, 'R', MaxRunningScan, ct))
+            {
                 if (r.GetDateTimeOffset("LeaseUntil") is not { } until || until <= now)
                 {
-                    expired.Add(r);
-                    if (expired.Count >= max) break;
+                    if (reclaimExpired && expired.Count < max) expired.Add(r);
+                    else if (probe != null) probe.EarliestLeaseUntil = now;
                 }
+                else if (probe != null && (probe.EarliestLeaseUntil is not { } seen || until < seen))
+                {
+                    probe.EarliestLeaseUntil = until;
+                }
+                if (probe == null && expired.Count >= max) break;
+            }
         }
+
         var pending = new List<StoreRow>();
         if (expired.Count < max)
             await foreach (var r in Range(runKey, 'P', max - expired.Count, ct: ct)) pending.Add(r);
+        if (probe != null) probe.PendingExhausted = pending.Count < max - expired.Count;
         if (pending.Count + expired.Count == 0) return [];
 
         var leaseUntil = now.Add(lease);
@@ -335,6 +363,11 @@ public sealed class WorkStore
         if (reclaiming && attempt > MaxAttempts)
         {
             await FinishAsync(runKey, [new Finish(seq, "Failed", $"Interrupted {attempt - 1} times without completing")], 'R', ct);
+            if (header.StopOnFailure)
+            {
+                await CancelPendingAsync(runKey, StoppedReason(row.GetString("TaskId")), ct);
+                return null;
+            }
             return await ClaimSequentialAsync(runKey, owner, lease, continuing, ct);
         }
 
@@ -351,6 +384,9 @@ public sealed class WorkStore
             ? new ClaimedTask(runKey, seq, row.GetString("TaskId")!, attempt)
             : null;
     }
+
+    /// <summary>Why a stop-on-failure run cancelled its remaining steps.</summary>
+    public static string StoppedReason(string? failedTaskId) => $"Not run: step {failedTaskId} failed and the run stops on failure";
 
     /// <summary>Give up a sequential run's driver lease so the next step can be claimed by anyone.</summary>
     public async Task ReleaseDriverAsync(string runKey, string owner, CancellationToken ct = default)
@@ -383,8 +419,10 @@ public sealed class WorkStore
         if (row == null || row.GetString("Owner") != owner) return false;
         var attempt = (row.GetInt32("Attempt") ?? 1) - (refundAttempt ? 1 : 0);
         await _rate.TakeAsync(runKey, 2, ct);
-        return await _store.TrySubmitAsync(_work, runKey,
+        var released = await _store.TrySubmitAsync(_work, runKey,
             [StoreOp.Delete(row), StoreOp.Insert(PendingRow(runKey, seq, row.GetString("TaskId")!, attempt))], ct);
+        if (released) Released?.Invoke(runKey);
+        return released;
     }
 
     /// <summary>Push the lease out on claims this owner still holds. Returns the claims it no longer holds.</summary>
@@ -582,7 +620,8 @@ public sealed class WorkStore
     // ── cancel ──
 
     /// <summary>Cancel every pending task of a run. Running tasks finish; the barrier then fires as usual.</summary>
-    public async Task<(int Cancelled, FinishOutcome? Outcome)> CancelPendingAsync(string runKey, CancellationToken ct = default)
+    public async Task<(int Cancelled, FinishOutcome? Outcome)> CancelPendingAsync(string runKey,
+        string reason = "Cancelled by user", CancellationToken ct = default)
     {
         var cancelled = 0;
         FinishOutcome? outcome = null;
@@ -590,7 +629,7 @@ public sealed class WorkStore
         {
             var page = new List<Finish>();
             await foreach (var r in Range(runKey, 'P', MaxPerTransaction, ct: ct))
-                if (SeqOf(r.RowKey) != AggregateSeq) page.Add(new Finish(SeqOf(r.RowKey), "Cancelled", "Cancelled by user"));
+                if (SeqOf(r.RowKey) != AggregateSeq) page.Add(new Finish(SeqOf(r.RowKey), "Cancelled", reason));
             if (page.Count == 0) return (cancelled, outcome);
             var result = await FinishAsync(runKey, page, 'P', ct);
             if (result == null || result.Applied == 0) return (cancelled, outcome);
@@ -707,6 +746,12 @@ public sealed class RunHeader
     public string? DriverOwner { get; set; }
     public DateTimeOffset? DriverLease { get; set; }
     public bool Sequential { get; init; }
+
+    /// <summary>At most this many of the run's tasks run at once; 0 is no limit. Not used with <see cref="Sequential"/>.</summary>
+    public int MaxConcurrency { get; init; }
+
+    /// <summary>Sequential runs: the first failed step cancels the steps after it instead of carrying on.</summary>
+    public bool StopOnFailure { get; init; }
     public bool CancelRequested { get; set; }
     public int Total { get; set; }
     public int Done { get; set; }
@@ -736,6 +781,8 @@ public sealed class RunHeader
             ["DriverOwner"] = DriverOwner,
             ["DriverLease"] = DriverLease,
             ["Sequential"] = Sequential ? 1 : 0,
+            ["MaxConcurrency"] = MaxConcurrency,
+            ["StopOnFailure"] = StopOnFailure ? 1 : 0,
             ["CancelRequested"] = CancelRequested ? 1 : 0,
             ["Total"] = Total,
             ["Done"] = Done,
@@ -762,6 +809,8 @@ public sealed class RunHeader
         DriverOwner = r.GetString("DriverOwner"),
         DriverLease = r.GetDateTimeOffset("DriverLease"),
         Sequential = r.GetInt32("Sequential") == 1,
+        MaxConcurrency = r.GetInt32("MaxConcurrency") ?? 0,
+        StopOnFailure = r.GetInt32("StopOnFailure") == 1,
         CancelRequested = r.GetInt32("CancelRequested") == 1,
         Total = r.GetInt32("Total") ?? 0,
         Done = r.GetInt32("Done") ?? 0,

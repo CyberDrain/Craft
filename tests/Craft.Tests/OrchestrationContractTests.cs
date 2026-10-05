@@ -1,11 +1,6 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using Craft.Configuration;
-using Craft.Orchestration;
-using Craft.PowerShellHost;
-using Craft.Storage;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
 
@@ -18,85 +13,13 @@ namespace Craft.Tests;
 /// </summary>
 public class OrchestrationContractTests
 {
-    private const string TaskFunc = "Invoke-CraftTask";
-    private const string PostExecFunc = "Invoke-CraftPostExecution";
+    private static Task<OrchestrationHarness> NewAsync() => OrchestrationHarness.CreateAsync();
 
-    private sealed class Svc(JobManager jobs, WorkStore store, ResultStore results, IConfiguration config, CraftSettings settings)
-        : OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, null!, jobs, store, results, config, settings)
-    {
-        public readonly ConcurrentQueue<Dictionary<string, object>> Tasks = new();
-        public readonly ConcurrentQueue<(Dictionary<string, object> Parameters, string[] Lines)> PostExecs = new();
-        public Func<Dictionary<string, object>, string>? Body;
-        public Func<Task>? PostExecBody;
-        public int Checkouts, Reclaims;
+    private static string Batch(int n, string prefix = "t") => OrchestrationHarness.Batch(n, prefix);
 
-        internal override string? FindScript(string name) => name;
-
-        internal override async Task<string> RunScriptAsync(string path, Dictionary<string, object> parameters, bool captureOutput,
-            PowerShellWorker? worker = null)
-        {
-            if (path == PostExecFunc)
-            {
-                PostExecs.Enqueue((parameters, File.ReadAllLines((string)parameters["ResultsPath"])));
-                if (PostExecBody != null) await PostExecBody();
-                return string.Empty;
-            }
-            var task = JsonSerializer.Deserialize<Dictionary<string, object>>((string)parameters["TaskJson"])!;
-            Tasks.Enqueue(task);
-            var output = Body?.Invoke(task) ?? JsonSerializer.Serialize(new { tenant = task["TenantFilter"].ToString() });
-            return captureOutput ? output : string.Empty;
-        }
-
-        internal override PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct) { Checkouts++; return null; }
-        internal override void ReclaimSequentialWorker(PowerShellWorker? worker, bool faulted) => Reclaims++;
-    }
-
-    private sealed record Harness(Svc Svc, WorkStore Store, WorkPump Pump, JobManager Jobs) : IAsyncDisposable
-    {
-        public async Task<bool> DriveUntil(Func<Task<bool>> done, int timeoutMs = 10_000)
-        {
-            var deadline = Environment.TickCount64 + timeoutMs;
-            while (Environment.TickCount64 < deadline)
-            {
-                await Pump.RefillAsync(CancellationToken.None);
-                if (await done()) return true;
-                await Task.Delay(10);
-            }
-            return await done();
-        }
-
-        public Task<bool> DriveUntilFinished(string name, int timeoutMs = 10_000) =>
-            DriveUntil(async () => await Store.GetRunByNameAsync(name) is { IsFinished: true }, timeoutMs);
-
-        public async ValueTask DisposeAsync() => await Jobs.StopAsync(CancellationToken.None);
-    }
-
-    private static async Task<Harness> NewAsync()
-    {
-        var settings = new CraftSettings();
-        settings.Worker.BgPoolSize = 4;
-        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
-        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
-        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
-        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
-        var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
-        var mem = new MemoryTableStore();
-        var store = new WorkStore(NullLogger<WorkStore>.Instance, settings, mem);
-        var results = new ResultStore(NullLogger<ResultStore>.Instance, settings, mem);
-        var svc = new Svc(jobs, store, results, config, settings);
-        await svc.ResumeInterruptedRunsAsync(CancellationToken.None);
-        var pump = new WorkPump(NullLogger<WorkPump>.Instance, store, jobs, config, settings, svc);
-        _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
-        return new Harness(svc, store, pump, jobs);
-    }
-
-    private static string Batch(int n, string prefix = "t") =>
-        JsonSerializer.Serialize(Enumerable.Range(0, n).Select(i => new { Name = "Job", TenantFilter = $"{prefix}{i}", N = i }));
-
-    private static Task<bool> Start(Harness h, string name, string batch, string? postExec = null, string? postParams = null,
-        bool sequential = false, int priority = 4, bool allowCollision = true) =>
-        h.Svc.StartFromBatchAsync(name, batch, priority, postExec, postParams, CancellationToken.None, sequential: sequential,
-            allowCollision: allowCollision);
+    private static Task<bool> Start(OrchestrationHarness h, string name, string batch, string? postExec = null,
+        string? postParams = null, bool sequential = false, int priority = 4, bool allowCollision = true) =>
+        h.Start(name, batch, postExec, postParams, sequential, priority, allowCollision);
 
     [Fact]
     public async Task EveryTaskRunsOnce_WithItsBatchItemAsTaskJson_AndTheRunCompletes()
@@ -352,10 +275,5 @@ public class OrchestrationContractTests
         Assert.Equal(["Urgent", "Zulu", "Alpha", "Background"], await ReadyNames(h));
     }
 
-    private static async Task<List<string>> ReadyNames(Harness h)
-    {
-        var names = new List<string>();
-        await foreach (var e in h.Store.ReadReadyAsync()) names.Add(e.Name);
-        return names;
-    }
+    private static Task<List<string>> ReadyNames(OrchestrationHarness h) => h.ReadyNamesAsync();
 }

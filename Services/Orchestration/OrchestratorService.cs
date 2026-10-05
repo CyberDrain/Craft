@@ -122,7 +122,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
             }
 
             await CreateAsync(name, tasks, priority, Path.GetFileNameWithoutExtension(taskPath), null, null, null, null, null,
-                false, ct);
+                new RunMode(false, 0, false), ct);
         }
         finally
         {
@@ -154,11 +154,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// (<paramref name="batchFilePath"/>, deleted on every path) or a JSON array string. Returns whether a run
     /// was created: false when the batch is empty, or when <paramref name="allowCollision"/> is false and a
     /// run of this name is still going. By default runs of one name stack up side by side.
+    /// <paramref name="maxConcurrency"/> above 0 caps how many of the run's tasks run at once; it has no meaning
+    /// for a sequential run (one step at a time already) and is dropped there. <paramref name="stopOnFailure"/>
+    /// makes a sequential run cancel its remaining steps at the first failure; other runs always carry on.
     /// </summary>
     public async Task<bool> StartFromBatchAsync(string name, string batchJson, int priority,
         string? postExecFunctionName, string? postExecParametersJson, CancellationToken ct,
         string? parentRunName = null, string? reference = null, string? batchFilePath = null,
-        bool sequential = false, string? parentRunKey = null, string? childKey = null, bool allowCollision = true)
+        bool sequential = false, string? parentRunKey = null, string? childKey = null, bool allowCollision = true,
+        int maxConcurrency = 0, bool stopOnFailure = false)
     {
         var gated = false;
         try
@@ -193,7 +197,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
             if (string.IsNullOrEmpty(postExecFunctionName)) postExecFunctionName = null;
             if (string.IsNullOrEmpty(postExecParametersJson)) postExecParametersJson = null;
             await CreateAsync(name, tasks, priority, genericTaskFunc, postExecFunctionName, postExecParametersJson,
-                reference, parentRunKey, childKey, sequential, ct);
+                reference, parentRunKey, childKey, ResolveMode(name, sequential, maxConcurrency, stopOnFailure), ct);
             return true;
         }
         finally
@@ -221,9 +225,30 @@ public class OrchestratorService : IJobDescriptorStateWriter
         return await _store.GetActiveRunsAsync(keyOrName);
     }
 
+    /// <summary>How a run's tasks are scheduled: one at a time on a pinned worker (sequential), at most N at once,
+    /// or all at once; and whether a sequential run stops at its first failure.</summary>
+    internal readonly record struct RunMode(bool Sequential, int MaxConcurrency, bool StopOnFailure);
+
+    private RunMode ResolveMode(string name, bool sequential, int maxConcurrency, bool stopOnFailure)
+    {
+        maxConcurrency = Math.Max(0, maxConcurrency);
+        if (sequential && maxConcurrency > 0)
+        {
+            _logger.LogWarning("[Orchestrator] Run {Name}: MaxConcurrency {Max} ignored, a sequential run already runs one step at a time",
+                name, maxConcurrency);
+            maxConcurrency = 0;
+        }
+        if (stopOnFailure && !sequential)
+        {
+            _logger.LogWarning("[Orchestrator] Run {Name}: StopOnFailure ignored, it applies to sequential runs only", name);
+            stopOnFailure = false;
+        }
+        return new RunMode(sequential, maxConcurrency, stopOnFailure);
+    }
+
     private async Task CreateAsync(string name, List<OrchestratorTaskItem> tasks, int priority, string taskScriptName,
         string? postExecFunctionName, string? postExecParametersJson, string? reference, string? parentRunKey,
-        string? childKey, bool sequential, CancellationToken ct)
+        string? childKey, RunMode mode, CancellationToken ct)
     {
         var started = NextStartTime();
         var header = new RunHeader
@@ -238,13 +263,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
             Reference = reference,
             ParentRunKey = parentRunKey,
             ParentChildKey = childKey,
-            Sequential = sequential,
+            Sequential = mode.Sequential,
+            MaxConcurrency = mode.MaxConcurrency,
+            StopOnFailure = mode.StopOnFailure,
         };
         await _store.CreateRunAsync(header, tasks.Select(t => new WorkStore.NewTask(t.Id, t.Parameters)).ToList(), ct);
-        _logger.LogInformation("[Orchestrator] Run {Name} created with {Count} tasks at P{Priority}{PostExec}{Sequential}",
+        _logger.LogInformation("[Orchestrator] Run {Name} created with {Count} tasks at P{Priority}{PostExec}{Mode}",
             name, tasks.Count, header.Priority,
             postExecFunctionName != null ? $" (PostExec: Push-{postExecFunctionName})" : "",
-            sequential ? " (sequential)" : "");
+            mode.Sequential ? (mode.StopOnFailure ? " (sequential, stop on failure)" : " (sequential)")
+                : mode.MaxConcurrency > 0 ? $" (max {mode.MaxConcurrency} at once)" : "");
     }
 
     private static long s_lastStartTicks;
@@ -473,7 +501,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     if (current.CancelRequested)
                     {
                         await FinishAsync(header, step.Seq, "Cancelled", "Cancelled by user");
-                        await _store.CancelPendingAsync(header.RunKey, jobCt);
+                        await _store.CancelPendingAsync(header.RunKey, ct: jobCt);
                         break;
                     }
                     if (step.Seq == WorkStore.AggregateSeq)
@@ -498,8 +526,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", step.TaskId);
                         await FinishAsync(header, step.Seq, "Failed", ex.Message);
+                        if (current.StopOnFailure)
+                        {
+                            _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — stopping the run", step.TaskId);
+                            await _store.CancelPendingAsync(header.RunKey, WorkStore.StoppedReason(step.TaskId), jobCt);
+                            break;
+                        }
+                        _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", step.TaskId);
                     }
 
                     if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, jobCt) is not { } next) break;
@@ -587,7 +621,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         foreach (var e in entries)
         {
             await _store.RequestCancelAsync(e.RunKey, ct);
-            total += (await _store.CancelPendingAsync(e.RunKey, ct)).Cancelled;
+            total += (await _store.CancelPendingAsync(e.RunKey, ct: ct)).Cancelled;
         }
         _logger.LogWarning("[JobQueue] Durable queue cleared — {Count} queued task(s) cancelled", total);
         return total;

@@ -25,9 +25,14 @@ public static class OrchestratorBridge
 
     /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
     /// while another run of the same name is unfinished.</param>
+    /// <param name="maxConcurrency">At most this many of the run's tasks run at once; 0 (the default) is no
+    /// limit. Ignored for a sequential run.</param>
+    /// <param name="stopOnFailure">Sequential runs only: the first failed step cancels the rest instead of the
+    /// run carrying on (the default).</param>
     public static void QueueOrchestration(string name, string batchJson, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true,
+        int maxConcurrency = 0, bool stopOnFailure = false)
     {
         // Sanitized here as well as at run creation so the child-run registration below
         // records the SAME name the service ends up creating — a raw name with a table-illegal
@@ -38,7 +43,7 @@ public static class OrchestratorBridge
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference,
             Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
-            AllowCollision: allowCollision));
+            AllowCollision: allowCollision, MaxConcurrency: maxConcurrency, StopOnFailure: stopOnFailure));
     }
 
     /// <summary>
@@ -54,9 +59,14 @@ public static class OrchestratorBridge
     /// </summary>
     /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
     /// while another run of the same name is unfinished.</param>
+    /// <param name="maxConcurrency">At most this many of the run's tasks run at once; 0 (the default) is no
+    /// limit. Ignored for a sequential run.</param>
+    /// <param name="stopOnFailure">Sequential runs only: the first failed step cancels the rest instead of the
+    /// run carrying on (the default).</param>
     public static void QueueOrchestrationFromFile(string name, string batchFilePath, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true,
+        int maxConcurrency = 0, bool stopOnFailure = false)
     {
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
@@ -64,7 +74,7 @@ public static class OrchestratorBridge
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
             Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
-            AllowCollision: allowCollision));
+            AllowCollision: allowCollision, MaxConcurrency: maxConcurrency, StopOnFailure: stopOnFailure));
     }
 
     /// <summary>
@@ -139,7 +149,8 @@ public static class OrchestratorBridge
             if (s_service == null) { DiscardUndispatchable(p); return; }
             created = await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
                 p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey, p.AllowCollision);
+                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey, p.AllowCollision,
+                p.MaxConcurrency, p.StopOnFailure);
         }
         catch (Exception ex)
         {
@@ -180,7 +191,8 @@ public static class OrchestratorBridge
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
         string? Reference = null, string? BatchFilePath = null, bool Sequential = false,
-        string? ParentRunKey = null, string? ChildKey = null, bool AllowCollision = true)
+        string? ParentRunKey = null, string? ChildKey = null, bool AllowCollision = true, int MaxConcurrency = 0,
+        bool StopOnFailure = false)
     {
         public bool PendingChildRegistered => ChildKey != null;
     }

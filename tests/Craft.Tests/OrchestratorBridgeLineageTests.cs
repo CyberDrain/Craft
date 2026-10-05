@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Collections.Concurrent;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
@@ -170,6 +171,88 @@ public class OrchestratorBridgeLineageTests
         var pending = TakePending("LineageSelf");
         Assert.NotNull(pending);
         Assert.Null(pending!.ParentRunName);
+    }
+
+    /// <summary>Run the real Start-CraftOrchestrator inside a production-configured worker, under a caller
+    /// context that the worker stamps into the runspace, and return what reached the bridge and the result.</summary>
+    private static async Task<(OrchestratorBridge.PendingOrchestration? Pending, string Result)> RunWrapperAsync(
+        string name, string inputObject, OperationContext.Invocation? caller = null)
+    {
+        var script = Path.Combine(AppContext.BaseDirectory, "Runtime", "CraftRuntime", "Start-CraftOrchestrator.ps1");
+        var worker = await NewPinnedWorkerAsync();
+        try
+        {
+            Collection<PSObject> output;
+            using (OperationContext.Set(caller ?? new OperationContext.Invocation("Push-Task")))
+                output = await worker.InvokeScriptAsync(ScriptBlock.Create(
+                    $"try {{ . '{script}'; Start-CraftOrchestrator -InputObject {inputObject} }} catch {{ \"ERROR: $_\" }}"));
+            var pending = TakePending(name);
+            if (pending?.BatchFilePath is { } path && File.Exists(path)) File.Delete(path);
+            return (pending, string.Join(",", output.Select(o => o?.ToString())));
+        }
+        finally
+        {
+            worker.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Wrapper_AChildInheritsOnlyItsParentsPriority_AndNamesItsExactParentRun()
+    {
+        var parent = new OperationContext.Invocation("Push-Task") { RunName = "WrapParent", RunKey = "WrapParent~8de0a1b2c3d4e5f", Priority = 7 };
+
+        var (pending, result) = await RunWrapperAsync("WrapChild",
+            "@{ OrchestratorName = 'WrapChild'; Batch = @(@{ FunctionName = 'X'; TenantFilter = 'a.com' }) }", parent);
+
+        Assert.Equal("Craft-WrapChild", result);
+        Assert.NotNull(pending);
+        Assert.Equal(7, pending!.Priority);
+        Assert.Equal("WrapParent~8de0a1b2c3d4e5f", pending.ParentRunName);
+        Assert.Equal((false, true, 0, false), (pending.Sequential, pending.AllowCollision, pending.MaxConcurrency, pending.StopOnFailure));
+    }
+
+    [Fact]
+    public async Task Wrapper_AChildsOwnPriorityAndModeWin_OverItsParent()
+    {
+        var parent = new OperationContext.Invocation("Push-Task") { RunName = "WrapSeqParent", Priority = 7 };
+
+        var (pending, _) = await RunWrapperAsync("WrapOwnMode",
+            "@{ OrchestratorName = 'WrapOwnMode'; Priority = 2; Sequential = $true; StopOnFailure = $true; MaxConcurrency = 3; AllowCollision = $false; Batch = @(@{ FunctionName = 'X' }) }",
+            parent);
+
+        Assert.NotNull(pending);
+        Assert.Equal(2, pending!.Priority);
+        Assert.Equal((true, false, 3, true), (pending.Sequential, pending.AllowCollision, pending.MaxConcurrency, pending.StopOnFailure));
+    }
+
+    [Fact]
+    public async Task Wrapper_WithoutAParent_UsesTheDefaultBand_AndNoLineage()
+    {
+        var (pending, _) = await RunWrapperAsync("WrapTopLevel", "@{ OrchestratorName = 'WrapTopLevel'; Batch = @(@{ FunctionName = 'X' }) }");
+
+        Assert.NotNull(pending);
+        Assert.Equal(4, pending!.Priority);
+        Assert.Null(pending.ParentRunName);
+    }
+
+    [Fact]
+    public async Task Wrapper_WithoutCollisions_SkipsAndSaysSo_WhileARunOfThatNameIsQueued()
+    {
+        OrchestratorBridge.QueueOrchestration("WrapBusy", "[]", 4);
+        try
+        {
+            var (pending, result) = await RunWrapperAsync("WrapBusy",
+                "@{ OrchestratorName = 'WrapBusy'; AllowCollision = $false; Batch = @(@{ FunctionName = 'X' }) }");
+
+            Assert.Equal("Craft-WrapBusy-Skipped", result);
+            Assert.NotNull(pending);                 // the first, queued directly above
+            Assert.True(string.IsNullOrEmpty(pending!.BatchFilePath));
+            Assert.Null(TakePending("WrapBusy"));     // and no second one
+        }
+        finally
+        {
+            TakePending("WrapBusy");
+        }
     }
 
     [Fact]

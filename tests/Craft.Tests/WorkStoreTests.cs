@@ -119,6 +119,54 @@ public class WorkStoreTests
         Assert.Equal("CompletedWithErrors", header.Status);
     }
 
+    private static Task<RunHeader> CreateModeAsync(WorkStore s, string name, int tasks, bool sequential = false,
+        bool stopOnFailure = false)
+    {
+        var h = Header(name);
+        return s.CreateRunAsync(new RunHeader
+        {
+            RunKey = h.RunKey,
+            Name = h.Name,
+            StartedUtc = h.StartedUtc,
+            TaskScriptName = h.TaskScriptName,
+            Sequential = sequential,
+            StopOnFailure = stopOnFailure,
+        }, Tasks(tasks));
+    }
+
+    [Fact]
+    public async Task ASequentialStepThatKeepsDying_StopsAStopOnFailureRun()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "SeqPoison", 4, sequential: true, stopOnFailure: true);
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.NotNull(await s.ClaimSequentialAsync(run.RunKey, $"w{i}", TimeSpan.FromMilliseconds(1)));
+            await Task.Delay(20);
+        }
+
+        Assert.Null(await s.ClaimSequentialAsync(run.RunKey, "w9", Lease));
+        var done = (await s.GetTasksAsync(run.RunKey, 'D')).OrderBy(t => t.Seq).ToList();
+        Assert.Equal(["Failed", "Cancelled", "Cancelled", "Cancelled"], done.Select(t => t.Status));
+        Assert.True((await s.GetRunAsync(run.RunKey))!.IsFinished);
+    }
+
+    [Fact]
+    public async Task ASequentialStepThatKeepsDying_IsFailed_AndTheRunCarriesOn_ByDefault()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "SeqPoisonCarry", 3, sequential: true);
+        for (var i = 0; i < 3; i++)
+        {
+            Assert.NotNull(await s.ClaimSequentialAsync(run.RunKey, $"w{i}", TimeSpan.FromMilliseconds(1)));
+            await Task.Delay(20);
+        }
+
+        var next = await s.ClaimSequentialAsync(run.RunKey, "w9", Lease);
+        Assert.Equal(1, next!.Seq);
+        Assert.Equal("Failed", Assert.Single(await s.GetTasksAsync(run.RunKey, 'D')).Status);
+    }
+
     [Fact]
     public async Task TwoClaimersRacingForTheSameRows_NeverBothWin()
     {

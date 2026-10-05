@@ -25,18 +25,30 @@ public class WorkPump : BackgroundService
     private readonly TimeSpan _idlePollInterval;
     private readonly Task? _claimGate;
 
-    /// <summary>How long a run that had nothing claimable is skipped while its counts stand still, and how often a
-    /// run's lapsed leases are looked for.</summary>
+    /// <summary>
+    /// Runs the pump has written off for now, so they cost no storage read until something can have changed.
+    ///
+    /// A run whose pending tasks ran out (its remaining work is running, or it waits on child runs) can only
+    /// have claimable work again when its counts move (a task or child finishes, its aggregation falls due),
+    /// when a claim is released back to pending, or when a claim lapses unrenewed. So it is skipped until its
+    /// Ready counts change, a release names it, or its earliest claim's lease runs out. Without this, runs
+    /// waiting at the head of a large queue spend the per-refill read budget over and over and starve every run
+    /// behind them.
+    ///
+    /// A run that came back empty for another reason (a lost race, a busy sequential driver) is skipped for
+    /// 30 s, doubling each time it is found empty again, up to 15 minutes, until its counts move.
+    /// </summary>
+    private readonly Dictionary<string, (int Done, int Total, DateTime Until, int Strikes)> _skip = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _released = new();
     private static readonly TimeSpan EmptyBackoff = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan ExpiredCheckInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan MaxEmptyBackoff = TimeSpan.FromMinutes(15);
 
-    /// <summary>Runs read from storage per refill. Skipped runs cost nothing, so a head of runs that are all waiting
-    /// (on children, or on their own running tasks) cannot hide the runs behind it.</summary>
+    /// <summary>Runs read from storage per refill. Skipped runs cost nothing.</summary>
     private const int MaxRunsReadPerRefill = 32;
-    private const int ReadyPageSize = 100;
 
-    private readonly Dictionary<string, (DateTime Until, int Done, int Total)> _emptyUntil = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTime> _expiredCheckedAt = new(StringComparer.Ordinal);
+    /// <summary>Ready rows per page: the whole list of a normal instance in one request, and few requests when a
+    /// large backlog has to be scanned past.</summary>
+    private const int ReadyPageSize = 1000;
 
     /// <summary>Claims handed to the JobManager, by job id, with when their lease runs out.</summary>
     private readonly Dictionary<string, (WorkStore.ClaimedTask Claim, DateTime LeaseUntil)> _inFlight = new(StringComparer.Ordinal);
@@ -56,6 +68,7 @@ public class WorkPump : BackgroundService
         _pollInterval = TimeSpan.FromMilliseconds(Math.Max(100, configuration.GetValue("JobQueuePollIntervalMs", 1000)));
         _idlePollInterval = TimeSpan.FromMilliseconds(Math.Max(_pollInterval.TotalMilliseconds,
             configuration.GetValue("JobQueueIdlePollIntervalMs", 10_000)));
+        _store.Released += _released.Enqueue;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -75,7 +88,6 @@ public class WorkPump : BackgroundService
             var claimed = 0;
             try
             {
-                Forget();
                 claimed = await RefillAsync(stoppingToken);
                 await RenewAsync(stoppingToken);
             }
@@ -95,7 +107,10 @@ public class WorkPump : BackgroundService
         }
     }
 
-    internal void ForgetBackoff() => _emptyUntil.Clear();
+    internal void ForgetBackoff() => _skip.Clear();
+
+    /// <summary>The pump's notion of now, for its backoff and renewal timing; tests replace it.</summary>
+    internal Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
 
     /// <summary>Stop tracking claims the JobManager is done with. Their finish (or release) was written by the job.</summary>
     private void Forget()
@@ -104,20 +119,42 @@ public class WorkPump : BackgroundService
             _inFlight.Remove(id);
     }
 
-    /// <summary>Claim until the buffer holds a batch. Returns how many tasks were claimed.</summary>
+    /// <summary>
+    /// Claim until the buffer holds a batch. Returns how many tasks were claimed.
+    ///
+    /// A run's concurrency limit is applied here, against the claims this process holds: only one Craft
+    /// instance works the tables, so what it holds is what is running. A claim left by a process that has
+    /// since died is not running, so it rightly does not count. During an overlapping restart, two processes
+    /// could briefly run up to the limit each.
+    /// </summary>
     internal async Task<int> RefillAsync(CancellationToken ct)
     {
+        Forget();
+        while (_released.TryDequeue(out var releasedRun)) _skip.Remove(releasedRun);
         if (_jobs.QueuedCount > _lowWater) return 0;
         var need = _batchSize - _jobs.QueuedCount;
         var claimed = 0;
-        var now = DateTime.UtcNow;
+        var now = Clock();
         var read = 0;
+        Dictionary<string, int>? held = null;
 
         await foreach (var entry in _store.ReadReadyAsync(ReadyPageSize, ct))
         {
             if (need <= 0 || read >= MaxRunsReadPerRefill) break;
-            if (_emptyUntil.TryGetValue(entry.RunKey, out var skip) && skip.Until > now
-                && skip.Done == entry.Done && skip.Total == entry.Total) continue;
+            var progressed = true;
+            if (_skip.TryGetValue(entry.RunKey, out var skip) && skip.Done == entry.Done && skip.Total == entry.Total)
+            {
+                if (skip.Until > now) continue;
+                progressed = false;
+            }
+
+            var want = need;
+            if (entry.MaxConcurrency > 0 && !entry.Sequential)
+            {
+                held ??= _inFlight.Values.GroupBy(v => v.Claim.RunKey).ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
+                want = Math.Min(need, entry.MaxConcurrency - held.GetValueOrDefault(entry.RunKey));
+                if (want <= 0) continue;
+            }
             read++;
 
             var header = await _store.GetRunAsync(entry.RunKey, ct);
@@ -128,6 +165,7 @@ public class WorkPump : BackgroundService
             }
 
             IReadOnlyList<WorkStore.ClaimedTask> claims;
+            var probe = new WorkStore.ClaimProbe();
             if (header.Sequential)
             {
                 var step = await _store.ClaimSequentialAsync(header.RunKey, _owner, _lease, ct: ct);
@@ -135,17 +173,26 @@ public class WorkPump : BackgroundService
             }
             else
             {
-                var checkExpired = !_expiredCheckedAt.TryGetValue(header.RunKey, out var at) || now - at >= ExpiredCheckInterval;
-                if (checkExpired) _expiredCheckedAt[header.RunKey] = now;
-                claims = await _store.ClaimAsync(header.RunKey, need, _owner, _lease, checkExpired, ct);
+                claims = await _store.ClaimAsync(header.RunKey, want, _owner, _lease, reclaimExpired: true, probe, ct);
             }
 
-            if (claims.Count == 0)
+            if (probe.PendingExhausted)
             {
-                _emptyUntil[header.RunKey] = (now + EmptyBackoff, entry.Done, entry.Total);
+                // A lapsing claim is the one change that bumps no count; look again when the earliest lease is due.
+                _skip[header.RunKey] = (entry.Done, entry.Total, probe.EarliestLeaseUntil?.UtcDateTime ?? DateTime.MaxValue, 0);
+            }
+            else if (claims.Count == 0)
+            {
+                var strikes = progressed ? 0 : skip.Strikes + 1;
+                var backoff = TimeSpan.FromTicks(Math.Min(MaxEmptyBackoff.Ticks, EmptyBackoff.Ticks << Math.Min(strikes, 10)));
+                _skip[header.RunKey] = (entry.Done, entry.Total, now + backoff, strikes);
                 continue;
             }
-            _emptyUntil.Remove(header.RunKey);
+            else
+            {
+                _skip.Remove(header.RunKey);
+            }
+            if (claims.Count == 0) continue;
 
             foreach (var c in claims)
             {
@@ -153,17 +200,14 @@ public class WorkPump : BackgroundService
                 var descriptor = new JobDescriptor(header.Name, c.TaskId, header.Priority) { RunKey = c.RunKey, Seq = c.Seq, Attempt = c.Attempt };
                 var jobId = _jobs.Enqueue(descriptor, name, id: $"{c.RunKey}|{c.Seq}");
                 _inFlight[jobId] = (c, now + _lease);
+                if (held != null) held[c.RunKey] = held.GetValueOrDefault(c.RunKey) + 1;
             }
             need -= claims.Count;
             claimed += claims.Count;
         }
 
-        if (_emptyUntil.Count > 10_000)
-            foreach (var key in _emptyUntil.Where(kv => kv.Value.Until <= now).Select(kv => kv.Key).ToList())
-            {
-                _emptyUntil.Remove(key);
-                _expiredCheckedAt.Remove(key);
-            }
+        // ponytail: forgetting every mark costs one read per run on the next pass; prune by Ready membership if that ever shows up.
+        if (_skip.Count > 50_000) _skip.Clear();
 
         return claimed;
     }
@@ -171,7 +215,7 @@ public class WorkPump : BackgroundService
     /// <summary>Renew claims in their last third, so a long buffer wait or a long task never loses its lease.</summary>
     private async Task RenewAsync(CancellationToken ct)
     {
-        var now = DateTime.UtcNow;
+        var now = Clock();
         var due = _inFlight.Where(kv => kv.Value.LeaseUntil - now < _lease / 3).ToList();
         if (due.Count == 0) return;
 

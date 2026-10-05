@@ -33,6 +33,10 @@ function Start-CraftOrchestrator {
           - AllowCollision    (bool)    — optional, default $true: runs of one name stack up side by side.
                                           $false skips this run while another run of the same name is still
                                           going (recurring work that must not pile up).
+          - MaxConcurrency    (int)     — optional, default 0 (no limit): at most this many of the run's tasks
+                                          run at once. Not used with Sequential.
+          - StopOnFailure     (bool)    — optional, Sequential only: the first failed step cancels the steps
+                                          after it. By default a sequential run carries on past a failure.
 
     .EXAMPLE
         # Fan-out (default): every task is queued up front and drained in parallel by the worker pool.
@@ -156,6 +160,8 @@ function Start-CraftOrchestrator {
     # Sequential mode: PowerShell marshals absent/$false to $false. When set, the orchestrator queues the
     # batch one task at a time in payload order rather than fanning out.
     $Sequential = [bool]($InputObject.Sequential)
+    $MaxConcurrency = [int]($InputObject.MaxConcurrency ?? 0)
+    $StopOnFailure = [bool]($InputObject.StopOnFailure)
 
     Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
@@ -167,7 +173,9 @@ function Start-CraftOrchestrator {
         $InputObject.Reference,
         $ParentRunName,
         $Sequential,
-        $AllowCollision
+        $AllowCollision,
+        $MaxConcurrency,
+        $StopOnFailure
     )
     return "Craft-$OrchestratorName"
 }
