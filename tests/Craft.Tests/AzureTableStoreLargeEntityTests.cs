@@ -237,4 +237,41 @@ public class AzureTableStoreLargeEntityTests
         await foreach (var _ in fx.Store.QueryPartitionAsync(fx.Table, "p")) any = true;
         Assert.False(any);
     }
+
+    [Fact]
+    public async Task Delete_TakesOnlyItsOwnPartRows_NotNeighboursSharingThePrefix()
+    {
+        await using var fx = await Fixture.TryConnectAsync();
+        if (fx == null) return;
+
+        // "task1" splits; "task1-partner" is an unrelated plain row and "task1-part9" an unrelated split
+        // entity, so both sit inside task1's "-part" key range without belonging to it.
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1", Text(1_200_000)));
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1-partner", "small"));
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1-part9", Text(1_200_000, 'y')));
+
+        await fx.Store.DeleteAsync(fx.Table, "p", "task1");
+
+        Assert.Null(await fx.Store.GetAsync(fx.Table, "p", "task1"));
+        Assert.Equal("small", (await fx.Store.GetAsync(fx.Table, "p", "task1-partner"))!.GetString("ParametersJson"));
+        Assert.Equal(Text(1_200_000, 'y'), (await fx.Store.GetAsync(fx.Table, "p", "task1-part9"))!.GetString("ParametersJson"));
+        Assert.True(await fx.PhysicalRowCountAsync("p") > 2);
+    }
+
+    [Fact]
+    public async Task FilteredQuery_OnASplitEntity_DoesNotReturnNeighboursSharingThePrefix()
+    {
+        await using var fx = await Fixture.TryConnectAsync();
+        if (fx == null) return;
+
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1", Text(1_200_000)));
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1-partner", "small"));
+        await fx.Store.UpsertAsync(fx.Table, Row("p", "task1-part9", Text(1_200_000, 'y')));
+
+        var rows = new List<StoreRow>();
+        await foreach (var r in fx.Store.QueryTableAsync(fx.Table, "PartitionKey eq 'p' and RowKey eq 'task1'")) rows.Add(r);
+
+        Assert.Equal(["task1"], rows.Select(r => r.RowKey));
+        Assert.Equal(Text(1_200_000), rows[0].GetString("ParametersJson"));
+    }
 }

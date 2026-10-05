@@ -80,6 +80,7 @@ public sealed class AzureTableStore : ICraftTableStore
     private TableServiceClient Service => _service ??= new TableServiceClient(_connectionString.Value, _clientOptions);
 
     private static readonly string[] select = new[] { "PartitionKey", "RowKey" };
+    private static readonly string[] PartLookupProperties = ["PartitionKey", "RowKey", EntitySplitter.OriginalEntityIdKey];
 
     public async Task PingAsync(CancellationToken ct = default)
     {
@@ -623,7 +624,10 @@ public sealed class AzureTableStore : ICraftTableStore
                 var filter = $"{partitionClause} and {BuildRowKeyPrefixClause(entityId)}";
                 await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct))
                 {
-                    if (seen.Add((row.PartitionKey, row.RowKey)))
+                    // The prefix range also holds unrelated keys ("task1-partner"); only this entity's rows belong.
+                    var owned = row.RowKey == entityId ||
+                        (row.TryGetValue(EntitySplitter.OriginalEntityIdKey, out var owner) && owner?.ToString() == entityId);
+                    if (owned && seen.Add((row.PartitionKey, row.RowKey)))
                         rows.Add(row);
                 }
             }
@@ -675,11 +679,14 @@ public sealed class AzureTableStore : ICraftTableStore
     private async Task RemoveStalePartRowsAsync(string table, string partitionKey, string originalRowKey,
         HashSet<string> live, CancellationToken ct)
     {
-        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and {EntitySplitter.OriginalEntityIdKey} eq '{Escape(originalRowKey)}'";
+        // A RowKey range is an index seek; filtering on the marker alone scans the whole partition, which
+        // every plain delete paid. The range also catches other keys sharing the prefix, so confirm the owner.
+        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and {BuildRowKeyPrefixClause($"{originalRowKey}-part")}";
         var stale = new List<string>();
-        await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, select: select, cancellationToken: ct))
+        await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, select: PartLookupProperties, cancellationToken: ct))
         {
-            if (!live.Contains(row.RowKey))
+            if (row.TryGetValue(EntitySplitter.OriginalEntityIdKey, out var owner) && owner?.ToString() == originalRowKey
+                && !live.Contains(row.RowKey))
                 stale.Add(row.RowKey);
         }
 
