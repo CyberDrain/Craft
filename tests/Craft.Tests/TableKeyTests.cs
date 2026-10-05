@@ -99,7 +99,7 @@ public class TableKeyTests
             }
             """);
 
-        var rowKey = JobQueueStore.BuildRowKey("UserTaskOrchestrator_No tenant", id);
+        var rowKey = JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "UserTaskOrchestrator_No tenant", id);
 
         Assert.True(TableKeys.IsSafe(rowKey));
     }

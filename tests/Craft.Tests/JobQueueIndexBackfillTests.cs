@@ -87,7 +87,7 @@ public class JobQueueIndexBackfillTests
 
         // The legacy row is gone; one row remains, keyed deterministically and carrying QueuedUtc.
         var only = Assert.Single(rows);
-        Assert.Equal(JobQueueStore.BuildRowKey("run-a", "task-0"), only.RowKey);
+        Assert.Equal(JobQueueStore.BuildRowKey(At(3), "run-a", "task-0"), only.RowKey);
         Assert.Equal(new DateTimeOffset(At(3), TimeSpan.Zero), only.GetDateTimeOffset("QueuedUtc"));
 
         // And it is still claimable, exactly once.

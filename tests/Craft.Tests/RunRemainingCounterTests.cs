@@ -26,7 +26,7 @@ public class RunRemainingCounterTests
     /// </summary>
     internal sealed class ConditionalStore : ICraftTableStore
     {
-        private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<(string, string), StoreRow>> _tables = new();
         private long _etag;
 
         public int ConditionalWrites { get; private set; }
@@ -41,8 +41,8 @@ public class RunRemainingCounterTests
         /// <summary>Awaited at the start of a partition query, with the table name — lets a test hold a read open.</summary>
         public Func<string, Task>? OnPartitionQuery { get; set; }
 
-        private Dictionary<(string, string), StoreRow> Table(string t) =>
-            _tables.TryGetValue(t, out var x) ? x : _tables[t] = new();
+        private System.Collections.Concurrent.ConcurrentDictionary<(string, string), StoreRow> Table(string t) =>
+            _tables.GetOrAdd(t, _ => new());
 
         private StoreRow Stamp(StoreRow row) => new(row.PartitionKey, row.RowKey)
         {
@@ -136,13 +136,13 @@ public class RunRemainingCounterTests
 
         public Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
         {
-            Table(table).Remove((partitionKey, rowKey));
+            Table(table).TryRemove((partitionKey, rowKey), out _);
             return Task.CompletedTask;
         }
 
         public Task DeletePartitionAsync(string table, string partitionKey, CancellationToken ct = default)
         {
-            foreach (var k in Table(table).Keys.Where(k => k.Item1 == partitionKey).ToList()) Table(table).Remove(k);
+            foreach (var k in Table(table).Keys.Where(k => k.Item1 == partitionKey).ToList()) Table(table).TryRemove(k, out _);
             return Task.CompletedTask;
         }
     }

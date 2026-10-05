@@ -12,8 +12,8 @@ namespace Craft.Storage;
 ///
 /// Key design, and it is doing real work:
 ///
-///   PartitionKey "P04"                     — the priority bucket, zero-padded so it sorts numerically.
-///   RowKey "{queuedTicks:D19}-{run}-{task}" — time-ordered within a bucket, unique by construction.
+///   PartitionKey "P04"                        — the priority bucket, zero-padded so it sorts numerically.
+///   RowKey "{runEpochTicks:D19}|{run}|{task}" — oldest run first within a bucket, one row per task.
 ///
 /// Azure Table returns rows ordered by partition key then row key, so a single unfiltered read yields
 /// the highest-priority, oldest-first work FIRST, across every run. That is the cross-run priority
@@ -99,15 +99,25 @@ public sealed class JobQueueStore : IDisposable
     private const string SchemaRowKey = "queue-index";
 
     /// <summary>
+    /// The row in a run's index partition holding the run's queue epoch: the time its first task was queued,
+    /// in whole seconds. Every queue key for the run is prefixed with it, so a bucket drains oldest run
+    /// first, and a re-enqueue of a task builds the same key however much later it happens.
+    /// </summary>
+    private const string EpochRowKey = "$epoch";
+
+    /// <summary>
     /// Current on-disk schema version, applied once per storage account by <see cref="MigrateSchemaAsync"/>:
     ///   1 — the run index exists (see the RUN INDEX note above).
     ///   2 — queue RowKeys are deterministic per (run, task) — <c>{run}|{task}</c> — instead of
     ///       time-prefixed, so re-dispatching a task UPDATES its row instead of writing a second one
     ///       (the duplicate-execution class). Enqueue time moves to the <c>QueuedUtc</c> property.
+    ///   3 — the key gains the run's epoch as a prefix — <c>{epoch}|{run}|{task}</c> — so a bucket drains
+    ///       oldest run first instead of alphabetically by run name, which starved late-sorting runs.
+    ///       Still deterministic per (run, task), because the epoch is stored once per run.
     /// A single forward migration takes any older account straight to this version; there is no
     /// backward-compatible dual-read — after the migration only the new key scheme is used.
     /// </summary>
-    private const int SchemaVersion = 2;
+    private const int SchemaVersion = 3;
 
     /// <summary>
     /// Rows buffered before the backfill flushes. Bounds peak memory on a very large queue — the
@@ -116,6 +126,9 @@ public sealed class JobQueueStore : IDisposable
     /// Rows for one run are written adjacently, so a window this size still groups them in practice.
     /// </summary>
     private const int BackfillFlushThreshold = 5_000;
+
+    /// <summary>Partition writes in flight at once during the migration.</summary>
+    private const int MigrationConcurrency = 16;
 
     public JobQueueStore(ILogger<JobQueueStore> logger, CraftSettings settings, ICraftTableStore store)
     {
@@ -138,18 +151,53 @@ public sealed class JobQueueStore : IDisposable
         "P" + Math.Clamp(priority, 0, MaxPriorityBucket).ToString("D2", CultureInfo.InvariantCulture);
 
     /// <summary>
-    /// The queue RowKey: deterministic per (run, task), so re-dispatching a task upserts its one row
-    /// instead of writing a second, time-prefixed one — the cause of a task running 2-6× (schema v2).
+    /// The queue RowKey: the run's epoch, then the run and task. Deterministic per (run, task) for a given
+    /// run epoch, so re-dispatching a task upserts its one row instead of writing a second (schema v2), and
+    /// ordered oldest run first within a bucket (schema v3). v2's bare <c>{run}|{task}</c> ordered a bucket
+    /// alphabetically, so a run whose name sorted late never ran while earlier-sorting runs kept arriving.
     ///
     /// Both components are escaped so the key is legal and the '|' separator is unambiguous; the row
     /// itself carries RunName/TaskId as properties, so nothing needs to parse the key back apart.
-    ///
-    /// The trade: within a priority bucket Azure now returns rows in run|task order rather than
-    /// oldest-first. Priority still orders across buckets, and a fan-out enqueues its tasks together, so
-    /// sub-priority FIFO fairness is the only thing given up — cheap next to never running a task twice.
     /// </summary>
-    internal static string BuildRowKey(string runName, string taskId) =>
-        $"{EscapeKeyComponent(runName)}|{EscapeKeyComponent(taskId)}";
+    internal static string BuildRowKey(DateTime runEpochUtc, string runName, string taskId) =>
+        $"{runEpochUtc.Ticks.ToString("D19", CultureInfo.InvariantCulture)}|{EscapeKeyComponent(runName)}|{EscapeKeyComponent(taskId)}";
+
+    /// <summary>Whole seconds, so an epoch builds the same key before and after a storage round trip.</summary>
+    internal static DateTime EpochOf(DateTime utc) =>
+        new(utc.Ticks - utc.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc);
+
+    /// <summary>The run epoch a v3 key starts with, or null for an older key.</summary>
+    internal static DateTime? ParseEpoch(string rowKey)
+    {
+        if (rowKey.Length < 21 || rowKey[19] != '|') return null;
+        if (!long.TryParse(rowKey.AsSpan(0, 19), NumberStyles.None, CultureInfo.InvariantCulture, out var ticks))
+            return null;
+        if (ticks <= 0 || ticks > DateTime.MaxValue.Ticks) return null;
+        return new DateTime(ticks, DateTimeKind.Utc);
+    }
+
+    /// <summary>
+    /// The run's stored epoch, or <paramref name="queuedUtc"/> recorded as it on the run's first enqueue.
+    /// ponytail: read-then-write rather than insert-if-absent, so two concurrent FIRST enqueues of one run
+    /// could record different epochs. A run is dispatched from one place and both dispatch and re-drive
+    /// check the index before enqueuing, so this is a narrow window, not a duplicate path.
+    /// </summary>
+    private async Task<DateTime> RunEpochAsync(string runName, DateTime queuedUtc, CancellationToken ct)
+    {
+        var stored = (await _store.GetAsync(_indexTable, IndexPartition(runName), EpochRowKey, ct))
+            ?.GetDateTimeOffset("EpochUtc");
+        if (stored != null) return EpochOf(stored.Value.UtcDateTime);
+
+        var epoch = EpochOf(queuedUtc);
+        await _store.UpsertAsync(_indexTable, EpochRow(runName, epoch), ct);
+        return epoch;
+    }
+
+    private static StoreRow EpochRow(string runName, DateTime epoch) =>
+        new(IndexPartition(runName), EpochRowKey)
+        {
+            Properties = { ["RunName"] = runName, ["EpochUtc"] = new DateTimeOffset(epoch, TimeSpan.Zero) }
+        };
 
     /// <summary>
     /// Escape a run or task id for use inside a queue RowKey: the Azure-illegal key characters plus '|'
@@ -233,7 +281,7 @@ public sealed class JobQueueStore : IDisposable
             Properties = { ["TaskId"] = taskId, ["RunName"] = runName }
         };
 
-    /// <summary>Add one task to the queue. Idempotent for a given (queuedUtc, run, task).</summary>
+    /// <summary>Add one task to the queue. Idempotent per (run, task): the key comes from the run's stored epoch.</summary>
     /// <remarks>
     /// Queue row first, index row second. The queue row is what makes the task actually run; the index
     /// only accelerates lookups. If the process dies between the two the task still executes, and the
@@ -246,7 +294,7 @@ public sealed class JobQueueStore : IDisposable
         CancellationToken ct = default)
     {
         var bucket = Bucket(priority);
-        var rowKey = BuildRowKey(runName, taskId);
+        var rowKey = BuildRowKey(await RunEpochAsync(runName, queuedUtc, ct), runName, taskId);
 
         await _store.UpsertAsync(_queueTable, new StoreRow(bucket, rowKey)
         {
@@ -276,12 +324,15 @@ public sealed class JobQueueStore : IDisposable
     public async Task EnqueueBatchAsync(string runName, IReadOnlyList<(string TaskId, int Priority)> tasks,
         DateTime queuedUtc, CancellationToken ct = default)
     {
+        if (tasks.Count == 0) return;
+
         var indexRows = new List<StoreRow>(tasks.Count);
+        var epoch = await RunEpochAsync(runName, queuedUtc, ct);
 
         foreach (var byBucket in tasks.GroupBy(t => Bucket(t.Priority)))
         {
             var queuedOffset = new DateTimeOffset(queuedUtc, TimeSpan.Zero);
-            var rows = byBucket.Select(t => new StoreRow(byBucket.Key, BuildRowKey(runName, t.TaskId))
+            var rows = byBucket.Select(t => new StoreRow(byBucket.Key, BuildRowKey(epoch, runName, t.TaskId))
             {
                 Properties =
                 {
@@ -297,13 +348,13 @@ public sealed class JobQueueStore : IDisposable
             await _store.UpsertBatchAsync(_queueTable, byBucket.Key, rows, ct);
 
             indexRows.AddRange(byBucket.Select(t =>
-                IndexRow(runName, t.TaskId, byBucket.Key, BuildRowKey(runName, t.TaskId))));
+                IndexRow(runName, t.TaskId, byBucket.Key, BuildRowKey(epoch, runName, t.TaskId))));
         }
 
         if (indexRows.Count > 0)
             await _store.UpsertBatchAsync(_indexTable, IndexPartition(runName), indexRows, ct);
 
-        if (tasks.Count > 0) WakePump();
+        WakePump();
     }
 
     /// <summary>A queued task this worker now owns, with the row key needed to release it.</summary>
@@ -817,6 +868,7 @@ public sealed class JobQueueStore : IDisposable
         var migrated = 0;
         var rekeyed = 0;
         var skipped = 0;
+        var epochs = new Dictionary<string, DateTime>(StringComparer.Ordinal);
 
         static void AddRow(Dictionary<string, List<StoreRow>> map, string key, StoreRow row)
         {
@@ -829,18 +881,22 @@ public sealed class JobQueueStore : IDisposable
             list.Add(rowKey);
         }
 
+        // Chunked to a transaction's worth, so the one big bucket partition goes in parallel too.
+        Task EachAsync<T>(Dictionary<string, List<T>> map, Func<string, IReadOnlyList<T>, Task> write) =>
+            Parallel.ForEachAsync(map.SelectMany(kv => kv.Value.Chunk(100).Select(c => (kv.Key, c))),
+                new ParallelOptions { MaxDegreeOfParallelism = MigrationConcurrency, CancellationToken = ct },
+                async (part, _) => await write(part.Key, part.c));
+
         async Task FlushAsync()
         {
             // New rows first, so a crash before the deletes leaves BOTH and the re-run converges — never
-            // the index advertising a queue row that no longer exists.
-            foreach (var (bucket, rows) in newQueue)
-                await _store.UpsertBatchAsync(_queueTable, bucket, rows, ct);
-            foreach (var (partition, rows) in newIndex)
-                await _store.UpsertBatchAsync(_indexTable, partition, rows, ct);
-            foreach (var (bucket, keys) in oldQueue)
-                await _store.DeleteBatchAsync(_queueTable, bucket, keys, ct);
-            foreach (var (partition, keys) in oldIndex)
-                await _store.DeleteBatchAsync(_indexTable, partition, keys, ct);
+            // the index advertising a queue row that no longer exists. Within a phase the partitions are
+            // independent, and the index has one per run, so they go in parallel: one at a time, a
+            // 16k-run backlog was ~32k sequential round trips while the pump waited to claim.
+            await EachAsync(newQueue, (bucket, rows) => _store.UpsertBatchAsync(_queueTable, bucket, rows, ct));
+            await EachAsync(newIndex, (partition, rows) => _store.UpsertBatchAsync(_indexTable, partition, rows, ct));
+            await EachAsync(oldQueue, (bucket, keys) => _store.DeleteBatchAsync(_queueTable, bucket, keys, ct));
+            await EachAsync(oldIndex, (partition, keys) => _store.DeleteBatchAsync(_indexTable, partition, keys, ct));
 
             migrated += buffered;
             newQueue.Clear(); newIndex.Clear(); oldQueue.Clear(); oldIndex.Clear();
@@ -854,8 +910,17 @@ public sealed class JobQueueStore : IDisposable
             if (string.IsNullOrEmpty(runName) || string.IsNullOrEmpty(taskId)) { skipped++; continue; }
 
             var bucket = row.PartitionKey;
-            var newKey = BuildRowKey(runName, taskId);
             var runPartition = IndexPartition(runName);
+
+            // One epoch per run. Rows already on a v3 key (a re-run after a crash) sort ahead of the run's
+            // unmigrated rows in the scan, so their epoch is seen first and the rest follow it.
+            if (!epochs.TryGetValue(runName, out var epoch))
+            {
+                epoch = ParseEpoch(row.RowKey) ?? EpochOf(QueuedUtcOf(row));
+                epochs[runName] = epoch;
+                AddRow(newIndex, runPartition, EpochRow(runName, epoch));
+            }
+            var newKey = BuildRowKey(epoch, runName, taskId);
 
             // The new-scheme row: same bucket + claim state + priority, key deterministic, enqueue time as
             // a property (from the row, or the legacy key, or now).

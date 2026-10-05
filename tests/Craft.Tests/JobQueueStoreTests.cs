@@ -196,9 +196,9 @@ public class JobQueueStoreTests
     {
         // Schema v2: the key is a function of (run, task) only, so re-dispatching a task upserts its one
         // row instead of writing a second, time-prefixed one — the duplicate-execution class.
-        Assert.Equal(JobQueueStore.BuildRowKey("r", "t"), JobQueueStore.BuildRowKey("r", "t"));
-        Assert.NotEqual(JobQueueStore.BuildRowKey("r", "t1"), JobQueueStore.BuildRowKey("r", "t2"));
-        Assert.NotEqual(JobQueueStore.BuildRowKey("r1", "t"), JobQueueStore.BuildRowKey("r2", "t"));
+        Assert.Equal(JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r", "t"), JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r", "t"));
+        Assert.NotEqual(JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r", "t1"), JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r", "t2"));
+        Assert.NotEqual(JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r1", "t"), JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "r2", "t"));
     }
 
     [Fact]
@@ -217,10 +217,10 @@ public class JobQueueStoreTests
     {
         // The '|' separator and '%' escape are themselves escaped, so "a|b"+"c" and "a"+"b|c" cannot
         // collide onto one row.
-        Assert.NotEqual(JobQueueStore.BuildRowKey("a|b", "c"), JobQueueStore.BuildRowKey("a", "b|c"));
+        Assert.NotEqual(JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "a|b", "c"), JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "a", "b|c"));
 
         // An illegal character in a component is escaped away, keeping the key legal for Azure Table.
-        var key = JobQueueStore.BuildRowKey("run", "Owner/Repo - No tenant");
+        var key = JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "run", "Owner/Repo - No tenant");
         Assert.DoesNotContain(key, c => c is '/' or '\\' or '#' or '?' || char.IsControl(c));
     }
 

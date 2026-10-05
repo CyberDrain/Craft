@@ -50,11 +50,11 @@ public class JobQueueDispatchableTests
     {
         var (queue, backing) = NewQueue();
         await queue.InitializeAsync();
-        await queue.EnqueueBatchAsync("R", [("a", 4), ("b", 4)], DateTime.UtcNow);
+        await queue.EnqueueBatchAsync("R", [("a", 4), ("b", 4)], DateTime.UnixEpoch);
 
         // Delete ONLY b's queue row, leaving its index row — the exact divergence a crash between the
         // two deletes, or a run carried in from a pre-pump build, leaves behind.
-        await backing.DeleteAsync(QueueTable, JobQueueStore.Bucket(4), JobQueueStore.BuildRowKey("R", "b"));
+        await backing.DeleteAsync(QueueTable, JobQueueStore.Bucket(4), JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "R", "b"));
 
         // The index — what the old re-drive trusted — still reports both as queued.
         var indexView = await queue.GetQueuedTaskIdsAsync("R");
@@ -72,11 +72,11 @@ public class JobQueueDispatchableTests
     {
         var (queue, backing) = NewQueue();
         await queue.InitializeAsync();
-        await queue.EnqueueBatchAsync("R", [("a", 4)], DateTime.UtcNow);
+        await queue.EnqueueBatchAsync("R", [("a", 4)], DateTime.UnixEpoch);
 
         // Owned with no LeaseUntil: neither "Owner eq ''" nor "LeaseUntil lt now", so the claim filter
         // can never match it and the pump will never dispatch it — a ghost as surely as a missing row.
-        var key = JobQueueStore.BuildRowKey("R", "a");
+        var key = JobQueueStore.BuildRowKey(DateTime.UnixEpoch, "R", "a");
         var row = await backing.GetAsync(QueueTable, JobQueueStore.Bucket(4), key);
         Assert.NotNull(row);
         row!["Owner"] = "dead-instance";
