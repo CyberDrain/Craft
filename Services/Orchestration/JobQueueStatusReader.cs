@@ -140,15 +140,21 @@ public class JobQueueStatusReader : IDisposable
         var snap = await GetAsync(ct: ct);
         if (snap == null) return summary;
 
-        // Waiting in storage = everything outstanding less what this process holds now (its queued and running
-        // orchestrator jobs). Using the snapshot's own subtraction would count claims made since it was taken twice.
-        var held = _jobs.GetJobs().Count(j => j.RunName != null && j.Status is "Queued" or "Running");
-        summary.QueuedDurable = Math.Max(0, snap.Total - held);
+        summary.QueuedDurable = WaitingInStorage(snap);
         summary.Queued += summary.QueuedDurable;
         if (snap.OldestUnclaimedUtc is { } oldest && (summary.OldestQueuedUtc == null || oldest < summary.OldestQueuedUtc))
             summary.OldestQueuedUtc = oldest;
         return summary;
     }
+
+    /// <summary>
+    /// Tasks waiting in storage, unclaimed: everything the snapshot found outstanding, less what this process holds
+    /// now (its queued and running orchestrator jobs). The snapshot's own <see cref="QueueSnapshot.Unclaimed"/>
+    /// subtracted what was held when it was taken, so adding it to a live local count double-counts every claim
+    /// made since (seen live: 202 queued on a 200-task run). Every merged count goes through here.
+    /// </summary>
+    public int WaitingInStorage(QueueSnapshot snap) =>
+        Math.Max(0, snap.Total - _jobs.GetJobs().Count(j => j.RunName != null && j.Status is "Queued" or "Running"));
 
     /// <summary>Local job records plus the head of the durable queue, for the job listing.</summary>
     public async Task<List<JobDetail>> GetJobDetailsAsync(string? runName = null, string? status = null,

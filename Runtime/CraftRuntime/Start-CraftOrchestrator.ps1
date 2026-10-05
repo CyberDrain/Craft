@@ -162,6 +162,12 @@ function Start-CraftOrchestrator {
     $Sequential = [bool]($InputObject.Sequential)
     $MaxConcurrency = [int]($InputObject.MaxConcurrency ?? 0)
     $StopOnFailure = [bool]($InputObject.StopOnFailure)
+    if ($Sequential -and $MaxConcurrency -gt 0) {
+        Write-Warning "Craft: MaxConcurrency is ignored for '$OrchestratorName': a sequential run already runs one step at a time"
+    }
+    if ($StopOnFailure -and -not $Sequential) {
+        Write-Warning "Craft: StopOnFailure is ignored for '$OrchestratorName': it applies to sequential runs only"
+    }
 
     Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(

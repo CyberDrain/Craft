@@ -439,13 +439,15 @@ Invoke-OrchCheck 'status' {
       if ($Sm.total -ne 200 -or ($Sm.completed + $Sm.queued + $Sm.running) -gt $Sm.total) {
         $Bad.Add("t=$([math]::Round($Sw.Elapsed.TotalSeconds,1))s total=$($Sm.total) c=$($Sm.completed) q=$($Sm.queued) r=$($Sm.running)")
       }
-      if (($G.jobsQueued + $G.jobsActive) -gt 200) { $SumBad.Add("q=$($G.jobsQueued) a=$($G.jobsActive)") }
+      # The global summary also counts unrelated local work (the e2e timer, leftovers of other checks), so bound
+      # the durable part: what is waiting in storage can never exceed this run's 200 tasks.
+      if ($G.jobsQueuedDurable -gt 200 -or ($G.jobsQueued - $G.jobsQueuedLocal) -ne $G.jobsQueuedDurable) { $SumBad.Add("q=$($G.jobsQueued) local=$($G.jobsQueuedLocal) durable=$($G.jobsQueuedDurable) a=$($G.jobsActive)") }
     }
     Start-Sleep -Milliseconds 400
   }
   $Done = (Get-OrchRuns $Name)[0]
   Add-Result 'orch-status' 'summaries-consistent' ($Samples -ge 5 -and $Bad.Count -eq 0) "$Samples samples" "in-flight samples=$Samples violations=$($Bad.Count) $(@($Bad | Select-Object -First 3) -join ' | ')"
-  Add-Result 'orch-status' 'summary-bounded' ($Samples -ge 5 -and $SumBad.Count -eq 0) '-' "GetSummary queued+active > batch in $($SumBad.Count) samples $(@($SumBad | Select-Object -First 3) -join ' | ')"
+  Add-Result 'orch-status' 'summary-bounded' ($Samples -ge 5 -and $SumBad.Count -eq 0) '-' "GetSummary durable queue > batch in $($SumBad.Count) samples $(@($SumBad | Select-Object -First 3) -join ' | ')"
   $Left = Wait-Orch {
     $Sm = (Invoke-OrchBridge 'summaries' $Name).runs | Select-Object -First 1
     if ((-not $Sm -or ($Sm.queued + $Sm.running) -eq 0) -and (Invoke-OrchBridge 'active' $Name).active -eq $false) { $true }

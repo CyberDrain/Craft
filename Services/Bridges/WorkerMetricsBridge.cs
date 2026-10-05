@@ -223,12 +223,13 @@ public static class WorkerMetricsBridge
             // the durable queue table. GetCached never blocks: a stale/missing snapshot kicks off a
             // background refresh and this poll reports what is known now.
             var durable = s_queueReader?.GetCached();
+            var waiting = durable == null ? 0 : s_queueReader!.WaitingInStorage(durable);
 
             snapshot.Jobs = new JobMetrics
             {
-                Queued = summary.Queued + (durable?.Unclaimed ?? 0),
+                Queued = summary.Queued + waiting,
                 QueuedLocal = summary.Queued,
-                QueuedDurable = durable?.Unclaimed ?? 0,
+                QueuedDurable = waiting,
                 Running = summary.Running,
                 Completed = summary.Completed,
                 Failed = summary.Failed,
@@ -590,7 +591,8 @@ public static class WorkerMetricsBridge
     /// <summary>Get a summary of just the busy/available counts.</summary>
     public static WorkerSummary GetSummary()
     {
-        var durable = s_queueReader?.GetCached();
+        var snapshot = s_queueReader?.GetCached();
+        var waiting = snapshot == null ? 0 : s_queueReader!.WaitingInStorage(snapshot);
         var localQueued = s_jobManager?.QueuedCount ?? 0;
 
         return new WorkerSummary
@@ -605,9 +607,9 @@ public static class WorkerMetricsBridge
             LimiterWaiting = s_limiter?.Waiting ?? 0,
             LimiterMax = s_limiter?.CurrentMax ?? 0,
             IsHttpThrottled = s_limiter?.IsHttpThrottled ?? false,
-            JobsQueued = localQueued + (durable?.Unclaimed ?? 0),
+            JobsQueued = localQueued + waiting,
             JobsQueuedLocal = localQueued,
-            JobsQueuedDurable = durable?.Unclaimed ?? 0,
+            JobsQueuedDurable = waiting,
             JobsActive = s_jobManager?.ActiveCount ?? 0,
         };
     }
