@@ -305,6 +305,17 @@ public class WorkPump : BackgroundService
                 continue;
             }
 
+            // A run being cancelled: claiming its pending tasks would only race the cancel. Cancel a page of them instead,
+            // so a cancel interrupted part-way still finishes; its aggregation runs once it falls due.
+            if (header.CancelRequested && header.Phase == RunPhase.Tasks)
+            {
+                var (cancelled, _) = _store.IsCancelling(header.RunKey)
+                    ? (0, null)
+                    : await _store.CancelPendingAsync(header.RunKey, maxPages: 1, ct: ct);
+                if (cancelled == 0) _skip[header.RunKey] = (entry.Done, entry.Total, DateTime.MaxValue, 0);
+                continue;
+            }
+
             IReadOnlyList<WorkStore.ClaimedTask> claims;
             var probe = new WorkStore.ClaimProbe();
             if (header.Sequential)

@@ -535,7 +535,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         if (current.StopOnFailure)
                         {
                             _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — stopping the run", step.TaskId);
-                            await _store.CancelPendingAsync(header.RunKey, WorkStore.StoppedReason(step.TaskId), jobCt);
+                            await _store.CancelPendingAsync(header.RunKey, WorkStore.StoppedReason(step.TaskId), ct: jobCt);
                             break;
                         }
                         _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", step.TaskId);
@@ -587,7 +587,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
         foreach (var header in runs)
         {
             await _store.RequestCancelAsync(header.RunKey);
-            var (cancelled, _) = await _store.CancelPendingAsync(header.RunKey);
+            await _store.CancelPendingAsync(header.RunKey);
+            // The pump cancels pages of a cancelled run too, so count what the run records, not what this call did.
+            var cancelled = ((await _store.GetRunAsync(header.RunKey))?.Cancelled ?? header.Cancelled) - header.Cancelled;
             total += cancelled;
             _logger.LogInformation("[Scheduler] Run {Name} cancelled: {Cancelled} pending tasks cancelled", header.Name, cancelled);
         }

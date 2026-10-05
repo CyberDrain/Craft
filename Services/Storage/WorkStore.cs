@@ -394,7 +394,7 @@ public sealed class WorkStore
             await FinishAsync(runKey, [new Finish(seq, "Failed", $"Interrupted {attempt - 1} times without completing")], 'R', ct);
             if (header.StopOnFailure)
             {
-                await CancelPendingAsync(runKey, StoppedReason(row.GetString("TaskId")), ct);
+                await CancelPendingAsync(runKey, StoppedReason(row.GetString("TaskId")), ct: ct);
                 return null;
             }
             return await ClaimSequentialAsync(runKey, owner, lease, continuing, othersAreDead, ct);
@@ -505,11 +505,14 @@ public sealed class WorkStore
         return outcome;
     }
 
+    /// <param name="known">Rows the caller has just read (by seq), used on the first attempt instead of reading each
+    /// one again; the transaction is still guarded by their ETags, and a retry reads afresh.</param>
     private async Task<FinishOutcome?> FinishChunkAsync(string runKey, IReadOnlyList<Finish> chunk, char? fromState,
-        CancellationToken ct)
+        CancellationToken ct, Dictionary<int, StoreRow>? known = null)
     {
         for (var attempt = 0; attempt < ConflictRetries; attempt++)
         {
+            if (attempt > 0) known = null;
             var headerRow = await _store.GetAsync(_work, runKey, HeaderKey, ct);
             if (headerRow == null) return null;
             var header = RunHeader.FromRow(headerRow);
@@ -535,8 +538,8 @@ public sealed class WorkStore
                     continue;
                 }
 
-                StoreRow? row = null;
-                foreach (var state in fromState is { } s ? [s] : new[] { 'R', 'P' })
+                StoreRow? row = known != null && known.TryGetValue(f.Seq, out var seenRow) ? seenRow : null;
+                foreach (var state in row != null ? [] : fromState is { } s ? [s] : new[] { 'R', 'P' })
                 {
                     row = await _store.GetAsync(_work, runKey, Key(state, f.Seq), ct);
                     if (row != null) break;
@@ -703,22 +706,60 @@ public sealed class WorkStore
     // ── cancel ──
 
     /// <summary>Cancel every pending task of a run. Running tasks finish; the barrier then fires as usual.</summary>
+    private readonly ConcurrentDictionary<string, int> _cancelling = new(StringComparer.Ordinal);
+
+    /// <summary>Whether a full cancel of the run is in progress in this process (the scheduler leaves it alone).</summary>
+    public bool IsCancelling(string runKey) => _cancelling.ContainsKey(runKey);
+
+    /// <param name="maxPages">Pages of up to 49 to cancel before returning; the scheduler does one per visit to finish
+    /// a cancel that was interrupted. A full cancel (no bound) marks the run as being cancelled while it works.</param>
     public async Task<(int Cancelled, FinishOutcome? Outcome)> CancelPendingAsync(string runKey,
-        string reason = "Cancelled by user", CancellationToken ct = default)
+        string reason = "Cancelled by user", int maxPages = int.MaxValue, CancellationToken ct = default)
+    {
+        if (maxPages != int.MaxValue) return await CancelPagesAsync(runKey, reason, maxPages, ct);
+        _cancelling.AddOrUpdate(runKey, 1, (_, n) => n + 1);
+        try
+        {
+            return await CancelPagesAsync(runKey, reason, maxPages, ct);
+        }
+        finally
+        {
+            if (_cancelling.AddOrUpdate(runKey, 0, (_, n) => n - 1) <= 0) _cancelling.TryRemove(runKey, out _);
+        }
+    }
+
+    private async Task<(int Cancelled, FinishOutcome? Outcome)> CancelPagesAsync(string runKey, string reason, int maxPages,
+        CancellationToken ct)
     {
         var cancelled = 0;
+        var idle = 0;
         FinishOutcome? outcome = null;
-        while (true)
+        for (var pages = 0; pages < maxPages; pages++)
         {
             var page = new List<Finish>();
+            var rows = new Dictionary<int, StoreRow>();
             await foreach (var r in Range(runKey, 'P', MaxPerTransaction, ct: ct))
-                if (SeqOf(r.RowKey) != AggregateSeq) page.Add(new Finish(SeqOf(r.RowKey), "Cancelled", reason));
+            {
+                var seq = SeqOf(r.RowKey);
+                if (seq == AggregateSeq) continue;
+                page.Add(new Finish(seq, "Cancelled", reason));
+                rows[seq] = r;
+            }
             if (page.Count == 0) return (cancelled, outcome);
-            var result = await FinishAsync(runKey, page, 'P', ct);
-            if (result == null || result.Applied == 0) return (cancelled, outcome);
+            var result = await FinishChunkAsync(runKey, page, 'P', ct, rows);
+            if (result == null) return (cancelled, outcome);
+            // Nothing applied means another writer cancelled (or claimed) this page first, not that none is left:
+            // only an empty pending range ends the loop. Bounded, so rows that somehow cannot be cancelled do not spin.
+            if (result.Applied == 0)
+            {
+                if (++idle >= 3) return (cancelled, outcome);
+                continue;
+            }
+            idle = 0;
             cancelled += result.Applied;
             outcome = result;
         }
+        return (cancelled, outcome);
     }
 
     // ── the instance lock ──

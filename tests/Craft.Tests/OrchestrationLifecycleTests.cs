@@ -167,6 +167,72 @@ public class OrchestrationLifecycleTests
         Assert.Empty(await h.ReadyNamesAsync());
     }
 
+    // ── bulk cancel ──
+
+    /// <summary>
+    /// Cancelling a big backlog while the pump is working. The pump once kept claiming the run's tasks during the
+    /// cancel (each cancelled page woke it), so the two fought over the same rows and the run header: the call took
+    /// tens of seconds, under-reported, and could give up on lost races. Now the pump leaves a run being
+    /// cancelled alone, and the cancel reuses the rows it has just read.
+    /// </summary>
+    [Fact]
+    public async Task CancellingABigBacklogWithThePumpRunning_CancelsEveryPendingTask_AndReportsTheTrueCount()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync(poolSize: 4);
+        h.Svc.HoldMs = 200;
+        h.Svc.MarkRecoveryDone();
+        await h.Pump.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await h.Start("Backlog", Batch(5000, "b")));
+            Assert.True(await h.DriveUntil(() => Task.FromResult(h.Svc.Started.Count >= 4)));
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (found, cancelled) = await h.Svc.CancelRunAsync("Backlog");
+            sw.Stop();
+
+            var run = (await h.Store.GetRunByNameAsync("Backlog"))!;
+            Assert.True(found);
+            Assert.Equal(run.Cancelled, cancelled);
+            Assert.Empty(await h.Store.GetTasksAsync(run.RunKey, 'P'));
+            Assert.True(cancelled >= 5000 - h.Svc.Started.Count - 8, $"cancelled {cancelled}, started {h.Svc.Started.Count}");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(20), $"cancelling 5,000 took {sw.Elapsed.TotalSeconds:F1}s");
+        }
+        finally
+        {
+            await h.Pump.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ACancelInterruptedAfterItsFlag_IsFinishedByThePump()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync(poolSize: 4);
+        Assert.True(await h.Start("Interrupted", Batch(300, "i"), "Agg"));
+        var run = (await h.Store.GetRunByNameAsync("Interrupted"))!;
+        await h.Store.RequestCancelAsync(run.RunKey);             // the process died before cancelling anything
+
+        Assert.True(await h.DriveUntilFinished("Interrupted", 30_000));
+        var after = (await h.Store.GetRunByNameAsync("Interrupted"))!;
+        Assert.Equal(300, after.Cancelled);
+        Assert.Empty(h.Svc.Started);
+        Assert.Single(h.Svc.PostExecs);
+    }
+
+    [Fact]
+    public async Task ABulkCancel_ReusesTheRowsItReads_RatherThanReadingEachAgain()
+    {
+        var count = new CountingTableStore(new MemoryTableStore());
+        await using var h = await OrchestrationHarness.CreateAsync(tables: count);
+        Assert.True(await h.Start("Cheap", Batch(4900, "c")));
+        count.Reset();
+
+        Assert.Equal(4900, (await h.Svc.CancelRunAsync("Cheap")).cancelledCount);
+
+        // 100 pages: the header before and after each, never one read per cancelled task.
+        Assert.InRange(count.For("OrchestratorWork").PointReads, 0, 400);
+    }
+
     // ── startup and cleanup ──
 
     [Fact]

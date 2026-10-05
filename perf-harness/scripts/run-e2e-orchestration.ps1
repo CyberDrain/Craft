@@ -20,11 +20,14 @@
 # Azurite) on craft:orch-v2-a4d72cf: 2x the median. Short tasks are bounded by the pump (about BgPoolSize claims
 # per 1s poll, so ~4 tasks/s here), which is what the fan-out numbers measure.
 $OrchGates = @{
-  Fanout1000Sec  = 510    # 1,000 no-op tasks + PostExecution, enqueue -> PostExecution ran (median 255s)
-  ManyRuns300Sec = 160    # 300 single-task runs queued at once, enqueue -> all 300 Done (median 79s)
-  Ttfs5000Ms     = 3800   # 5,000-task run on a warm pump, enqueue -> first task started (median 1.9s)
+  # Provisional after the pump wake-up and bulk-cancel fixes (2026-10-06, one run: 15.6s / 9s / 1371ms / 238MB /
+  # 84ms; cancel-5000 measured after the fix). About 2.5x the measured value; re-calibrate from 3 runs.
+  Fanout1000Sec  = 40     # 1,000 no-op tasks + PostExecution, enqueue -> PostExecution ran
+  ManyRuns300Sec = 25     # 300 single-task runs queued at once, enqueue -> all 300 Done
+  Ttfs5000Ms     = 3500   # 5,000-task run on a warm pump, enqueue -> first task started
   RssMB          = 470    # SUT RSS after the perf runs (median 233MB)
-  IdleClaimMs    = 12000  # run queued into an idle engine -> first start (idle poll cap 10s + slack); not calibrated
+  IdleClaimMs    = 1500   # run queued into an idle engine -> first start (the pump wakes on a new run)
+  Cancel5000Sec  = 30     # CancelRun on a 5,000-task run -> run finished with every pending task cancelled
 }
 
 $OrchSkipped = @{}
@@ -550,10 +553,13 @@ Invoke-OrchCheck 'perf' {
   $W5k = Wait-Orch { $S = Get-OrchSummary $Ns; if ($S['tf5k'].tasks -ge 1) { $S['tf5k'] } } 180 100
   $Ttfs5k = if ($W5k.ok) { ConvertTo-OrchMs ($W5k.value.minStart - $E5k.enqueueTicks) } else { -1 }
   Add-Result 'orch-perf' 'ttfs-5000' ($W5k.ok -and $Ttfs5k -le $OrchGates.Ttfs5000Ms) "${Ttfs5k}ms" "enqueue->first task start: 5,000-task run ${Ttfs5k}ms vs 10-task run ${Ttfs10}ms (x$([math]::Round($Ttfs5k / [math]::Max(1, $Ttfs10), 1))); gate $($OrchGates.Ttfs5000Ms)ms"
+  $CancelSw = [Diagnostics.Stopwatch]::StartNew()
   $Cancelled = (Invoke-OrchBridge 'cancel' "E2ETf5k-$Id").cancelled
-  $D = Wait-OrchRunsDone "E2ETf5k-$Id" 1 240 2000
+  $D = Wait-OrchRunsDone "E2ETf5k-$Id" 1 240 500
+  $CancelSec = [math]::Round($CancelSw.Elapsed.TotalSeconds, 1)
   $H = (Get-OrchRuns "E2ETf5k-$Id")[0]
-  Add-Result 'orch-perf' 'cancel-5000' ($D.ok -and $H.status -eq 'CompletedWithErrors' -and $H.done -eq 5000 -and $H.cancelled -gt 0) "$($D.sec)s" "CancelRun returned $Cancelled; run=$($H.status) done=$($H.done)/$($H.total) cancelled=$($H.cancelled)"
+  # CancelRun reports what the run records, so it must match the header (it once returned 0 while 4,995 were cancelled).
+  Add-Result 'orch-perf' 'cancel-5000' ($D.ok -and $H.status -eq 'CompletedWithErrors' -and $H.done -eq 5000 -and $H.cancelled -gt 0 -and [int]$Cancelled -eq [int]$H.cancelled -and $CancelSec -le $OrchGates.Cancel5000Sec) "${CancelSec}s" "CancelRun returned $Cancelled; run=$($H.status) done=$($H.done)/$($H.total) cancelled=$($H.cancelled); gate $($OrchGates.Cancel5000Sec)s"
   $null = Invoke-OrchGet "/API/PerfE2EState?ns=$Ns&wipe=1"
 
   Start-Sleep -Seconds 5
@@ -601,4 +607,4 @@ Invoke-OrchCheck 'restart' {
   Add-Result 'orch-restart' 'postexec-once' ($P.Count -eq 1 -and $P[0].lines -eq $N -and $H.postExecStatus -eq 'Completed') '-' "posts=$($P.Count) lines=$($P[0].lines) postExec=$($H.postExecStatus)"
 }
 
-Info ("orchestration gates: fanout-1000 <= {0}s, runs-300 <= {1}s, ttfs-5000 <= {2}ms, rss <= {3}MB, idle claim <= {4}ms" -f $OrchGates.Fanout1000Sec, $OrchGates.ManyRuns300Sec, $OrchGates.Ttfs5000Ms, $OrchGates.RssMB, $OrchGates.IdleClaimMs)
+Info ("orchestration gates: fanout-1000 <= {0}s, runs-300 <= {1}s, ttfs-5000 <= {2}ms, rss <= {3}MB, idle claim <= {4}ms, cancel-5000 <= {5}s" -f $OrchGates.Fanout1000Sec, $OrchGates.ManyRuns300Sec, $OrchGates.Ttfs5000Ms, $OrchGates.RssMB, $OrchGates.IdleClaimMs, $OrchGates.Cancel5000Sec)
