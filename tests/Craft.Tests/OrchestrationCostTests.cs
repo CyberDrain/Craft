@@ -229,6 +229,45 @@ public class OrchestrationCostTests(ITestOutputHelper output)
         Assert.Equal(20, await s.SweepFinishedAsync(TimeSpan.Zero));
     }
 
+    [Fact]
+    public async Task AWholeFanOut_CostsAFewTableCallsPerTask_EndToEnd()
+    {
+        var count = new CountingTableStore(new MemoryTableStore());
+        await using var h = await OrchestrationHarness.CreateAsync(poolSize: 8, tables: count);
+        count.Reset();
+        Assert.True(await h.Start("Throughput", OrchestrationHarness.Batch(1_000, "t"), "Agg"));
+
+        Assert.True(await h.DriveUntilFinished("Throughput", 60_000));
+        var t = count.Total();
+        output.WriteLine($"1,000-task fan-out end to end: {t}  work {count.For(Work)}");
+        // Measured: see the output line. Bounds leave headroom for scheduling noise, not for a new per-task call.
+        Assert.InRange(t.Submits / 1000.0, 0, PerTaskSubmits);
+        Assert.InRange(t.PointReads / 1000.0, 0, PerTaskPointReads);
+        Assert.InRange(t.Queries / 1000.0, 0, PerTaskQueries);
+        Assert.InRange((t.Upserts + t.BatchUpserts) / 1000.0, 0, PerTaskWrites);
+    }
+
+    [Fact]
+    public async Task ManySmallRuns_CostAFewTableCallsPerRun_EndToEnd()
+    {
+        var count = new CountingTableStore(new MemoryTableStore());
+        await using var h = await OrchestrationHarness.CreateAsync(poolSize: 8, tables: count);
+        count.Reset();
+        for (var i = 0; i < 300; i++) Assert.True(await h.Start($"Small{i}", OrchestrationHarness.Batch(1, $"s{i}_")));
+
+        Assert.True(await h.DriveUntilAllFinished(60_000));
+        var t = count.Total();
+        output.WriteLine($"300 single-task runs end to end: {t}");
+        Assert.InRange((t.Submits + t.PointReads + t.Queries + t.Upserts + t.BatchUpserts + t.Deletes) / 300.0, 0, PerSmallRunCalls);
+    }
+
+    // Measured 2026-10-06 (three runs, steady): per task 0.25 transactions (claims and finishes batched),
+    // 3.66 point reads (header and payload at dispatch, the claimed row and header at finish), 0.39 queries and
+    // 1.13 writes (each task's result row for the aggregation, plus a Ready update per finish batch); per
+    // single-task run 21.5 calls in all. Bounds are about 1.5x.
+    private const double PerTaskSubmits = 0.4, PerTaskPointReads = 5.5, PerTaskQueries = 0.6, PerTaskWrites = 1.7,
+        PerSmallRunCalls = 32;
+
     /// <summary>
     /// The case that wedges a big instance: thousands of runs that have nothing to claim (waiting on children,
     /// or on claims held elsewhere) sit ahead of one run that does. The pump gives each run it looks at a
