@@ -337,13 +337,16 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             if (prof) buildTicks = System.Diagnostics.Stopwatch.GetTimestamp() - bStart;
 
             var rStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            var asyncResult = _pwsh.BeginInvoke();
-            var results = await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
+            // A fresh output collection per invocation: after an invocation that threw, the PowerShell object's
+            // own output buffer comes back null from the next EndInvoke, silently dropping that call's output.
+            using var outputs = new PSDataCollection<PSObject>();
+            var asyncResult = _pwsh.BeginInvoke<PSObject, PSObject>(null, outputs);
+            await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
             ct.ThrowIfCancellationRequested();
             if (prof) runTicks = System.Diagnostics.Stopwatch.GetTimestamp() - rStart;
 
             var cpStart = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            var coll = new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+            var coll = new Collection<PSObject>(outputs.ReadAll());
             if (prof) copyTicks = System.Diagnostics.Stopwatch.GetTimestamp() - cpStart;
             return coll;
         }
@@ -382,11 +385,13 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             if (ct.CanBeCanceled)
                 registration = ct.Register(() => _pwsh.Stop());
 
-            var asyncResult = _pwsh.BeginInvoke();
-            var results = await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
+            // A fresh output collection per invocation; see InvokeAsync.
+            using var outputs = new PSDataCollection<PSObject>();
+            var asyncResult = _pwsh.BeginInvoke<PSObject, PSObject>(null, outputs);
+            await Task.Factory.FromAsync(asyncResult, _pwsh.EndInvoke);
 
             ct.ThrowIfCancellationRequested();
-            return new Collection<PSObject>(results?.ToList() ?? new List<PSObject>());
+            return new Collection<PSObject>(outputs.ReadAll());
         }
         catch (PipelineStoppedException) when (ct.IsCancellationRequested)
         {
