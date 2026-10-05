@@ -113,6 +113,8 @@ public class OrchestratorSequentialTests
         Set(svc, "_requeueFailures", new ConcurrentDictionary<string, int>());
         Set(svc, "_deferrals", NewFieldDict(svc, "_deferrals"));
         Set(svc, "_redriveBackoff", NewFieldDict(svc, "_redriveBackoff"));
+        Set(svc, "_redriveInFlight", NewFieldDict(svc, "_redriveInFlight"));
+        Set(svc, "_redriveSlots", new SemaphoreSlim(8, 8));
         Set(svc, "_shedParameters", false);
         Set(svc, "_redriveBackoffEnabled", false); // pin the sequential logic, not the backoff timing
         Set(svc, "_redriveBase", TimeSpan.FromSeconds(60));

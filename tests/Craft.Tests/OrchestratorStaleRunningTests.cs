@@ -85,6 +85,8 @@ public class OrchestratorStaleRunningTests
         Set(svc, "_requeueFailures", new ConcurrentDictionary<string, int>());
         Set(svc, "_deferrals", NewFieldValue(svc, "_deferrals"));
         Set(svc, "_redriveBackoff", NewFieldValue(svc, "_redriveBackoff"));
+        Set(svc, "_redriveInFlight", NewFieldValue(svc, "_redriveInFlight"));
+        Set(svc, "_redriveSlots", new SemaphoreSlim(8, 8));
         Set(svc, "_shedParameters", false);
         var jm = (JobManager)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(JobManager));
         var jobsField = typeof(JobManager).GetField("_jobs", BindingFlags.NonPublic | BindingFlags.Instance)!;

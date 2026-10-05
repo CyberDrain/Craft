@@ -25,7 +25,7 @@ namespace Craft.Orchestration;
 ///   6. After 3 interruptions (host crash/reboot), a task is marked Failed
 ///   7. PostExecStatus tracks PostExecution lifecycle for crash resilience
 /// </summary>
-public class OrchestratorService : IJobDescriptorStateWriter
+public class OrchestratorService : IJobDescriptorStateWriter, IDisposable
 {
     internal readonly ILogger<OrchestratorService> _logger;
     private readonly PowerShellRunnerService _psRunner;
@@ -79,6 +79,20 @@ public class OrchestratorService : IJobDescriptorStateWriter
     /// Dropped at finalize.
     /// </summary>
     private readonly ConcurrentDictionary<string, (DateTime NextUtc, TimeSpan Interval)> _redriveBackoff = new();
+
+    /// <summary>Runs with a re-drive verification in flight; a tick skips them instead of starting another.</summary>
+    private readonly ConcurrentDictionary<string, byte> _redriveInFlight = new();
+
+    /// <summary>Caps concurrent re-drive verifications across all runs; a tick that finds none free skips the run.</summary>
+    private readonly SemaphoreSlim _redriveSlots = new(RedriveMaxConcurrent, RedriveMaxConcurrent);
+
+    private const int RedriveMaxConcurrent = 8;
+
+    public void Dispose()
+    {
+        _redriveSlots.Dispose();
+        GC.SuppressFinalize(this);
+    }
 
     /// <summary>Per-run status/re-drive tick cadence, from <c>Orchestrator:StatusTimerIntervalSeconds</c>.</summary>
     private readonly TimeSpan _statusInterval;
@@ -1807,9 +1821,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
         // verifies each candidate against the queue table (one point read apiece; the candidate set is
         // small), returning only tasks the pump can actually still claim. Anything else is a ghost to
         // re-enqueue.
+        // The sweep starts this for every live run each tick without awaiting it, so unguarded a slow
+        // verification overlapped the next tick's for the same run and the reads piled up in-process.
+        if (!_redriveInFlight.TryAdd(run.Name, 0)) return;
+
         HashSet<string> dispatchable;
+        var holdsSlot = false;
         try
         {
+            await _redriveSlots.WaitAsync();
+            holdsSlot = true;
             Interlocked.Increment(ref _redriveStorageReads);
             dispatchable = await _queue.GetDispatchableTaskIdsAsync(
                 run.Name, candidates.Select(t => t.Id).ToList());
@@ -1821,8 +1842,22 @@ public class OrchestratorService : IJobDescriptorStateWriter
             _logger.LogWarning(ex, "[Scheduler] Could not read queued tasks for {Run} — skipping re-drive", run.Name);
             return;
         }
+        finally
+        {
+            if (holdsSlot) _redriveSlots.Release();
+            _redriveInFlight.TryRemove(run.Name, out _);
+        }
 
-        var orphaned = candidates.Where(t => !dispatchable.Contains(t.Id)).ToList();
+        // Re-check under the lock: a candidate can be claimed, run and finish while waiting for a slot or the
+        // read, and its row is then gone for the right reason.
+        List<OrchestratorTaskItem> orphaned;
+        lock (_lock)
+        {
+            orphaned = candidates
+                .Where(t => !dispatchable.Contains(t.Id))
+                .Where(t => t.Status == "Pending" && !_jobManager.IsQueuedOrRunning($"{run.Name}-{t.Id}"))
+                .ToList();
+        }
         if (orphaned.Count == 0)
         {
             // Verified clean: grow the interval (double, capped) so this run's next storage read is further

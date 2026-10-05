@@ -38,6 +38,9 @@ public class RunRemainingCounterTests
         /// <summary>Set to run at the start of any table query — lets a test model unreachable storage.</summary>
         public Action? OnBeforeQuery { get; set; }
 
+        /// <summary>Awaited at the start of a partition query, with the table name — lets a test hold a read open.</summary>
+        public Func<string, Task>? OnPartitionQuery { get; set; }
+
         private Dictionary<(string, string), StoreRow> Table(string t) =>
             _tables.TryGetValue(t, out var x) ? x : _tables[t] = new();
 
@@ -116,6 +119,7 @@ public class RunRemainingCounterTests
         public async IAsyncEnumerable<StoreRow> QueryPartitionAsync(string table, string partitionKey,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
+            if (OnPartitionQuery != null) await OnPartitionQuery(table);
             foreach (var r in Ordered(table).Where(r => r.PartitionKey == partitionKey))
             {
                 yield return r;
