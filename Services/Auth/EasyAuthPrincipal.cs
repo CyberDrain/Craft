@@ -74,6 +74,26 @@ public static class EasyAuthPrincipal
         Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(principal)));
 
     /// <summary>
+    /// Encodes the normalised SWA-format principal for an EasyAuth <paramref name="source"/>, keeping the
+    /// token's original <c>claims</c> so the hosted app can read any of them (e.g. <c>azp</c>, <c>scp</c>).
+    /// </summary>
+    /// <remarks>
+    /// The claims are those of the token EasyAuth validated, and <c>userRoles</c> marks the result as
+    /// already normalised (<see cref="NeedsTransform"/>), so it is never transformed twice.
+    /// </remarks>
+    public static string EncodeNormalised(
+        JsonElement source, string identityProvider, string userId, string userDetails, IReadOnlyList<string> userRoles)
+    {
+        var claims = source.ValueKind == JsonValueKind.Object &&
+                     source.TryGetProperty("claims", out var sourceClaims) &&
+                     sourceClaims.ValueKind == JsonValueKind.Array
+            ? sourceClaims.Clone()
+            : JsonDocument.Parse("[]").RootElement.Clone();
+
+        return Encode(new { identityProvider, userId, userDetails, userRoles, claims });
+    }
+
+    /// <summary>
     /// Pulls the identity claims out of an EasyAuth principal.
     /// </summary>
     public static EasyAuthClaims ExtractClaims(JsonElement root)

@@ -51,7 +51,7 @@ public static class CraftAuthMiddleware
             if (hasPrincipal)
             {
                 // Returns false when the caller was rejected and a response has already been written.
-                if (!await TryNormalisePrincipalAsync(context, authService, logger, existingHeader.ToString()))
+                if (!await TryNormalisePrincipalAsync(context, ids => authService.GetUserRoles(ids), logger, existingHeader.ToString()))
                     return;
             }
             else if (isDevelopment)
@@ -68,9 +68,10 @@ public static class CraftAuthMiddleware
         return app;
     }
 
+    /// <param name="resolveUserRoles">Looks a signed-in user up in the allowedUsers table by its identifiers.</param>
     /// <returns><see langword="false"/> if the request was rejected and the response is already written.</returns>
-    private static async Task<bool> TryNormalisePrincipalAsync(
-        HttpContext context, AuthService authService, ILogger logger, string headerValue)
+    internal static async Task<bool> TryNormalisePrincipalAsync(
+        HttpContext context, Func<IEnumerable<string?>, Task<string[]?>> resolveUserRoles, ILogger logger, string headerValue)
     {
         try
         {
@@ -91,13 +92,8 @@ public static class CraftAuthMiddleware
                 // Service principal. The idp header MUST stay "aad": the hosted app keys off it to treat
                 // the caller as an API client and resolve its name from the ApiClients table. The real
                 // provider goes in identityProvider for audit only.
-                context.Request.Headers["x-ms-client-principal"] = EasyAuthPrincipal.Encode(new
-                {
-                    identityProvider = realIdp,
-                    userId = claims.ObjectId ?? claims.AppId,
-                    userDetails = claims.AppId,
-                    userRoles = Array.Empty<string>(),
-                });
+                context.Request.Headers["x-ms-client-principal"] = EasyAuthPrincipal.EncodeNormalised(
+                    root, realIdp, claims.ObjectId ?? claims.AppId, claims.AppId, Array.Empty<string>());
                 context.Request.Headers["x-ms-client-principal-idp"] = "aad";
                 context.Request.Headers["x-ms-client-principal-name"] = claims.AppId;
                 return true;
@@ -114,7 +110,7 @@ public static class CraftAuthMiddleware
 
             // Resolve roles by the display name AND the stable object id (a GitHub user's numeric id,
             // an Entra user's oid), so an allowedUsers row keyed on either one grants the user its roles.
-            var roles = await authService.GetUserRoles(new[] { userName, claims.ObjectId });
+            var roles = await resolveUserRoles(new[] { userName, claims.ObjectId });
             if (roles is null)
             {
                 // Authenticated by the platform but not authorised here. Strip the header so nothing
@@ -125,13 +121,8 @@ public static class CraftAuthMiddleware
                 return false;
             }
 
-            context.Request.Headers["x-ms-client-principal"] = EasyAuthPrincipal.Encode(new
-            {
-                identityProvider = realIdp,
-                userId = claims.ObjectId ?? userName,
-                userDetails = userName,
-                userRoles = roles,
-            });
+            context.Request.Headers["x-ms-client-principal"] = EasyAuthPrincipal.EncodeNormalised(
+                root, realIdp, claims.ObjectId ?? userName, userName, roles);
             context.Request.Headers["x-ms-client-principal-idp"] = "azureStaticWebApps";
             context.Request.Headers["x-ms-client-principal-name"] = userName;
 
