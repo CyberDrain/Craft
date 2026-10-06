@@ -805,12 +805,12 @@ public sealed class WorkStore
         return ok ? (true, new InstanceLock(owner, now.Add(lease), acquired)) : (false, await GetInstanceLockAsync(ct));
     }
 
-    /// <summary>Give the instance lock up, if <paramref name="owner"/> still holds it, so a successor starts at once.</summary>
-    public async Task ReleaseInstanceLockAsync(string owner, CancellationToken ct = default)
+    /// <summary>Give the instance lock up, if <paramref name="owner"/> still holds it, so a successor starts at once.
+    /// False when <paramref name="owner"/> still held it and the delete lost a race.</summary>
+    public async Task<bool> ReleaseInstanceLockAsync(string owner, CancellationToken ct = default)
     {
         var row = await _store.GetAsync(_names, LockPartition, LockKey, ct);
-        if (row?.GetString("Owner") == owner)
-            await _store.TrySubmitAsync(_names, LockPartition, [StoreOp.Delete(row)], ct);
+        return row?.GetString("Owner") != owner || await _store.TrySubmitAsync(_names, LockPartition, [StoreOp.Delete(row)], ct);
     }
 
     // ── index repair ──

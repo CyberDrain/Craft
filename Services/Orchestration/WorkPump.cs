@@ -381,9 +381,10 @@ public class WorkPump : BackgroundService
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         await base.StopAsync(cancellationToken);
+        _logger.LogInformation("[WorkPump] Stopping with {Count} claim(s) in flight; lock held={Held}", _inFlight.Count, _holdsLock);
         foreach (var (id, v) in _inFlight.ToList())
         {
-            if (_jobs.GetJobs().FirstOrDefault(j => j.Id == id) is not { Status: "Queued" }) continue;
+            if (!_jobs.WithdrawJob(id)) continue;
             try { await _store.ReleaseAsync(v.Claim.RunKey, v.Claim.Seq, _owner, refundAttempt: true, cancellationToken); }
             catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release {Job} on shutdown", id); }
         }
@@ -399,9 +400,19 @@ public class WorkPump : BackgroundService
                     await Task.Delay(250, cancellationToken);
                 }
             }
-            catch (OperationCanceledException) { return; }
-            try { await _store.ReleaseInstanceLockAsync(_owner, cancellationToken); }
-            catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release the instance lock on shutdown"); }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("[WorkPump] Shutdown cut short with tasks still running; the instance lock lapses at its lease");
+                return;
+            }
+            try
+            {
+                if (await _store.ReleaseInstanceLockAsync(_owner, cancellationToken))
+                    _logger.LogInformation("[WorkPump] Released the instance lock");
+                else
+                    _logger.LogWarning("[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease");
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease"); }
             _holdsLock = false;
         }
     }

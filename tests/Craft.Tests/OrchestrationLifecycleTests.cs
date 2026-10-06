@@ -91,6 +91,31 @@ public class OrchestrationLifecycleTests
     }
 
     /// <summary>
+    /// The job manager stops after the pump, so it can still dispatch during shutdown. A claim handed back must
+    /// also be taken out of its queue, or this process runs the task while its successor runs it again.
+    /// </summary>
+    [Fact]
+    public async Task OnShutdown_AHandedBackClaim_IsNeverRunByThisProcess()
+    {
+        var (store, pump, jobs) = NewIdlePump();
+        var ran = 0;
+        jobs.SetWorkResolver((_, _) => Task.FromResult<Func<CancellationToken, Task>?>(_ =>
+        {
+            Interlocked.Increment(ref ran);
+            return Task.CompletedTask;
+        }));
+        await CreateAsync(store, "Handback", 4);
+        Assert.Equal(4, await pump.RefillAsync(CancellationToken.None));
+
+        await pump.StopAsync(CancellationToken.None);
+        _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
+        await Task.Delay(500);
+
+        Assert.Equal(0, ran);
+        await jobs.StopAsync(CancellationToken.None);
+    }
+
+    /// <summary>
     /// Depending on timing, the cancel lands while the job is still queued or just after the dispatcher has
     /// dequeued it. The second case once dropped the state-writer notification: the claim was never finished,
     /// lapsed half an hour later and ran after all. Either way the task must end up Cancelled.

@@ -378,18 +378,26 @@ public class JobManager : BackgroundService
             };
             opScope = OperationContext.Set(parentInvocation);
 
-            // Cancelled after the dispatcher's own check but before the job got going.
-            if (_cancelledJobIds.TryRemove(job.Record.Id, out var notified))
+            // Cancelled or withdrawn after the dispatcher's own check but before the job got going. Under the
+            // record's lock so WithdrawJob either stops it here or sees it Running, never both.
+            bool skip, notified;
+            lock (job.Record)
+            {
+                skip = _cancelledJobIds.TryRemove(job.Record.Id, out notified);
+                if (!skip)
+                {
+                    job.Record.Status = "Running";
+                    job.Record.StartedUtc = DateTime.UtcNow;
+                }
+            }
+            if (skip)
             {
                 if (!notified && job.Descriptor is { } cancelled)
                     NotifyStateWriter(w => w.Cancelled(cancelled), "cancellation", job.Record.Name);
                 return;
             }
 
-            job.Record.Status = "Running";
-            job.Record.StartedUtc = DateTime.UtcNow;
-
-            var queueTime = job.Record.StartedUtc.Value - job.Record.QueuedUtc;
+            var queueTime = job.Record.StartedUtc!.Value - job.Record.QueuedUtc;
             if (queueTime.TotalSeconds > 1)
             {
                 _logger.LogInformation(
@@ -556,24 +564,45 @@ public class JobManager : BackgroundService
     public bool CancelJob(string jobId)
     {
         if (!_jobs.TryGetValue(jobId, out var record)) return false;
-        if (record.Status != "Queued") return false;
-
-        record.Status = "Cancelled";
-        record.CompletedUtc = DateTime.UtcNow;
-        record.LastError = "Cancelled by user";
-
-        // Under the queue lock, so the dispatcher either still finds the entry (and we tell the state writer
-        // here) or has already dequeued it (and tells it when it skips the job).
         JobDescriptor? descriptor;
-        lock (_queueLock)
+        lock (record)
         {
-            descriptor = FindLiveEntry(record)?.Descriptor;
-            _cancelledJobIds[jobId] = descriptor != null;
+            if (record.Status != "Queued") return false;
+
+            record.Status = "Cancelled";
+            record.CompletedUtc = DateTime.UtcNow;
+            record.LastError = "Cancelled by user";
+
+            // Under the queue lock, so the dispatcher either still finds the entry (and we tell the state writer
+            // here) or has already dequeued it (and tells it when it skips the job).
+            lock (_queueLock)
+            {
+                descriptor = FindLiveEntry(record)?.Descriptor;
+                _cancelledJobIds[jobId] = descriptor != null;
+            }
         }
         if (descriptor is { } d)
             NotifyStateWriter(w => w.Cancelled(d), "cancellation", record.Name);
 
         _logger.LogInformation("[JobManager] Cancelled: {Name} ({Id})", record.Name, jobId);
+        return true;
+    }
+
+    /// <summary>
+    /// Take a queued job back without running it and without recording an outcome, so its owner can hand the
+    /// work to another process. False once it has started.
+    /// </summary>
+    public bool WithdrawJob(string jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return false;
+        lock (record)
+        {
+            if (record.Status != "Queued") return false;
+            record.Status = "Cancelled";
+            record.CompletedUtc = DateTime.UtcNow;
+            record.LastError = "Withdrawn at shutdown";
+            _cancelledJobIds[jobId] = true;
+        }
         return true;
     }
 
