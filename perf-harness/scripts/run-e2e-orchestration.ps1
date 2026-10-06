@@ -387,6 +387,19 @@ Invoke-OrchCheck 'seq' {
   # Every step that succeeded must reach the PostExecution, including the one right after the failed step.
   $Got = @($P.idxs -split ',' | Sort-Object) -join ','
   Add-Result 'orch-seq' 'postexec-gets-every-success' ($P.lines -eq 4 -and $Got -eq 'sf/0,sf/1,sf/3,sf/4') '-' "expected sf/0,sf/1,sf/3,sf/4 (step 2 throws); PostExecution received lines=$($P.lines) idxs=$($P.idxs)"
+
+  # Every step runs inside the one job that drives the run, but worker stats and the queue page must show
+  # each step on its own: the worker under the step it is on, the queue with one task per step.
+  $Id = New-OrchId; $Ns = "seqv-$Id"; $Name = "E2ESeqV-$Id"
+  $null = Start-OrchRuns $Ns @(@{ name = $Name; label = 'sv'; Sequential = $true; tasks = 4; task = @{ holdms = 1500 } })
+  $Labels = [System.Collections.Generic.HashSet[string]]::new()
+  $null = Wait-Orch {
+    foreach ($B in @((Invoke-OrchBridge 'workers').busy)) { if ($B.fn -like "$Name-*") { [void]$Labels.Add($B.fn) } }
+    $S = Get-OrchSummary $Ns; if ($S['sv'].ended -ge 4) { $true }
+  } 60 250
+  $Q = Wait-Orch { $E = @((Invoke-OrchBridge 'queue' $Name).entries)[0]; if ($E.Status -eq 'Completed') { $E } } 30
+  $E = $Q.value
+  Add-Result 'orch-seq' 'each-step-visible' ($Labels.Count -ge 3 -and $E.TotalTasks -eq 4 -and $E.CompletedTasks -eq 4 -and @($E.Tasks).Count -eq 4) '-' "worker labels seen=$($Labels.Count) (of 4 steps); queue total=$($E.TotalTasks) completed=$($E.CompletedTasks) tasks listed=$(@($E.Tasks).Count)"
 }
 
 # -- 9. Priority and start-order ------------------------------------------------------------------------------

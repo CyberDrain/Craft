@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.PowerShellHost;
 using Craft.Services;
 using Craft.Storage;
@@ -498,6 +499,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
             PowerShellWorker? worker = null;
             var faulted = false;
             var step = new WorkStore.ClaimedTask(header.RunKey, first.Seq, first.TaskId, first.Attempt);
+            // The job this driver runs in carries each step's name in turn, and keeps a record of each step it finishes.
+            var jobId = WorkPump.JobId(step);
+            void StepDone(string status, string? error, WorkStore.ClaimedTask? next) =>
+                _jobManager.AdvanceStep(jobId, status, error, next is { } n ? WorkPump.JobName(header.Name, n) : null);
             RunHeader? known = null;
             Dictionary<string, object>? nextPayload = null;
             try
@@ -511,6 +516,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     if (current.CancelRequested)
                     {
                         await FinishAsync(header, step.Seq, "Cancelled", "Cancelled by user");
+                        StepDone("Cancelled", "Cancelled by user", null);
                         await _store.CancelPendingAsync(header.RunKey, ct: jobCt);
                         break;
                     }
@@ -527,7 +533,18 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     try
                     {
                         if (parameters == null) throw new InvalidOperationException("The task's payload row is missing");
-                        var output = await RunScriptAsync(taskPath, TaskInvocation(parameters), current.HasPostExec, worker);
+                        var job = OperationContext.Current;
+                        string output;
+                        using (OperationContext.Set(new OperationContext.Invocation(WorkPump.JobName(header.Name, step))
+                        {
+                            WorkerId = job?.WorkerId,
+                            RunName = job?.RunName,
+                            RunKey = job?.RunKey,
+                            Priority = job?.Priority,
+                        }))
+                        {
+                            output = await RunScriptAsync(taskPath, TaskInvocation(parameters), current.HasPostExec, worker);
+                        }
                         if (current.HasPostExec && !string.IsNullOrEmpty(output))
                             await _results.StoreResultAsync(header.RunKey, step.TaskId, output);
                         finish = new WorkStore.Finish(step.Seq, "Completed", Owner: Owner);
@@ -541,6 +558,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         if (current.StopOnFailure)
                         {
                             await FinishAsync(header, step.Seq, "Failed", ex.Message);
+                            StepDone("Failed", ex.Message, null);
                             _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — stopping the run", step.TaskId);
                             await _store.CancelPendingAsync(header.RunKey, WorkStore.StoppedReason(step.TaskId), ct: jobCt);
                             break;
@@ -558,10 +576,13 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         _logger.LogWarning(ex, "[Scheduler] Could not finish step {TaskId} of {Run} with its successor; recording it on its own",
                             step.TaskId, header.Name);
                         await _finisher.FinishAsync(header.RunKey, finish);
-                        if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, ct: jobCt) is not { } claimed) break;
+                        var claimed = await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, ct: jobCt);
+                        StepDone(finish.Status, finish.Error, claimed);
+                        if (claimed == null) break;
                         step = claimed;
                         continue;
                     }
+                    StepDone(finish.Status, finish.Error, result.Next);
                     if (result.Next is not { } next)
                     {
                         if (result.Outcome?.Header is { CancelRequested: true, IsFinished: false })

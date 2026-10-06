@@ -161,6 +161,12 @@ public class WorkPump : BackgroundService
 
     internal void ForgetBackoff() => _skip.Clear();
 
+    /// <summary>The job a claimed task runs as: its id, and the name job lists and worker stats show.</summary>
+    internal static string JobId(WorkStore.ClaimedTask c) => $"{c.RunKey}|{c.Seq}";
+
+    internal static string JobName(string runName, WorkStore.ClaimedTask c) =>
+        c.Seq == WorkStore.AggregateSeq ? $"{runName}-PostExec" : $"{runName}-{c.TaskId}";
+
     /// <summary>
     /// Wait until this process holds the instance lock. A predecessor that shut down cleanly released it, so this
     /// is immediate after a normal recycle; one that crashed holds it until its lease runs out.
@@ -348,9 +354,8 @@ public class WorkPump : BackgroundService
 
             foreach (var c in claims)
             {
-                var name = c.Seq == WorkStore.AggregateSeq ? $"{header.Name}-PostExec" : $"{header.Name}-{c.TaskId}";
                 var descriptor = new JobDescriptor(header.Name, c.TaskId, header.Priority) { RunKey = c.RunKey, Seq = c.Seq, Attempt = c.Attempt };
-                var jobId = _jobs.Enqueue(descriptor, name, id: $"{c.RunKey}|{c.Seq}");
+                var jobId = _jobs.Enqueue(descriptor, JobName(header.Name, c), id: JobId(c));
                 _inFlight[jobId] = (c, now + _lease);
                 if (held != null) held[c.RunKey] = held.GetValueOrDefault(c.RunKey) + 1;
             }

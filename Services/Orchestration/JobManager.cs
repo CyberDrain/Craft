@@ -199,6 +199,7 @@ public class JobManager : BackgroundService
             Id = jobId,
             Name = name,
             RunName = descriptor.RunName,
+            RunKey = descriptor.RunKey,
             Priority = descriptor.Priority,
             Status = "Queued",
             QueuedUtc = DateTime.UtcNow
@@ -420,7 +421,9 @@ public class JobManager : BackgroundService
 
             await work(ct);
 
-            job.Record.Status = "Completed";
+            var (status, error) = _lastStep.TryRemove(job.Record.Id, out var last) ? last : ("Completed", null);
+            job.Record.Status = status;
+            job.Record.LastError = error;
             job.Record.CompletedUtc = DateTime.UtcNow;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -438,6 +441,7 @@ public class JobManager : BackgroundService
         }
         finally
         {
+            _lastStep.TryRemove(job.Record.Id, out _);
             // Accounting first, context teardown second: ReleaseSlot cannot throw, Dispose can.
             Interlocked.Decrement(ref _activeCount);
             Interlocked.Increment(ref _totalProcessed);
@@ -474,7 +478,7 @@ public class JobManager : BackgroundService
             .GroupBy(j => j.RunName!)
             .Select(g =>
             {
-                var jobs = g.ToList();
+                var jobs = LatestOuting(g);
                 return new JobRunSummary
                 {
                     Name = g.Key,
@@ -493,6 +497,18 @@ public class JobManager : BackgroundService
             .OrderBy(r => r.Priority)
             .ThenByDescending(r => r.StartedUtc)
             .ToList();
+    }
+
+    /// <summary>A run's jobs, newest first, from its latest outing only: earlier runs of the same name are left out.</summary>
+    public List<JobRecord> GetRunJobs(string runName, int limit) =>
+        LatestOuting(_jobs.Values.Where(j => string.Equals(j.RunName, runName, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(j => j.QueuedUtc).Take(limit).ToList();
+
+    private static List<JobRecord> LatestOuting(IEnumerable<JobRecord> jobs)
+    {
+        var list = jobs.ToList();
+        var latest = list.Where(j => j.RunKey != null).MaxBy(j => j.QueuedUtc)?.RunKey;
+        return latest == null ? list : list.Where(j => j.RunKey == latest).ToList();
     }
 
     public List<JobRecord> GetJobs(string? runName = null, string? status = null, int? limit = null)
@@ -587,6 +603,43 @@ public class JobManager : BackgroundService
         _logger.LogInformation("[JobManager] Cancelled: {Name} ({Id})", record.Name, jobId);
         return true;
     }
+
+    /// <summary>
+    /// A job that runs a sequential run's steps one after another has finished a step. The step is kept as its
+    /// own finished record and the job carries on under <paramref name="nextName"/>; when there is no next step,
+    /// this step's outcome becomes the job's. Job lists, run summaries and queue pages then show every step,
+    /// not just the one the job was dispatched for.
+    /// </summary>
+    public void AdvanceStep(string jobId, string status, string? error, string? nextName)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return;
+        if (nextName == null)
+        {
+            _lastStep[jobId] = (status, error);
+            return;
+        }
+        var now = DateTime.UtcNow;
+        var stepId = $"{jobId}#{Interlocked.Increment(ref _stepRecords)}";
+        _jobs[stepId] = new JobRecord
+        {
+            Id = stepId,
+            Name = record.Name,
+            RunName = record.RunName,
+            RunKey = record.RunKey,
+            Priority = record.Priority,
+            Status = status,
+            QueuedUtc = record.QueuedUtc,
+            StartedUtc = record.StartedUtc,
+            CompletedUtc = now,
+            LastError = error,
+        };
+        record.Name = nextName;
+        record.QueuedUtc = now;
+        record.StartedUtc = now;
+    }
+
+    private readonly ConcurrentDictionary<string, (string Status, string? Error)> _lastStep = new();
+    private long _stepRecords;
 
     /// <summary>
     /// Take a queued job back without running it and without recording an outcome, so its owner can hand the

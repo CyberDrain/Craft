@@ -13,6 +13,9 @@ public class JobRecord
     public string Id { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string? RunName { get; set; }
+
+    /// <summary>The outing of the run this job belongs to, when it came from a stored run.</summary>
+    public string? RunKey { get; set; }
     public int Priority { get; set; }
     public string Status { get; set; } = "Queued";
     public DateTime QueuedUtc { get; set; }

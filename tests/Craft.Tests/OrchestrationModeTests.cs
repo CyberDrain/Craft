@@ -160,6 +160,66 @@ public class OrchestrationModeTests
         Assert.Equal(3, Assert.Single(h.Svc.PostExecs).Lines.Length);
     }
 
+    /// <summary>
+    /// A sequential run's steps all run inside the one job that drives them. Each step must still show up as
+    /// a job of its own: under its own name on the worker, and as its own record in job lists and run
+    /// summaries, or the queue page reports one task for the whole run.
+    /// </summary>
+    [Fact]
+    public async Task EveryStepOfASequentialRun_ShowsUpAsItsOwnJob()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync();
+        h.Svc.Body = t => FakeOrchestrator.IdOf(t) == "s1" ? throw new InvalidOperationException("step down") : "{}";
+        Assert.True(await h.Start("SeqJobs", Batch(4, "s"), sequential: true));
+
+        Assert.True(await h.DriveUntilFinished("SeqJobs"));
+        Assert.Equal(["SeqJobs-Job_s0", "SeqJobs-Job_s1", "SeqJobs-Job_s2", "SeqJobs-Job_s3"], h.Svc.RanAs);
+        Assert.True(await h.DriveUntil(() => Task.FromResult(h.Jobs.GetJobs("SeqJobs").All(j => j.Status is not ("Queued" or "Running")))));
+        var jobs = h.Jobs.GetJobs("SeqJobs").ToDictionary(j => j.Name, j => j.Status);
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["SeqJobs-Job_s0"] = "Completed",
+            ["SeqJobs-Job_s1"] = "Failed",
+            ["SeqJobs-Job_s2"] = "Completed",
+            ["SeqJobs-Job_s3"] = "Completed",
+        }, jobs);
+        var summary = Assert.Single(h.Jobs.GetRunSummaries(), s => s.Name == "SeqJobs");
+        Assert.Equal((4, 3, 1), (summary.Total, summary.Completed, summary.Failed));
+    }
+
+    [Fact]
+    public async Task ARunsSummaryAndTaskList_CoverItsLatestOuting_NotEveryRunOfThatName()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync();
+        for (var outing = 0; outing < 2; outing++)
+        {
+            Assert.True(await h.Start("SeqTwice", Batch(3, "s"), sequential: true));
+            Assert.True(await h.DriveUntilFinished("SeqTwice"));
+            Assert.True(await h.DriveUntil(() => Task.FromResult(h.Jobs.GetJobs("SeqTwice").All(j => j.Status is not ("Queued" or "Running")))));
+        }
+
+        Assert.Equal(6, h.Jobs.GetJobs("SeqTwice").Count);
+        Assert.Equal(3, h.Jobs.GetRunJobs("SeqTwice", 100).Count);
+        var summary = Assert.Single(h.Jobs.GetRunSummaries(), s => s.Name == "SeqTwice");
+        Assert.Equal((3, 3), (summary.Total, summary.Completed));
+    }
+
+    [Fact]
+    public async Task ASequentialRunsLastStep_DecidesItsJobsOutcome_AndItsAggregationIsAJobToo()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync();
+        h.Svc.Body = t => FakeOrchestrator.IdOf(t) == "s1" ? throw new InvalidOperationException("last down") : "{}";
+        Assert.True(await h.Start("SeqLast", Batch(2, "s"), "Agg", sequential: true));
+
+        Assert.True(await h.DriveUntilFinished("SeqLast"));
+        Assert.True(await h.DriveUntil(() => Task.FromResult(h.Jobs.GetJobs("SeqLast").All(j => j.Status is not ("Queued" or "Running")))));
+        var jobs = h.Jobs.GetJobs("SeqLast").ToDictionary(j => j.Name, j => j.Status);
+        Assert.Equal("Completed", jobs["SeqLast-Job_s0"]);
+        Assert.Equal("Failed", jobs["SeqLast-Job_s1"]);
+        Assert.Equal("Completed", jobs["SeqLast-PostExec"]);
+        Assert.Equal(3, jobs.Count);
+    }
+
     [Fact]
     public async Task CancellingASequentialRun_StopsItAfterTheStepInHand()
     {

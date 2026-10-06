@@ -800,6 +800,11 @@ function Invoke-PerfE2EBridge {
                     startHasMaxConcurrency = ($Def -match 'MaxConcurrency'); startHasStopOnFailure = ($Def -match 'StopOnFailure') }
             }
             'active' { $Body = @{ active = [Craft.Services.OrchestratorBridge]::IsRunActive($Name) } }
+            'queue' { $Body = @{ entries = @([Craft.Services.QueueStatusBridge]::GetRunStatus($null, $Name) | ConvertFrom-Json) } }
+            'workers' {
+                $Body = @{ busy = @([Craft.Services.WorkerMetricsBridge]::GetSnapshot().BgPool.Workers | Where-Object IsBusy |
+                    ForEach-Object { @{ id = $_.WorkerId; fn = $_.CurrentFunction } }) }
+            }
             'cancel' { $Body = @{ cancelled = [Craft.Services.WorkerMetricsBridge]::CancelRun($Name) } }
             'summaries' {
                 $Body = @{ runs = @([Craft.Services.WorkerMetricsBridge]::GetRunSummaries() | Where-Object { -not $Name -or $_.Name -eq $Name } | ForEach-Object {

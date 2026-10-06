@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Craft.Configuration;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Storage;
@@ -23,6 +24,9 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
 
     public readonly ConcurrentQueue<Dictionary<string, object>> Tasks = new();
     public readonly ConcurrentQueue<string> Started = new();
+
+    /// <summary>The job name each task ran under, as worker stats show it.</summary>
+    public readonly ConcurrentQueue<string?> RanAs = new();
     public readonly ConcurrentQueue<(Dictionary<string, object> Parameters, string[] Lines)> PostExecs = new();
 
     /// <summary>The task's output; throw to fail it.</summary>
@@ -55,6 +59,7 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
         var task = JsonSerializer.Deserialize<Dictionary<string, object>>((string)parameters["TaskJson"])!;
         Tasks.Enqueue(task);
         Started.Enqueue(IdOf(task));
+        RanAs.Enqueue(OperationContext.Current?.Function);
         var now = Interlocked.Increment(ref _active);
         for (var seen = _maxActive; now > seen; seen = _maxActive)
             if (Interlocked.CompareExchange(ref _maxActive, now, seen) == seen) break;
