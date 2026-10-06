@@ -321,6 +321,8 @@ public static class CraftHostBuilderExtensions
         services.AddSingleton<StartupTelemetryService>();
         services.AddHostedService(sp => sp.GetRequiredService<StartupTelemetryService>());
 
+        services.AddHostedService<MemoryTrimService>();
+
         return services;
     }
 

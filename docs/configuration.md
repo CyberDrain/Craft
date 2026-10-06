@@ -179,6 +179,10 @@ Controls the PowerShell runspace pools that execute all scripts.
   // only to A/B or if a module misbehaves on a long-lived pipeline thread.
   "ReuseRunspaceThread": true,
 
+  // Minutes between timed memory trims (compacting full GC that hands freed heap back to the OS).
+  // Runs alongside the every-100-invocations trim, sharing its 2-minute cooldown. 0 = disabled.
+  "MemoryTrimIntervalMinutes": 5,
+
   // Maximum execution time (seconds) for HTTP request handlers.
   // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
   // 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints.

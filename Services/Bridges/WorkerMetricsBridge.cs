@@ -442,7 +442,7 @@ public static class WorkerMetricsBridge
     public static MemoryBreakdown GetMemoryBreakdown()
     {
         var proc = Process.GetCurrentProcess();
-        var gcInfo = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+        var gcInfo = GC.GetGCMemoryInfo(GCKind.Any);
         var heapBytes = GC.GetTotalMemory(false);
         var workingSet = proc.WorkingSet64;
         var containerBytes = GetContainerMemoryLimit() ?? gcInfo.TotalAvailableMemoryBytes;
@@ -823,7 +823,7 @@ public static class WorkerMetricsBridge
 
     /// <summary>
     /// Force a full GC collection with LOH compaction and working-set trim.
-    /// Called automatically every 100 invocations and after orchestrator runs complete.
+    /// Called every 100 invocations and on the MemoryTrimService timer (Worker.MemoryTrimIntervalMinutes).
     /// Has a built-in 2-minute cooldown to avoid GC thrashing.
     /// Returns the MB reclaimed, or -1 if skipped due to cooldown.
     /// </summary>
