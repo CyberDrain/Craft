@@ -505,15 +505,63 @@ public sealed class WorkStore
         return outcome;
     }
 
+    /// <summary>What <see cref="FinishStepAsync"/> did: the finish, the step it claimed next (null when there is
+    /// none, the run was asked to cancel, or another driver holds it) and that step's payload when it could be read.</summary>
+    public sealed record StepResult(FinishOutcome? Outcome, ClaimedTask? Next, Dictionary<string, object>? Payload);
+
+    private sealed class StepClaim(string owner, TimeSpan lease)
+    {
+        public string Owner { get; } = owner;
+        public TimeSpan Lease { get; } = lease;
+        public ClaimedTask? Claimed { get; set; }
+    }
+
+    /// <summary>
+    /// Finish a sequential run's current step and claim its next one in the same transaction, renewing the
+    /// driver lease: the next pending step, or the aggregation task when this step completes the run's tasks.
+    /// One round trip of concurrent reads, one transaction, then the Ready update alongside the next payload read.
+    /// </summary>
+    public async Task<StepResult> FinishStepAsync(string runKey, Finish finish, string owner, TimeSpan lease,
+        CancellationToken ct = default)
+    {
+        var claim = new StepClaim(owner, lease);
+        Task<Dictionary<string, object>?>? payload = null;
+        var outcome = await FinishChunkAsync(runKey, [finish], 'R', ct, claim: claim,
+            afterSubmit: () => payload = claim.Claimed is { Seq: not AggregateSeq } next ? TryGetPayloadAsync(runKey, next.Seq, ct) : null);
+        return new StepResult(outcome, claim.Claimed, payload == null ? null : await payload);
+    }
+
+    private async Task<Dictionary<string, object>?> TryGetPayloadAsync(string runKey, int seq, CancellationToken ct)
+    {
+        try { return await GetPayloadAsync(runKey, seq, ct); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { return null; }
+    }
+
+    private async Task<StoreRow?> FirstAsync(char state, string runKey, CancellationToken ct)
+    {
+        await foreach (var r in Range(runKey, state, 1, ct)) return r;
+        return null;
+    }
+
     /// <param name="known">Rows the caller has just read (by seq), used on the first attempt instead of reading each
     /// one again; the transaction is still guarded by their ETags, and a retry reads afresh.</param>
     private async Task<FinishOutcome?> FinishChunkAsync(string runKey, IReadOnlyList<Finish> chunk, char? fromState,
-        CancellationToken ct, Dictionary<int, StoreRow>? known = null)
+        CancellationToken ct, Dictionary<int, StoreRow>? known = null, StepClaim? claim = null, Action? afterSubmit = null)
     {
         for (var attempt = 0; attempt < ConflictRetries; attempt++)
         {
             if (attempt > 0) known = null;
-            var headerRow = await _store.GetAsync(_work, runKey, HeaderKey, ct);
+            StoreRow? headerRow, nextRow = null;
+            if (claim != null)
+            {
+                var headerRead = _store.GetAsync(_work, runKey, HeaderKey, ct);
+                var stepRead = _store.GetAsync(_work, runKey, Key('R', chunk[0].Seq), ct);
+                var nextRead = FirstAsync('P', runKey, ct);
+                await Task.WhenAll(headerRead, stepRead, nextRead);
+                (headerRow, nextRow) = (headerRead.Result, nextRead.Result);
+                known = stepRead.Result is { } stepRow ? new() { [chunk[0].Seq] = stepRow } : [];
+            }
+            else headerRow = await _store.GetAsync(_work, runKey, HeaderKey, ct);
             if (headerRow == null) return null;
             var header = RunHeader.FromRow(headerRow);
             var ops = new List<StoreOp>();
@@ -575,6 +623,12 @@ public sealed class WorkStore
 
             if (applied == 0) return new FinishOutcome(header, false, false, 0);
 
+            var now = DateTimeOffset.UtcNow;
+            var claimable = claim != null && !header.CancelRequested
+                && !(header.DriverOwner is { } driver && driver != claim.Owner && header.DriverLease > now);
+            var until = now.Add(claim?.Lease ?? TimeSpan.Zero);
+            ClaimedTask? next = null;
+
             if (!completed && header.Phase == RunPhase.Tasks && header.Done >= header.Total)
             {
                 barrier = true;
@@ -582,9 +636,28 @@ public sealed class WorkStore
                 {
                     header.Phase = RunPhase.Aggregate;
                     header.PostExecStatus = "Pending";
-                    ops.Add(StoreOp.Insert(PendingRow(runKey, AggregateSeq, "PostExecution", 0)));
+                    if (claimable)
+                    {
+                        ops.Add(StoreOp.Insert(RunningRow(runKey, AggregateSeq, "PostExecution", 1, claim!.Owner, until)));
+                        next = new ClaimedTask(runKey, AggregateSeq, "PostExecution", 1);
+                    }
+                    else ops.Add(StoreOp.Insert(PendingRow(runKey, AggregateSeq, "PostExecution", 0)));
                 }
                 else completed = true;
+            }
+            else if (claimable && !completed && nextRow != null)
+            {
+                var seq = SeqOf(nextRow.RowKey);
+                var taskId = nextRow.GetString("TaskId")!;
+                var nextAttempt = (nextRow.GetInt32("Attempt") ?? 0) + 1;
+                ops.Add(StoreOp.Delete(nextRow));
+                ops.Add(StoreOp.Insert(RunningRow(runKey, seq, taskId, nextAttempt, claim!.Owner, until)));
+                next = new ClaimedTask(runKey, seq, taskId, nextAttempt);
+            }
+            if (next != null)
+            {
+                header.DriverOwner = claim!.Owner;
+                header.DriverLease = until;
             }
             if (completed)
             {
@@ -597,7 +670,13 @@ public sealed class WorkStore
             await _rate.TakeAsync(runKey, ops.Count, ct);
             if (await _store.TrySubmitAsync(_work, runKey, ops, ct))
             {
-                var after = (await GetRunAsync(runKey, ct)) ?? header;
+                if (claim != null)
+                {
+                    claim.Claimed = next;
+                    afterSubmit?.Invoke();
+                }
+                // The step path wrote the header under its ETag, so what it wrote is the state after it.
+                var after = claim != null ? header : (await GetRunAsync(runKey, ct)) ?? header;
                 if (completed) await RetireAsync(after, ct);
                 else await IndexAsync("update its Ready counts", runKey, () => PublishReadyAsync(after, ct), ct);
                 Changed(runKey);

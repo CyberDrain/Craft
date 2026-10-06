@@ -120,7 +120,7 @@ public class WorkStoreTests
     }
 
     private static Task<RunHeader> CreateModeAsync(WorkStore s, string name, int tasks, bool sequential = false,
-        bool stopOnFailure = false)
+        bool stopOnFailure = false, string? postExec = null)
     {
         var h = Header(name);
         return s.CreateRunAsync(new RunHeader
@@ -131,7 +131,94 @@ public class WorkStoreTests
             TaskScriptName = h.TaskScriptName,
             Sequential = sequential,
             StopOnFailure = stopOnFailure,
+            PostExecFunctionName = postExec,
         }, Tasks(tasks));
+    }
+
+    // ── a sequential step: finish it and claim the next in one transaction ──
+
+    [Fact]
+    public async Task FinishingASequentialStep_ClaimsTheNextOne_WithItsPayload_UnderTheDriverLease()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "Step", 3, sequential: true);
+        var first = (await s.ClaimSequentialAsync(run.RunKey, "w", Lease))!;
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(first.Seq, "Completed", Owner: "w"), "w", Lease);
+
+        Assert.Equal((1, "t1", 1), (r.Next!.Seq, r.Next.TaskId, r.Next.Attempt));
+        Assert.Equal("1", r.Payload!["i"].ToString());
+        Assert.Equal("Completed", Assert.Single(await s.GetTasksAsync(run.RunKey, 'D')).Status);
+        Assert.Equal("w", Assert.Single(await s.GetTasksAsync(run.RunKey, 'R')).Owner);
+        var header = (await s.GetRunAsync(run.RunKey))!;
+        Assert.Equal(("w", 1), (header.DriverOwner, header.Done));
+        Assert.Equal(header.Done, r.Outcome!.Header.Done);
+    }
+
+    [Fact]
+    public async Task FinishingTheLastSequentialStep_ClaimsTheAggregationDirectly()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "StepAgg", 2, sequential: true, postExec: "Agg");
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", Lease))!;
+        step = (await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(step.Seq, "Completed", Owner: "w"), "w", Lease)).Next!;
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(step.Seq, "Failed", "x", "w"), "w", Lease);
+
+        Assert.Equal(WorkStore.AggregateSeq, r.Next!.Seq);
+        Assert.Null(r.Payload);
+        Assert.True(r.Outcome!.ReachedBarrier);
+        Assert.Empty(await s.GetTasksAsync(run.RunKey, 'P'));
+        Assert.Equal(WorkStore.AggregateSeq, Assert.Single(await s.GetTasksAsync(run.RunKey, 'R')).Seq);
+        var header = (await s.GetRunAsync(run.RunKey))!;
+        Assert.Equal((RunPhase.Aggregate, "Pending", 1), (header.Phase, header.PostExecStatus, header.Failed));
+    }
+
+    [Fact]
+    public async Task FinishingTheLastSequentialStep_WithoutAggregation_CompletesTheRun_AndClaimsNothing()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "StepLast", 1, sequential: true);
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", Lease))!;
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(step.Seq, "Completed", Owner: "w"), "w", Lease);
+
+        Assert.Null(r.Next);
+        Assert.True(r.Outcome!.Completed);
+        Assert.Equal("Completed", (await s.GetRunAsync(run.RunKey))!.Status);
+    }
+
+    [Fact]
+    public async Task ACancelRequest_StopsTheNextStepBeingClaimed()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "StepCancel", 3, sequential: true);
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", Lease))!;
+        await s.RequestCancelAsync(run.RunKey);
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(step.Seq, "Completed", Owner: "w"), "w", Lease);
+
+        Assert.Null(r.Next);
+        Assert.True(r.Outcome!.Header.CancelRequested);
+        Assert.Equal(2, (await s.GetTasksAsync(run.RunKey, 'P')).Count);
+        Assert.Empty(await s.GetTasksAsync(run.RunKey, 'R'));
+    }
+
+    [Fact]
+    public async Task AStepTakenOverByAnotherDriver_IsNeitherFinishedNorFollowed_ByItsFormerOwner()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "StepLost", 3, sequential: true);
+        Assert.NotNull(await s.ClaimSequentialAsync(run.RunKey, "old", TimeSpan.FromMilliseconds(1)));
+        await Task.Delay(20);
+        var taken = (await s.ClaimSequentialAsync(run.RunKey, "new", Lease))!;
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(taken.Seq, "Completed", Owner: "old"), "old", Lease);
+
+        Assert.Null(r.Next);
+        Assert.Equal(0, r.Outcome!.Applied);
+        Assert.Equal("new", Assert.Single(await s.GetTasksAsync(run.RunKey, 'R')).Owner);
+        Assert.Equal("new", (await s.GetRunAsync(run.RunKey))!.DriverOwner);
     }
 
     [Fact]

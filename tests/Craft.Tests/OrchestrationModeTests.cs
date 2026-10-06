@@ -161,6 +161,45 @@ public class OrchestrationModeTests
     }
 
     [Fact]
+    public async Task CancellingASequentialRun_StopsItAfterTheStepInHand()
+    {
+        await using var h = await OrchestrationHarness.CreateAsync();
+        h.Svc.BeforeRun = async t =>
+        {
+            if (FakeOrchestrator.IdOf(t) == "s1") await h.Svc.CancelRunAsync("SeqCancel");
+        };
+        Assert.True(await h.Start("SeqCancel", Batch(5, "s"), "Agg", sequential: true));
+
+        Assert.True(await h.DriveUntilFinished("SeqCancel"));
+        Assert.Equal(["s0", "s1"], h.Svc.Started);
+        var run = (await h.Store.GetRunByNameAsync("SeqCancel"))!;
+        Assert.Equal((0, 3, "CompletedWithErrors"), (run.Failed, run.Cancelled, run.Status));
+    }
+
+    /// <summary>
+    /// A step's finish and the claim of the next share one transaction. If that cannot be written the finish
+    /// goes the ordinary way (retried in the background) and the next step is claimed on its own.
+    /// </summary>
+    [Fact]
+    public async Task ASequentialStepWhoseCombinedWriteFails_IsRecordedOnItsOwn_AndTheRunCarriesOn()
+    {
+        var faulty = new FaultyTableStore(new MemoryTableStore());
+        var failures = 0;
+        faulty.FailSubmit = (_, ops) =>
+            ops.Count(o => o.Row.RowKey.StartsWith("R|", StringComparison.Ordinal)) == 2
+            && Interlocked.CompareExchange(ref failures, 1, 0) == 0;
+        await using var h = await OrchestrationHarness.CreateAsync(tables: faulty);
+        Assert.True(await h.Start("SeqFallback", Batch(4, "s"), "Agg", sequential: true));
+
+        Assert.True(await h.DriveUntilFinished("SeqFallback"));
+        Assert.Equal(1, failures);
+        Assert.Equal(["s0", "s1", "s2", "s3"], h.Svc.Started);
+        var run = (await h.Store.GetRunByNameAsync("SeqFallback"))!;
+        Assert.Equal(("Completed", 4), (run.Status, run.Done));
+        Assert.Contains(h.Log.Lines, l => l.Message.Contains("with its successor; recording it on its own", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task StopOnFailure_CancelsTheStepsAfterTheFirstFailure_AndStillAggregates()
     {
         await using var h = await OrchestrationHarness.CreateAsync();

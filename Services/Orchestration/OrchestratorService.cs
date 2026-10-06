@@ -496,12 +496,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
             PowerShellWorker? worker = null;
             var faulted = false;
             var step = new WorkStore.ClaimedTask(header.RunKey, first.Seq, first.TaskId, first.Attempt);
+            RunHeader? known = null;
+            Dictionary<string, object>? nextPayload = null;
             try
             {
                 worker = CheckoutSequentialWorker(jobCt);
                 while (true)
                 {
-                    var current = await _store.GetRunAsync(header.RunKey, jobCt);
+                    var current = known ?? await _store.GetRunAsync(header.RunKey, jobCt);
+                    known = null;
                     if (current == null || current.IsFinished) break;
                     if (current.CancelRequested)
                     {
@@ -516,14 +519,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         break;
                     }
 
-                    var parameters = await _store.GetPayloadAsync(header.RunKey, step.Seq, jobCt);
+                    var parameters = nextPayload ?? await _store.GetPayloadAsync(header.RunKey, step.Seq, jobCt);
+                    nextPayload = null;
+                    WorkStore.Finish finish;
                     try
                     {
                         if (parameters == null) throw new InvalidOperationException("The task's payload row is missing");
                         var output = await RunScriptAsync(taskPath, TaskInvocation(parameters), current.HasPostExec, worker);
                         if (current.HasPostExec && !string.IsNullOrEmpty(output))
                             await _results.StoreResultAsync(header.RunKey, step.TaskId, output);
-                        await FinishAsync(header, step.Seq, "Completed");
+                        finish = new WorkStore.Finish(step.Seq, "Completed", Owner: Owner);
                     }
                     catch (OperationCanceledException) when (jobCt.IsCancellationRequested)
                     {
@@ -531,18 +536,39 @@ public class OrchestratorService : IJobDescriptorStateWriter
                     }
                     catch (Exception ex)
                     {
-                        await FinishAsync(header, step.Seq, "Failed", ex.Message);
                         if (current.StopOnFailure)
                         {
+                            await FinishAsync(header, step.Seq, "Failed", ex.Message);
                             _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — stopping the run", step.TaskId);
                             await _store.CancelPendingAsync(header.RunKey, WorkStore.StoppedReason(step.TaskId), ct: jobCt);
                             break;
                         }
                         _logger.LogError(ex, "[Scheduler] Sequential task failed: {TaskId} — continuing with the next step", step.TaskId);
+                        finish = new WorkStore.Finish(step.Seq, "Failed", ex.Message, Owner);
                     }
 
-                    if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, ct: jobCt) is not { } next) break;
+                    // Finish this step and claim the next in one transaction; if that cannot be written, the batcher
+                    // keeps retrying the finish and the next step is claimed on its own.
+                    WorkStore.StepResult result;
+                    try { result = await _store.FinishStepAsync(header.RunKey, finish, Owner, Lease, jobCt); }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger.LogWarning(ex, "[Scheduler] Could not finish step {TaskId} of {Run} with its successor; recording it on its own",
+                            step.TaskId, header.Name);
+                        await _finisher.FinishAsync(header.RunKey, finish);
+                        if (await _store.ClaimSequentialAsync(header.RunKey, Owner, Lease, continuing: true, ct: jobCt) is not { } claimed) break;
+                        step = claimed;
+                        continue;
+                    }
+                    if (result.Next is not { } next)
+                    {
+                        if (result.Outcome?.Header is { CancelRequested: true, IsFinished: false })
+                            await _store.CancelPendingAsync(header.RunKey, ct: jobCt);
+                        break;
+                    }
                     step = next;
+                    known = result.Outcome?.Header;
+                    nextPayload = result.Payload;
                 }
             }
             catch (OperationCanceledException) when (jobCt.IsCancellationRequested)

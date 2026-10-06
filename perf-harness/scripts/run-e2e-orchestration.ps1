@@ -28,6 +28,7 @@ $OrchGates = @{
   RssMB          = 470    # SUT RSS after the perf runs (median 233MB)
   IdleClaimMs    = 1500   # run queued into an idle engine -> first start (the pump wakes on a new run)
   Cancel5000Sec  = 30     # CancelRun on a 5,000-task run -> run finished with every pending task cancelled
+  SeqStepMs      = 20     # sequential no-op steps, first start -> last end per step (9.6ms; 32.6ms before finish+claim shared a txn)
 }
 
 $OrchSkipped = @{}
@@ -533,6 +534,14 @@ Invoke-OrchCheck 'perf' {
   Add-Result 'orch-perf' 'runs-300' ($W.ok -and $Ran -eq 300 -and $Sec -le $OrchGates.ManyRuns300Sec) "${Sec}s" "runs=$($R.Count) done=$(@($R.Where({ $_.phase -eq 'Done' })).Count) tasks ran once=$Ran; gate $($OrchGates.ManyRuns300Sec)s"
   $null = Invoke-OrchGet "/API/PerfE2EState?ns=$Ns&wipe=1"
 
+  # Storage cost between sequential steps: each step's finish and the next step's claim share one transaction.
+  $Id = New-OrchId; $Ns = "ps-$Id"
+  $null = Start-OrchRuns $Ns @(@{ name = "E2ESeqPerf-$Id"; label = 'sq'; Sequential = $true; tasks = 100 })
+  $W = Wait-Orch { $S = Get-OrchSummary $Ns; if ($S['sq'].ended -ge 100) { $S['sq'] } } 120 250
+  $StepMs = if ($W.ok) { [math]::Round((ConvertTo-OrchMs ($W.value.maxEnd - $W.value.minStart)) / 99, 1) } else { -1 }
+  Add-Result 'orch-perf' 'sequential-step' ($W.ok -and $W.value.tasks -eq 100 -and $StepMs -le $OrchGates.SeqStepMs) "${StepMs}ms" "100 steps, first start -> last end per step ${StepMs}ms; gate $($OrchGates.SeqStepMs)ms"
+  $null = Invoke-OrchGet "/API/PerfE2EState?ns=$Ns&wipe=1"
+
   # An idle pump backs off its poll to JobQueueIdlePollIntervalMs (10s default), so a run queued into an idle
   # engine waits for the next poll. Pin that bound, then keep the pump warm (a held task in flight keeps it on
   # the 1s poll) so the size comparison below measures claiming, not the idle backoff.
@@ -607,4 +616,4 @@ Invoke-OrchCheck 'restart' {
   Add-Result 'orch-restart' 'postexec-once' ($P.Count -eq 1 -and $P[0].lines -eq $N -and $H.postExecStatus -eq 'Completed') '-' "posts=$($P.Count) lines=$($P[0].lines) postExec=$($H.postExecStatus)"
 }
 
-Info ("orchestration gates: fanout-1000 <= {0}s, runs-300 <= {1}s, ttfs-5000 <= {2}ms, rss <= {3}MB, idle claim <= {4}ms, cancel-5000 <= {5}s" -f $OrchGates.Fanout1000Sec, $OrchGates.ManyRuns300Sec, $OrchGates.Ttfs5000Ms, $OrchGates.RssMB, $OrchGates.IdleClaimMs, $OrchGates.Cancel5000Sec)
+Info ("orchestration gates: fanout-1000 <= {0}s, runs-300 <= {1}s, ttfs-5000 <= {2}ms, rss <= {3}MB, idle claim <= {4}ms, cancel-5000 <= {5}s, sequential step <= {6}ms" -f $OrchGates.Fanout1000Sec, $OrchGates.ManyRuns300Sec, $OrchGates.Ttfs5000Ms, $OrchGates.RssMB, $OrchGates.IdleClaimMs, $OrchGates.Cancel5000Sec, $OrchGates.SeqStepMs)

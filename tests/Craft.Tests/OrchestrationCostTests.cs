@@ -126,6 +126,33 @@ public class OrchestrationCostTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task ASequentialStep_FinishesAndClaimsTheNext_InOneTransaction_FromAnyRunSize()
+    {
+        var (s, c) = NewStore();
+        var started = NextStart();
+        var run = await s.CreateRunAsync(new RunHeader
+        {
+            RunKey = WorkStore.RunKeyFor("Steps", started),
+            Name = "Steps",
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+            Sequential = true,
+        }, Enumerable.Range(0, 10_000).Select(i => new WorkStore.NewTask($"t{i}", new() { ["i"] = i })).ToList());
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", Lease))!;
+        c.Reset();
+
+        var r = await s.FinishStepAsync(run.RunKey, new WorkStore.Finish(step.Seq, "Completed", Owner: "w"), "w", Lease);
+
+        Assert.NotNull(r.Payload);
+        var w = c.For(Work);
+        output.WriteLine($"step: work {w}  ready {c.For(Ready)}");
+        Assert.Equal(3, w.PointReads);              // header and step (with the next-step range, read together), payload
+        Assert.Equal((1, 1, 0), (w.Queries, w.Rows, w.UnboundedRanges));
+        Assert.Equal(1, w.Submits);
+        Assert.Equal(1, c.For(Ready).Upserts);
+    }
+
+    [Fact]
     public async Task FinishingABatch_IsOneTransaction_AndOneReadyUpdate()
     {
         var (s, c) = NewStore();
