@@ -169,14 +169,15 @@ public class OrchestratorService : IJobDescriptorStateWriter
         bool sequential = false, string? parentRunKey = null, string? childKey = null, bool allowCollision = true,
         int maxConcurrency = 0, bool stopOnFailure = false)
     {
-        var gated = false;
+        string? gate = null;
         try
         {
             name = TableKeys.Sanitize(name);
             if (!allowCollision)
             {
-                gated = _activePlanners.TryAdd(name, true);
-                if (!gated || await IsActiveAsync(name, ct))
+                var family = WorkStore.CollisionFamily(name);
+                if (_activePlanners.TryAdd(family, true)) gate = family;
+                if (gate == null || await _store.IsFamilyActiveAsync(family, ct))
                 {
                     _logger.LogWarning("[Orchestrator] Run {Name} skipped: a run of that name is still active and collisions are off", name);
                     return false;
@@ -207,7 +208,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
         }
         finally
         {
-            if (gated) _activePlanners.TryRemove(name, out _);
+            if (gate != null) _activePlanners.TryRemove(gate, out _);
             if (!string.IsNullOrEmpty(batchFilePath))
             {
                 try { if (File.Exists(batchFilePath)) File.Delete(batchFilePath); }
@@ -219,8 +220,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
     private async Task<bool> IsActiveAsync(string name, CancellationToken ct) =>
         (await _store.GetActiveRunsAsync(name, ct)).Count > 0;
 
-    /// <summary>Whether any run with this name is unfinished.</summary>
-    public Task<bool> IsRunActiveAsync(string name, CancellationToken ct = default) => IsActiveAsync(TableKeys.Sanitize(name), ct);
+    /// <summary>Whether any run of this name's collision family (<see cref="WorkStore.CollisionFamily"/>) is unfinished.</summary>
+    public Task<bool> IsRunActiveAsync(string name, CancellationToken ct = default) =>
+        _store.IsFamilyActiveAsync(WorkStore.CollisionFamily(TableKeys.Sanitize(name)), ct);
 
     /// <summary>The runs an operator action names: the run with that key, or every unfinished run of that name.</summary>
     private async Task<List<RunHeader>> TargetRunsAsync(string keyOrName)

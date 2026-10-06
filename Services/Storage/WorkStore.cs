@@ -194,6 +194,29 @@ public sealed class WorkStore
         return runs;
     }
 
+    /// <summary>
+    /// The name runs collide on: the run name without a trailing <c>-{guid}</c>, the queue id a caller appends so
+    /// its queue page can find each outing (<c>Cache-{queueId}</c> and <c>Cache</c> are one family).
+    /// </summary>
+    public static string CollisionFamily(string name) =>
+        name.Length > 37 && name[^37] == '-' && Guid.TryParseExact(name.AsSpan(name.Length - 36), "D", out _)
+            ? name[..^37]
+            : name;
+
+    /// <summary>Whether any run of this collision family is unfinished: one range read for the plain name and one
+    /// for <c>{family}-...</c>.</summary>
+    public async Task<bool> IsFamilyActiveAsync(string family, CancellationToken ct = default)
+    {
+        if ((await GetActiveRunsAsync(family, ct)).Count > 0) return true;
+        await foreach (var row in _store.QueryRowKeyRangeAsync(_names, ActivePartition, $"{family}-", $"{family}.", ct: ct))
+        {
+            if (row.GetString("Name") is { } name && CollisionFamily(name) == family
+                && await GetRunAsync(row.RowKey, ct) is { IsFinished: false })
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>A run by its key, or else the newest unfinished run with that name.</summary>
     public async Task<RunHeader?> ResolveRunAsync(string keyOrName, CancellationToken ct = default) =>
         (keyOrName.Contains('~') ? await GetRunAsync(keyOrName, ct) : null)

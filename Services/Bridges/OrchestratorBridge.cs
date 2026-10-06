@@ -113,15 +113,16 @@ public static class OrchestratorBridge
         string.IsNullOrEmpty(parentRunName) ? null : s_service?.RegisterPendingChild(parentRunName, childName);
 
     /// <summary>
-    /// Whether a run of this name is unfinished or already queued here to start. Lets a caller that does not
-    /// want overlapping runs (<c>allowCollision: false</c>) skip, and say so, before building the batch. The
-    /// start itself checks again, so a run that appears in between is still skipped.
+    /// Whether a run of this name is unfinished or already queued here to start, counting outings that carry a
+    /// queue id suffix (<c>Name-{guid}</c>) as the same name. Lets a caller that does not want overlapping runs
+    /// (<c>allowCollision: false</c>) skip, and say so, before building the batch. The start itself checks
+    /// again, so a run that appears in between is still skipped.
     /// PS usage: <c>[Craft.Services.OrchestratorBridge]::IsRunActive($name)</c>.
     /// </summary>
     public static bool IsRunActive(string name)
     {
-        name = TableKeys.Sanitize(name);
-        if (s_pending.Any(p => p.Name == name)) return true;
+        var family = WorkStore.CollisionFamily(TableKeys.Sanitize(name));
+        if (s_pending.Any(p => WorkStore.CollisionFamily(TableKeys.Sanitize(p.Name)) == family)) return true;
         return s_service != null && Task.Run(() => s_service.IsRunActiveAsync(name)).GetAwaiter().GetResult();
     }
 

@@ -306,6 +306,14 @@ public class OrchestratorBridgeLineageTests
             OrchestratorBridge.QueueOrchestration("LineageQueuedRun", "[]", 4);
             Assert.True(OrchestratorBridge.IsRunActive("LineageQueuedRun"));
             Assert.NotNull(TakePending("LineageQueuedRun"));
+
+            await CreateRunAsync(store, $"LineageFamily-{Guid.NewGuid()}");
+            Assert.True(OrchestratorBridge.IsRunActive($"LineageFamily-{Guid.NewGuid()}"));
+            Assert.True(OrchestratorBridge.IsRunActive("LineageFamily"));
+            var queued = $"LineageQueuedFamily-{Guid.NewGuid()}";
+            OrchestratorBridge.QueueOrchestration(queued, "[]", 4);
+            Assert.True(OrchestratorBridge.IsRunActive($"LineageQueuedFamily-{Guid.NewGuid()}"));
+            Assert.NotNull(TakePending(queued));
         }
         finally
         {

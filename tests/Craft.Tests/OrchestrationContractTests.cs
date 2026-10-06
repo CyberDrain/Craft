@@ -104,6 +104,38 @@ public class OrchestrationContractTests
         Assert.True(await Start(h, "Recurring", Batch(1), allowCollision: false));
     }
 
+    /// <summary>
+    /// Callers append a queue id to a run's name so their queue page can find each outing. Without collisions,
+    /// <c>Cache-{queueId}</c> must still collide with yesterday's <c>Cache-{otherQueueId}</c> and with plain
+    /// <c>Cache</c>, or the flag never skips anything.
+    /// </summary>
+    [Fact]
+    public async Task WithoutCollisions_OutingsThatCarryAQueueId_CollideWithEachOther_AndWithThePlainName()
+    {
+        await using var h = await NewAsync();
+        var first = $"Cache-{Guid.NewGuid()}";
+        Assert.True(await Start(h, first, Batch(1), allowCollision: false));
+
+        Assert.False(await Start(h, $"Cache-{Guid.NewGuid()}", Batch(1), allowCollision: false));
+        Assert.False(await Start(h, "Cache", Batch(1), allowCollision: false));
+        Assert.True(await Start(h, $"CacheMore-{Guid.NewGuid()}", Batch(1), allowCollision: false));
+        Assert.True(await Start(h, "Cache-weekly", Batch(1), allowCollision: false));
+        Assert.True(await Start(h, $"Cache-{Guid.NewGuid()}", Batch(1)));
+
+        Assert.True(await h.DriveUntilAllFinished());
+        Assert.True(await Start(h, $"Cache-{Guid.NewGuid()}", Batch(1), allowCollision: false));
+    }
+
+    [Fact]
+    public async Task ANameSuffixThatIsNotAQueueId_IsItsOwnName_ForCollisions()
+    {
+        await using var h = await NewAsync();
+        Assert.True(await Start(h, "Report-weekly", Batch(1), allowCollision: false));
+
+        Assert.True(await Start(h, "Report", Batch(1), allowCollision: false));
+        Assert.False(await Start(h, $"Report-{Guid.NewGuid()}", Batch(1), allowCollision: false));
+    }
+
     [Fact]
     public async Task ByDefault_RunsOfOneNameStackUp_AndEachRunsEveryTask()
     {
