@@ -1,19 +1,15 @@
 using System.Text.Json;
 using Craft.Configuration;
-using Craft.Orchestration;
 using Craft.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
 
 /// <summary>
-/// End-to-end guard for the failure this whole change exists for: a scheduled task whose Parameters
-/// embed a whole policy template serialize to more than Azure Table's 64 KiB-per-property limit, so the
-/// orchestrator's Tasks row used to 400 with PropertyValueTooLarge, get dropped, and the task could never
-/// be rehydrated at dispatch ("Parameters could not be rehydrated at dispatch — the Tasks-table row is
-/// missing"). With large-entity splitting in the backing store, the task row persists and both read paths
-/// the orchestrator uses — GetRunAsync (partition scan) and GetTaskParametersAsync (point read, the
-/// dispatch rehydrate) — return the Parameters byte-for-byte.
+/// End-to-end guard against a real table backend: a scheduled task whose parameters embed a whole policy
+/// template is far over Azure Table's 64 KiB-per-property limit, and so can be a run's PostExecution
+/// parameters. The payload row must persist and rehydrate byte-for-byte, and the run must still move through
+/// claim, finish and its barrier: those are real entity-group transactions here, which cannot split a row.
 ///
 /// Azurite by default, a real account via CRAFT_TEST_TABLE_CONNECTION; skipped, not failed, when neither
 /// is reachable.
@@ -21,7 +17,7 @@ namespace Craft.Tests;
 [Collection(LargeAllocationSerialTests.Name)]
 public class OrchestratorTaskLargeParametersAzuriteTests
 {
-    private static async Task<OrchestratorTableStore?> TryConnectAsync()
+    private static async Task<WorkStore?> TryConnectAsync()
     {
         var settings = new CraftSettings();
         var connection = Environment.GetEnvironmentVariable("CRAFT_TEST_TABLE_CONNECTION");
@@ -43,7 +39,7 @@ public class OrchestratorTaskLargeParametersAzuriteTests
             return null;
         }
 
-        var store = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, backing);
+        var store = new WorkStore(NullLogger<WorkStore>.Instance, settings, backing);
         await store.InitializeAsync();
         return store;
     }
@@ -56,54 +52,49 @@ public class OrchestratorTaskLargeParametersAzuriteTests
     };
 
     [Theory]
-    [InlineData(80_000)]      // > 64 KiB per-property: the exact reported failure (column split)
+    [InlineData(80_000)]      // > 64 KiB per-property: column split
     [InlineData(1_200_000)]   // > 1 MiB entity: forces a cross-row split too
-    public async Task ATaskWhoseParametersExceedTheLimit_PersistsAndRehydrates(int settingsChars)
+    public async Task ARunWithParametersOverTheLimit_PersistsRehydratesAndCompletes(int settingsChars)
     {
         var store = await TryConnectAsync();
         if (store == null) return;
 
-        const string run = "UserTaskOrchestrator_contoso.com";
         var big = new string('T', settingsChars);
-        var parameters = new Dictionary<string, object>
+        var started = DateTime.UtcNow;
+        var header = new RunHeader
         {
-            ["Tenant"] = "contoso.com",
-            ["Settings"] = big,
+            RunKey = WorkStore.RunKeyFor("UserTaskOrchestrator_contoso.com", started),
+            Name = "UserTaskOrchestrator_contoso.com",
+            Priority = 2,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+            PostExecFunctionName = "Agg",
+            PostExecParametersJson = JsonSerializer.Serialize(new { blob = big }),
         };
 
         try
         {
-            await store.UpsertRunAsync(new OrchestratorRun
-            {
-                Name = run,
-                Status = "Running",
-                Priority = 2,
-                StartedUtc = DateTime.UtcNow,
-                TaskScriptName = "ExecScheduledCommand",
-                Tasks = [new OrchestratorTaskItem { Id = "task-0", Status = "Pending" }]
-            });
+            await store.CreateRunAsync(header,
+                [new WorkStore.NewTask("task-0", new() { ["Tenant"] = "contoso.com", ["Settings"] = big })]);
 
-            // The exact write path Start-UserTasksOrchestrator uses to enqueue a task's payload.
-            await store.UpsertTaskBatchAsync(run, new List<OrchestratorTaskItem>
-            {
-                new() { Id = "task-0", Status = "Pending", Parameters = parameters }
-            });
-
-            // Dispatch rehydrate: a point read of the one task's Parameters.
-            var rehydrated = await store.GetTaskParametersAsync(run, "task-0");
-            Assert.NotNull(rehydrated);
+            var claim = Assert.Single(await store.ClaimAsync(header.RunKey, 10, "w", TimeSpan.FromMinutes(5), true));
+            var rehydrated = await store.GetPayloadAsync(header.RunKey, claim.Seq);
             Assert.Equal("contoso.com", AsString(rehydrated!["Tenant"]));
             Assert.Equal(big, AsString(rehydrated["Settings"]));
 
-            // Whole-run read: the partition scan reassembles the same task.
-            var loaded = await store.GetRunAsync(run);
-            Assert.NotNull(loaded);
-            var task = Assert.Single(loaded!.Tasks);
-            Assert.Equal(big, AsString(task.Parameters["Settings"]));
+            var barrier = await store.FinishAsync(header.RunKey, [new WorkStore.Finish(claim.Seq, "Completed", Owner: "w")]);
+            Assert.True(barrier!.ReachedBarrier);
+            Assert.Equal(header.PostExecParametersJson, await store.GetPostExecParametersAsync(header.RunKey));
+
+            var aggregate = Assert.Single(await store.ClaimAsync(header.RunKey, 10, "w", TimeSpan.FromMinutes(5), true));
+            Assert.Equal(WorkStore.AggregateSeq, aggregate.Seq);
+            var done = await store.FinishAsync(header.RunKey, [new WorkStore.Finish(aggregate.Seq, "Completed", Owner: "w")]);
+            Assert.True(done!.Completed);
+            Assert.Equal("Completed", done.Header.Status);
         }
         finally
         {
-            await store.CleanupRunAsync(run);
+            await store.DeleteRunAsync(header.RunKey);
         }
     }
 }

@@ -223,12 +223,13 @@ public static class WorkerMetricsBridge
             // the durable queue table. GetCached never blocks: a stale/missing snapshot kicks off a
             // background refresh and this poll reports what is known now.
             var durable = s_queueReader?.GetCached();
+            var waiting = durable == null ? 0 : s_queueReader!.WaitingInStorage(durable);
 
             snapshot.Jobs = new JobMetrics
             {
-                Queued = summary.Queued + (durable?.Unclaimed ?? 0),
+                Queued = summary.Queued + waiting,
                 QueuedLocal = summary.Queued,
-                QueuedDurable = durable?.Unclaimed ?? 0,
+                QueuedDurable = waiting,
                 Running = summary.Running,
                 Completed = summary.Completed,
                 Failed = summary.Failed,
@@ -441,7 +442,7 @@ public static class WorkerMetricsBridge
     public static MemoryBreakdown GetMemoryBreakdown()
     {
         var proc = Process.GetCurrentProcess();
-        var gcInfo = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+        var gcInfo = GC.GetGCMemoryInfo(GCKind.Any);
         var heapBytes = GC.GetTotalMemory(false);
         var workingSet = proc.WorkingSet64;
         var containerBytes = GetContainerMemoryLimit() ?? gcInfo.TotalAvailableMemoryBytes;
@@ -590,7 +591,8 @@ public static class WorkerMetricsBridge
     /// <summary>Get a summary of just the busy/available counts.</summary>
     public static WorkerSummary GetSummary()
     {
-        var durable = s_queueReader?.GetCached();
+        var snapshot = s_queueReader?.GetCached();
+        var waiting = snapshot == null ? 0 : s_queueReader!.WaitingInStorage(snapshot);
         var localQueued = s_jobManager?.QueuedCount ?? 0;
 
         return new WorkerSummary
@@ -605,9 +607,9 @@ public static class WorkerMetricsBridge
             LimiterWaiting = s_limiter?.Waiting ?? 0,
             LimiterMax = s_limiter?.CurrentMax ?? 0,
             IsHttpThrottled = s_limiter?.IsHttpThrottled ?? false,
-            JobsQueued = localQueued + (durable?.Unclaimed ?? 0),
+            JobsQueued = localQueued + waiting,
             JobsQueuedLocal = localQueued,
-            JobsQueuedDurable = durable?.Unclaimed ?? 0,
+            JobsQueuedDurable = waiting,
             JobsActive = s_jobManager?.ActiveCount ?? 0,
         };
     }
@@ -660,7 +662,7 @@ public static class WorkerMetricsBridge
             var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
             if (row == null) return false;
 
-            return await s_orchestrator.TryCancelQueuedTaskAsync(row.RunName, row.TaskId);
+            return await s_orchestrator.TryCancelQueuedTaskAsync(row.RunKey, row.Seq);
         });
     }
 
@@ -693,10 +695,8 @@ public static class WorkerMetricsBridge
         => s_jobManager?.DeleteJob(jobId) ?? false;
 
     /// <summary>
-    /// Empty the durable job queue — a maintenance/reset primitive. Returns the number of queue rows
-    /// removed, or -1 if the orchestrator is unavailable or the clear failed. In-flight work is
-    /// unaffected and Pending tasks may be re-driven, so pair with <see cref="CancelRun"/> when the
-    /// intent is to STOP work rather than clear a wedged or corrupted queue.
+    /// Empty the durable job queue — cancel every task still waiting in storage. Returns how many were
+    /// cancelled, or -1 if the orchestrator is unavailable or the clear failed. Running tasks finish.
     /// PS usage: <c>[Craft.Services.WorkerMetricsBridge]::ClearQueue()</c>.
     /// </summary>
     public static int ClearQueue()
@@ -714,28 +714,20 @@ public static class WorkerMetricsBridge
     }
 
     /// <summary>
-    /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for an
-    /// unclaimed durable row it moves the row to the new priority bucket (keeping its age) and records
-    /// the override on the task so a restart re-queues it at the operator's priority.
+    /// Change a queued job's priority. In the local buffer this re-enqueues at the new priority; for a task
+    /// still in storage it moves the task's whole run to the new priority band, since a run's tasks share
+    /// one queue position.
     /// </summary>
     public static bool ChangePriority(string jobId, int newPriority)
     {
         if (s_jobManager?.ChangePriority(jobId, newPriority) == true) return true;
-        if (s_queueReader == null) return false;
+        if (s_queueReader == null || s_orchestrator == null) return false;
 
         return RunBridged(async ct =>
         {
             var snap = await s_queueReader.GetAsync(TimeSpan.FromSeconds(2), ct);
             var row = snap?.Rows.FirstOrDefault(r => !r.Claimed && $"{r.RunName}-{r.TaskId}" == jobId);
-            if (row == null) return false;
-
-            var moved = await s_queueReader.Queue.ReprioritizeTaskAsync(row.RunName, row.TaskId, newPriority, ct);
-            if (moved == 0) return false;
-
-            // Best-effort durability of the override itself: only effective where the run is live,
-            // which on the dispatching node it is. The row move above is what changes dispatch order.
-            s_orchestrator?.PriorityChanged(new JobDescriptor(row.RunName, row.TaskId, row.Priority), newPriority);
-            return true;
+            return row != null && await s_orchestrator.ReprioritizeRunAsync(row.RunName, newPriority);
         });
     }
 
@@ -831,7 +823,7 @@ public static class WorkerMetricsBridge
 
     /// <summary>
     /// Force a full GC collection with LOH compaction and working-set trim.
-    /// Called automatically every 100 invocations and after orchestrator runs complete.
+    /// Called every 100 invocations and on the MemoryTrimService timer (Worker.MemoryTrimIntervalMinutes).
     /// Has a built-in 2-minute cooldown to avoid GC thrashing.
     /// Returns the MB reclaimed, or -1 if skipped due to cooldown.
     /// </summary>

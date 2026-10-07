@@ -16,8 +16,9 @@ namespace Craft.Tests;
 /// fresh copy of that job is queued or running. <c>IsQueuedOrRunning</c> reads the frozen record and
 /// answers "no" for a job that is very much running.
 ///
-/// That answer is load-bearing. JobQueuePump.ReleaseFinishedAsync treats it as "this job is done" and
-/// DELETES the task's durable queue row. Observed live: the pump released 7-9 "finished" jobs every
+/// That answer is load-bearing. WorkPump.Forget treats it as "this job is done" and stops renewing the
+/// task's claim, so a long task loses its lease and runs again elsewhere. Observed live (when the pump
+/// deleted the queue row instead): the pump released 7-9 "finished" jobs every
 /// second while only 8 could physically be running, on a run where individual tasks executed up to five
 /// times.
 /// </summary>
@@ -74,10 +75,10 @@ public class JobManagerReEnqueueTests
 
         await WaitUntilAsync(() => Volatile.Read(ref ran) == 2, "second job never started");
 
-        // The job IS running. Answering "no" here is what makes the pump delete a live job's queue row.
+        // The job IS running. Answering "no" here is what makes the pump stop renewing a live job's claim.
         Assert.True(jobs.IsQueuedOrRunning(id),
             "the manager reports a running job as finished — its record is frozen at the previous run's " +
-            "status, so JobQueuePump.ReleaseFinishedAsync will drop the durable row out from under it");
+            "status, so WorkPump.Forget will stop renewing its claim");
 
         release.Release();
         await jobs.StopAsync(CancellationToken.None);

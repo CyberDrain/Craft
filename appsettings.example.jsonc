@@ -173,6 +173,9 @@
       // docs/dispatch-analysis.md). Set false only to A/B or if a module misbehaves on a long-lived thread.
       // "ReuseRunspaceThread": true,
 
+      // Minutes between timed memory trims (compacting full GC). 0 = disabled. Default 5.
+      // "MemoryTrimIntervalMinutes": 5,
+
       // Host-tier pool sizing. When set, the first matching entry overrides
       // HttpPoolSize/BgPoolSize above based on the runtime environment.
       //   SkuEnv: name of the env var to read for the host tier identifier

@@ -8,207 +8,120 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Craft.Tests;
 
 /// <summary>
-/// The table-backed status view. Since task ownership moved into the queue table, the in-memory
-/// JobManager holds only a worker-pool-sized buffer — so every status consumer that reads it as "the
-/// queue" reports a 7,000-task fan-out as eight queued jobs. These tests pin the merge semantics: the
-/// durable backlog is counted and listed, claimed rows are never double-counted against the local
-/// records that represent them, and run sizes come from the counter row rather than from whatever
-/// slice this instance happened to claim.
+/// The status APIs read the durable backlog from the Ready list: every run is counted from its counts, only
+/// the head is listed task by task, and work this process holds is not counted as waiting.
 /// </summary>
 public class JobQueueStatusReaderTests
 {
-    private static readonly TimeSpan Lease = TimeSpan.FromMinutes(20);
-    private static readonly TimeSpan Fresh = TimeSpan.Zero;
-
-    private sealed class Fixture
-    {
-        public required RunRemainingCounterTests.ConditionalStore Backing { get; init; }
-        public required JobQueueStore Queue { get; init; }
-        public required OrchestratorTableStore Store { get; init; }
-        public required JobManager Jobs { get; init; }
-        public required JobQueueStatusReader Reader { get; init; }
-    }
-
-    private static async Task<Fixture> NewFixtureAsync()
+    private static (JobQueueStatusReader Reader, WorkStore Store, JobManager Jobs) New()
     {
         var settings = new CraftSettings();
-        settings.Worker.BgPoolSize = 2;
         var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
         var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
         var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
         var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
+        var store = new WorkStore(NullLogger<WorkStore>.Instance, settings, new MemoryTableStore());
+        return (new JobQueueStatusReader(NullLogger<JobQueueStatusReader>.Instance, jobs, store), store, jobs);
+    }
 
-        var backing = new RunRemainingCounterTests.ConditionalStore();
-        var queue = new JobQueueStore(NullLogger<JobQueueStore>.Instance, settings, backing);
-        var store = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, backing);
-        await queue.InitializeAsync();
-        await store.InitializeAsync();
-
-        return new Fixture
+    private static Task<RunHeader> Create(WorkStore s, string name, int tasks, int minute)
+    {
+        var started = new DateTime(2026, 10, 5, 3, minute, 0, DateTimeKind.Utc);
+        return s.CreateRunAsync(new RunHeader
         {
-            Backing = backing,
-            Queue = queue,
-            Store = store,
-            Jobs = jobs,
-            Reader = new JobQueueStatusReader(NullLogger<JobQueueStatusReader>.Instance, jobs, queue, store),
-        };
-    }
-
-    private static DateTime At(int minute) => new(2026, 8, 12, 3, minute, 0, DateTimeKind.Utc);
-
-    [Fact]
-    public async Task SummaryCountsTheDurableBacklog_NotJustTheLocalBuffer()
-    {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueBatchAsync("StandardsApply",
-            Enumerable.Range(0, 120).Select(i => ($"std-{i}", 4)).ToList(), At(5));
-
-        var summary = await f.Reader.GetSummaryAsync();
-
-        Assert.Equal(120, summary.Queued);
-        Assert.Equal(120, summary.QueuedDurable);
-        Assert.Equal(0, summary.QueuedLocal);
-        Assert.Equal(At(5), summary.OldestQueuedUtc);
+            RunKey = WorkStore.RunKeyFor(name, started),
+            Name = name,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+        }, Enumerable.Range(0, tasks).Select(i => new WorkStore.NewTask($"t{i}", [])).ToList());
     }
 
     [Fact]
-    public async Task ClaimedRowsAreNotCountedAsQueued()
+    public async Task EveryRunIsCounted_ButOnlyTheHeadIsListed()
     {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueBatchAsync("run",
-            Enumerable.Range(0, 10).Select(i => ($"task-{i}", 4)).ToList(), At(0));
-        var claimed = await f.Queue.ClaimBatchAsync("worker-a", 4, Lease);
-        Assert.Equal(4, claimed.Count);
+        var (reader, store, _) = New();
+        for (var i = 0; i < 60; i++) await Create(store, $"Run{i:D2}", 50, i % 60);
 
-        var summary = await f.Reader.GetSummaryAsync();
+        var snap = (await reader.GetAsync())!;
 
-        // The four claimed rows are some instance's buffer — represented by its local records, not by
-        // the backlog count.
-        Assert.Equal(6, summary.QueuedDurable);
-        Assert.Equal(6, summary.Queued);
+        Assert.Equal(3_000, snap.Total);
+        Assert.Equal(3_000, snap.Unclaimed);
+        Assert.Equal(60, snap.ByRun.Count);
+        Assert.Equal(JobQueueStatusReader.HeadRows, snap.Rows.Count);
+        Assert.Equal("Run00", snap.Rows[0].RunName);
     }
 
     [Fact]
-    public async Task JobDetails_ListTheBacklog_WithoutDuplicatingLocallyClaimedWork()
+    public async Task WorkThisProcessHolds_IsNotCountedAsWaiting()
     {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueAsync("run", "claimed-here", 4, At(0));
-        await f.Queue.EnqueueAsync("run", "claimed-elsewhere", 4, At(1));
-        await f.Queue.EnqueueAsync("run", "waiting", 4, At(2));
+        var (reader, store, jobs) = New();
+        var run = await Create(store, "Busy", 5, 0);
+        foreach (var c in await store.ClaimAsync(run.RunKey, 2, "me", TimeSpan.FromMinutes(5), false))
+            jobs.Enqueue(new JobDescriptor("Busy", c.TaskId, 4) { RunKey = c.RunKey, Seq = c.Seq }, $"Busy-{c.TaskId}");
 
-        // Claim one locally, the way the pump does: claim the row, enqueue the descriptor locally. Which
-        // of the two "claimed-*" tasks comes first is no longer time-ordered under schema v2, so drive the
-        // local record off whatever was actually claimed rather than a hard-coded id.
-        var mine = await f.Queue.ClaimBatchAsync("this-node", 1, Lease);
-        var mineId = Assert.Single(mine).TaskId;
-        f.Jobs.Enqueue(new JobDescriptor("run", mineId, 4), $"run-{mineId}");
+        var snap = (await reader.GetAsync())!;
 
-        // Another instance's claim: a row under lease with no local record at all.
-        var theirs = await f.Queue.ClaimBatchAsync("other-node", 1, Lease);
-        var theirsId = Assert.Single(theirs).TaskId;
-        Assert.NotEqual(mineId, theirsId);
+        Assert.Equal(5, snap.Total);
+        Assert.Equal(3, snap.Unclaimed);
+        Assert.Equal(3, snap.Rows.Count);
+        var summary = await reader.GetSummaryAsync();
+        Assert.Equal(3, summary.QueuedDurable);
+    }
 
-        var details = await f.Reader.GetJobDetailsAsync();
+    /// <summary>
+    /// The snapshot is cached for seconds while this process keeps claiming. Merged views once added the live
+    /// local queue to the snapshot's own "unclaimed", which had already subtracted the claims held when it was
+    /// taken, so every claim made since was counted twice (seen live: 202 queued on a 200-task run).
+    /// </summary>
+    [Fact]
+    public async Task ClaimsMadeAfterTheSnapshot_AreNotCountedTwice()
+    {
+        var (reader, store, jobs) = New();
+        var run = await Create(store, "Busy", 5, 0);
+        void Hold(IEnumerable<WorkStore.ClaimedTask> claims)
+        {
+            foreach (var c in claims) jobs.Enqueue(new JobDescriptor("Busy", c.TaskId, 4) { RunKey = c.RunKey, Seq = c.Seq }, $"Busy-{c.TaskId}", $"{c.RunKey}|{c.Seq}");
+        }
+        Hold(await store.ClaimAsync(run.RunKey, 2, "me", TimeSpan.FromMinutes(5), false));
+        await reader.GetAsync(TimeSpan.FromMinutes(5));                     // cached with 2 held
+        Hold(await store.ClaimAsync(run.RunKey, 2, "me", TimeSpan.FromMinutes(5), false));
 
-        // The locally-claimed row once (its local record), the still-waiting row once (durable), the row
-        // claimed by the other instance not at all — its records live there. ("waiting" sorts last, so the
-        // two claims took the "claimed-*" pair and it is what remains.)
-        Assert.Equal(2, details.Count);
-        Assert.Single(details, d => d.Id == $"run-{mineId}");
-        Assert.DoesNotContain(details, d => d.Id == $"run-{theirsId}");
-        var waiting = Assert.Single(details, d => d.Id == "run-waiting");
-        Assert.Equal("Queued", waiting.Status);
-        Assert.Equal(At(2), waiting.QueuedUtc);
-        Assert.True(waiting.WaitSeconds > 0);
+        var summary = await reader.GetSummaryAsync();
+        Assert.Equal(1, summary.QueuedDurable);
+        Assert.Equal(5, summary.Queued + summary.Running);
+
+        var busy = Assert.Single(await reader.GetRunSummariesAsync(), r => r.Name == "Busy");
+        Assert.Equal(5, busy.Total);
+        Assert.True(busy.Queued + busy.Running + busy.Completed + busy.Failed <= busy.Total,
+            $"queued {busy.Queued} running {busy.Running} completed {busy.Completed} failed {busy.Failed} over total {busy.Total}");
+        Assert.Equal(5, busy.Queued + busy.Running);
     }
 
     [Fact]
-    public async Task JobDetails_RespectStatusFilterAndLimit()
+    public async Task RunsSharingAName_AreSummedUnderThatName()
     {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueBatchAsync("run",
-            Enumerable.Range(0, 5).Select(i => ($"task-{i}", 4)).ToList(), At(0));
+        var (reader, store, _) = New();
+        await Create(store, "Twin", 3, 0);
+        await Create(store, "Twin", 4, 1);
 
-        // A non-Queued filter describes claimed work, which only local records know about.
-        Assert.Empty(await f.Reader.GetJobDetailsAsync(status: "Running"));
+        var info = (await reader.GetAsync())!.ByRun["Twin"];
 
-        var queuedOnly = await f.Reader.GetJobDetailsAsync(status: "Queued");
-        Assert.Equal(5, queuedOnly.Count);
-        Assert.All(queuedOnly, d => Assert.Equal("Queued", d.Status));
-
-        Assert.Equal(3, (await f.Reader.GetJobDetailsAsync(limit: 3)).Count);
+        Assert.Equal(7, info.Total);
+        Assert.Equal(7, info.Unclaimed);
     }
 
     [Fact]
-    public async Task RunSummaries_SizeARunFromItsCounter_NotFromTheClaimedSlice()
+    public async Task AFinishedRun_LeavesTheBacklog()
     {
-        var f = await NewFixtureAsync();
+        var (reader, store, _) = New();
+        var run = await Create(store, "Quick", 2, 0);
+        var claims = await store.ClaimAsync(run.RunKey, 2, "w", TimeSpan.FromMinutes(5), false);
+        await store.FinishAsync(run.RunKey, claims.Select(c => new WorkStore.Finish(c.Seq, "Completed", Owner: "w")).ToList());
 
-        // A 10-task run: one durably finished, one claimed into this instance, eight still queued.
-        await f.Store.InitRemainingAsync("run", 10);
-        await f.Store.DecrementRemainingAsync("run", 1);
-        await f.Queue.EnqueueBatchAsync("run",
-            Enumerable.Range(0, 9).Select(i => ($"task-{i}", 4)).ToList(), At(0));
-        var claimed = await f.Queue.ClaimBatchAsync("this-node", 1, Lease);
-        f.Jobs.Enqueue(new JobDescriptor("run", claimed[0].TaskId, 4), $"run-{claimed[0].TaskId}");
+        var snap = (await reader.GetAsync())!;
 
-        var summary = Assert.Single(await f.Reader.GetRunSummariesAsync(), s => s.Name == "run");
-
-        Assert.Equal(10, summary.Total);
-        Assert.Equal(9, summary.Queued);      // 8 unclaimed + 1 buffered locally
-        Assert.Equal(1, summary.Completed);   // Total − Remaining, durable across restarts
-    }
-
-    [Fact]
-    public async Task RunSummaries_SynthesizeARunTheJobManagerHasNeverSeen()
-    {
-        var f = await NewFixtureAsync();
-        await f.Store.InitRemainingAsync("cold-run", 50);
-        await f.Queue.EnqueueBatchAsync("cold-run",
-            Enumerable.Range(0, 50).Select(i => ($"task-{i}", 3)).ToList(), At(0));
-
-        var summary = Assert.Single(await f.Reader.GetRunSummariesAsync(), s => s.Name == "cold-run");
-
-        Assert.Equal(50, summary.Total);
-        Assert.Equal(50, summary.Queued);
-        Assert.Equal(3, summary.Priority);
-        Assert.Equal(0, summary.Running);
-    }
-
-    [Fact]
-    public async Task AFailedRefreshServesThePreviousSnapshot()
-    {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueAsync("run", "task-0", 4, At(0));
-
-        var first = await f.Reader.GetAsync(Fresh);
-        Assert.NotNull(first);
-        Assert.Equal(1, first!.Unclaimed);
-
-        f.Backing.OnBeforeQuery = () => throw new InvalidOperationException("storage is down");
-        var second = await f.Reader.GetAsync(Fresh);
-
-        // Stale data with an honest timestamp, not an exception on a health endpoint.
-        Assert.Same(first, second);
-    }
-
-    [Fact]
-    public async Task SnapshotAggregatesPerRun()
-    {
-        var f = await NewFixtureAsync();
-        await f.Queue.EnqueueBatchAsync("run-a",
-            Enumerable.Range(0, 3).Select(i => ($"a-{i}", 4)).ToList(), At(0));
-        await f.Queue.EnqueueBatchAsync("run-b",
-            Enumerable.Range(0, 2).Select(i => ($"b-{i}", 1)).ToList(), At(1));
-
-        var snap = await f.Reader.GetAsync(Fresh);
-
-        Assert.NotNull(snap);
-        Assert.Equal(5, snap!.Total);
-        Assert.Equal(3, snap.ByRun["run-a"].Unclaimed);
-        Assert.Equal(2, snap.ByRun["run-b"].Unclaimed);
-        Assert.Equal(1, snap.ByRun["run-b"].MinPriority);
-        Assert.Equal(At(0), snap.OldestUnclaimedUtc);
+        Assert.Equal(0, snap.Total);
+        Assert.Empty(snap.ByRun);
     }
 }

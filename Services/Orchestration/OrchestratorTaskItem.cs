@@ -1,36 +1,9 @@
 namespace Craft.Orchestration;
 
+/// <summary>A task parsed from a batch or planner output, before it is stored.</summary>
 public class OrchestratorTaskItem
 {
     public string Id { get; set; } = string.Empty;
     public string Status { get; set; } = "Pending";
     public Dictionary<string, object> Parameters { get; set; } = [];
-    public int AttemptCount { get; set; }
-    public string? LastError { get; set; }
-    public DateTime? CompletedUtc { get; set; }
-
-    /// <summary>
-    /// Dispatch priority override for this task alone. Null — the normal case — means "inherit the
-    /// run's priority", so existing rows and everything the planner emits behave exactly as before
-    /// with no backfill needed.
-    ///
-    /// Set only when an operator reprioritizes one queued job (<c>JobManager.ChangePriority</c>).
-    /// Persisted so the override survives a restart, instead of silently reverting to the run's
-    /// priority when <c>ResumeInterruptedRunsAsync</c> re-queues the task.
-    /// </summary>
-    public int? Priority { get; set; }
-
-    /// <summary>
-    /// Position of this task in the batch as submitted (0-based). Only meaningful for a run marked
-    /// <see cref="OrchestratorRun.Sequential"/>, where tasks are dispatched one at a time in ascending
-    /// Sequence order. Non-sequential runs leave it 0 and ignore it.
-    /// </summary>
-    public int Sequence { get; set; }
-
-    /// <summary>
-    /// Set when a worker in THIS process marks the task Running. Never persisted, so a Running status
-    /// rehydrated from storage (another process's pre-invoke marker) reads false: it is not proof that
-    /// anything here is executing the task. See <c>OrchestratorService.ResolveTaskWorkAsync</c>.
-    /// </summary>
-    internal bool OwnedHere;
 }

@@ -1,0 +1,7 @@
+# Override for scripts/run-orch-bench.ps1: point the SUT at another storage account and an isolated table prefix,
+# so one engine's run never reads another's tables. Layered on docker-compose.e2e-azure.yml.
+services:
+  sut:
+    environment:
+      - AzureWebJobsStorage=${BENCH_STORAGE}
+      - App__Orchestrator__TablePrefix=${BENCH_PREFIX}

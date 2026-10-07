@@ -83,12 +83,6 @@ public class JobDurabilityTests
         }
     }
 
-    private static OrchestratorTableStore NewStore(out FakeStore backing)
-    {
-        backing = new FakeStore();
-        return new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, new CraftSettings(), backing);
-    }
-
     private static JobManager NewJobManager()
     {
         var settings = new CraftSettings();
@@ -115,62 +109,6 @@ public class JobDurabilityTests
         {
             lock (Cancellations) Cancellations.Add(descriptor);
         }
-    }
-
-    // ── Per-task priority ───────────────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task TaskPriority_RoundTripsThroughStorage()
-    {
-        var store = NewStore(out _);
-        await store.InitializeAsync();
-
-        var tasks = new List<OrchestratorTaskItem>
-        {
-            new() { Id = "inherits", Status = "Pending" },                  // null ⇒ run priority
-            new() { Id = "overridden", Status = "Pending", Priority = 0 },  // escalated by an operator
-        };
-        await store.UpsertRunAsync(new OrchestratorRun
-        {
-            Name = "run",
-            Status = "Running",
-            Priority = 5,
-            StartedUtc = DateTime.UtcNow,
-            Tasks = tasks,
-        });
-        await store.UpsertTaskBatchAsync("run", tasks);
-
-        var recovered = await store.GetRunAsync("run");
-
-        Assert.Equal(5, recovered!.Priority);
-        Assert.Null(recovered.Tasks.Single(t => t.Id == "inherits").Priority);
-        Assert.Equal(0, recovered.Tasks.Single(t => t.Id == "overridden").Priority);
-    }
-
-    /// <summary>
-    /// The Replace-mode trap: the batched status writer rewrites the WHOLE row, so a column it does not
-    /// carry is erased. If Priority ever drops out of TaskStatusWrite, the override survives exactly
-    /// until the task moves to Running — this fails the moment that regresses.
-    /// </summary>
-    [Fact]
-    public async Task StatusWrite_PreservesTaskPriority_RatherThanErasingIt()
-    {
-        var store = NewStore(out _);
-        await store.InitializeAsync();
-
-        var task = new OrchestratorTaskItem { Id = "t1", Status = "Pending", Priority = 0 };
-        await store.UpsertTaskBatchAsync("run", [task]);
-        await store.UpsertRunAsync(new OrchestratorRun { Name = "run", Status = "Running", Priority = 5 });
-
-        // A status transition through the coalescing writer's path.
-        await store.WriteTaskStatusBatchAsync(
-            [new TaskStatusWrite("run", "t1", "Running", "{}", 0, null, null, task.Priority)]);
-
-        var recovered = await store.GetRunAsync("run");
-        var reloaded = recovered!.Tasks.Single();
-
-        Assert.Equal("Running", reloaded.Status);
-        Assert.Equal(0, reloaded.Priority);
     }
 
     // ── Durable operator actions ────────────────────────────────────────────────────────────────────

@@ -91,7 +91,7 @@ public class TableKeyTests
     [Fact]
     public void QueueRowKeyIsLegalForARepoNamedTask()
     {
-        // The end of the chain the bug actually travelled: id → BuildRowKey → upsert → 400.
+        // The end of the chain the bug actually travelled: id → row key → upsert → 400.
         var id = IdFor("""
             {
               "FunctionName": "ExecScheduledCommand",
@@ -99,8 +99,8 @@ public class TableKeyTests
             }
             """);
 
-        var rowKey = JobQueueStore.BuildRowKey("UserTaskOrchestrator_No tenant", id);
-
-        Assert.True(TableKeys.IsSafe(rowKey));
+        // The id keys the task's result row; the run key is the partition of both tables.
+        Assert.True(TableKeys.IsSafe(id));
+        Assert.True(TableKeys.IsSafe(WorkStore.RunKeyFor("UserTaskOrchestrator_No tenant", DateTime.UnixEpoch)));
     }
 }

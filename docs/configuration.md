@@ -179,6 +179,10 @@ Controls the PowerShell runspace pools that execute all scripts.
   // only to A/B or if a module misbehaves on a long-lived pipeline thread.
   "ReuseRunspaceThread": true,
 
+  // Minutes between timed memory trims (compacting full GC that hands freed heap back to the OS).
+  // Runs alongside the every-100-invocations trim, sharing its 2-minute cooldown. 0 = disabled.
+  "MemoryTrimIntervalMinutes": 5,
+
   // Maximum execution time (seconds) for HTTP request handlers.
   // When exceeded, the PowerShell pipeline is stopped and the worker is reclaimed.
   // 0 = no timeout (default). Recommended: 120-300 for HTTP endpoints.
@@ -370,26 +374,15 @@ By default it starts narrow and ramps slowly, to keep idle memory low; tune it f
 
 ### Orchestrator
 
-Fan-out/fan-in task execution with crash recovery.
+Fan-out/fan-in task execution. Every run's state lives in storage — one partition of `{Prefix}Work` per
+run, where each task is one row and every state change is one partition transaction — so a restart has
+nothing to recover: claims held by a stopped process lapse and are taken again.
 
 ```jsonc
 "Orchestrator": {
-  // Prefix for Azure Tables: {Prefix}Runs, {Prefix}Tasks, {Prefix}Results
+  // Prefix for Azure Tables: {Prefix}Work, {Prefix}Ready, {Prefix}Names, {Prefix}Finished, {Prefix}TaskResults.
+  // The previous design's {Prefix}Queue/QueueIndex/Tasks/Runs/Results tables are dropped at startup.
   "TablePrefix": "Orchestrator",
-
-  // Batch + coalesce per-task/run STATUS writes off the fan-out critical path, in ≤100-entity byte-budgeted
-  // Azure Table transactions. Default true. This is the throughput fix for large fan-outs — the per-task
-  // table write was the ceiling (see docs/orch-analysis.md). Results are NEVER batched (their chunking /
-  // multi-row large-payload path is untouched). Set false to fall back to per-task writes.
-  "BatchStatusWrites": true,
-  // Write the pre-invoke "Running" marker under a durable barrier (persisted BEFORE the task runs, batched
-  // with concurrently-starting tasks) so AttemptCount/MaxRetries still bounds poison tasks. Default true.
-  // False = eventual: the marker rides the periodic flush and the task doesn't wait — max throughput (100%
-  // pool utilization) at the cost of the strict poison-before-invoke guarantee. Terminal + run states stay
-  // durable in both modes (flushed before a run finalizes and on shutdown).
-  "DurableRunningBarrier": true,
-  // Status-writer flush interval / barrier latency ceiling (ms). Default 25.
-  "StatusFlushIntervalMs": 25,
 
   // PS function that executes individual tasks. Receives TaskJson parameter.
   // Default: "Invoke-CraftTask" (provided in CraftRuntime/)
@@ -407,14 +400,13 @@ Fan-out/fan-in task execution with crash recovery.
   // Default: "Invoke-CraftPostExecution" (provided in CraftRuntime/)
   "PostExecFunction": "Invoke-CraftPostExecution",
 
-  // Max task interruptions (host crash/restart) before marking Failed.
+  // Max task interruptions (host crash/restart) before marking Failed; also PostExecution attempts.
   "MaxRetries": 3,
 
-  // Retention sweep over the three tables. A run that finished — or that nothing is driving and that
-  // last wrote to storage — longer ago than RetentionHours is removed together with its Tasks/Results
-  // partitions, as is any Tasks/Results partition whose Run row is already gone. Runs once at startup
-  // (after crash recovery) and then every CleanupIntervalHours; 0 keeps only the startup pass. Craft
-  // needs the rows only while a run is live — the retention is for operators reading recent history.
+  // Retention sweep. A run that finished longer ago than RetentionHours is removed with its Work and
+  // Results partitions. Runs once at startup and then every CleanupIntervalHours; 0 keeps only the
+  // startup pass. Craft needs the rows only while a run is live — the retention is for operators
+  // reading recent history.
   "RetentionHours": 48,
   "CleanupIntervalHours": 4
 }

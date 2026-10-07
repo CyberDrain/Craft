@@ -23,19 +23,27 @@ public static class OrchestratorBridge
 
     public static void Initialize(OrchestratorService service) => s_service = service;
 
+    /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
+    /// while another run of the same name is unfinished.</param>
+    /// <param name="maxConcurrency">At most this many of the run's tasks run at once; 0 (the default) is no
+    /// limit. Ignored for a sequential run.</param>
+    /// <param name="stopOnFailure">Sequential runs only: the first failed step cancels the rest instead of the
+    /// run carrying on (the default).</param>
     public static void QueueOrchestration(string name, string batchJson, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true,
+        int maxConcurrency = 0, bool stopOnFailure = false)
     {
         // Sanitized here as well as at run creation so the child-run registration below
         // records the SAME name the service ends up creating — a raw name with a table-illegal
         // character would register a child link no live run ever matches.
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
-        var gated = RegisterPendingChild(parentRunName, name);
+        var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, batchJson, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference,
-            PendingChildRegistered: gated, Sequential: sequential));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
+            AllowCollision: allowCollision, MaxConcurrency: maxConcurrency, StopOnFailure: stopOnFailure));
     }
 
     /// <summary>
@@ -49,20 +57,29 @@ public static class OrchestratorBridge
     ///
     /// The file is owned by the orchestrator from this point: it is deleted once parsed.
     /// </summary>
+    /// <param name="allowCollision">True (the default) lets runs of one name stack up; false skips this run
+    /// while another run of the same name is unfinished.</param>
+    /// <param name="maxConcurrency">At most this many of the run's tasks run at once; 0 (the default) is no
+    /// limit. Ignored for a sequential run.</param>
+    /// <param name="stopOnFailure">Sequential runs only: the first failed step cancels the rest instead of the
+    /// run carrying on (the default).</param>
     public static void QueueOrchestrationFromFile(string name, string batchFilePath, int priority,
         string? postExecFunctionName = null, string? postExecParametersJson = null,
-        string? reference = null, string? parentRunName = null, bool sequential = false)
+        string? reference = null, string? parentRunName = null, bool sequential = false, bool allowCollision = true,
+        int maxConcurrency = 0, bool stopOnFailure = false)
     {
         name = TableKeys.Sanitize(name);
         parentRunName = ResolveParentRunName(name, parentRunName);
-        var gated = RegisterPendingChild(parentRunName, name);
+        var child = RegisterPendingChild(parentRunName, name);
         s_pending.Enqueue(new PendingOrchestration(name, string.Empty, priority,
             postExecFunctionName, postExecParametersJson, parentRunName, reference, batchFilePath,
-            PendingChildRegistered: gated, Sequential: sequential));
+            Sequential: sequential, ParentRunKey: child?.ParentRunKey, ChildKey: child?.ChildKey,
+            AllowCollision: allowCollision, MaxConcurrency: maxConcurrency, StopOnFailure: stopOnFailure));
     }
 
     /// <summary>
-    /// Resolve the parent run of a queued orchestration. The explicit argument wins — PowerShell
+    /// Resolve the parent run of a queued orchestration: a run key (exact — runs of one name can overlap) or a
+    /// run name (the newest outing). The explicit argument wins — PowerShell
     /// callers MUST pass it (read from the stamped $global:CraftOperationContext), because the
     /// ambient fallback cannot work for them: the pipeline runs on the runspace's reused thread,
     /// whose frozen ExecutionContext never sees the per-invocation AsyncLocal (see
@@ -75,7 +92,7 @@ public static class OrchestratorBridge
     private static string? ResolveParentRunName(string name, string? parentRunName)
     {
         if (string.IsNullOrEmpty(parentRunName))
-            parentRunName = OperationContext.Current?.RunName;
+            parentRunName = OperationContext.Current?.RunKey ?? OperationContext.Current?.RunName;
         if (string.IsNullOrEmpty(parentRunName))
             return null;
         // Sanitized like the child name: the parent was created under its sanitized name, and the
@@ -88,76 +105,87 @@ public static class OrchestratorBridge
     }
 
     /// <summary>
-    /// Register the child link at ENQUEUE time — while the parent task's script is still executing,
-    /// so the parent cannot pass its completion check before the gate exists. Registering after
-    /// StartFromBatchAsync (the old shape) loses that race for the parent's LAST task: the drain
-    /// runs in a background Task.Run while the enqueuing task is marked terminal immediately, so
-    /// the parent would finalize — and dispatch PostExecution — before its child was visible.
-    /// Returns whether a gate was taken, so the drain releases exactly what was registered.
+    /// Make the parent wait for this child, at ENQUEUE time — while the parent's task is still executing, so
+    /// the parent cannot reach its barrier first. The returned keys travel with the queued run: the child
+    /// fills the placeholder when it finishes, and a child that is never created releases it on the drain.
     /// </summary>
-    private static bool RegisterPendingChild(string? parentRunName, string childName) =>
-        !string.IsNullOrEmpty(parentRunName) &&
-        s_service?.TryRegisterPendingChildRun(parentRunName, childName) == true;
+    private static (string ParentRunKey, string ChildKey)? RegisterPendingChild(string? parentRunName, string childName) =>
+        string.IsNullOrEmpty(parentRunName) ? null : s_service?.RegisterPendingChild(parentRunName, childName);
 
     /// <summary>
-    /// Synchronous drain — blocks until all pending orchestrations are started.
-    /// Safe to call from any context (no SynchronizationContext on background workers).
+    /// Whether a run of this name is unfinished or already queued here to start, counting outings that carry a
+    /// queue id suffix (<c>Name-{guid}</c>) as the same name. Lets a caller that does not want overlapping runs
+    /// (<c>allowCollision: false</c>) skip, and say so, before building the batch. The start itself checks
+    /// again, so a run that appears in between is still skipped.
+    /// PS usage: <c>[Craft.Services.OrchestratorBridge]::IsRunActive($name)</c>.
     /// </summary>
+    public static bool IsRunActive(string name)
+    {
+        var family = WorkStore.CollisionFamily(TableKeys.Sanitize(name));
+        if (s_pending.Any(p => WorkStore.CollisionFamily(TableKeys.Sanitize(p.Name)) == family)) return true;
+        return s_service != null && Task.Run(() => s_service.IsRunActiveAsync(name)).GetAwaiter().GetResult();
+    }
+
+    private static readonly System.Text.Json.JsonSerializerOptions s_inspectJson = new() { WriteIndented = true };
+
+    /// <summary>
+    /// Why a run is or is not moving, as JSON: counts and mode, whether the scheduler can see it, its claims
+    /// and who holds them, child runs it waits for, its aggregation, the instance lock, and a diagnosis.
+    /// Takes a run key, or a run name (every unfinished run of it, else the latest).
+    /// PS usage: <c>[Craft.Services.OrchestratorBridge]::InspectRun('MailboxRules_contoso.com')</c>.
+    /// </summary>
+    public static string InspectRun(string nameOrKey) => s_service == null
+        ? "{\"error\":\"orchestrator not initialised\"}"
+        : System.Text.Json.JsonSerializer.Serialize(Task.Run(() => s_service.InspectRunAsync(nameOrKey)).GetAwaiter().GetResult(), s_inspectJson);
+
+    /// <summary>
+    /// Rebuild the Ready and Finished indexes from the active-run list now, as the pump does at startup: relists
+    /// unfinished runs, retires finished ones, removes runs whose creation never finished. Returns a JSON summary.
+    /// PS usage: <c>[Craft.Services.OrchestratorBridge]::RepairIndexes()</c>.
+    /// </summary>
+    public static string RepairIndexes() => s_service == null
+        ? "{\"error\":\"orchestrator not initialised\"}"
+        : System.Text.Json.JsonSerializer.Serialize(Task.Run(() => s_service.RepairIndexesAsync()).GetAwaiter().GetResult(), s_inspectJson);
+
+    /// <summary>Synchronous drain — blocks until all pending orchestrations are started.</summary>
     public static void DrainPending()
     {
         while (s_pending.TryDequeue(out var p))
-        {
-            try
-            {
-                if (s_service == null) { DiscardUndispatchable(p); continue; }
-                s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential)
-                    .GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
-            }
-            finally
-            {
-                // The enqueue-time gate lifts on EVERY path once the start attempt is over: a
-                // started child is in _activeRuns by now (which takes over blocking the parent),
-                // and one that failed to start must stop blocking — a leaked gate would defer the
-                // parent's finalize forever, re-checked every 60s for the process lifetime.
-                if (p.PendingChildRegistered)
-                    s_service?.ReleasePendingChildRun(p.Name);
-            }
-        }
+            Task.Run(() => StartAsync(p)).GetAwaiter().GetResult();
         DrainPendingPlanners();
     }
 
-    /// <summary>
-    /// Async drain — preferred from async call sites (PostExec lambdas, ExecuteScript).
-    /// </summary>
+    /// <summary>Async drain — preferred from async call sites (PostExec, ExecuteScript).</summary>
     public static async Task DrainPendingAsync()
     {
         while (s_pending.TryDequeue(out var p))
+            await StartAsync(p);
+        await DrainPendingPlannersAsync();
+    }
+
+    private static async Task StartAsync(PendingOrchestration p)
+    {
+        var created = false;
+        try
         {
-            try
+            if (s_service == null) { DiscardUndispatchable(p); return; }
+            created = await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
+                p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
+                p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential, p.ParentRunKey, p.ChildKey, p.AllowCollision,
+                p.MaxConcurrency, p.StopOnFailure);
+        }
+        catch (Exception ex)
+        {
+            s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
+        }
+        finally
+        {
+            if (!created && p.ParentRunKey != null && p.ChildKey != null && s_service != null)
             {
-                if (s_service == null) { DiscardUndispatchable(p); continue; }
-                await s_service.StartFromBatchAsync(p.Name, p.BatchJson, p.Priority,
-                    p.PostExecFunctionName, p.PostExecParametersJson, CancellationToken.None,
-                    p.ParentRunName, p.Reference, p.BatchFilePath, p.Sequential);
-            }
-            catch (Exception ex)
-            {
-                s_service?._logger.LogError(ex, "[Orchestrator] DrainPending failed for {Name}", p.Name);
-            }
-            finally
-            {
-                // See DrainPending: the gate lifts whatever the outcome of the start attempt.
-                if (p.PendingChildRegistered)
-                    s_service?.ReleasePendingChildRun(p.Name);
+                try { await s_service.AbandonPendingChildAsync(p.ParentRunKey, p.ChildKey); }
+                catch (Exception ex) { s_service._logger.LogWarning(ex, "[Orchestrator] Could not release {Name} from its parent", p.Name); }
             }
         }
-        await DrainPendingPlannersAsync();
     }
 
     /// <summary>
@@ -179,15 +207,17 @@ public static class OrchestratorBridge
 
     /// <summary>
     /// A queued run. Exactly one of <paramref name="BatchJson"/> and <paramref name="BatchFilePath"/>
-    /// carries the batch; the file path wins when both are set.
-    /// <paramref name="PendingChildRegistered"/> records whether enqueue took a pending-child gate on
-    /// the orchestrator, so the drain releases exactly the gates that were taken — releasing on a
-    /// refused registration could lift a gate held by ANOTHER queued entry of the same child name.
+    /// carries the batch; the file path wins when both are set. <paramref name="ParentRunKey"/> and
+    /// <paramref name="ChildKey"/> are set when the parent was made to wait for this run.
     /// </summary>
     public record PendingOrchestration(string Name, string BatchJson, int Priority,
         string? PostExecFunctionName, string? PostExecParametersJson, string? ParentRunName,
-        string? Reference = null, string? BatchFilePath = null,
-        bool PendingChildRegistered = false, bool Sequential = false);
+        string? Reference = null, string? BatchFilePath = null, bool Sequential = false,
+        string? ParentRunKey = null, string? ChildKey = null, bool AllowCollision = true, int MaxConcurrency = 0,
+        bool StopOnFailure = false)
+    {
+        public bool PendingChildRegistered => ChildKey != null;
+    }
 
     private static readonly ConcurrentQueue<PendingPlannerRun> s_pendingPlanners = new();
 

@@ -26,7 +26,7 @@ namespace Craft.Tests;
 /// </summary>
 public class OrchestratorResultsAzuriteTests
 {
-    private static async Task<OrchestratorTableStore?> TryConnectAsync()
+    private static async Task<ResultStore?> TryConnectAsync()
     {
         var settings = new CraftSettings();
 
@@ -54,8 +54,8 @@ public class OrchestratorResultsAzuriteTests
             return null;
         }
 
-        var store = new OrchestratorTableStore(
-            NullLogger<OrchestratorTableStore>.Instance, settings, backing);
+        var store = new ResultStore(
+            NullLogger<ResultStore>.Instance, settings, backing);
         await store.InitializeAsync();
         return store;
     }
@@ -99,7 +99,7 @@ public class OrchestratorResultsAzuriteTests
         finally
         {
             if (File.Exists(path)) File.Delete(path);
-            await store.CleanupRunAsync("run");
+            await store.DeleteRunAsync("run");
         }
     }
 
@@ -134,7 +134,7 @@ public class OrchestratorResultsAzuriteTests
         finally
         {
             if (File.Exists(path)) File.Delete(path);
-            await store.CleanupRunAsync("run");
+            await store.DeleteRunAsync("run");
         }
     }
 }

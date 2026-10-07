@@ -502,6 +502,7 @@ public class PowerShellRunnerService : IDisposable
         {
             WorkerId = $"W{worker.Id}",
             RunName = parentRun,
+            RunKey = OperationContext.Current?.RunKey,
             Priority = OperationContext.Current?.Priority,
             Category = "Job"
         };
@@ -644,6 +645,7 @@ public class PowerShellRunnerService : IDisposable
         {
             WorkerId = $"W{worker.Id}",
             RunName = parentRun,
+            RunKey = OperationContext.Current?.RunKey,
             Priority = OperationContext.Current?.Priority,
             Category = "Planner"
         };

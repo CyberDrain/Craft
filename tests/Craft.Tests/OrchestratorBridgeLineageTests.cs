@@ -1,12 +1,13 @@
 using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
 using Craft.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -172,24 +173,98 @@ public class OrchestratorBridgeLineageTests
         Assert.Null(pending!.ParentRunName);
     }
 
-    [Fact]
-    public void Drain_ReleasesTheGate_WhenStartFails()
+    /// <summary>Run the real Start-CraftOrchestrator inside a production-configured worker, under a caller
+    /// context that the worker stamps into the runspace, and return what reached the bridge and the result.</summary>
+    private static async Task<(OrchestratorBridge.PendingOrchestration? Pending, string Result)> RunWrapperAsync(
+        string name, string inputObject, OperationContext.Invocation? caller = null)
     {
-        // The deadlock-avoidance guarantee: a child whose start attempt throws must stop gating
-        // its parent. The service here is deliberately missing its storage fields, so
-        // StartFromBatchAsync fails immediately — the finally in DrainPending must still release.
-        var svc = (OrchestratorService)RuntimeHelpers.GetUninitializedObject(typeof(OrchestratorService));
-        void Set(string field, object value) =>
-            typeof(OrchestratorService).GetField(field, BindingFlags.NonPublic | BindingFlags.Instance)!
-                .SetValue(svc, value);
-        Set("_logger", NullLogger<OrchestratorService>.Instance);
-        var activeRuns = new ConcurrentDictionary<string, OrchestratorRun>();
-        Set("_activeRuns", activeRuns);
-        Set("_childRuns", new ConcurrentDictionary<string, ConcurrentBag<string>>());
-        Set("_recoveringChildren", new ConcurrentDictionary<string, bool>());
-        var pendingChildRuns = new ConcurrentDictionary<string, int>();
-        Set("_pendingChildRuns", pendingChildRuns);
-        activeRuns.TryAdd("LineageDrainParent", new OrchestratorRun { Name = "LineageDrainParent", Status = "Running" });
+        var script = Path.Combine(AppContext.BaseDirectory, "Runtime", "CraftRuntime", "Start-CraftOrchestrator.ps1");
+        var worker = await NewPinnedWorkerAsync();
+        try
+        {
+            Collection<PSObject> output;
+            using (OperationContext.Set(caller ?? new OperationContext.Invocation("Push-Task")))
+                output = await worker.InvokeScriptAsync(ScriptBlock.Create(
+                    $"try {{ . '{script}'; Start-CraftOrchestrator -InputObject {inputObject} }} catch {{ \"ERROR: $_\" }}"));
+            var pending = TakePending(name);
+            if (pending?.BatchFilePath is { } path && File.Exists(path)) File.Delete(path);
+            return (pending, string.Join(",", output.Select(o => o?.ToString())));
+        }
+        finally
+        {
+            worker.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Wrapper_AChildInheritsOnlyItsParentsPriority_AndNamesItsExactParentRun()
+    {
+        var parent = new OperationContext.Invocation("Push-Task") { RunName = "WrapParent", RunKey = "WrapParent~8de0a1b2c3d4e5f", Priority = 7 };
+
+        var (pending, result) = await RunWrapperAsync("WrapChild",
+            "@{ OrchestratorName = 'WrapChild'; Batch = @(@{ FunctionName = 'X'; TenantFilter = 'a.com' }) }", parent);
+
+        Assert.Equal("Craft-WrapChild", result);
+        Assert.NotNull(pending);
+        Assert.Equal(7, pending!.Priority);
+        Assert.Equal("WrapParent~8de0a1b2c3d4e5f", pending.ParentRunName);
+        Assert.Equal((false, true, 0, false), (pending.Sequential, pending.AllowCollision, pending.MaxConcurrency, pending.StopOnFailure));
+    }
+
+    [Fact]
+    public async Task Wrapper_AChildsOwnPriorityAndModeWin_OverItsParent()
+    {
+        var parent = new OperationContext.Invocation("Push-Task") { RunName = "WrapSeqParent", Priority = 7 };
+
+        var (pending, _) = await RunWrapperAsync("WrapOwnMode",
+            "@{ OrchestratorName = 'WrapOwnMode'; Priority = 2; Sequential = $true; StopOnFailure = $true; MaxConcurrency = 3; AllowCollision = $false; Batch = @(@{ FunctionName = 'X' }) }",
+            parent);
+
+        Assert.NotNull(pending);
+        Assert.Equal(2, pending!.Priority);
+        Assert.Equal((true, false, 3, true), (pending.Sequential, pending.AllowCollision, pending.MaxConcurrency, pending.StopOnFailure));
+    }
+
+    [Fact]
+    public async Task Wrapper_WithoutAParent_UsesTheDefaultBand_AndNoLineage()
+    {
+        var (pending, _) = await RunWrapperAsync("WrapTopLevel", "@{ OrchestratorName = 'WrapTopLevel'; Batch = @(@{ FunctionName = 'X' }) }");
+
+        Assert.NotNull(pending);
+        Assert.Equal(4, pending!.Priority);
+        Assert.Null(pending.ParentRunName);
+    }
+
+    [Fact]
+    public async Task Wrapper_WithoutCollisions_SkipsAndSaysSo_WhileARunOfThatNameIsActive()
+    {
+        // Against a real active run rather than a queued entry: the bridge queue is process-wide and any
+        // test's PostExecution drains it.
+        var (svc, store) = NewStoreBackedService();
+        await CreateRunAsync(store, "WrapBusy");
+        var previousService = s_serviceField.GetValue(null);
+        try
+        {
+            OrchestratorBridge.Initialize(svc);
+            var (pending, result) = await RunWrapperAsync("WrapBusy",
+                "@{ OrchestratorName = 'WrapBusy'; AllowCollision = $false; Batch = @(@{ FunctionName = 'X' }) }");
+
+            Assert.Equal("Craft-WrapBusy-Skipped", result);
+            Assert.Null(pending);
+        }
+        finally
+        {
+            s_serviceField.SetValue(null, previousService);
+        }
+    }
+
+    [Fact]
+    public async Task Drain_ReleasesTheParent_WhenTheChildIsNeverCreated()
+    {
+        // The deadlock-avoidance guarantee: a child registered at enqueue that then fails to start (here an
+        // empty batch) must stop holding its parent, or the parent never reaches its barrier.
+        var (svc, store) = NewStoreBackedService();
+        var parent = await CreateRunAsync(store, "LineageDrainParent");
 
         var previousService = s_serviceField.GetValue(null);
         try
@@ -198,18 +273,78 @@ public class OrchestratorBridgeLineageTests
 
             OrchestratorBridge.QueueOrchestration("LineageDrainChild", "[]", 4,
                 null, null, null, parentRunName: "LineageDrainParent");
-            Assert.True(pendingChildRuns.ContainsKey("LineageDrainChild"));
+            Assert.Equal(2, (await store.GetRunAsync(parent.RunKey))!.Total);
 
             OrchestratorBridge.DrainPending();
 
-            Assert.False(pendingChildRuns.ContainsKey("LineageDrainChild"));
-            Assert.False(activeRuns.ContainsKey("LineageDrainChild"));
+            var after = (await store.GetRunAsync(parent.RunKey))!;
+            Assert.Equal(1, after.Done);
+            Assert.Equal(2, after.Total);
+            Assert.Null(await store.GetRunByNameAsync("LineageDrainChild"));
         }
         finally
         {
             // The bridge service is static process state — put back whatever was there so this
-            // test cannot redirect other tests' drains into the crippled service.
+            // test cannot redirect other tests' drains into this one.
             s_serviceField.SetValue(null, previousService);
         }
+    }
+
+    [Fact]
+    public async Task IsRunActive_SeesUnfinishedRunsAndRunsQueuedToStart_SoACallerCanSkipAndSaySo()
+    {
+        var (svc, store) = NewStoreBackedService();
+        await CreateRunAsync(store, "LineageActiveRun");
+
+        var previousService = s_serviceField.GetValue(null);
+        try
+        {
+            OrchestratorBridge.Initialize(svc);
+            Assert.True(OrchestratorBridge.IsRunActive("LineageActiveRun"));
+            Assert.False(OrchestratorBridge.IsRunActive("LineageNoSuchRun"));
+
+            OrchestratorBridge.QueueOrchestration("LineageQueuedRun", "[]", 4);
+            Assert.True(OrchestratorBridge.IsRunActive("LineageQueuedRun"));
+            Assert.NotNull(TakePending("LineageQueuedRun"));
+
+            await CreateRunAsync(store, $"LineageFamily-{Guid.NewGuid()}");
+            Assert.True(OrchestratorBridge.IsRunActive($"LineageFamily-{Guid.NewGuid()}"));
+            Assert.True(OrchestratorBridge.IsRunActive("LineageFamily"));
+            var queued = $"LineageQueuedFamily-{Guid.NewGuid()}";
+            OrchestratorBridge.QueueOrchestration(queued, "[]", 4);
+            Assert.True(OrchestratorBridge.IsRunActive($"LineageQueuedFamily-{Guid.NewGuid()}"));
+            Assert.NotNull(TakePending(queued));
+        }
+        finally
+        {
+            s_serviceField.SetValue(null, previousService);
+        }
+    }
+
+    private static (OrchestratorService Service, Craft.Storage.WorkStore Store) NewStoreBackedService()
+    {
+        var settings = new Craft.Configuration.CraftSettings();
+        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        var jobs = new Craft.Orchestration.JobManager(NullLogger<Craft.Orchestration.JobManager>.Instance, settings, limiter);
+        var mem = new MemoryTableStore();
+        var store = new Craft.Storage.WorkStore(NullLogger<Craft.Storage.WorkStore>.Instance, settings, mem);
+        var svc = new OrchestratorService(NullLogger<OrchestratorService>.Instance, null!, limiter, jobs, store,
+            new Craft.Storage.ResultStore(NullLogger<Craft.Storage.ResultStore>.Instance, settings, mem), config, settings);
+        return (svc, store);
+    }
+
+    private static Task<Craft.Storage.RunHeader> CreateRunAsync(Craft.Storage.WorkStore store, string name)
+    {
+        var started = DateTime.UtcNow;
+        return store.CreateRunAsync(new Craft.Storage.RunHeader
+        {
+            RunKey = Craft.Storage.WorkStore.RunKeyFor(name, started),
+            Name = name,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+        }, [new Craft.Storage.WorkStore.NewTask("t0", new())]);
     }
 }

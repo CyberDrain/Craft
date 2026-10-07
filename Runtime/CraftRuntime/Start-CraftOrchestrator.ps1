@@ -30,6 +30,13 @@ function Start-CraftOrchestrator {
                                           worker and runs every step on it to completion, without going
                                           back to the pool between steps. A step that fails is recorded and
                                           the run carries on with the next (best-effort).
+          - AllowCollision    (bool)    — optional, default $true: runs of one name stack up side by side.
+                                          $false skips this run while another run of the same name is still
+                                          going (recurring work that must not pile up).
+          - MaxConcurrency    (int)     — optional, default 0 (no limit): at most this many of the run's tasks
+                                          run at once. Not used with Sequential.
+          - StopOnFailure     (bool)    — optional, Sequential only: the first failed step cancels the steps
+                                          after it. By default a sequential run carries on past a failure.
 
     .EXAMPLE
         # Fan-out (default): every task is queued up front and drained in parallel by the worker pool.
@@ -67,6 +74,13 @@ function Start-CraftOrchestrator {
     )
 
     $OrchestratorName = $InputObject.OrchestratorName ?? 'UnnamedOrchestrator'
+
+    # Collisions off: a run of this name that is still going wins, and this one is skipped up front.
+    $AllowCollision = $InputObject.AllowCollision -ne $false
+    if (-not $AllowCollision -and [Craft.Services.OrchestratorBridge]::IsRunActive($OrchestratorName)) {
+        Write-Warning "Craft: Skipped orchestrator '$OrchestratorName' - a run with this name is still active"
+        return "Craft-$OrchestratorName-Skipped"
+    }
 
     # QueueFunction pattern: call the function first to generate batch items
     if (-not $InputObject.Batch -and $InputObject.QueueFunction) {
@@ -140,11 +154,20 @@ function Start-CraftOrchestrator {
     # Lineage: pass the enclosing run explicitly. The bridge's own ambient read is null for calls
     # made from the pipeline thread — which is exactly where this function runs — so without this
     # a parent run would finalize (and dispatch its PostExecution) before its child runs complete.
-    $ParentRunName = $OpContext.RunName
+    # RunKey names the exact run when several runs share a name.
+    $ParentRunName = $OpContext.RunKey ?? $OpContext.RunName
 
     # Sequential mode: PowerShell marshals absent/$false to $false. When set, the orchestrator queues the
     # batch one task at a time in payload order rather than fanning out.
     $Sequential = [bool]($InputObject.Sequential)
+    $MaxConcurrency = [int]($InputObject.MaxConcurrency ?? 0)
+    $StopOnFailure = [bool]($InputObject.StopOnFailure)
+    if ($Sequential -and $MaxConcurrency -gt 0) {
+        Write-Warning "Craft: MaxConcurrency is ignored for '$OrchestratorName': a sequential run already runs one step at a time"
+    }
+    if ($StopOnFailure -and -not $Sequential) {
+        Write-Warning "Craft: StopOnFailure is ignored for '$OrchestratorName': it applies to sequential runs only"
+    }
 
     Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
     [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
@@ -155,7 +178,10 @@ function Start-CraftOrchestrator {
         $PostExecParametersJson,
         $InputObject.Reference,
         $ParentRunName,
-        $Sequential
+        $Sequential,
+        $AllowCollision,
+        $MaxConcurrency,
+        $StopOnFailure
     )
     return "Craft-$OrchestratorName"
 }

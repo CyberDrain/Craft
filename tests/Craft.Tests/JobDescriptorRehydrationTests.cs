@@ -1,99 +1,18 @@
-using System.Runtime.CompilerServices;
 using Craft.Configuration;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
-using Craft.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
 
 /// <summary>
-/// Covers the descriptor queue's dispatch-time rehydration: what the resolver is handed, what it costs,
-/// and what happens when the descriptor has gone stale underneath it.
-///
-/// The design question these answer is "what does an extra storage read per dispatch cost at ~200
-/// dispatches/min?" — the answer being that the steady-state path performs ZERO reads, because the run
-/// is already live in <c>_activeRuns</c> and object identity must be preserved anyway (see
-/// <c>OrchestratorService.ResolveTaskWorkAsync</c>). Reads happen only on the recovery path.
+/// Covers the descriptor queue's dispatch-time rehydration: what the resolver is handed, and what happens
+/// when the descriptor has gone stale underneath it.
 /// </summary>
 public class JobDescriptorRehydrationTests
 {
-    /// <summary>An in-memory <see cref="ICraftTableStore"/> that counts point reads.</summary>
-    private sealed class CountingStore : ICraftTableStore
-    {
-
-        // Claims are not exercised by this fake. Fail loudly rather than pretend the guard held —
-        // a silent 'true' here would look exactly like a successful claim.
-        public Task<bool> TryReplaceBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
-            CancellationToken ct = default) => throw new NotSupportedException();
-        private readonly Dictionary<string, Dictionary<(string, string), StoreRow>> _tables = new();
-        public int PointReads;
-        public int PartitionScans;
-
-        public Task PingAsync(CancellationToken ct = default) => Task.CompletedTask;
-
-        public Task EnsureTableAsync(string table, CancellationToken ct = default)
-        {
-            if (!_tables.ContainsKey(table)) _tables[table] = new();
-            return Task.CompletedTask;
-        }
-
-        public Task UpsertAsync(string table, StoreRow row, CancellationToken ct = default)
-        {
-            _tables[table][(row.PartitionKey, row.RowKey)] = row;
-            return Task.CompletedTask;
-        }
-
-        public Task UpsertBatchAsync(string table, string partitionKey, IReadOnlyList<StoreRow> rows,
-            CancellationToken ct = default)
-        {
-            foreach (var r in rows) _tables[table][(r.PartitionKey, r.RowKey)] = r;
-            return Task.CompletedTask;
-        }
-
-        public Task<StoreRow?> GetAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
-        {
-            Interlocked.Increment(ref PointReads);
-            return Task.FromResult(_tables[table].TryGetValue((partitionKey, rowKey), out var r) ? r : null);
-        }
-
-        public async IAsyncEnumerable<StoreRow> QueryPartitionAsync(string table, string partitionKey,
-            [EnumeratorCancellation] CancellationToken ct = default)
-        {
-            Interlocked.Increment(ref PartitionScans);
-            foreach (var kv in _tables[table].Where(k => k.Key.Item1 == partitionKey).ToList())
-            {
-                yield return kv.Value;
-                await Task.Yield();
-            }
-        }
-
-        public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table,
-            [EnumeratorCancellation] CancellationToken ct = default)
-        {
-            foreach (var kv in _tables[table].ToList())
-            {
-                yield return kv.Value;
-                await Task.Yield();
-            }
-        }
-
-        public Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
-        {
-            _tables[table].Remove((partitionKey, rowKey));
-            return Task.CompletedTask;
-        }
-
-        public Task DeletePartitionAsync(string table, string partitionKey, CancellationToken ct = default)
-        {
-            foreach (var k in _tables[table].Keys.Where(k => k.Item1 == partitionKey).ToList())
-                _tables[table].Remove(k);
-            return Task.CompletedTask;
-        }
-    }
-
-    private static (JobManager Jobs, CountingStore Store, OrchestratorTableStore Orch) NewHarness()
+    private static JobManager NewHarness()
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = 8;
@@ -102,9 +21,7 @@ public class JobDescriptorRehydrationTests
         var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance, config, settings);
         var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
         var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
-        var store = new CountingStore();
-        var orch = new OrchestratorTableStore(NullLogger<OrchestratorTableStore>.Instance, settings, store);
-        return (jobs, store, orch);
+        return jobs;
     }
 
     private static Task Pump(JobManager jobs) => Task.Run(() => jobs.StartAsync(CancellationToken.None));
@@ -124,7 +41,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public async Task Dispatch_HandsTheDescriptorToTheResolver()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
         var seen = new List<JobDescriptor>();
         var done = 0;
 
@@ -157,7 +74,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public async Task StaleDescriptor_IsSkipped_AndDispatchContinues()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
         var ran = 0;
 
         jobs.SetWorkResolver((d, _) => Task.FromResult<Func<CancellationToken, Task>?>(
@@ -183,7 +100,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public async Task DescriptorWithNoResolver_FailsTheJob_RatherThanDisappearing()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
         jobs.Enqueue(new JobDescriptor("run", "task", 0), "run-task");
 
         _ = Pump(jobs);
@@ -193,46 +110,6 @@ public class JobDescriptorRehydrationTests
         await Task.WhenAny(jobs.StopAsync(CancellationToken.None), Task.Delay(5000));
 
         Assert.Contains("resolver", failed.LastError, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// The cost question. Rehydrating a task that is NOT already in memory costs exactly one partition
-    /// read of the run — the same read the crash-recovery path already performs. This pins the cost so a
-    /// future change that turns it into a per-task read shows up as a failure.
-    /// </summary>
-    [Fact]
-    public async Task Rehydration_FromStorage_CostsOneRunReadPerRun_NotPerTask()
-    {
-        var (_, counting, store) = NewHarness();
-        await store.InitializeAsync();
-
-        var tasks = Enumerable.Range(0, 200).Select(i => new OrchestratorTaskItem
-        {
-            Id = $"Graph_tenant{i:D3}",
-            Status = "Pending",
-            Parameters = new Dictionary<string, object> { ["TenantFilter"] = $"tenant{i:D3}.onmicrosoft.com" },
-        }).ToList();
-
-        await store.UpsertRunAsync(new OrchestratorRun
-        {
-            Name = "CIPPDBCacheRun",
-            Status = "Running",
-            Priority = 5,
-            StartedUtc = DateTime.UtcNow,
-            Tasks = tasks,
-            TaskScriptName = "Invoke-CIPPDBCacheTask",
-        });
-        await store.UpsertTaskBatchAsync("CIPPDBCacheRun", tasks);
-
-        counting.PointReads = 0;
-        counting.PartitionScans = 0;
-
-        var rehydrated = await store.GetRunAsync("CIPPDBCacheRun");
-
-        Assert.NotNull(rehydrated);
-        Assert.Equal(200, rehydrated!.Tasks.Count);
-        Assert.Equal(1, counting.PointReads);        // the run row
-        Assert.Equal(1, counting.PartitionScans);    // all 200 task rows in one partition query
     }
 
     // ── OWNERSHIP, as used by the Pending re-drive ───────────────────────────────────────────────────
@@ -245,7 +122,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public void IsQueuedOrRunning_True_ForAQueuedJob()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
 
         jobs.Enqueue(new JobDescriptor("run-a", "task-1", 4), name: "run-a-task-1");
 
@@ -261,7 +138,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public async Task IsQueuedOrRunning_False_OnceTheJobHasCompleted()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
         _ = Pump(jobs);
 
         var ran = new TaskCompletionSource();
@@ -277,7 +154,7 @@ public class JobDescriptorRehydrationTests
     [Fact]
     public void IsQueuedOrRunning_False_ForAnUnknownJob()
     {
-        var (jobs, _, _) = NewHarness();
+        var jobs = NewHarness();
 
         Assert.False(jobs.IsQueuedOrRunning("run-c-task-never-enqueued"));
     }

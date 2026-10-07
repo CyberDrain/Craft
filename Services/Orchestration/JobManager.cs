@@ -57,6 +57,12 @@ public class JobManager : BackgroundService
 
     // ── Tracking ──
     private readonly ConcurrentDictionary<string, JobRecord> _jobs = new();
+    /// <summary>
+    /// Jobs cancelled while queued, with whether the state writer was told. A cancel that finds the job still
+    /// in the queue tells it straight away; one that lands after the dispatcher has dequeued the job cannot see
+    /// its descriptor, so the dispatcher (or the job's start) tells it instead. Without that, the claim behind
+    /// the job was never finished, lapsed half an hour later, and ran after all.
+    /// </summary>
     private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
     private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
 
@@ -78,6 +84,10 @@ public class JobManager : BackgroundService
     public int MaxConcurrency { get; }
     public int ActiveCount => _activeCount;
     public int QueuedCount { get { lock (_queueLock) return _pendingQueue.Count; } }
+
+    /// <summary>Raised each time a job leaves the queue for a worker, so a feeder can top the queue up at once
+    /// instead of waiting for its next poll.</summary>
+    public event Action? Dispatched;
 
     /// <summary>
     /// Is this job still in flight — queued or running?
@@ -189,6 +199,7 @@ public class JobManager : BackgroundService
             Id = jobId,
             Name = name,
             RunName = descriptor.RunName,
+            RunKey = descriptor.RunKey,
             Priority = descriptor.Priority,
             Status = "Queued",
             QueuedUtc = DateTime.UtcNow
@@ -200,11 +211,9 @@ public class JobManager : BackgroundService
         // writes status onto the queue item's own record), so the TRACKED record sat frozen at the
         // previous outing's "Completed" while a live copy of the job was queued or running.
         //
-        // IsQueuedOrRunning reads this dictionary, and JobQueuePump.ReleaseFinishedAsync treats a "no"
-        // as permission to DELETE that task's durable queue row. A stale record therefore had the pump
-        // dropping rows out from under running work — observed live releasing 7-9 "finished" jobs per
-        // second against 8 slots. RedrivePendingTasks consults the same predicate, so it was misreading
-        // task state for the same reason.
+        // IsQueuedOrRunning reads this dictionary, and WorkPump treats a "no" as the job being done and stops
+        // renewing its claim. A stale record once had the pump dropping work out from under running jobs —
+        // observed live releasing 7-9 "finished" jobs per second against 8 slots.
         _jobs[jobId] = record;
 
         lock (_queueLock)
@@ -257,6 +266,11 @@ public class JobManager : BackgroundService
                 {
                     _pendingQueue.TryDequeue(out job, out _);
                 }
+                if (job != null)
+                {
+                    try { Dispatched?.Invoke(); }
+                    catch (Exception ex) { _logger.LogDebug(ex, "[JobManager] A dispatch listener failed"); }
+                }
 
                 if (job == null)
                 {
@@ -277,9 +291,11 @@ public class JobManager : BackgroundService
                 // The work ref must go too: CancelJob only marks the id, so leaving the entry here
                 // stranded the captured closure (and everything it captured) in _pendingWork forever —
                 // nothing else ever removes it, not even CleanupOldJobs.
-                if (_cancelledJobIds.TryRemove(job.Record.Id, out _))
+                if (_cancelledJobIds.TryRemove(job.Record.Id, out var notified))
                 {
                     _pendingWork.TryRemove(job.Record.Id, out _);
+                    if (!notified && job.Descriptor is { } cancelled)
+                        NotifyStateWriter(w => w.Cancelled(cancelled), "cancellation", job.Record.Name);
                     _limiter.ReleaseSlot();
                     slotHeld = false;
                     continue;
@@ -357,15 +373,32 @@ public class JobManager : BackgroundService
             var parentInvocation = new OperationContext.Invocation(job.Record.Name)
             {
                 RunName = job.Record.RunName,
+                RunKey = job.Descriptor?.RunKey,
                 Priority = job.Descriptor != null ? job.Record.Priority : job.InheritPriority,
                 Category = "Job"
             };
             opScope = OperationContext.Set(parentInvocation);
 
-            job.Record.Status = "Running";
-            job.Record.StartedUtc = DateTime.UtcNow;
+            // Cancelled or withdrawn after the dispatcher's own check but before the job got going. Under the
+            // record's lock so WithdrawJob either stops it here or sees it Running, never both.
+            bool skip, notified;
+            lock (job.Record)
+            {
+                skip = _cancelledJobIds.TryRemove(job.Record.Id, out notified);
+                if (!skip)
+                {
+                    job.Record.Status = "Running";
+                    job.Record.StartedUtc = DateTime.UtcNow;
+                }
+            }
+            if (skip)
+            {
+                if (!notified && job.Descriptor is { } cancelled)
+                    NotifyStateWriter(w => w.Cancelled(cancelled), "cancellation", job.Record.Name);
+                return;
+            }
 
-            var queueTime = job.Record.StartedUtc.Value - job.Record.QueuedUtc;
+            var queueTime = job.Record.StartedUtc!.Value - job.Record.QueuedUtc;
             if (queueTime.TotalSeconds > 1)
             {
                 _logger.LogInformation(
@@ -388,7 +421,9 @@ public class JobManager : BackgroundService
 
             await work(ct);
 
-            job.Record.Status = "Completed";
+            var (status, error) = _lastStep.TryRemove(job.Record.Id, out var last) ? last : ("Completed", null);
+            job.Record.Status = status;
+            job.Record.LastError = error;
             job.Record.CompletedUtc = DateTime.UtcNow;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -406,6 +441,7 @@ public class JobManager : BackgroundService
         }
         finally
         {
+            _lastStep.TryRemove(job.Record.Id, out _);
             // Accounting first, context teardown second: ReleaseSlot cannot throw, Dispose can.
             Interlocked.Decrement(ref _activeCount);
             Interlocked.Increment(ref _totalProcessed);
@@ -442,7 +478,7 @@ public class JobManager : BackgroundService
             .GroupBy(j => j.RunName!)
             .Select(g =>
             {
-                var jobs = g.ToList();
+                var jobs = LatestOuting(g);
                 return new JobRunSummary
                 {
                     Name = g.Key,
@@ -461,6 +497,18 @@ public class JobManager : BackgroundService
             .OrderBy(r => r.Priority)
             .ThenByDescending(r => r.StartedUtc)
             .ToList();
+    }
+
+    /// <summary>A run's jobs, newest first, from its latest outing only: earlier runs of the same name are left out.</summary>
+    public List<JobRecord> GetRunJobs(string runName, int limit) =>
+        LatestOuting(_jobs.Values.Where(j => string.Equals(j.RunName, runName, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(j => j.QueuedUtc).Take(limit).ToList();
+
+    private static List<JobRecord> LatestOuting(IEnumerable<JobRecord> jobs)
+    {
+        var list = jobs.ToList();
+        var latest = list.Where(j => j.RunKey != null).MaxBy(j => j.QueuedUtc)?.RunKey;
+        return latest == null ? list : list.Where(j => j.RunKey == latest).ToList();
     }
 
     public List<JobRecord> GetJobs(string? runName = null, string? status = null, int? limit = null)
@@ -532,19 +580,82 @@ public class JobManager : BackgroundService
     public bool CancelJob(string jobId)
     {
         if (!_jobs.TryGetValue(jobId, out var record)) return false;
-        if (record.Status != "Queued") return false;
-
-        record.Status = "Cancelled";
-        record.CompletedUtc = DateTime.UtcNow;
-        record.LastError = "Cancelled by user";
-        _cancelledJobIds.TryAdd(jobId, true);
-
         JobDescriptor? descriptor;
-        lock (_queueLock) descriptor = FindLiveEntry(record)?.Descriptor;
+        lock (record)
+        {
+            if (record.Status != "Queued") return false;
+
+            record.Status = "Cancelled";
+            record.CompletedUtc = DateTime.UtcNow;
+            record.LastError = "Cancelled by user";
+
+            // Under the queue lock, so the dispatcher either still finds the entry (and we tell the state writer
+            // here) or has already dequeued it (and tells it when it skips the job).
+            lock (_queueLock)
+            {
+                descriptor = FindLiveEntry(record)?.Descriptor;
+                _cancelledJobIds[jobId] = descriptor != null;
+            }
+        }
         if (descriptor is { } d)
             NotifyStateWriter(w => w.Cancelled(d), "cancellation", record.Name);
 
         _logger.LogInformation("[JobManager] Cancelled: {Name} ({Id})", record.Name, jobId);
+        return true;
+    }
+
+    /// <summary>
+    /// A job that runs a sequential run's steps one after another has finished a step. The step is kept as its
+    /// own finished record and the job carries on under <paramref name="nextName"/>; when there is no next step,
+    /// this step's outcome becomes the job's. Job lists, run summaries and queue pages then show every step,
+    /// not just the one the job was dispatched for.
+    /// </summary>
+    public void AdvanceStep(string jobId, string status, string? error, string? nextName)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return;
+        if (nextName == null)
+        {
+            _lastStep[jobId] = (status, error);
+            return;
+        }
+        var now = DateTime.UtcNow;
+        var stepId = $"{jobId}#{Interlocked.Increment(ref _stepRecords)}";
+        _jobs[stepId] = new JobRecord
+        {
+            Id = stepId,
+            Name = record.Name,
+            RunName = record.RunName,
+            RunKey = record.RunKey,
+            Priority = record.Priority,
+            Status = status,
+            QueuedUtc = record.QueuedUtc,
+            StartedUtc = record.StartedUtc,
+            CompletedUtc = now,
+            LastError = error,
+        };
+        record.Name = nextName;
+        record.QueuedUtc = now;
+        record.StartedUtc = now;
+    }
+
+    private readonly ConcurrentDictionary<string, (string Status, string? Error)> _lastStep = new();
+    private long _stepRecords;
+
+    /// <summary>
+    /// Take a queued job back without running it and without recording an outcome, so its owner can hand the
+    /// work to another process. False once it has started.
+    /// </summary>
+    public bool WithdrawJob(string jobId)
+    {
+        if (!_jobs.TryGetValue(jobId, out var record)) return false;
+        lock (record)
+        {
+            if (record.Status != "Queued") return false;
+            record.Status = "Cancelled";
+            record.CompletedUtc = DateTime.UtcNow;
+            record.LastError = "Withdrawn at shutdown";
+            _cancelledJobIds[jobId] = true;
+        }
         return true;
     }
 
@@ -559,6 +670,8 @@ public class JobManager : BackgroundService
         var descriptors = new List<JobDescriptor>(toCancel.Count);
         lock (_queueLock)
         {
+            // Marked under the lock for the same reason as CancelJob: found here means told here.
+            foreach (var record in toCancel) _cancelledJobIds[record.Id] = false;
             var wanted = toCancel.ToDictionary(r => r.Id, r => r);
             foreach (var (entry, _) in _pendingQueue.UnorderedItems)
             {
@@ -567,6 +680,7 @@ public class JobManager : BackgroundService
                 if (!ReferenceEquals(entry.Record, rec)) continue;
                 if (_reprioritized.TryGetValue(rec.Id, out var live) && entry.Epoch != live) continue;
                 descriptors.Add(d);
+                _cancelledJobIds[rec.Id] = true;
             }
         }
 
@@ -575,7 +689,6 @@ public class JobManager : BackgroundService
             record.Status = "Cancelled";
             record.CompletedUtc = DateTime.UtcNow;
             record.LastError = "Run cancelled by user";
-            _cancelledJobIds.TryAdd(record.Id, true);
         }
 
         foreach (var d in descriptors)

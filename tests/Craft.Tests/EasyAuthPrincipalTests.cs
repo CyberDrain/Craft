@@ -210,4 +210,41 @@ public class EasyAuthPrincipalTests
         // The middleware catches this and passes the request through as anonymous rather than 500ing.
         Assert.ThrowsAny<FormatException>(() => EasyAuthPrincipal.Decode("not-base64!!"));
     }
+
+    [Fact]
+    public void Normalised_KeepsTheTokenClaims()
+    {
+        // The hosted app reads claims beyond the identity (e.g. azp, the app a user signed in through).
+        var source = WithClaims(("upn", "a@b.com"), ("azp", "client-abc"), ("scp", "user_impersonation"));
+
+        using var result = EasyAuthPrincipal.Decode(
+            EasyAuthPrincipal.EncodeNormalised(source, "aad", "oid-1", "a@b.com", AdminRole));
+        var root = result.RootElement;
+
+        Assert.Equal("a@b.com", root.GetProperty("userDetails").GetString());
+        Assert.Equal("admin", root.GetProperty("userRoles")[0].GetString());
+        Assert.Equal(source.GetProperty("claims").GetRawText(), root.GetProperty("claims").GetRawText());
+        Assert.Equal("client-abc", EasyAuthPrincipal.ExtractClaims(root).AppId);
+    }
+
+    [Fact]
+    public void Normalised_IsNeverTransformedAgain()
+    {
+        var source = WithClaims(("upn", "a@b.com"));
+
+        using var result = EasyAuthPrincipal.Decode(
+            EasyAuthPrincipal.EncodeNormalised(source, "aad", "oid-1", "a@b.com", Array.Empty<string>()));
+
+        Assert.False(EasyAuthPrincipal.NeedsTransform(result.RootElement));
+    }
+
+    [Fact]
+    public void Normalised_WithoutClaims_EmitsAnEmptyArray()
+    {
+        using var result = EasyAuthPrincipal.Decode(
+            EasyAuthPrincipal.EncodeNormalised(Principal("{}"), "aad", "id", "name", Array.Empty<string>()));
+
+        Assert.Equal(JsonValueKind.Array, result.RootElement.GetProperty("claims").ValueKind);
+        Assert.Equal(0, result.RootElement.GetProperty("claims").GetArrayLength());
+    }
 }

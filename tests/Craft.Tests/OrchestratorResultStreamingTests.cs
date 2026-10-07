@@ -98,12 +98,19 @@ public class OrchestratorResultStreamingTests
         }
     }
 
-    private static (OrchestratorTableStore Store, LazyProbeStore Backing) NewStore()
+    private static (ResultStore Store, LazyProbeStore Backing) NewStore()
     {
         var backing = new LazyProbeStore();
-        var store = new OrchestratorTableStore(
-            NullLogger<OrchestratorTableStore>.Instance, new CraftSettings(), backing);
+        var store = new ResultStore(
+            NullLogger<ResultStore>.Instance, new CraftSettings(), backing);
         return (store, backing);
+    }
+
+    private static async Task<string[]> ReadAllAsync(ResultStore store, string run)
+    {
+        var all = new List<string>();
+        await foreach (var r in store.StreamResultsAsync(run)) all.Add(r);
+        return all.ToArray();
     }
 
     /// <summary>A result whose JSON exceeds the per-property limit and so gets chunked.</summary>
@@ -211,7 +218,7 @@ public class OrchestratorResultStreamingTests
         await store.StoreResultAsync("run", "b-chunked", chunked);
         await store.StoreResultAsync("run", "c-spilled", spilled);
 
-        var results = await store.GetResultsAsync("run");
+        var results = await ReadAllAsync(store, "run");
 
         Assert.Equal(3, results.Length);
         Assert.Contains(small, results);
@@ -233,7 +240,7 @@ public class OrchestratorResultStreamingTests
         // still complete by chunk count rather than by arrival order.
         backing.Order = rows => rows.Reverse();
 
-        var results = await store.GetResultsAsync("run");
+        var results = await ReadAllAsync(store, "run");
 
         Assert.Equal(2, results.Length);
         Assert.Contains(spilled, results);
@@ -346,7 +353,7 @@ public class OrchestratorResultStreamingTests
             // lines yields zero results without needing to special-case it.
             Assert.Equal(0, count);
             Assert.Equal("", await File.ReadAllTextAsync(path));
-            Assert.Empty(await store.GetResultsAsync("run"));
+            Assert.Empty(await ReadAllAsync(store, "run"));
         }
         finally
         {

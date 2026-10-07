@@ -190,7 +190,7 @@ public static class QueueStatusBridge
     {
         if (s_jobManager == null) return [];
 
-        var jobs = s_jobManager.GetJobs(runName, limit: 100);
+        var jobs = s_jobManager.GetRunJobs(runName, limit: 100);
         return jobs.Select(j => new TaskDetail
         {
             Timestamp = (j.CompletedUtc ?? j.StartedUtc ?? j.QueuedUtc).ToString("O"),

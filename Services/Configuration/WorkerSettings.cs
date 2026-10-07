@@ -167,6 +167,12 @@ public class WorkerSettings
     public int RecycleAfterInvocations { get; set; }
 
     /// <summary>
+    /// Run a memory trim (compacting full GC) every this many minutes, so freed heap is handed back
+    /// to the OS on idle hosts that never reach the every-100-invocations trim. 0 = disabled. Default 5.
+    /// </summary>
+    public int MemoryTrimIntervalMinutes { get; set; } = 5;
+
+    /// <summary>
     /// Run each worker's PowerShell pipeline on one reused thread (PSThreadOptions.ReuseThread) instead of
     /// spinning a new thread per invocation. Default true. This is the single biggest per-request dispatch
     /// win (thread creation was ~50% of the PS-invoke cost — see docs/dispatch-analysis.md) and matches how

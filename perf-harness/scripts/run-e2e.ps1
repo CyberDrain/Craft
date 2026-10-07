@@ -19,7 +19,10 @@ param(
   [int]$Port = 5399,
   [int]$ReadyTimeoutSec = 180,
   [switch]$Build,
-  [switch]$KeepUp
+  [switch]$KeepUp,
+  # Run only the orchestration section (skips the platform checks), optionally only some of its groups.
+  [switch]$OrchOnly,
+  [string[]]$OrchChecks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,9 +36,14 @@ $results  = New-Object System.Collections.ArrayList
 
 function Info($m) { Write-Host "[e2e] $m" -ForegroundColor Cyan }
 function Add-Result($area, $name, $pass, $perf, $detail) {
-  [void]$results.Add([pscustomobject]@{ area = $area; name = $name; pass = [bool]$pass; perf = $perf; detail = $detail })
+  [void]$results.Add([pscustomobject]@{ area = $area; name = $name; pass = [bool]$pass; skip = $false; perf = $perf; detail = $detail })
   $tag = if ($pass) { 'PASS' } else { 'FAIL' }
-  Write-Host ("  [{0}] {1,-12} {2,-18} {3,-8} {4}" -f $tag, $area, $name, $perf, $detail) -ForegroundColor $(if ($pass) { 'Green' } else { 'Red' })
+  Write-Host ("  [{0}] {1,-14} {2,-28} {3,-10} {4}" -f $tag, $area, $name, $perf, $detail) -ForegroundColor $(if ($pass) { 'Green' } else { 'Red' })
+}
+# A check this SUT cannot run (the feature is not in the image). Neither a pass nor a failure.
+function Add-Skip($area, $name, $detail) {
+  [void]$results.Add([pscustomobject]@{ area = $area; name = $name; pass = $true; skip = $true; perf = '-'; detail = $detail })
+  Write-Host ("  [SKIP] {0,-14} {1,-28} {2,-10} {3}" -f $area, $name, '-', $detail) -ForegroundColor Yellow
 }
 function Api($path) { try { return Invoke-RestMethod "$base$path" -TimeoutSec 20 } catch { return $null } }
 # Same, but against an absolute URL — the throwaway containers further down run on their own ports.
@@ -82,6 +90,8 @@ try {
   Add-Result 'health' 'readiness'    $ready                    '-' "status=$($h.status)"
   Add-Result 'storage' 'azurite-ready' ($h.ready.storage -eq $true) '-' "storageReady=$($h.ready.storage)"
 
+  $suiteSw = [Diagnostics.Stopwatch]::StartNew()
+  if (-not $OrchOnly) {
   # ── API dispatch ────────────────────────────────────────────────────────────
   $sw = [Diagnostics.Stopwatch]::StartNew(); $ping = Api '/API/PerfPing'; $sw.Stop()
   Add-Result 'api' 'dispatch-ping' ($ping.ok -eq $true) ("{0}ms" -f $sw.ElapsedMilliseconds) "endpoint=$($ping.endpoint)"
@@ -274,11 +284,18 @@ try {
   $id = Fetch "$base/bundle.js" @('-H', 'Accept-Encoding: identity')
   Add-Result 'frontend' 'identity-content' ($id.Code -eq 200 -and $id.Body -match 'E2E_BUNDLE_MARKER') ("{0}ms {1}B" -f $id.TimeMs, $id.Size) "identity bundle content correct"
 
+  }
+
+  # -- Orchestration engine (run-e2e-orchestration.ps1) ------------------------------
+  if ($ready) { . (Join-Path $here 'run-e2e-orchestration.ps1') }
+  else { Add-Result 'orchestration' 'not-run' $false '-' 'SUT never became ready' }
+
   # ── Summary ─────────────────────────────────────────────────────────────────
   $fail = @($results | Where-Object { -not $_.pass })
-  $pass = @($results | Where-Object { $_.pass })
+  $skip = @($results | Where-Object { $_.skip })
+  $pass = @($results | Where-Object { $_.pass -and -not $_.skip })
   Write-Host ""
-  Write-Host ("===== E2E: {0} passed, {1} failed =====" -f $pass.Count, $fail.Count) -ForegroundColor $(if ($fail.Count) { 'Red' } else { 'Green' })
+  Write-Host ("===== E2E: {0} passed, {1} failed, {2} skipped ({3:N0}s) =====" -f $pass.Count, $fail.Count, $skip.Count, $suiteSw.Elapsed.TotalSeconds) -ForegroundColor $(if ($fail.Count) { 'Red' } else { 'Green' })
 
   # GitHub Actions job summary — renders the PASS/FAIL table on the run page (no-op locally). Written
   # before the non-zero exit so a failing run still shows exactly which checks failed.
@@ -289,7 +306,7 @@ try {
     [void]$md.AppendLine("| Result | Area | Check | Perf | Detail |")
     [void]$md.AppendLine("|:------:|------|-------|------|--------|")
     foreach ($r in $results) {
-      [void]$md.AppendLine("| $(if ($r.pass) { '✅' } else { '❌' }) | $($r.area) | $($r.name) | $($r.perf) | $($r.detail) |")
+      [void]$md.AppendLine("| $(if ($r.skip) { 'SKIP' } elseif ($r.pass) { '✅' } else { '❌' }) | $($r.area) | $($r.name) | $($r.perf) | $($r.detail) |")
     }
     Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $md.ToString()
   }

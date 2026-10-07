@@ -80,6 +80,7 @@ public sealed class AzureTableStore : ICraftTableStore
     private TableServiceClient Service => _service ??= new TableServiceClient(_connectionString.Value, _clientOptions);
 
     private static readonly string[] select = new[] { "PartitionKey", "RowKey" };
+    private static readonly string[] PartLookupProperties = ["PartitionKey", "RowKey", EntitySplitter.OriginalEntityIdKey];
 
     public async Task PingAsync(CancellationToken ct = default)
     {
@@ -267,6 +268,45 @@ public sealed class AzureTableStore : ICraftTableStore
             await RemoveStalePartRowsAsync(table, pk, rk, live, ct);
 
         return true;
+    }
+
+    public async Task DeleteTableAsync(string table, CancellationToken ct = default)
+    {
+        try { await Service.DeleteTableAsync(table, ct); }
+        catch (RequestFailedException ex) when (ex.Status == 404) { }
+    }
+
+    public async Task<bool> TrySubmitAsync(string table, string partitionKey, IReadOnlyList<StoreOp> ops,
+        CancellationToken ct = default)
+    {
+        if (ops.Count == 0) return true;
+        if (ops.Count > MaxBatch)
+            throw new ArgumentException($"A transaction is limited to {MaxBatch} ops, got {ops.Count}.", nameof(ops));
+
+        var actions = ops.Select(op => op.Kind switch
+        {
+            StoreOpKind.Insert => new TableTransactionAction(TableTransactionActionType.Add, ToEntity(op.Row)),
+            StoreOpKind.Replace => new TableTransactionAction(TableTransactionActionType.UpdateReplace, ToEntity(op.Row),
+                new ETag(op.Row.ETag ?? throw new ArgumentException($"Replace of {op.Row.RowKey} needs an ETag.", nameof(ops)))),
+            StoreOpKind.Delete => new TableTransactionAction(TableTransactionActionType.Delete,
+                new TableEntity(op.Row.PartitionKey, op.Row.RowKey), op.Row.ETag is { } etag ? new ETag(etag) : ETag.All),
+            _ => new TableTransactionAction(TableTransactionActionType.UpsertReplace, ToEntity(op.Row)),
+        }).ToList();
+
+        try
+        {
+            await Client(table).SubmitTransactionAsync(actions, ct);
+            return true;
+        }
+        catch (RequestFailedException ex) when (IsTableNotFound(ex))
+        {
+            await RecreateTableAsync(table, ct);
+            return false;
+        }
+        catch (RequestFailedException ex) when (ex.Status is 412 or 404 or 409)
+        {
+            return false;
+        }
     }
 
     private async Task SubmitAsync(string table, TableClient client, List<TableTransactionAction> batch, CancellationToken ct)
@@ -462,6 +502,23 @@ public sealed class AzureTableStore : ICraftTableStore
             yield return ToRow(entity);
     }
 
+    public async IAsyncEnumerable<StoreRow> QueryTableAsync(string table, string? filter, int maxPerPage,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var entity in StreamReassembledAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, maxPerPage: maxPerPage, cancellationToken: ct), ct))
+            yield return ToRow(entity);
+    }
+
+    public async IAsyncEnumerable<StoreRow> QueryRowKeyRangeAsync(string table, string partitionKey, string fromRowKey,
+        string toRowKey, IReadOnlyList<string>? properties = null, int? maxPerPage = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and RowKey ge '{Escape(fromRowKey)}' and RowKey lt '{Escape(toRowKey)}'";
+        await foreach (var entity in EnumerateAsync(table, () => Client(table).QueryAsync<TableEntity>(filter: filter, maxPerPage: maxPerPage,
+            select: properties, cancellationToken: ct), ct))
+            yield return ToRow(entity);
+    }
+
     public async Task DeleteAsync(string table, string partitionKey, string rowKey, CancellationToken ct = default)
     {
         try
@@ -623,7 +680,10 @@ public sealed class AzureTableStore : ICraftTableStore
                 var filter = $"{partitionClause} and {BuildRowKeyPrefixClause(entityId)}";
                 await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, cancellationToken: ct))
                 {
-                    if (seen.Add((row.PartitionKey, row.RowKey)))
+                    // The prefix range also holds unrelated keys ("task1-partner"); only this entity's rows belong.
+                    var owned = row.RowKey == entityId ||
+                        (row.TryGetValue(EntitySplitter.OriginalEntityIdKey, out var owner) && owner?.ToString() == entityId);
+                    if (owned && seen.Add((row.PartitionKey, row.RowKey)))
                         rows.Add(row);
                 }
             }
@@ -675,11 +735,14 @@ public sealed class AzureTableStore : ICraftTableStore
     private async Task RemoveStalePartRowsAsync(string table, string partitionKey, string originalRowKey,
         HashSet<string> live, CancellationToken ct)
     {
-        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and {EntitySplitter.OriginalEntityIdKey} eq '{Escape(originalRowKey)}'";
+        // A RowKey range is an index seek; filtering on the marker alone scans the whole partition, which
+        // every plain delete paid. The range also catches other keys sharing the prefix, so confirm the owner.
+        var filter = $"PartitionKey eq '{Escape(partitionKey)}' and {BuildRowKeyPrefixClause($"{originalRowKey}-part")}";
         var stale = new List<string>();
-        await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, select: select, cancellationToken: ct))
+        await foreach (var row in Client(table).QueryAsync<TableEntity>(filter: filter, select: PartLookupProperties, cancellationToken: ct))
         {
-            if (!live.Contains(row.RowKey))
+            if (row.TryGetValue(EntitySplitter.OriginalEntityIdKey, out var owner) && owner?.ToString() == originalRowKey
+                && !live.Contains(row.RowKey))
                 stale.Add(row.RowKey);
         }
 
