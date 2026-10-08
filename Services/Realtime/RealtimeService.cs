@@ -39,6 +39,14 @@ public sealed class RealtimeService : IDisposable
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, Connection>> _conns =
         new(StringComparer.OrdinalIgnoreCase);
 
+    // Watch grants: jobId -> the users allowed to receive that job's events. Granted server-side by the
+    // app, from the authenticated request that started the job; the browser never names a job itself.
+    private readonly ConcurrentDictionary<string, JobWatch> _watches = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Timer? _runPump;
+    private int _pumping;
+
+    private static readonly TimeSpan RunPumpInterval = TimeSpan.FromSeconds(3);
+
     private long _seq;
     private int _connectionCount;
 
@@ -56,6 +64,23 @@ public sealed class RealtimeService : IDisposable
 
         var period = TimeSpan.FromMinutes(Math.Clamp(_cfg.EntryTtlMinutes, 1, 1440) / 2.0 + 0.5);
         _sweep = new Timer(_ => SweepExpired(), null, period, period);
+        _runPump = new Timer(_ => PumpRuns(), null, RunPumpInterval, RunPumpInterval);
+    }
+
+    /// <summary>A watched run that has not appeared by then is never going to: stop reading run status for it.</summary>
+    internal TimeSpan RunStartGrace { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>Run-status source for the pump; swapped in tests.</summary>
+    internal Func<IReadOnlyCollection<string>, Dictionary<string, QueueStatusBridge.RunRollup>> RunStatusSource { get; set; } =
+        QueueStatusBridge.GetRunRollups;
+
+    private sealed class JobWatch
+    {
+        public readonly ConcurrentDictionary<string, byte> Users = new(StringComparer.OrdinalIgnoreCase);
+        public volatile bool TrackRun;
+        public string? LastRunState;
+        public readonly long CreatedTimestamp = Stopwatch.GetTimestamp();
+        public long UpdatedTimestamp = Stopwatch.GetTimestamp();
     }
 
     public bool Enabled => _enabled;
@@ -90,19 +115,14 @@ public sealed class RealtimeService : IDisposable
     // ── Publish ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Publish a job event. <paramref name="userId"/> and <paramref name="jobId"/> (a GUID) are
-    /// required; everything else is optional. Best-effort and non-throwing.
+    /// Publish a job event. <paramref name="userId"/> and <paramref name="jobId"/> (see <see cref="IsSafeJobId"/>)
+    /// are required; everything else is optional. Best-effort and non-throwing.
     /// </summary>
     public void Publish(string userId, string jobId, string? mode, object? data,
         string? urlHref, string? urlLabel, int? status, string? message)
     {
         if (!_enabled) return;
-        if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(jobId)) return;
-        if (!Guid.TryParse(jobId, out _))
-        {
-            _logger.LogWarning("[Realtime] Rejected non-GUID jobId '{JobId}'", jobId);
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(userId) || !IsSafeJobId(jobId, _logger)) return;
 
         var m = NormalizeMode(mode);
         var outStatus = status;
@@ -131,13 +151,10 @@ public sealed class RealtimeService : IDisposable
         var frame = BuildFrame(jobId, m, seq, outStatus, outMessage, urlHref, urlLabel, dataJson);
         var key = Key(userId, jobId);
 
-        if (m == "end")
+        if (!oversized)
         {
-            _matrix.TryRemove(key, out _);
-        }
-        else if (!oversized)
-        {
-            // Store the delivered frame as the current message for reconnect replay. On oversize we
+            // Store the delivered frame as the current message for reconnect replay, "end" included so a tab
+            // that dropped before the end still gets the final state; the TTL sweep evicts it. On oversize we
             // keep the previous good frame (do not overwrite it with a truncated marker).
             if (_matrix.ContainsKey(key) || _matrix.Count < _cfg.MaxActiveJobs)
             {
@@ -159,6 +176,108 @@ public sealed class RealtimeService : IDisposable
         if (_conns.TryGetValue(userId, out var set))
             foreach (var c in set.Values)
                 c.Enqueue(frame);
+    }
+
+    // ── Watches ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Grant <paramref name="userId"/> the events of <paramref name="jobId"/> (see <see cref="IsSafeJobId"/>). Call it from the
+    /// authenticated request that started the job, with that request's principal name. With
+    /// <paramref name="trackRun"/>, Craft also pushes the job's orchestrator run status itself, matched the
+    /// same way as <see cref="QueueStatusBridge.GetRun"/>, until the run finishes.
+    /// </summary>
+    public void Watch(string userId, string jobId, bool trackRun)
+    {
+        if (!_enabled || string.IsNullOrWhiteSpace(userId) || !IsSafeJobId(jobId, _logger)) return;
+
+        if (!_watches.TryGetValue(jobId, out var watch))
+        {
+            if (_watches.Count >= _cfg.MaxActiveJobs)
+            {
+                _logger.LogWarning("[Realtime] MaxActiveJobs ({Max}) reached — not watching job {JobId}",
+                    _cfg.MaxActiveJobs, jobId);
+                return;
+            }
+            watch = _watches.GetOrAdd(jobId, _ => new JobWatch());
+        }
+
+        watch.Users[userId] = 0;
+        watch.UpdatedTimestamp = Stopwatch.GetTimestamp();
+        if (trackRun) watch.TrackRun = true;
+    }
+
+    /// <summary>Publish to every user granted <paramref name="jobId"/> through <see cref="Watch"/>.</summary>
+    public void Notify(string jobId, string? mode, object? data)
+    {
+        if (!_enabled || string.IsNullOrWhiteSpace(jobId) || !_watches.TryGetValue(jobId, out var watch)) return;
+        watch.UpdatedTimestamp = Stopwatch.GetTimestamp();
+        foreach (var userId in watch.Users.Keys)
+            Publish(userId, jobId, mode, data, null, null, null, null);
+    }
+
+    /// <summary>
+    /// Push the run status of every tracked watch whose counts changed since the last push. One read of
+    /// the run summaries serves all watches, so the cost does not grow with the number of open tabs.
+    /// </summary>
+    internal void PumpRuns()
+    {
+        if (Interlocked.Exchange(ref _pumping, 1) == 1) return; // a slow storage read is still running
+        try
+        {
+            var tracked = new List<string>();
+            foreach (var kv in _watches)
+                if (kv.Value.TrackRun) tracked.Add(kv.Key);
+            if (tracked.Count == 0) return;
+
+            var rollups = RunStatusSource(tracked);
+            foreach (var jobId in tracked)
+            {
+                if (!_watches.TryGetValue(jobId, out var watch)) continue;
+                if (!rollups.TryGetValue(jobId, out var run))
+                {
+                    if (Stopwatch.GetElapsedTime(watch.CreatedTimestamp) <= RunStartGrace) continue;
+                    // Tell the watcher to stop waiting rather than leave a tracker that no longer polls hanging.
+                    watch.TrackRun = false;
+                    Notify(jobId, "end", new Dictionary<string, object?> { ["status"] = "NotFound" });
+                    continue;
+                }
+
+                if (run.State == watch.LastRunState) continue;
+                watch.LastRunState = run.State;
+
+                var finished = run.Status is "Completed" or "CompletedWithErrors";
+                if (finished) watch.TrackRun = false;
+                Notify(jobId, finished ? "end" : "update", run.Data);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Realtime] Run status pump failed");
+        }
+        finally
+        {
+            Volatile.Write(ref _pumping, 0);
+        }
+    }
+
+    private const int MaxJobIdLength = 128;
+
+    /// <summary>
+    /// A job id is any short token an app already uses (a GUID, <c>BEC-20261008-ab12</c>, a run name): 1-128
+    /// letters, digits, <c>-</c>, <c>_</c>, <c>.</c> or <c>:</c>. Anything else is dropped, never thrown, and only
+    /// its length is logged, so a hostile id cannot reach a log line, a key separator or the frame.
+    /// </summary>
+    internal static bool IsSafeJobId(string? jobId, ILogger? logger = null)
+    {
+        if (jobId is { Length: > 0 and <= MaxJobIdLength })
+        {
+            var safe = true;
+            foreach (var c in jobId)
+                if (!(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or ':')) { safe = false; break; }
+            if (safe) return true;
+        }
+        logger?.LogWarning("[Realtime] Rejected a job id that is not a short token ({Length} chars)", jobId?.Length ?? 0);
+        return false;
     }
 
     // ── SSE connection management ────────────────────────────────────────────────
@@ -209,6 +328,9 @@ public sealed class RealtimeService : IDisposable
             foreach (var kv in _matrix)
                 if (Stopwatch.GetElapsedTime(kv.Value.UpdatedTimestamp) > ttl)
                     _matrix.TryRemove(kv.Key, out _);
+            foreach (var kv in _watches)
+                if (!kv.Value.TrackRun && Stopwatch.GetElapsedTime(kv.Value.UpdatedTimestamp) > ttl)
+                    _watches.TryRemove(kv.Key, out _);
         }
         catch (Exception ex)
         {
@@ -250,6 +372,8 @@ public sealed class RealtimeService : IDisposable
     {
         null => null,
         string or bool or int or long or double or float or decimal or DateTime or DateTimeOffset or Guid => v,
+        JsonElement => v,
+        PSObject { BaseObject: PSCustomObject } ps => NormalizeProperties(ps),
         PSObject ps => Normalize(ps.BaseObject),
         IDictionary d => NormalizeDict(d),
         IEnumerable e => NormalizeList(e),
@@ -264,6 +388,15 @@ public sealed class RealtimeService : IDisposable
         return r;
     }
 
+    // A [pscustomobject] (and anything ConvertFrom-Json returns) has no CLR shape of its own: its note properties are the data.
+    private static Dictionary<string, object?> NormalizeProperties(PSObject ps)
+    {
+        var r = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var p in ps.Properties)
+            r[p.Name] = Normalize(p.Value);
+        return r;
+    }
+
     private static List<object?> NormalizeList(IEnumerable e)
     {
         var r = new List<object?>();
@@ -271,5 +404,9 @@ public sealed class RealtimeService : IDisposable
         return r;
     }
 
-    public void Dispose() => _sweep?.Dispose();
+    public void Dispose()
+    {
+        _sweep?.Dispose();
+        _runPump?.Dispose();
+    }
 }

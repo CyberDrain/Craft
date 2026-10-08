@@ -307,8 +307,12 @@ if (egressAccountingEnabled || apiCompressionEnabled)
     });
 }
 
+// The realtime stream is API traffic too: same switch and compressor, each flushed frame batch sent at once.
+if (apiCompressionEnabled)
+    app.UseWhen(IsEventsPath, ev => ev.UseResponseCompression());
+
 if (compressionEnabled)
-    app.UseWhen(ctx => !IsApiPath(ctx), sf => sf.UseResponseCompression());
+    app.UseWhen(ctx => !IsApiPath(ctx) && !IsEventsPath(ctx), sf => sf.UseResponseCompression());
 
 logger.LogInformation(
     "[System] Compression — static: {Static}  /api: {Api}  level: {Level}  (egress accounting: {Egress})",
@@ -321,6 +325,9 @@ logger.LogInformation(
 // compressor act on. Static, /.auth, /healthz and SPA routes take the other branch.
 static bool IsApiPath(HttpContext c) =>
     c.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase);
+
+static bool IsEventsPath(HttpContext c) =>
+    c.Request.Path.Equals(RealtimeEndpoint.Path, StringComparison.OrdinalIgnoreCase);
 
 // Nodes without the Http role do not short-circuit /api or auth paths: the HTTP endpoints simply aren't
 // mapped (see the `if (capHttp)` blocks below), so those requests fall through to static file serving

@@ -30,8 +30,9 @@ public class RealtimeSettings
     /// <summary>Heartbeat comment interval, seconds, to keep the stream alive through proxies. Default 20.</summary>
     public int HeartbeatSeconds { get; set; } = 20;
 
-    /// <summary>TTL for a stored entry that never receives an <c>end</c> (crash backstop), minutes. Default 60.</summary>
-    public int EntryTtlMinutes { get; set; } = 60;
+    /// <summary>How long a job's last frame (an <c>end</c> included) is kept for reconnect replay, and a grant
+    /// with no activity is kept, minutes. Default 30.</summary>
+    public int EntryTtlMinutes { get; set; } = 30;
 
     /// <summary>
     /// Resolved enabled state. The <c>CRAFT_REALTIME_ENABLED</c> environment variable (true/1 or false/0)

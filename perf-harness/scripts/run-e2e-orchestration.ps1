@@ -13,7 +13,7 @@
   them. The restart check runs last: it restarts the SUT container.
 
   $OrchChecks (from run-e2e.ps1) limits the run to the named groups:
-    post fail child prio collide attrib cancel seq order status maxconc stopfail perf restart
+    post fail child prio collide attrib cancel seq order status maxconc stopfail perf realtime restart
 #>
 
 # Perf gates. Calibrated from 3 full runs on the reference dev box (combined role, BgPoolSize=4, cpus=2,
@@ -397,9 +397,9 @@ Invoke-OrchCheck 'seq' {
     foreach ($B in @((Invoke-OrchBridge 'workers').busy)) { if ($B.fn -like "$Name-*") { [void]$Labels.Add($B.fn) } }
     $S = Get-OrchSummary $Ns; if ($S['sv'].ended -ge 4) { $true }
   } 60 250
-  $Q = Wait-Orch { $E = @((Invoke-OrchBridge 'queue' $Name).entries)[0]; if ($E.Status -eq 'Completed') { $E } } 30
+  $Q = Wait-Orch { $E = @((Invoke-OrchBridge 'queue' $Name).entries)[0]; if ($E.status -eq 'Completed') { $E } } 30
   $E = $Q.value
-  Add-Result 'orch-seq' 'each-step-visible' ($Labels.Count -ge 3 -and $E.TotalTasks -eq 4 -and $E.CompletedTasks -eq 4 -and @($E.Tasks).Count -eq 4) '-' "worker labels seen=$($Labels.Count) (of 4 steps); queue total=$($E.TotalTasks) completed=$($E.CompletedTasks) tasks listed=$(@($E.Tasks).Count)"
+  Add-Result 'orch-seq' 'each-step-visible' ($Labels.Count -ge 3 -and $E.total -eq 4 -and $E.completed -eq 4 -and @($E.tasks).Count -eq 4) '-' "worker labels seen=$($Labels.Count) (of 4 steps); queue total=$($E.total) completed=$($E.completed) tasks listed=$(@($E.tasks).Count)"
 }
 
 # -- 9. Priority and start-order ------------------------------------------------------------------------------
@@ -587,6 +587,103 @@ Invoke-OrchCheck 'perf' {
   Start-Sleep -Seconds 5
   $M = Invoke-OrchBridge 'summary'
   Add-Result 'orch-perf' 'memory-after-perf' ($M.rssMB -le $OrchGates.RssMB) "$($M.rssMB)MB" "rss=$($M.rssMB)MB workingSet=$($M.workingSetMB)MB heap=$($M.heapMB)MB committed=$($M.committedMB)MB; gate rss $($OrchGates.RssMB)MB"
+}
+
+# -- 15. Realtime run status ---------------------------------------------------------------------------------
+# A user granted a queue id (RealtimeBridge.WatchRun) gets Craft's run roll-up over /.craft/events: progress while
+# the runs work, then one "end" once every task of every run carrying the id has ended, children and grandchildren
+# included (a grandchild queued through the bridge, i.e. drained after the task that queued it returned). Nobody
+# else sees those frames.
+function Get-OrchPrincipal([string]$User) {
+  $Json = @{ identityProvider = 'aad'; userId = $User; userDetails = $User; userRoles = @('authenticated') } | ConvertTo-Json -Compress
+  @{ 'x-ms-client-principal-name' = $User; 'x-ms-client-principal' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Json)) }
+}
+
+function Start-OrchSse([string]$User, [string]$Path) {
+  $H = Get-OrchPrincipal $User
+  $ArgLine = "-N -s --compressed --max-time 300 -o `"$Path`" -H `"x-ms-client-principal-name: $User`" -H `"x-ms-client-principal: $($H['x-ms-client-principal'])`" $base/.craft/events"
+  Start-Process -FilePath $curl -ArgumentList $ArgLine -PassThru -NoNewWindow
+}
+
+function Get-OrchSseFrames([string]$Path) {
+  $Txt = try {
+    $Sr = [IO.StreamReader]::new([IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite'))
+    try { $Sr.ReadToEnd() } finally { $Sr.Dispose() }
+  } catch { '' }
+  return , @(foreach ($L in ($Txt -split "`n")) { if ($L.StartsWith('data: ')) { $L.Substring(6) | ConvertFrom-Json } })
+}
+
+function ConvertTo-OrchUnixMs([long]$Ticks) { [long](($Ticks - 621355968000000000) / 10000) }
+
+# The end frame alone must fill the queue tracker: every task listed, each in its final state.
+function Test-OrchFrameTasks($Frame, [int]$Count) {
+  $T = @($Frame.data.tasks)
+  $T.Count -eq $Count -and @($T.Where({ $_.status -notin 'Completed', 'Failed' })).Count -eq 0
+}
+
+$RtNames = @('needs-signed-in-user', 'stream-compressed', 'fanout-progress', 'nested-ends-after-all', 'failure-ends-with-errors', 'other-user-sees-nothing')
+Invoke-OrchCheck 'realtime' {
+  $Caps = try { Invoke-RestMethod "$base/API/PerfWatchRun" -Headers (Get-OrchPrincipal 'rt-probe') -TimeoutSec 20 } catch { $null }
+  if (-not $Caps.ok) { foreach ($N in $RtNames) { Add-Skip 'orch-realtime' $N 'image lacks RealtimeBridge.WatchRun' }; return }
+
+  $Bare = Fetch "$base/.craft/events" @('--max-time', '3', '-H', 'x-ms-client-principal-name: rt-bare')
+  Add-Result 'orch-realtime' 'needs-signed-in-user' ($Bare.Code -eq 401) '-' "principal-name header alone -> HTTP $($Bare.Code)"
+
+  $P = Get-OrchPrincipal 'rt-probe'
+  $Comp = Fetch "$base/.craft/events" @('--max-time', '2', '-H', 'Accept-Encoding: gzip', '-H', "x-ms-client-principal-name: rt-probe", '-H', "x-ms-client-principal: $($P['x-ms-client-principal'])")
+  Add-Result 'orch-realtime' 'stream-compressed' ($Comp.Headers -match '(?im)^content-encoding:\s*gzip') '-' "Accept-Encoding: gzip -> $((([regex]'(?im)^content-encoding:.*$').Match([string]$Comp.Headers).Value).Trim())"
+
+  $Id = New-OrchId; $Ns = "rt-$Id"
+  $Fan = [guid]::NewGuid().ToString(); $Tree = [guid]::NewGuid().ToString(); $Bad = [guid]::NewGuid().ToString()
+  $Mine = New-TemporaryFile; $Theirs = New-TemporaryFile
+  $Streams = @((Start-OrchSse 'rt-alice' $Mine.FullName), (Start-OrchSse 'rt-mallory' $Theirs.FullName))
+  try {
+    Start-Sleep -Milliseconds 1000
+    foreach ($Q in $Fan, $Tree, $Bad) { $null = Invoke-RestMethod "$base/API/PerfWatchRun?jobId=$Q" -Headers (Get-OrchPrincipal 'rt-alice') -TimeoutSec 20 }
+    $null = Start-OrchRuns $Ns @(
+      @{ name = "E2ERtFan-$Fan"; label = 'fan'; tasks = 40; holdms = 1000 }
+      @{ name = "E2ERtP-$Tree"; label = 'rtP'; tasks = 3; holdms = 300
+        overrides = @{ '0' = @{ child = @{ name = "E2ERtC-$Tree"; label = 'rtC'; tasks = 2; holdms = 1500
+              overrides = @{ '0' = @{ child = @{ name = "E2ERtG-$Tree"; label = 'rtG'; tasks = 4; holdms = 2500; via = 'bridge' } } } } } } }
+      @{ name = "E2ERtBad-$Bad"; label = 'bad'; tasks = 4; holdms = 300; overrides = @{ '2' = @{ fail = $true } } }
+    )
+    $W = Wait-Orch {
+      $F = Get-OrchSseFrames $Mine.FullName
+      if (@($F.Where({ $_.mode -eq 'end' -and $_.jobId -in @($Fan, $Tree, $Bad) }) | Select-Object -ExpandProperty jobId -Unique).Count -eq 3) { $true }
+    } 180
+    Start-Sleep -Seconds 4   # window in which a second "end" or a late frame would show up
+    $Frames = Get-OrchSseFrames $Mine.FullName
+    $Rows = Get-OrchRecords $Ns
+    $Of = { param($Q) , @($Frames.Where({ $_.jobId -eq $Q })) }
+    $LastEnd = { param([string[]]$Labels) ConvertTo-OrchUnixMs (Get-OrchMax @(foreach ($L in $Labels) { (Get-OrchTasks $Rows $L).end })) }
+
+    $F = & $Of $Fan; $Ends = @($F.Where({ $_.mode -eq 'end' })); $Ups = @($F.Where({ $_.mode -eq 'update' }))
+    $Done = @($Ups | ForEach-Object { [int]$_.data.completed + [int]$_.data.failed })
+    $Mid = @($Ups.Where({ [int]$_.data.completed + [int]$_.data.failed -lt [int]$_.data.total })).Count
+    $E = $Ends | Select-Object -First 1
+    $Ok = $W.ok -and $Ends.Count -eq 1 -and $Mid -ge 1 -and (($Done -join ',') -eq (@($Done | Sort-Object) -join ',')) -and
+      $E.data.status -eq 'Completed' -and [int]$E.data.completed -eq [int]$E.data.total -and [int]$E.data.total -eq 40 -and
+      $F[-1].mode -eq 'end' -and $E.ts -ge (& $LastEnd @('fan')) -and (Test-OrchFrameTasks $E 40) -and $E.data.runName
+    Add-Result 'orch-realtime' 'fanout-progress' $Ok "$($W.sec)s" "updates=$($Ups.Count) (mid-run $Mid) completed=[$($Done -join ',')] ends=$($Ends.Count) end=$($E.data.status) $($E.data.completed)/$($E.data.total) endTasks=$(@($E.data.tasks).Count) run=$($E.data.runName)"
+
+    $F = & $Of $Tree; $Ends = @($F.Where({ $_.mode -eq 'end' })); $E = $Ends | Select-Object -First 1
+    $Counts = @('rtP', 'rtC', 'rtG' | ForEach-Object { "$_=$((Get-OrchTasks $Rows $_).Count)" }) -join ' '
+    $Lead = if ($E) { $E.ts - (& $LastEnd @('rtP', 'rtC', 'rtG')) } else { 'n/a' }
+    $Ok = $Ends.Count -eq 1 -and $Counts -eq 'rtP=3 rtC=2 rtG=4' -and $E.data.status -eq 'Completed' -and
+      [int]$E.data.completed -eq [int]$E.data.total -and [int]$E.data.total -ge 9 -and $Lead -ge 0 -and (Test-OrchFrameTasks $E 9)
+    Add-Result 'orch-realtime' 'nested-ends-after-all' $Ok "+${Lead}ms" "end minus last grandchild/child/parent task end=${Lead}ms ends=$($Ends.Count) tasks $Counts end=$($E.data.status) $($E.data.completed)/$($E.data.total) endTasks=$(@($E.data.tasks).Count) frames=$($F.Count)"
+
+    $F = & $Of $Bad; $Ends = @($F.Where({ $_.mode -eq 'end' })); $E = $Ends | Select-Object -First 1
+    $Ok = $Ends.Count -eq 1 -and $E.data.status -eq 'CompletedWithErrors' -and [int]$E.data.failed -eq 1 -and $E.ts -ge (& $LastEnd @('bad')) -and
+      (Test-OrchFrameTasks $E 4) -and @(@($E.data.tasks).Where({ $_.status -eq 'Failed' })).Count -eq 1
+    Add-Result 'orch-realtime' 'failure-ends-with-errors' $Ok '-' "ends=$($Ends.Count) end=$($E.data.status) failed=$($E.data.failed) $($E.data.completed)/$($E.data.total)"
+
+    $Leak = @((Get-OrchSseFrames $Theirs.FullName).Where({ $_.jobId -in @($Fan, $Tree, $Bad) })).Count
+    Add-Result 'orch-realtime' 'other-user-sees-nothing' ($Leak -eq 0) '-' "frames for alice's queues on mallory's stream=$Leak"
+  } finally {
+    $Streams | Stop-Process -Force -ErrorAction SilentlyContinue
+    Remove-Item $Mine, $Theirs -ErrorAction SilentlyContinue
+  }
 }
 
 # -- 10. Restart recovery + legacy table drop (restarts the SUT; keep last) -------------------------------------

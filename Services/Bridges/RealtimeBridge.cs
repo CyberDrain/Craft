@@ -11,7 +11,7 @@ namespace Craft.Services;
 /// <summary>
 /// Static publish surface for the realtime channel, so downstream PowerShell (and Craft's own C#) can
 /// push job events without an HTTP round-trip — mirrors <see cref="AppLifecycleBridge"/> /
-/// <see cref="SchedulerBridge"/>. Delivery, gating, GUID/size enforcement and storage live in
+/// <see cref="SchedulerBridge"/>. Delivery, gating, job-id/size enforcement and storage live in
 /// <see cref="RealtimeService"/>.
 ///
 /// PS usage:
@@ -19,8 +19,8 @@ namespace Craft.Services;
 ///   [Craft.Services.RealtimeBridge]::Publish($userId, $jobId, "update", @{ done = 142; total = 300 })
 ///   [Craft.Services.RealtimeBridge]::Publish($userId, $jobId, "end",    @{ done = 300; total = 300 })
 ///
-/// Only <c>userId</c> and <c>jobId</c> (a GUID) are required; everything else is optional. Every call is
-/// best-effort and never throws back to the caller.
+/// Only <c>userId</c> and <c>jobId</c> (a short token: 1-128 letters, digits, <c>-_.:</c>) are required; everything
+/// else is optional. Every call is best-effort and never throws back to the caller.
 /// </summary>
 public static class RealtimeBridge
 {
@@ -41,6 +41,40 @@ public static class RealtimeBridge
     /// <summary>Publish with a click-to-navigate url object.</summary>
     public static void Publish(string userId, string jobId, string mode, object? data, string? urlHref, string? urlLabel) =>
         Publish(userId, jobId, mode, data, urlHref, urlLabel, null, null);
+
+    /// <summary>
+    /// Grant <paramref name="userId"/> the events of <paramref name="jobId"/>, so later
+    /// <see cref="Notify(string)"/> calls reach them without knowing who they are. Call it from the request
+    /// that started the job, with that request's principal name.
+    /// PS usage: [Craft.Services.RealtimeBridge]::Watch($Request.Headers.'x-ms-client-principal-name', $JobId)
+    /// </summary>
+    public static void Watch(string userId, string jobId)
+    {
+        try { s_service?.Watch(userId, jobId, trackRun: false); }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// <see cref="Watch"/>, and have Craft push the orchestrator run status for <paramref name="jobId"/>
+    /// (a queue id; matched like <see cref="QueueStatusBridge.GetRun"/>) until the run finishes.
+    /// </summary>
+    public static void WatchRun(string userId, string jobId)
+    {
+        try { s_service?.Watch(userId, jobId, trackRun: true); }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>Signal every user granted <paramref name="jobId"/> (mode update, no payload).</summary>
+    public static void Notify(string jobId) => Notify(jobId, null, null);
+
+    public static void Notify(string jobId, string? mode) => Notify(jobId, mode, null);
+
+    /// <summary>Publish to every user granted <paramref name="jobId"/> through <see cref="Watch"/> or <see cref="WatchRun"/>.</summary>
+    public static void Notify(string jobId, string? mode, object? data)
+    {
+        try { s_service?.Notify(jobId, mode, data); }
+        catch { /* best-effort */ }
+    }
 
     /// <summary>Full form. <paramref name="mode"/> is start | update | end (default update).</summary>
     public static void Publish(string userId, string jobId, string? mode, object? data,
