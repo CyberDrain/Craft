@@ -1,6 +1,7 @@
+using System.Text.Json;
+using Craft.Auth;
 using Craft.Configuration;
 using Craft.Realtime;
-using Microsoft.AspNetCore.Http.Features;
 
 namespace Craft.Hosting.Endpoints;
 
@@ -11,6 +12,9 @@ namespace Craft.Hosting.Endpoints;
 /// </summary>
 public static class RealtimeEndpoint
 {
+    /// <summary>The stream's path. Program.cs routes it through the /api compressor.</summary>
+    public const string Path = "/.craft/events";
+
     /// <summary>
     /// Maps the SSE endpoint on nodes that face a browser, when realtime is switched on.
     /// </summary>
@@ -40,11 +44,11 @@ public static class RealtimeEndpoint
         var realtime = app.Services.GetRequiredService<RealtimeService>();
         var heartbeat = TimeSpan.FromSeconds(Math.Max(5, settings.Realtime.HeartbeatSeconds));
 
-        app.MapGet("/.craft/events", async (HttpContext ctx) =>
+        app.MapGet(Path, async (HttpContext ctx) =>
         {
             // Delivery is identity-gated: a stream is only ever fed this user's own job events.
-            var userId = ctx.Request.Headers["x-ms-client-principal-name"].ToString();
-            if (string.IsNullOrEmpty(userId)) { ctx.Response.StatusCode = 401; return; }
+            var userId = ResolveSignedInUser(ctx);
+            if (userId is null) { ctx.Response.StatusCode = 401; return; }
 
             var (connId, conn) = realtime.Connect(userId);
             if (conn is null) { ctx.Response.StatusCode = 503; return; }   // over MaxConnections
@@ -52,7 +56,8 @@ public static class RealtimeEndpoint
             ctx.Response.Headers["Content-Type"] = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
             ctx.Response.Headers["X-Accel-Buffering"] = "no";   // stop nginx buffering the stream
-            ctx.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
+            // No DisableBuffering: every batch of frames is flushed below, which is all the stream needs, and
+            // the compressor then encodes a batch as one block instead of flushing after every write.
 
             var ct = ctx.RequestAborted;
             try
@@ -100,5 +105,36 @@ public static class RealtimeEndpoint
 
         logger.LogInformation("[System] Realtime SSE endpoint: /.craft/events");
         return app;
+    }
+
+    /// <summary>
+    /// The principal name of a signed-in user, read after <see cref="CraftAuthMiddleware"/> has normalised
+    /// the request. The principal must carry a real role, which rules out anonymous callers and app-only
+    /// API clients (normalised with no roles). Null when the caller is neither.
+    /// </summary>
+    internal static string? ResolveSignedInUser(HttpContext ctx)
+    {
+        var name = ctx.Request.Headers["x-ms-client-principal-name"].ToString();
+        var principal = ctx.Request.Headers["x-ms-client-principal"].ToString();
+        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(principal)) return null;
+
+        try
+        {
+            using var doc = EasyAuthPrincipal.Decode(principal);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object ||
+                !doc.RootElement.TryGetProperty("userRoles", out var roles) ||
+                roles.ValueKind != JsonValueKind.Array)
+                return null;
+
+            foreach (var role in roles.EnumerateArray())
+                if (role.ValueKind == JsonValueKind.String && role.GetString() is { Length: > 0 } r &&
+                    !r.Equals("anonymous", StringComparison.OrdinalIgnoreCase))
+                    return name;
+        }
+        catch
+        {
+            // Unreadable principal: not a signed-in user.
+        }
+        return null;
     }
 }

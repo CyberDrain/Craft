@@ -194,7 +194,7 @@ public static class CraftHostBuilderExtensions
         return level;
     }
 
-    private static readonly string[] second = new[] { "application/json", "text/json", "application/javascript", "text/javascript" };
+    private static readonly string[] second = new[] { "application/json", "text/json", "application/javascript", "text/javascript", "text/event-stream" };
 
     /// <summary>
     /// Resolves the on-the-fly compression level from the <c>CRAFT_API_COMPRESSION_LEVEL</c> env var

@@ -672,9 +672,46 @@ endpoint is still only mapped by nodes carrying the **Http** or **Frontend** rol
   "MaxConnections": 1000,     // max concurrent SSE streams
   "PerConnectionQueue": 256,  // buffered frames per connection before the oldest is dropped
   "HeartbeatSeconds": 20,     // keep-alive comment interval
-  "EntryTtlMinutes": 60       // backstop eviction for jobs that never send "end"
+  "EntryTtlMinutes": 30       // how long a job's last frame (an "end" included) stays for reconnect replay
 }
 ```
+
+A stream opens only for a signed-in user: the principal Craft's auth middleware resolved must carry a role
+other than `anonymous`, so app-only API clients and anonymous callers get a 401. The browser never names a
+job. The app grants a job to the user from the authenticated request that started it, and events for that
+job then reach that user only:
+
+```powershell
+$User = $Request.Headers.'x-ms-client-principal-name'
+[Craft.Services.RealtimeBridge]::Watch($User, $JobId)     # grant; the app publishes with Notify
+[Craft.Services.RealtimeBridge]::WatchRun($User, $QueueId) # grant, and Craft pushes the run status itself
+[Craft.Services.RealtimeBridge]::Notify($JobId)            # from any worker: signal every granted user
+```
+
+`WatchRun` pushes what `QueueStatusBridge.GetRun($QueueId)` returns, every 3 seconds while the counts or a
+task's status change, ending with an `end` frame when the run finishes. A run that has not appeared within 10
+minutes ends with `status: "NotFound"`. One read of the run summaries serves every watch. The status is
+app-neutral (camelCase); shaping it for a UI is the app's job:
+
+```jsonc
+{
+  "runName": "SyncOrchestrator-6f1c2b8e-...", "reference": "...", "label": "Sync users", "link": "",
+  "status": "Running",            // Queued | Running | Completed | CompletedWithErrors
+  "total": 16, "queued": 0, "running": 1, "completed": 14, "failed": 1,
+  "startedUtc": "2026-10-08T01:31:41Z",
+  "tasks": [ { "name": "Push-Sync_contoso.com", "status": "Completed", "at": "2026-10-08T01:31:45Z" } ]
+}
+```
+
+A queue id that spans several runs (chained continuations, child runs named with the same id) is rolled up into
+one status. `GetRuns($Lookup)` returns the same shape per run. Counts follow the task list when it holds every
+task, so they never trail it; the status follows storage, so a run is never reported done before it and any
+child it waits on have finished.
+
+The stream is compressed by the `/api` compressor under the same switch (`App:Api:Compression` /
+`CRAFT_API_COMPRESSION`) and level: br or gzip as the browser accepts, one compression context per connection, so
+the repeated keys and tenant names of successive frames compress against each other. Each batch of frames is
+flushed as it is written, so compression never delays an event.
 
 ### Frontend
 

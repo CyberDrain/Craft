@@ -132,7 +132,9 @@ try {
   foreach ($mode in 'start', 'update') {
     try { Invoke-RestMethod "$base/API/PerfPublish?jobId=$jobId&mode=$mode" -Headers @{ 'x-ms-client-principal-name' = 'ciuser' } -TimeoutSec 20 | Out-Null } catch {}
   }
-  $sseTxt = (& $curl '-N' '-s' '--max-time' '4' '-H' $hdr "$base/.craft/events" 2>$null | Out-String)
+  # The stream opens only for a signed-in user: a principal with a real role, as EasyAuth/Craft auth would pass on.
+  $ciPrincipal = 'x-ms-client-principal: ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"identityProvider":"aad","userId":"ciuser","userDetails":"ciuser","userRoles":["authenticated"]}'))
+  $sseTxt = (& $curl '-N' '-s' '--max-time' '4' '-H' $hdr '-H' $ciPrincipal "$base/.craft/events" 2>$null | Out-String)
   try { Invoke-RestMethod "$base/API/PerfPublish?jobId=$jobId&mode=end" -Headers @{ 'x-ms-client-principal-name' = 'ciuser' } -TimeoutSec 20 | Out-Null } catch {}
   $sseOk = ($sseTxt -match [regex]::Escape($jobId)) -and ($sseTxt -match '"mode":"update"')
   Add-Result 'realtime' 'sse-deliver' $sseOk '-' "publish -> stored -> SSE replay delivered"

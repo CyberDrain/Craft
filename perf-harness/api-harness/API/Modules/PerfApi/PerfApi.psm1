@@ -563,6 +563,15 @@ function Invoke-PerfPublish {
     return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfPublish'; jobId = $jobId; mode = $mode; userId = $userId } }
 }
 
+# Grant the caller a queue id's run status over the realtime channel (?jobId=<guid>). ok is false on an image
+# without WatchRun, so the realtime orchestration check can skip instead of failing.
+function Invoke-PerfWatchRun {
+    param($Request, $TriggerMetadata)
+    $Has = $null -ne [Craft.Services.RealtimeBridge].GetMethod('WatchRun')
+    if ($Has) { [Craft.Services.RealtimeBridge]::WatchRun([string]$Request.Headers.'x-ms-client-principal-name', [string]$Request.Query.jobId) }
+    return @{ StatusCode = 200; Body = @{ ok = $Has; jobId = [string]$Request.Query.jobId } }
+}
+
 # -- Orchestration e2e probes (scripts/run-e2e-orchestration.ps1) -----------------------------------------
 # Each check gets its own namespace (ns). Tasks and PostExecutions record what they saw under that ns, in the
 # shared cache by default or in the E2EProbe table (sink=table) when the record has to survive a restart.
@@ -800,7 +809,7 @@ function Invoke-PerfE2EBridge {
                     startHasMaxConcurrency = ($Def -match 'MaxConcurrency'); startHasStopOnFailure = ($Def -match 'StopOnFailure') }
             }
             'active' { $Body = @{ active = [Craft.Services.OrchestratorBridge]::IsRunActive($Name) } }
-            'queue' { $Body = @{ entries = @([Craft.Services.QueueStatusBridge]::GetRunStatus($null, $Name) | ConvertFrom-Json) } }
+            'queue' { $Body = @{ entries = @([Craft.Services.QueueStatusBridge]::GetRuns($Name) | ConvertFrom-Json) } }
             'workers' {
                 $Body = @{ busy = @([Craft.Services.WorkerMetricsBridge]::GetSnapshot().BgPool.Workers | Where-Object IsBusy |
                     ForEach-Object { @{ id = $_.WorkerId; fn = $_.CurrentFunction } }) }

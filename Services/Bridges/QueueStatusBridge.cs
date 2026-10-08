@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using Craft.Orchestration;
 
@@ -11,9 +12,10 @@ using Craft.Orchestration;
 namespace Craft.Services;
 
 /// <summary>
-/// Static bridge allowing PowerShell (Get-CIPPQueueData) to query orchestrator/job
-/// progress without HTTP round-trips. Returns data in the shape the CIPP frontend expects.
-/// PS usage: [Craft.Services.QueueStatusBridge]::GetRunStatus($Reference, $QueueId)
+/// Run status for PowerShell and the realtime channel, without HTTP round-trips. App-neutral: a run's
+/// counts, status and task list plus whatever label/link the app registered; the app shapes it for its own
+/// UI. JSON is camelCase.
+/// PS usage: [Craft.Services.QueueStatusBridge]::GetRun($QueueId) / ::GetRuns($Lookup)
 /// </summary>
 public static class QueueStatusBridge
 {
@@ -21,11 +23,8 @@ public static class QueueStatusBridge
     private static OrchestratorService? s_orchestratorService;
     private static JobQueueStatusReader? s_queueReader;
 
-    /// <summary>
-    /// Maps QueueId (GUID) or Reference to friendly display metadata (Name, Link).
-    /// Populated by New-CippQueueEntry in CIPPNG mode.
-    /// </summary>
-    private static readonly ConcurrentDictionary<string, QueueMetadata> s_queueMetadata = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Display metadata the app registered for a queue id or reference.</summary>
+    private static readonly ConcurrentDictionary<string, RunLabel> s_labels = new(StringComparer.OrdinalIgnoreCase);
 
     public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null,
         JobQueueStatusReader? queueReader = null)
@@ -36,115 +35,207 @@ public static class QueueStatusBridge
     }
 
     /// <summary>
-    /// Register friendly queue metadata from PowerShell (New-CippQueueEntry).
-    /// PS usage: [Craft.Services.QueueStatusBridge]::RegisterQueueMetadata($QueueId, $Name, $Link, $Reference)
+    /// Register a display label and link for a queue id (and its reference), returned with its runs.
+    /// PS usage: [Craft.Services.QueueStatusBridge]::RegisterQueueMetadata($QueueId, $Label, $Link, $Reference)
     /// </summary>
-    public static void RegisterQueueMetadata(string queueId, string name, string link, string reference)
+    public static void RegisterQueueMetadata(string queueId, string label, string link, string reference)
     {
-        var meta = new QueueMetadata { Name = name, Link = link ?? "", Reference = reference ?? "" };
+        var meta = new RunLabel(label ?? "", link ?? "");
         if (!string.IsNullOrEmpty(queueId))
-            s_queueMetadata[queueId] = meta;
+            s_labels[queueId] = meta;
         if (!string.IsNullOrEmpty(reference))
-            s_queueMetadata[reference] = meta;
+            s_labels[reference] = meta;
     }
 
     /// <summary>
-    /// Get queue/run status in the format expected by the CIPP frontend.
-    /// Looks up by run name (Reference) or returns all recent runs.
-    /// Returns a JSON string matching the Get-CIPPQueueData output shape.
+    /// Each run matching <paramref name="lookup"/> (a run name, a reference, or a queue id the run name ends
+    /// with), or every run of the last 3 hours when it is empty. JSON array of <see cref="RunStatus"/>.
     /// </summary>
-    /// <param name="reference">Optional run reference/name to filter by (maps to RunName in JobManager)</param>
-    /// <param name="queueId">Optional queue ID (same as reference in Craft context)</param>
-    /// <returns>JSON array of queue status objects</returns>
-    public static string GetRunStatus(string? reference = null, string? queueId = null)
+    public static string GetRuns(string? lookup = null)
     {
         if (s_jobManager == null) return "[]";
-
-        // PowerShell converts $null to "" when calling .NET string parameters,
-        // so treat empty strings the same as null.
-        var effectiveQueueId = string.IsNullOrEmpty(queueId) ? null : queueId;
-        var effectiveReference = string.IsNullOrEmpty(reference) ? null : reference;
-        var lookup = effectiveQueueId ?? effectiveReference;
         var summaries = GetMergedRunSummaries();
-
         if (!string.IsNullOrEmpty(lookup))
         {
-            // Try exact match on run name first
-            var matched = summaries
-                .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            // If no exact match, try matching by Reference via orchestrator service
-            if (matched.Count == 0 && s_orchestratorService != null)
-            {
-                var runName = s_orchestratorService.FindRunByReference(lookup);
-                if (runName != null)
-                {
-                    matched = summaries
-                        .Where(s => s.Name.Equals(runName, StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                }
-            }
-
-            // Last resort: match run names ending with the lookup (QueueId is often the GUID suffix)
-            if (matched.Count == 0)
-            {
-                matched = summaries
-                    .Where(s => s.Name.EndsWith(lookup, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-            }
-
-            summaries = matched;
+            summaries = MatchRuns(summaries, lookup);
         }
         else
         {
-            // Return only runs from last 3 hours (matches legacy behavior)
             var cutoff = DateTime.UtcNow.AddHours(-3);
-            summaries = summaries
-                .Where(s => s.StartedUtc == null || s.StartedUtc > cutoff)
+            summaries = summaries.Where(s => s.StartedUtc == null || s.StartedUtc > cutoff).ToList();
+        }
+        return JsonSerializer.Serialize(summaries.Select(s => ToStatus([Load(s)])).ToList(), s_json);
+    }
+
+    /// <summary>
+    /// One <see cref="RunStatus"/> for everything <paramref name="lookup"/> matches, chained and child runs
+    /// rolled up; JSON <c>null</c> when nothing matches yet. The same object the realtime channel pushes.
+    /// </summary>
+    public static string GetRun(string lookup)
+    {
+        if (s_jobManager == null || string.IsNullOrEmpty(lookup)) return "null";
+        return GetRunRollups([lookup]).TryGetValue(lookup, out var run) ? run.Data.GetRawText() : "null";
+    }
+
+    /// <summary>
+    /// A run as storage has it (which decides its status), its counts made to agree with its task list (see
+    /// <see cref="Reconcile"/>), and the task list.
+    /// </summary>
+    private static (JobRunSummary Storage, JobRunSummary Counts, List<RunTask> Tasks) Load(JobRunSummary s)
+    {
+        var tasks = GetTasks(s.Name);
+        return (s, Reconcile(s, tasks.Select(t => t.Status).ToList()), tasks);
+    }
+
+    /// <summary>
+    /// The run's counts made to agree with its task list. Storage counts a task done only once its finish is
+    /// committed, a few seconds after the job manager marks it, so a tracker showing both would have its numbers
+    /// trail its per-task chips. A list holding every task gives the counts outright. A partial one (tasks not
+    /// yet claimed here, a fan-out bigger than the list, a parent whose total counts its child runs) can only
+    /// add: a task it shows finished is finished, so done counts take the higher of the two and the rest is
+    /// queued. Only the counts: the status stays storage's, which alone knows the run (and any child it is
+    /// waiting on) has finished, so a run never reports done early.
+    /// </summary>
+    internal static JobRunSummary Reconcile(JobRunSummary s, IReadOnlyCollection<string> taskStatuses)
+    {
+        if (s.Total <= 0 || taskStatuses.Count == 0 || taskStatuses.Count > s.Total) return s;
+        int queued = 0, running = 0, completed = 0, failed = 0;
+        foreach (var status in taskStatuses)
+        {
+            switch (status)
+            {
+                case "Queued": queued++; break;
+                case "Running": running++; break;
+                case "Failed": failed++; break;
+                default: completed++; break;
+            }
+        }
+
+        var r = new JobRunSummary
+        {
+            Name = s.Name,
+            Reference = s.Reference,
+            Priority = s.Priority,
+            Total = s.Total,
+            StartedUtc = s.StartedUtc,
+            CompletedUtc = s.CompletedUtc
+        };
+        if (taskStatuses.Count == s.Total)
+        {
+            (r.Queued, r.Running, r.Completed, r.Failed) = (queued, running, completed, failed);
+            return r;
+        }
+
+        r.Completed = Math.Max(s.Completed, completed);
+        r.Failed = Math.Max(s.Failed, failed);
+        r.Running = Math.Min(Math.Max(s.Running, running), s.Total - r.Completed - r.Failed);
+        r.Queued = s.Total - r.Completed - r.Failed - r.Running;
+        return r;
+    }
+
+    /// <summary>
+    /// One status for one or more runs of the same queue: the first run's name, reference and label, the
+    /// summed counts, every run's tasks, and the status of the runs together as storage has them.
+    /// </summary>
+    private static RunStatus ToStatus(List<(JobRunSummary Storage, JobRunSummary Counts, List<RunTask> Tasks)> runs)
+    {
+        var first = runs[0].Counts;
+        var reference = s_orchestratorService?.GetRunReference(first.Name) ?? first.Name;
+        JobRunSummary counts = new(), storage = new();
+        foreach (var (st, c, _) in runs)
+        {
+            counts.Total += c.Total;
+            counts.Queued += c.Queued;
+            counts.Running += c.Running;
+            counts.Completed += c.Completed;
+            counts.Failed += c.Failed;
+            storage.Queued += st.Queued;
+            storage.Running += st.Running;
+            storage.Completed += st.Completed;
+            storage.Failed += st.Failed;
+        }
+        var label = FindLabel(reference, first.Name);
+        return new RunStatus
+        {
+            RunName = first.Name,
+            Reference = reference,
+            Label = label?.Label,
+            Link = label?.Link,
+            Status = DeriveStatus(storage),
+            Total = counts.Total,
+            Queued = counts.Queued,
+            Running = counts.Running,
+            Completed = counts.Completed,
+            Failed = counts.Failed,
+            StartedUtc = runs.Min(r => r.Counts.StartedUtc),
+            Tasks = runs.SelectMany(r => r.Tasks).ToList()
+        };
+    }
+
+    /// <summary>The label registered for a run: by its reference, its name, or the queue id its name ends with.</summary>
+    private static RunLabel? FindLabel(string reference, string runName)
+    {
+        if (s_labels.TryGetValue(reference, out var label) || s_labels.TryGetValue(runName, out label)) return label;
+        return runName.Length > 36 && Guid.TryParse(runName[^36..], out _) && s_labels.TryGetValue(runName[^36..], out label)
+            ? label
+            : null;
+    }
+
+    /// <summary>
+    /// Runs for one queue id or reference: exact run name, then the orchestrator's reference, then the
+    /// run-name suffix (apps commonly name runs "Name-&lt;QueueId&gt;").
+    /// </summary>
+    private static List<JobRunSummary> MatchRuns(List<JobRunSummary> summaries, string lookup)
+    {
+        var matched = summaries
+            .Where(s => s.Name.Equals(lookup, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (matched.Count == 0 && s_orchestratorService?.FindRunByReference(lookup) is { } runName)
+        {
+            matched = summaries
+                .Where(s => s.Name.Equals(runName, StringComparison.OrdinalIgnoreCase))
                 .ToList();
         }
 
-        var result = summaries.Select(s =>
+        if (matched.Count == 0)
         {
-            var completedTasks = s.Completed + s.Failed;
-            var total = Math.Max(s.Total, 1);
-            var status = DeriveStatus(s);
-            var runReference = s_orchestratorService?.GetRunReference(s.Name) ?? s.Name;
+            matched = summaries
+                .Where(s => s.Name.EndsWith(lookup, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
 
-            // Look up friendly metadata by reference, then by run name,
-            // then by QueueId GUID suffix (run names follow "OrchestratorName-<GUID>" pattern)
-            s_queueMetadata.TryGetValue(runReference, out var meta);
-            if (meta == null)
-                s_queueMetadata.TryGetValue(s.Name, out meta);
-            if (meta == null && s.Name.Length > 36)
-            {
-                var guidSuffix = s.Name[^36..];
-                if (Guid.TryParse(guidSuffix, out _))
-                    s_queueMetadata.TryGetValue(guidSuffix, out meta);
-            }
+        return matched;
+    }
 
-            return new QueueStatusEntry
-            {
-                PartitionKey = "CippQueue",
-                RowKey = s.Name,
-                Name = meta?.Name ?? s.Name,
-                Link = meta?.Link ?? "",
-                Reference = runReference,
-                TotalTasks = s.Total,
-                CompletedTasks = completedTasks,
-                RunningTasks = s.Running,
-                FailedTasks = s.Failed,
-                PercentComplete = Math.Round(((double)completedTasks / total) * 100, 1),
-                PercentFailed = Math.Round(((double)s.Failed / total) * 100, 1),
-                PercentRunning = Math.Round(((double)s.Running / total) * 100, 1),
-                Tasks = GetTaskDetails(s.Name),
-                Status = status,
-                Timestamp = s.StartedUtc?.ToString("O") ?? DateTime.UtcNow.ToString("O")
-            };
-        }).ToList();
+    /// <summary>
+    /// What the realtime pump pushes for one queue id: its <see cref="RunStatus"/>, and a signature of its
+    /// progress that changes only when the counts or a task's status do.
+    /// </summary>
+    internal sealed record RunRollup(string Status, JsonElement Data, string State);
 
-        return JsonSerializer.Serialize(result, s_jsonOptions);
+    /// <summary>The rolled-up status per queue id from one read of the run summaries. Ids with no run yet are left out.</summary>
+    internal static Dictionary<string, RunRollup> GetRunRollups(IReadOnlyCollection<string> ids) =>
+        s_jobManager == null || ids.Count == 0
+            ? new Dictionary<string, RunRollup>(StringComparer.OrdinalIgnoreCase)
+            : RollUp(GetMergedRunSummaries(), ids);
+
+    internal static Dictionary<string, RunRollup> RollUp(List<JobRunSummary> summaries, IReadOnlyCollection<string> ids)
+    {
+        var result = new Dictionary<string, RunRollup>(StringComparer.OrdinalIgnoreCase);
+        foreach (var id in ids)
+        {
+            var runs = MatchRuns(summaries, id);
+            if (runs.Count == 0) continue;
+
+            var status = ToStatus(runs.Select(Load).ToList());
+            var state = new StringBuilder()
+                .Append(status.Status).Append('|').Append(status.Total).Append('|').Append(status.Queued)
+                .Append('|').Append(status.Running).Append('|').Append(status.Completed).Append('|').Append(status.Failed);
+            foreach (var t in status.Tasks) state.Append('|').Append(t.Name).Append(':').Append(t.Status);
+            result[id] = new RunRollup(status.Status, JsonSerializer.SerializeToElement(status, s_json), state.ToString());
+        }
+        return result;
     }
 
     /// <summary>
@@ -173,11 +264,12 @@ public static class QueueStatusBridge
         return s_jobManager?.GetRunSummaries() ?? [];
     }
 
+    /// <summary>Queued, Running, Completed or CompletedWithErrors.</summary>
     private static string DeriveStatus(JobRunSummary s)
     {
         if (s.Queued == 0 && s.Running == 0)
         {
-            return s.Failed > 0 ? "Completed (with errors)" : "Completed";
+            return s.Failed > 0 ? "CompletedWithErrors" : "Completed";
         }
         if (s.Running > 0 || s.Completed > 0 || s.Failed > 0)
         {
@@ -186,77 +278,50 @@ public static class QueueStatusBridge
         return "Queued";
     }
 
-    private static List<TaskDetail> GetTaskDetails(string runName)
+    /// <summary>A run's most recent tasks, each named by its job name without the run's own prefix.</summary>
+    private static List<RunTask> GetTasks(string runName)
     {
         if (s_jobManager == null) return [];
 
-        var jobs = s_jobManager.GetRunJobs(runName, limit: 100);
-        return jobs.Select(j => new TaskDetail
+        return s_jobManager.GetRunJobs(runName, limit: 100).Select(j => new RunTask
         {
-            Timestamp = (j.CompletedUtc ?? j.StartedUtc ?? j.QueuedUtc).ToString("O"),
-            Name = ExtractTaskDisplayName(j.Name, runName),
-            Status = j.Status
+            Name = j.Name.StartsWith(runName + "-", StringComparison.OrdinalIgnoreCase) ? j.Name[(runName.Length + 1)..] : j.Name,
+            Status = j.Status,
+            At = j.CompletedUtc ?? j.StartedUtc ?? j.QueuedUtc
         }).ToList();
     }
 
-    /// <summary>
-    /// Extract a clean display name from the full job name.
-    /// Job names follow pattern: "{RunName}-{FunctionName}_{TenantFilter}"
-    /// We want just the tenant (or meaningful identifier) portion.
-    /// </summary>
-    private static string ExtractTaskDisplayName(string jobName, string runName)
+    // ── Output models ──
+
+    /// <summary>A queue's runs as one status. Serialized camelCase.</summary>
+    internal sealed class RunStatus
     {
-        // Strip the run name prefix (e.g. "GraphRequestOrchestrator-guid-")
-        var remaining = jobName;
-        if (jobName.StartsWith(runName + "-", StringComparison.OrdinalIgnoreCase))
-            remaining = jobName[(runName.Length + 1)..];
-
-        // Strip function name prefix (e.g. "ListGraphRequestQueue_") — take everything after first underscore
-        var underscoreIdx = remaining.IndexOf('_');
-        if (underscoreIdx >= 0 && underscoreIdx < remaining.Length - 1)
-            return remaining[(underscoreIdx + 1)..];
-
-        return remaining;
-    }
-
-    // ── Output Models (match Get-CIPPQueueData shape) ──
-
-    private sealed class QueueStatusEntry
-    {
-        public string PartitionKey { get; set; } = "";
-        public string RowKey { get; set; } = "";
-        public string Name { get; set; } = "";
-        public string Link { get; set; } = "";
+        public string RunName { get; set; } = "";
         public string Reference { get; set; } = "";
-        public int TotalTasks { get; set; }
-        public int CompletedTasks { get; set; }
-        public int RunningTasks { get; set; }
-        public int FailedTasks { get; set; }
-        public double PercentComplete { get; set; }
-        public double PercentFailed { get; set; }
-        public double PercentRunning { get; set; }
-        public List<TaskDetail> Tasks { get; set; } = [];
+        public string? Label { get; set; }
+        public string? Link { get; set; }
         public string Status { get; set; } = "";
-        public string Timestamp { get; set; } = "";
+        public int Total { get; set; }
+        public int Queued { get; set; }
+        public int Running { get; set; }
+        public int Completed { get; set; }
+        public int Failed { get; set; }
+        public DateTime? StartedUtc { get; set; }
+        public List<RunTask> Tasks { get; set; } = [];
     }
 
-    private sealed class TaskDetail
+    internal sealed class RunTask
     {
-        public string Timestamp { get; set; } = "";
         public string Name { get; set; } = "";
         public string Status { get; set; } = "";
+        public DateTime At { get; set; }
     }
 
-    private static readonly JsonSerializerOptions s_jsonOptions = new()
+    private sealed record RunLabel(string Label, string Link);
+
+    private static readonly JsonSerializerOptions s_json = new()
     {
-        PropertyNamingPolicy = null,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = false
     };
-
-    private sealed class QueueMetadata
-    {
-        public string Name { get; set; } = "";
-        public string Link { get; set; } = "";
-        public string Reference { get; set; } = "";
-    }
 }
