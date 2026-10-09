@@ -127,7 +127,7 @@ public static class PowerShellDispatchEndpoint
                     context.Response.Headers["X-Cache-Bypass"] = cacheBypassReason;
                 context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
-                if (result.StatusCode == 200)
+                if (result.StatusCode is >= 200 and < 300)
                 {
                     HandleOrchestratorTrigger(result.Body, psRunner, orchestrator, logger, "[API] Orchestrator triggered");
                     HandleScriptTrigger(result.Body, psRunner, jobManager, logger);
