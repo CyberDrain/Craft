@@ -60,6 +60,7 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
         Tasks.Enqueue(task);
         Started.Enqueue(IdOf(task));
         RanAs.Enqueue(OperationContext.Current?.Function);
+        RanOn.Enqueue(worker);
         var now = Interlocked.Increment(ref _active);
         for (var seen = _maxActive; now > seen; seen = _maxActive)
             if (Interlocked.CompareExchange(ref _maxActive, now, seen) == seen) break;
@@ -76,8 +77,22 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
         }
     }
 
-    internal override PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct) { Interlocked.Increment(ref Checkouts); return null; }
-    internal override void ReclaimSequentialWorker(PowerShellWorker? worker, bool faulted) => Interlocked.Increment(ref Reclaims);
+    /// <summary>The worker a sequential driver checks out; null unless a test supplies one.</summary>
+    public Func<PowerShellWorker?>? NextWorker;
+    public readonly ConcurrentQueue<PowerShellWorker?> RanOn = new();
+    public readonly ConcurrentQueue<(PowerShellWorker? Worker, bool Faulted)> Reclaimed = new();
+
+    internal override PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct)
+    {
+        Interlocked.Increment(ref Checkouts);
+        return NextWorker?.Invoke();
+    }
+
+    internal override void ReclaimSequentialWorker(PowerShellWorker? worker, bool faulted)
+    {
+        Interlocked.Increment(ref Reclaims);
+        Reclaimed.Enqueue((worker, faulted));
+    }
 }
 
 /// <summary>Store, pump and JobManager wired as in the host, over an in-memory table store, driven by hand.</summary>

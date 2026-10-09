@@ -48,6 +48,7 @@ public static class HealthEndpoint
                 status = (httpReady && bgReady && storageReady) ? "ready" : "starting",
                 roles = new { frontend = roles.Frontend, http = roles.Http, background = roles.Background },
                 ready = new { http = httpReady, background = bgReady, storage = storageReady },
+                workers = new { hung = pool.HungWorkers, hungTotal = pool.HungWorkersTotal },
             });
         });
 

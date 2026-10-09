@@ -232,6 +232,11 @@
       // 0 = no timeout (default). Recommended: 600-3600 for background jobs
       // "BgTimeoutSeconds": 0,
 
+      // Grace (seconds) a timed-out or cancelled pipeline gets to stop. A pipeline blocked inside a .NET
+      // call never sees the stop; past this grace its worker is abandoned and replaced, and the caller
+      // gets the usual timeout. /healthz reports workers.hung / workers.hungTotal.
+      // "StopGraceSeconds": 30,
+
       // How long an HTTP request waits for a free runspace when the pool is saturated before it is
       // shed with 503 "Server busy, please retry". A load-shedding bound, NOT a capacity knob — it
       // does not add throughput, it only decides how long callers wait before a spurious 503. Widen
