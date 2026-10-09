@@ -34,6 +34,12 @@ public class PowerShellWorkerPool : IDisposable
     public int BgAvailable => _bgPool.Count;
     public int HttpPoolSize => _httpPoolSize;
     public int BgPoolSize => _bgPoolSize;
+    /// <summary>Workers abandoned as hung whose blocked call has not returned yet.</summary>
+    public int HungWorkers => Volatile.Read(ref _hungNow);
+    /// <summary>Workers abandoned as hung since startup.</summary>
+    public long HungWorkersTotal => Interlocked.Read(ref _hungTotal);
+    private int _hungNow;
+    private long _hungTotal;
 
     public PowerShellWorkerPool(ScriptRepository repo, ILogger<PowerShellWorkerPool> logger, IConfiguration config, CraftSettings settings)
     {
@@ -168,7 +174,7 @@ public class PowerShellWorkerPool : IDisposable
 
         // ── Base worker: parse shared modules ──────────────────────────────
         var baseISS = BuildISSForModules(sharedModules);
-        var baseWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), baseISS, _logger);
+        var baseWorker = NewWorker(baseISS);
         baseWorker.Initialize(_repo, _apiBasePath, _settings);
 
         var baseMs = sw.ElapsedMilliseconds;
@@ -184,7 +190,7 @@ public class PowerShellWorkerPool : IDisposable
 
         // ── HTTP first-worker (cloned base + HTTP-only modules) ────────────
         var httpISS = BuildClonedISSWithModules(baseState, httpOnlyModules);
-        var firstHttpWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), httpISS, _logger);
+        var firstHttpWorker = NewWorker(httpISS);
         InitializeClonedWorker(firstHttpWorker, baseState);
         var httpState = firstHttpWorker.ExportModuleState();
 
@@ -210,7 +216,7 @@ public class PowerShellWorkerPool : IDisposable
             var clonedHttpISS = BuildClonedISS(_httpClonedState);
             var httpRemaining = new List<PowerShellWorker>();
             for (int i = 1; i < _httpPoolSize; i++)
-                httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+                httpRemaining.Add(NewWorker(clonedHttpISS));
 
             Parallel.ForEach(httpRemaining, w => InitializeClonedWorker(w, _httpClonedState!));
             foreach (var w in httpRemaining)
@@ -223,7 +229,7 @@ public class PowerShellWorkerPool : IDisposable
 
         // ── BG first-worker (cloned base + BG-only modules) ────────────────
         var bgISS = BuildClonedISSWithModules(baseState, bgOnlyModules);
-        var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), bgISS, _logger);
+        var firstBgWorker = NewWorker(bgISS);
         InitializeClonedWorker(firstBgWorker, baseState);
         var bgState = firstBgWorker.ExportModuleState();
 
@@ -245,7 +251,7 @@ public class PowerShellWorkerPool : IDisposable
             var clonedBgISS = BuildClonedISS(_bgClonedState);
             var bgRemaining = new List<PowerShellWorker>();
             for (int i = 1; i < _bgPoolSize; i++)
-                bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+                bgRemaining.Add(NewWorker(clonedBgISS));
 
             Parallel.ForEach(bgRemaining, w => InitializeClonedWorker(w, _bgClonedState!));
             foreach (var w in bgRemaining)
@@ -279,7 +285,7 @@ public class PowerShellWorkerPool : IDisposable
         {
             // First HTTP worker: full module import
             var fullHttpISS = BuildISS(isHttp: true);
-            var firstWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullHttpISS, _logger);
+            var firstWorker = NewWorker(fullHttpISS);
             firstWorker.Initialize(_repo, _apiBasePath, _settings);
 
             _httpClonedState = firstWorker.ExportModuleState();
@@ -302,7 +308,7 @@ public class PowerShellWorkerPool : IDisposable
                 var clonedHttpISS = BuildClonedISS(_httpClonedState);
                 var httpRemaining = new List<PowerShellWorker>();
                 for (int i = 1; i < _httpPoolSize; i++)
-                    httpRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedHttpISS, _logger));
+                    httpRemaining.Add(NewWorker(clonedHttpISS));
 
                 Parallel.ForEach(httpRemaining, w => InitializeClonedWorker(w, _httpClonedState!));
                 foreach (var w in httpRemaining)
@@ -329,7 +335,7 @@ public class PowerShellWorkerPool : IDisposable
             {
                 var bgSw = System.Diagnostics.Stopwatch.StartNew();
                 var fullBgISS = BuildISS(isHttp: false);
-                var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullBgISS, _logger);
+                var firstBgWorker = NewWorker(fullBgISS);
                 firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
                 _bgClonedState = firstBgWorker.ExportModuleState();
 
@@ -351,7 +357,7 @@ public class PowerShellWorkerPool : IDisposable
             var bgStart = separateModuleLists ? 1 : 0;
             var bgRemaining = new List<PowerShellWorker>();
             for (int i = bgStart; i < _bgPoolSize; i++)
-                bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+                bgRemaining.Add(NewWorker(clonedBgISS));
 
             if (bgRemaining.Count > 0)
             {
@@ -365,7 +371,7 @@ public class PowerShellWorkerPool : IDisposable
             // Background-only node — no HTTP worker exists to clone from; build the BG base directly.
             var bgSw = System.Diagnostics.Stopwatch.StartNew();
             var fullBgISS = BuildISS(isHttp: false);
-            var firstBgWorker = new PowerShellWorker(Interlocked.Increment(ref _nextId), fullBgISS, _logger);
+            var firstBgWorker = NewWorker(fullBgISS);
             firstBgWorker.Initialize(_repo, _apiBasePath, _settings);
             _bgClonedState = firstBgWorker.ExportModuleState();
 
@@ -382,7 +388,7 @@ public class PowerShellWorkerPool : IDisposable
                 var clonedBgISS = BuildClonedISS(_bgClonedState);
                 var bgRemaining = new List<PowerShellWorker>();
                 for (int i = 1; i < _bgPoolSize; i++)
-                    bgRemaining.Add(new PowerShellWorker(Interlocked.Increment(ref _nextId), clonedBgISS, _logger));
+                    bgRemaining.Add(NewWorker(clonedBgISS));
 
                 Parallel.ForEach(bgRemaining, w => InitializeClonedWorker(w, _bgClonedState!));
                 foreach (var w in bgRemaining)
@@ -504,6 +510,19 @@ public class PowerShellWorkerPool : IDisposable
         worker.CheckoutTimestamp = 0;
         worker.InvocationCount++;
 
+        if (worker.HungRun is { } hungRun)
+        {
+            _workerFaults.TryRemove(worker.Id, out _);
+            Interlocked.Increment(ref _hungTotal);
+            var stuck = Interlocked.Increment(ref _hungNow);
+            _ = hungRun.ContinueWith(_ => Interlocked.Decrement(ref _hungNow), CancellationToken.None,
+                TaskContinuationOptions.None, TaskScheduler.Default);
+            _logger.LogError("[Pool] Replacing hung W{Id} ({Type}); {Stuck} abandoned worker(s) still blocked",
+                worker.Id, isHttp ? "HTTP" : "BG", stuck);
+            Replace(worker, isHttp);
+            return;
+        }
+
         bool needsReplace = false;
 
         if (faulted)
@@ -532,42 +551,52 @@ public class PowerShellWorkerPool : IDisposable
 
         if (needsReplace)
         {
-            var oldId = worker.Id;
-            WorkerMetricsBridge.DeregisterWorker(oldId);
-            worker.Dispose();
-
-            // Build the replacement off the calling thread so the dispatch loop is not held
-            // for the 6-13s ISS rebuild + Initialize() cost. Capacity briefly drops by 1 (the
-            // pool is short one worker until this Task completes), but the thread that just
-            // finished a task returns to the dispatch loop immediately.
-            var ish = isHttp;
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    var cloned = ish ? _httpClonedState : _bgClonedState;
-                    var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: ish);
-                    var fresh = new PowerShellWorker(Interlocked.Increment(ref _nextId), iss, _logger);
-                    if (cloned != null)
-                        InitializeClonedWorker(fresh, cloned);
-                    else
-                        fresh.Initialize(_repo, _apiBasePath, _settings);
-                    WorkerMetricsBridge.RegisterWorker(fresh.Id, ish);
-                    if (ish) _httpPool.Add(fresh); else _bgPool.Add(fresh);
-                    _logger.LogInformation("[Pool] Replaced W{OldId} → W{NewId} ({Type}) (background recycle)",
-                        oldId, fresh.Id, ish ? "HTTP" : "BG");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "[Pool] Background recycle failed for W{OldId} ({Type}); pool capacity reduced by 1",
-                        oldId, ish ? "HTTP" : "BG");
-                }
-            });
+            Replace(worker, isHttp);
             return;
         }
 
         if (isHttp) _httpPool.Add(worker); else _bgPool.Add(worker);
     }
+
+    private void Replace(PowerShellWorker worker, bool isHttp)
+    {
+        var oldId = worker.Id;
+        WorkerMetricsBridge.DeregisterWorker(oldId);
+        worker.Dispose();
+
+        // Build the replacement off the calling thread so the dispatch loop is not held
+        // for the 6-13s ISS rebuild + Initialize() cost. Capacity briefly drops by 1 (the
+        // pool is short one worker until this Task completes), but the thread that just
+        // finished a task returns to the dispatch loop immediately.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var cloned = isHttp ? _httpClonedState : _bgClonedState;
+                var iss = cloned != null ? BuildClonedISS(cloned) : BuildISS(isHttp: isHttp);
+                var fresh = NewWorker(iss);
+                if (cloned != null)
+                    InitializeClonedWorker(fresh, cloned);
+                else
+                    fresh.Initialize(_repo, _apiBasePath, _settings);
+                WorkerMetricsBridge.RegisterWorker(fresh.Id, isHttp);
+                if (isHttp) _httpPool.Add(fresh); else _bgPool.Add(fresh);
+                _logger.LogInformation("[Pool] Replaced W{OldId} → W{NewId} ({Type}) (background recycle)",
+                    oldId, fresh.Id, isHttp ? "HTTP" : "BG");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Pool] Background recycle failed for W{OldId} ({Type}); pool capacity reduced by 1",
+                    oldId, isHttp ? "HTTP" : "BG");
+            }
+        });
+    }
+
+    private PowerShellWorker NewWorker(InitialSessionState iss) =>
+        new(Interlocked.Increment(ref _nextId), iss, _logger)
+        {
+            StopGrace = TimeSpan.FromSeconds(_settings.Worker.StopGraceSeconds > 0 ? _settings.Worker.StopGraceSeconds : 30),
+        };
 
     private InitialSessionState BuildISS(bool isHttp)
     {

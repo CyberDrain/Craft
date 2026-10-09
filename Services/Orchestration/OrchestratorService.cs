@@ -527,6 +527,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         break;
                     }
 
+                    if (worker is { IsHung: true })
+                    {
+                        // A step timed out on a worker that could not be stopped. Hand it back for replacement.
+                        ReclaimSequentialWorker(worker, faulted: true);
+                        worker = null;
+                        worker = CheckoutSequentialWorker(jobCt);
+                    }
+
                     var parameters = nextPayload ?? await _store.GetPayloadAsync(header.RunKey, step.Seq, jobCt);
                     nextPayload = null;
                     WorkStore.Finish finish;

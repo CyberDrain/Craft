@@ -193,6 +193,11 @@ Controls the PowerShell runspace pools that execute all scripts.
   // 0 = no timeout (default). Recommended: 600-3600 for background jobs.
   "BgTimeoutSeconds": 0,
 
+  // Grace (seconds) a timed-out or cancelled pipeline gets to stop. A pipeline blocked inside a .NET
+  // call never sees the stop; past this grace its worker is abandoned and replaced, and the caller
+  // gets the usual timeout. /healthz reports workers.hung / workers.hungTotal.
+  "StopGraceSeconds": 30,
+
   // Extra env vars injected into every runspace.
   // Use "{ApiBasePath}" as a placeholder — replaced with the resolved API directory.
   "EnvVars": {

@@ -93,6 +93,14 @@ public class WorkerSettings
     public int BgTimeoutSeconds { get; set; }
 
     /// <summary>
+    /// How long a timed-out or cancelled invocation gets to unwind after PowerShell is asked to stop.
+    /// A pipeline blocked inside a .NET call (a lock, a sync wait, a read with no timeout) never sees a
+    /// stop request; past this grace its worker is abandoned and replaced, so the pool does not shrink
+    /// to nothing. Values below 1 use the default of 30 seconds.
+    /// </summary>
+    public int StopGraceSeconds { get; set; } = 30;
+
+    /// <summary>
     /// How long an incoming HTTP request waits for a free PowerShell runspace when every worker in the
     /// HTTP pool is already busy, before it is shed with <c>503 "Server busy, please retry"</c>.
     ///

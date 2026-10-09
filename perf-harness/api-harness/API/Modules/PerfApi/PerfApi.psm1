@@ -866,3 +866,47 @@ function Invoke-PerfE2ELegacy {
         return @{ StatusCode = 500; Body = @{ ok = $false; error = "$_" } }
     }
 }
+
+# Hung-worker drivers (run-e2e-hung-workers.ps1). Each call blocks its worker in a .NET wait that PowerShell's stop
+# request cannot interrupt, the shape of a stuck lock or a read with no timeout. PerfHangRelease frees them all.
+function New-PerfHangGate {
+    $gate = [System.Threading.ManualResetEventSlim]::new($false)
+    [Craft.Services.PowerShellRunnerService]::GetSharedCache('E2E:Hang')[[guid]::NewGuid().ToString('N')] = $gate
+    $gate
+}
+
+function Invoke-PerfHang {
+    param($Request, $TriggerMetadata)
+    $null = (New-PerfHangGate).Wait()
+    return @{ StatusCode = 200; Body = @{ ok = $true; endpoint = 'PerfHang' } }
+}
+
+# Query: n=N hung background tasks (default 1).
+function Invoke-PerfBgHangEnqueue {
+    param($Request, $TriggerMetadata)
+    $n = 1; if ($Request.Query.n) { $n = [int]$Request.Query.n }
+    $batch = @(for ($i = 0; $i -lt $n; $i++) { @{ FunctionName = 'PerfBgHang'; idx = $i } })
+    $run = Start-CraftOrchestrator -InputObject @{
+        OrchestratorName = "PerfBgHang-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        Batch            = $batch
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; enqueued = $n; run = $run } }
+}
+
+function Push-PerfBgHang {
+    param($Item)
+    $null = (New-PerfHangGate).Wait()
+    return @{ ok = $true; idx = $Item.idx }
+}
+
+function Invoke-PerfHangRelease {
+    param($Request, $TriggerMetadata)
+    $cache = [Craft.Services.PowerShellRunnerService]::GetSharedCache('E2E:Hang')
+    $released = 0
+    foreach ($key in @($cache.Keys)) {
+        $cache[$key].Set()
+        $cache.Remove($key)
+        $released++
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; released = $released } }
+}
