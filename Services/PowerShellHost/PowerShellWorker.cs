@@ -18,20 +18,11 @@ public class PowerShellWorker : IDisposable
         new[] { typeof(Cmdlet), typeof(bool), typeof(bool), typeof(string[]) },
         null);
     private static readonly object[] s_getJobsArgs = { null!, false, false, null! };
-    // PSModuleInfo.SetName + CommandInfo.Module setter — internal APIs used to reattach ModuleName
-    // after SSFE clone (SessionStateFunctionEntry cannot preserve module association).
-    private static readonly MethodInfo? s_psModuleInfoSetName = typeof(PSModuleInfo).GetMethod(
-        "SetName", NonPublicInstance, null, new[] { typeof(string) }, null);
-    private static readonly MethodInfo? s_commandInfoModuleSetter = typeof(CommandInfo)
-        .GetProperty(nameof(CommandInfo.Module), BindingFlags.Public | BindingFlags.Instance)
-        ?.GetSetMethod(nonPublic: true);
     private static HashSet<string>? s_builtinGlobalVars;
 
     private readonly PowerShell _pwsh;
     private readonly ILogger _logger;
     private bool _initialized;
-    private readonly Dictionary<string, PSModuleInfo> _moduleNameShells =
-        new(StringComparer.OrdinalIgnoreCase);
 
     public int Id { get; }
 
@@ -52,15 +43,20 @@ public class PowerShellWorker : IDisposable
     /// <summary>This worker's runspace. Test-only access — production code goes through _pwsh.</summary>
     internal Runspace Runspace => _pwsh.Runspace;
 
-    public void Initialize(ScriptRepository repo, string apiBasePath, CraftSettings settings)
+    public void Initialize(ScriptRepository repo, string apiBasePath, CraftSettings settings,
+        IReadOnlyList<(string Name, ScriptBlock Body)>? sharedModules = null)
     {
         if (_initialized) return;
 
         // Reuse one pipeline thread across invocations instead of spinning a new thread per BeginInvoke
-        // (measured ~50% of the PS-invoke cost). Must be set before the runspace opens — GetGlobalVariables()
-        // below is the first SessionStateProxy access, which opens it. On by default; see docs/dispatch-analysis.md.
+        // (measured ~50% of the PS-invoke cost). Must be set before the runspace opens — the first invocation
+        // or SessionStateProxy access below opens it. On by default; see docs/dispatch-analysis.md.
         if (settings.Worker.ReuseRunspaceThread)
             _pwsh.Runspace.ThreadOptions = PSThreadOptions.ReuseThread;
+
+        // Before the built-in globals are captured, so the runspace looks as it would had the ISS imported them.
+        foreach (var (name, body) in sharedModules ?? [])
+            ImportSharedModule(name, body);
 
         // Capture built-in globals for cleanup (once, thread-safe)
         if (s_builtinGlobalVars == null)
@@ -234,79 +230,36 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         _logger.LogInformation("Worker{Id}: {Count} functions deployed", Id, deployed);
     }
 
-    /// <summary>
-    /// Reattach <see cref="CommandInfo.ModuleName"/> on SSFE-injected functions using names captured
-    /// at export time. <see cref="SessionStateFunctionEntry"/> cannot preserve module association, so
-    /// cloned workers otherwise report empty ModuleName (e.g. <c>\Push-ExecOnboardTenantQueue</c>),
-    /// which breaks downstream allowlists that key off module identity.
-    /// <para>
-    /// Metadata only — does not restore <c>Get-Module</c>, module scope, or private functions.
-    /// Skips commands that already have a ModuleName (native ImportPSModule / binary modules).
-    /// </para>
-    /// </summary>
-    public void RestoreExportedModuleNames(ExportedModuleState state)
+    /// <summary>Instantiate a module from a parse shared by every worker (see <see cref="SharedScriptModules"/>).</summary>
+    private void ImportSharedModule(string name, ScriptBlock body)
     {
-        if (s_psModuleInfoSetName == null || s_commandInfoModuleSetter == null)
-        {
-            _logger.LogWarning(
-                "Worker{Id}: cannot restore module names — PSModuleInfo.SetName / CommandInfo.Module reflection unavailable",
-                Id);
-            return;
-        }
-
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (name, _, module) in state.Functions)
-        {
-            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(module))
-                continue;
-            map[name] = module;
-        }
-
-        if (map.Count == 0)
-            return;
-
-        var prevDefault = Runspace.DefaultRunspace;
-        var stamped = 0;
         try
         {
-            Runspace.DefaultRunspace = _pwsh.Runspace;
-
-            foreach (var (name, moduleName) in map)
-            {
-                try
-                {
-                    var cmd = _pwsh.Runspace.SessionStateProxy.InvokeCommand.GetCommand(
-                        name, CommandTypes.Function);
-                    if (cmd == null || !string.IsNullOrEmpty(cmd.ModuleName))
-                        continue;
-
-                    if (!_moduleNameShells.TryGetValue(moduleName, out var shell))
-                    {
-                        shell = new PSModuleInfo(linkToGlobal: true);
-                        s_psModuleInfoSetName.Invoke(shell, new object[] { moduleName });
-                        _moduleNameShells[moduleName] = shell;
-                    }
-
-                    s_commandInfoModuleSetter.Invoke(cmd, new object[] { shell });
-                    stamped++;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Worker{Id}: failed to restore ModuleName for {Function}", Id, name);
-                }
-            }
+            _pwsh.AddCommand("New-Module").AddParameter("Name", name).AddParameter("ScriptBlock", body)
+                 .AddCommand("Import-Module");
+            _pwsh.Invoke();
+            foreach (var err in _pwsh.Streams.Error)
+                _logger.LogError("Worker{Id}: module {Module} import error: {Error}", Id, name, err.ToString());
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Worker{Id}: RestoreExportedModuleNames failed", Id);
+            _logger.LogError(ex, "Worker{Id}: module {Module} failed to import", Id, name);
         }
-        finally
-        {
-            Runspace.DefaultRunspace = prevDefault;
-        }
+        finally { _pwsh.Commands.Clear(); _pwsh.Streams.ClearStreams(); }
+    }
 
-        if (stamped > 0)
-            _logger.LogDebug("Worker{Id}: restored ModuleName on {Count} SSFE-injected functions", Id, stamped);
+    /// <summary>Modules loaded in this worker's runspace.</summary>
+    internal List<PSModuleInfo> LoadedModules()
+    {
+        try { return _pwsh.AddCommand("Get-Module").Invoke<PSModuleInfo>().ToList(); }
+        finally { _pwsh.Commands.Clear(); _pwsh.Streams.ClearStreams(); }
+    }
+
+    /// <summary>Functions visible to scripts in this worker (exported module functions + deployed scripts).</summary>
+    internal int FunctionCount()
+    {
+        try { return _pwsh.AddScript("@(Get-ChildItem Function:).Count").Invoke<int>().FirstOrDefault(); }
+        finally { _pwsh.Commands.Clear(); _pwsh.Streams.ClearStreams(); }
     }
 
     /// <summary>
@@ -629,112 +582,6 @@ try {{
 
         _pwsh.Commands.Clear();
         _pwsh.Streams.ClearStreams();
-    }
-
-    /// <summary>
-    /// Export all functions, variables, and aliases from this worker's loaded modules
-    /// so they can be injected into a cloned ISS for faster worker init.
-    /// Must be called after Initialize() completes.
-    /// </summary>
-    public ExportedModuleState ExportModuleState()
-    {
-        var state = new ExportedModuleState();
-
-        // Get all loaded modules and extract their exported functions,
-        // plus detect modules that have private (non-exported) functions
-        _pwsh.AddScript(@"
-            Get-Module | ForEach-Object {
-                $mod = $_
-                $hasPrivate = $false
-                # Compare all commands in the module against exported functions
-                $allCommands = & $mod { Get-Command -Module $mod.Name -CommandType Function -ErrorAction SilentlyContinue }
-                $exportedNames = [System.Collections.Generic.HashSet[string]]::new(
-                    [StringComparer]::OrdinalIgnoreCase)
-                $mod.ExportedFunctions.Values | ForEach-Object { $null = $exportedNames.Add($_.Name) }
-                foreach ($cmd in $allCommands) {
-                    if (-not $exportedNames.Contains($cmd.Name)) {
-                        $hasPrivate = $true
-                        break
-                    }
-                }
-                $mod.ExportedFunctions.Values | ForEach-Object {
-                    [PSCustomObject]@{
-                        Module = $mod.Name
-                        Name = $_.Name
-                        Definition = $_.Definition
-                        HasPrivateFunctions = $hasPrivate
-                        ModulePath = $mod.Path
-                    }
-                }
-            }
-        ");
-        var functions = _pwsh.Invoke();
-        _pwsh.Commands.Clear();
-        _pwsh.Streams.ClearStreams();
-
-        var modulesWithPrivate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var fn in functions)
-        {
-            var name = fn.Properties["Name"]?.Value?.ToString();
-            var definition = fn.Properties["Definition"]?.Value?.ToString();
-            var module = fn.Properties["Module"]?.Value?.ToString();
-            if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(definition))
-                state.Functions.Add((name, definition, module ?? ""));
-
-            // Track modules that have private functions — these need native import on cloned workers
-            if (fn.Properties["HasPrivateFunctions"]?.Value is true)
-            {
-                var modPath = fn.Properties["ModulePath"]?.Value?.ToString();
-                if (!string.IsNullOrEmpty(modPath) && !string.IsNullOrEmpty(module))
-                    modulesWithPrivate.Add(modPath);
-            }
-        }
-        state.NativeImportModulePaths.UnionWith(modulesWithPrivate);
-
-        // Get module-level variables that need to be preserved
-        _pwsh.AddScript(@"
-            Get-Module | ForEach-Object {
-                $mod = $_
-                $mod.ExportedVariables.Values | ForEach-Object {
-                    [PSCustomObject]@{
-                        Module = $mod.Name
-                        Name = $_.Name
-                        Value = $_.Value
-                    }
-                }
-            }
-        ");
-        var variables = _pwsh.Invoke();
-        _pwsh.Commands.Clear();
-        _pwsh.Streams.ClearStreams();
-
-        foreach (var v in variables)
-        {
-            var name = v.Properties["Name"]?.Value?.ToString();
-            var value = v.Properties["Value"]?.Value;
-            if (!string.IsNullOrEmpty(name))
-                state.Variables.Add((name, value));
-        }
-
-        // Get loaded module paths for modules that need native import
-        // (binary modules with cmdlets can't be cloned via function entries)
-        _pwsh.AddScript(@"
-            Get-Module | Where-Object { $_.ModuleType -eq 'Binary' } | ForEach-Object {
-                $_.Path
-            }
-        ");
-        var binaryModules = _pwsh.Invoke();
-        _pwsh.Commands.Clear();
-        _pwsh.Streams.ClearStreams();
-
-        foreach (var bm in binaryModules)
-        {
-            var path = bm.BaseObject?.ToString();
-            if (!string.IsNullOrEmpty(path))
-                state.BinaryModulePaths.Add(path);
-        }
-
-        return state;
     }
 
     public void Dispose()
