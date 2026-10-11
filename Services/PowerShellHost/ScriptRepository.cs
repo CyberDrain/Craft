@@ -372,9 +372,9 @@ public class ScriptRepository
             {
                 try
                 {
-                    var raw = File.ReadAllText(psm1);
-                    foreach (Match m in FunctionBlockRegex.Matches(raw))
-                        known.Add(m.Groups[1].Value);
+                    using var reader = new StreamReader(psm1);
+                    foreach (var function in ModuleFunctionNames(reader))
+                        known.Add(function);
                 }
                 catch { /* skip unreadable modules */ }
             }
@@ -384,5 +384,61 @@ public class ScriptRepository
         }
         _moduleFunctionNames = known;
         return known.Contains(name);
+    }
+
+    private static readonly Regex FunctionAtStart = new(@"\Afunction\s+([\w-]+)\s*\{", RegexOptions.IgnoreCase);
+    private static readonly Regex FunctionPrefix = new(@"\Afunction(\s*|\s+[\w-]+\s*)\z", RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// The names FunctionBlockRegex finds, read a line at a time: a built module is tens of MB, and reading it whole
+    /// put that much on the large object heap. Only lines that can start a match are materialised; a candidate takes
+    /// the following lines while it is still a prefix of a match, and gives them back if it fails.
+    /// </summary>
+    internal static IEnumerable<string> ModuleFunctionNames(TextReader reader)
+    {
+        var pushedBack = new List<string>();
+        var sb = new System.Text.StringBuilder();
+        while (true)
+        {
+            string? line;
+            if (pushedBack.Count > 0) { line = pushedBack[0]; pushedBack.RemoveAt(0); }
+            else if ((line = ReadLine(reader, candidatesOnly: true, sb)) == null) yield break;
+            if (!line.StartsWith("function", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var candidate = line;
+            var taken = new List<string>();
+            while (true)
+            {
+                var match = FunctionAtStart.Match(candidate);
+                if (match.Success) { yield return match.Groups[1].Value; taken.Clear(); break; }
+                if (!FunctionPrefix.IsMatch(candidate)) break;
+                string? next;
+                if (pushedBack.Count > 0) { next = pushedBack[0]; pushedBack.RemoveAt(0); }
+                else if ((next = ReadLine(reader, candidatesOnly: false, sb)) == null) break;
+                taken.Add(next);
+                candidate += "\n" + next;
+            }
+            pushedBack.InsertRange(0, taken);
+        }
+    }
+
+    // A line up to (not including) '\n', null at the end. With candidatesOnly, a line that cannot start with
+    // "function" is skipped without being built and comes back as "".
+    private static string? ReadLine(TextReader reader, bool candidatesOnly, System.Text.StringBuilder sb)
+    {
+        var c = reader.Read();
+        if (c < 0) return null;
+        sb.Clear();
+        while (c >= 0 && c != '\n')
+        {
+            if (candidatesOnly && sb.Length < 8 && char.ToLowerInvariant((char)c) != "function"[sb.Length])
+            {
+                while (c >= 0 && c != '\n') c = reader.Read();
+                return string.Empty;
+            }
+            sb.Append((char)c);
+            c = reader.Read();
+        }
+        return sb.ToString();
     }
 }
