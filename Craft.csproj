@@ -67,6 +67,8 @@
     -->
     <Content Include="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Runtime\**\*.ps1" CopyToOutputDirectory="PreserveNewest" LinkBase="Runtime" />
+    <!-- Read from $PSHOME: stops PowerShell formatting a syslog entry for every command start and stop. -->
+    <Content Include="powershell.config.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!--

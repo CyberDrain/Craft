@@ -358,29 +358,31 @@ public class ScriptRepository
     /// </summary>
     public bool IsModuleFunction(string name)
     {
-        if (_moduleFunctionNames != null)
-            return _moduleFunctionNames.Contains(name);
+        var known = _moduleFunctionNames;
+        if (known != null)
+            return known.Contains(name);
 
-        // Build the set lazily from all .psm1 files in Modules/
-        _moduleFunctionNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (_apiBasePath == null) return false;
-
-        var modulesPath = Path.Combine(_apiBasePath, "Modules");
-        if (!Directory.Exists(modulesPath)) return false;
-
-        foreach (var psm1 in Directory.GetFiles(modulesPath, "*.psm1", SearchOption.AllDirectories))
+        // Build the set lazily from all .psm1 files in Modules/. Published only once filled: a concurrent
+        // first caller must never see a partial set and report a real function as missing.
+        known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var modulesPath = _apiBasePath == null ? null : Path.Combine(_apiBasePath, "Modules");
+        if (modulesPath != null && Directory.Exists(modulesPath))
         {
-            try
+            foreach (var psm1 in Directory.GetFiles(modulesPath, "*.psm1", SearchOption.AllDirectories))
             {
-                var raw = File.ReadAllText(psm1);
-                foreach (Match m in FunctionBlockRegex.Matches(raw))
-                    _moduleFunctionNames.Add(m.Groups[1].Value);
+                try
+                {
+                    var raw = File.ReadAllText(psm1);
+                    foreach (Match m in FunctionBlockRegex.Matches(raw))
+                        known.Add(m.Groups[1].Value);
+                }
+                catch { /* skip unreadable modules */ }
             }
-            catch { /* skip unreadable modules */ }
-        }
 
-        _logger.LogInformation("[System] Module function index: {Count} functions across all modules",
-            _moduleFunctionNames.Count);
-        return _moduleFunctionNames.Contains(name);
+            _logger.LogInformation("[System] Module function index: {Count} functions across all modules",
+                known.Count);
+        }
+        _moduleFunctionNames = known;
+        return known.Contains(name);
     }
 }
