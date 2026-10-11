@@ -254,6 +254,14 @@ Controls the PowerShell runspace pools that execute all scripts.
 
 **Startup behavior:** The first HTTP worker initializes sequentially and runs `WarmupScripts` (which set process-level state like auth tokens and caches). All remaining workers (HTTP + BG) initialize **in parallel** afterward, benefiting from the process-level state already set. With source (non-compiled) modules, parallel init significantly reduces startup time.
 
+**How app modules load:** a script module (`.psm1` root, no binary root, nested or required modules, type/format data, `ScriptsToProcess` or top-level dot-sourcing) is parsed once per process and each worker builds it with `New-Module`. Anything else is imported per worker from its manifest. A shared module behaves like a manifest import with these differences, which modules can rely on:
+
+- every function in the `.psm1` is exported, including ones `FunctionsToExport` leaves out (ModuleBuilder lists one function per file, and apps call the rest across modules); aliases and variables are not exported;
+- `ModuleBase`, `Path` and `$PSScriptRoot` are the module's directory, and `& (Get-Module X) { }` works (ModuleInjections depend on it);
+- `Version` reads `0.0`.
+
+**PowerShell logging:** `powershell.config.json` next to `Craft.dll` (`$PSHOME`) sets `LogLevel` to `Warning`. Without it PowerShell formats a syslog entry for every command start and stop, which cost about 11% of all allocation in a CIPP cache collection.
+
 ---
 
 ### Auth
