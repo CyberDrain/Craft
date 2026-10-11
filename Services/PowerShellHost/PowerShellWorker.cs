@@ -20,6 +20,10 @@ public class PowerShellWorker : IDisposable
     private static readonly object[] s_getJobsArgs = { null!, false, false, null! };
     private static HashSet<string>? s_builtinGlobalVars;
 
+    // Global JSON preloads are parsed by the first worker and the same object is handed to the rest: the values
+    // are read-only lookup tables, and a parse per worker cost a full copy each.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> s_jsonPreloads = new();
+
     private readonly PowerShell _pwsh;
     private readonly ILogger _logger;
     private bool _initialized;
@@ -182,6 +186,13 @@ if (Test-Path -LiteralPath '{asmPath}') {{
             if (string.IsNullOrEmpty(preload.File) || string.IsNullOrEmpty(preload.Variable))
                 continue;
             var filePath = Path.Combine(apiBasePath, preload.File).Replace("\\", "/");
+            var preloadKey = $"{preload.Scope}|{preload.AsHashtable}|{filePath}";
+            if (!preload.Scope.Equals("env", StringComparison.OrdinalIgnoreCase)
+                && s_jsonPreloads.TryGetValue(preloadKey, out var shared))
+            {
+                _pwsh.Runspace.SessionStateProxy.PSVariable.Set(preload.Variable, shared);
+                continue;
+            }
             switch (preload.Scope.ToLowerInvariant())
             {
                 case "env":
@@ -203,6 +214,9 @@ $_fp = '{filePath}'
 if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | ConvertFrom-Json }}");
                     break;
             }
+            if (!preload.Scope.Equals("env", StringComparison.OrdinalIgnoreCase)
+                && _pwsh.Runspace.SessionStateProxy.PSVariable.GetValue(preload.Variable) is { } parsed)
+                s_jsonPreloads.TryAdd(preloadKey, parsed);
         }
 
         // Run post-init scripts from config
@@ -483,7 +497,18 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         _pwsh.Streams.ClearStreams();
         ResetPipelineExecutionContext();
         CleanupGlobalVariables();
+        ClearErrorVariable();
         CleanupJobs();
+    }
+
+    /// <summary>
+    /// Empty $Error. It is a built-in global, so the variable sweep keeps it, and every caught or silenced error
+    /// of every invocation accumulated there (up to $MaximumErrorCount) with its exception and target object.
+    /// </summary>
+    private void ClearErrorVariable()
+    {
+        try { (_pwsh.Runspace.SessionStateProxy.PSVariable.GetValue("Error") as System.Collections.ArrayList)?.Clear(); }
+        catch { }
     }
 
     /// <summary>
