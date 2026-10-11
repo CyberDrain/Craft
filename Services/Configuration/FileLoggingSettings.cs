@@ -35,8 +35,8 @@ public class FileLoggingSettings
     public bool IncludeCategory { get; set; }
 
     /// <summary>
-    /// Minimum log level for file and console output AND PowerShell stream capture.
-    /// Controls which PS preference variables are set to 'Continue' in runspaces:
+    /// Minimum log level for file and console output, and for PowerShell stream capture unless
+    /// <see cref="PowerShellLogLevel"/> narrows it. Controls which PS preference variables are set to 'Continue' in runspaces:
     ///   - "Error"       → only Write-Error captured
     ///   - "Warning"     → Write-Error, Write-Warning
     ///   - "Information" → (default) Write-Error, Write-Warning, Write-Information/Write-Host
@@ -45,6 +45,14 @@ public class FileLoggingSettings
     /// Also overridable via CRAFT_LOG_LEVEL environment variable.
     /// </summary>
     public string LogLevel { get; set; } = "Information";
+
+    /// <summary>
+    /// Which PowerShell streams workers capture, independent of the .NET log level: "Trace" captures Write-Verbose
+    /// and Write-Debug, "Debug" Write-Debug only, "Information" neither. It can only narrow <see cref="LogLevel"/>
+    /// (the records are logged at Debug/Trace and would be dropped anyway). Empty: follows LogLevel.
+    /// Env override: <c>App__FileLogging__PowerShellLogLevel</c>.
+    /// </summary>
+    public string? PowerShellLogLevel { get; set; }
 
     /// <summary>
     /// Mask UPNs and customer domains in file and console output, keeping them readable at a glance
@@ -61,6 +69,18 @@ public class FileLoggingSettings
         : OperatingSystem.IsLinux()
             ? Path.Combine(RuntimePaths.Home, "logs")
             : Path.Combine(AppContext.BaseDirectory, "logs");
+
+    /// <summary>The level PowerShell preference variables are set from: the less verbose of LogLevel and PowerShellLogLevel.</summary>
+    internal Microsoft.Extensions.Logging.LogLevel ParsedPowerShellLogLevel
+    {
+        get
+        {
+            var level = ParsedLogLevel;
+            return Enum.TryParse<Microsoft.Extensions.Logging.LogLevel>(PowerShellLogLevel, ignoreCase: true, out var powerShell) && powerShell > level
+                ? powerShell
+                : level;
+        }
+    }
 
     /// <summary>Parse the configured LogLevel string into a .NET LogLevel enum value.</summary>
     internal Microsoft.Extensions.Logging.LogLevel ParsedLogLevel

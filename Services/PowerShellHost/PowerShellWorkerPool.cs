@@ -509,7 +509,7 @@ public class PowerShellWorkerPool : IDisposable
         // The value must be the ActionPreference enum: a string entry replaces the
         // type-constrained built-in with a raw string, and module code that re-binds it
         // (e.g. -Verbose:$VerbosePreference) then fails parameter binding.
-        var logLevel = _settings.FileLogging.ParsedLogLevel;
+        var logLevel = _settings.FileLogging.ParsedPowerShellLogLevel;
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Trace)
             iss.Variables.Add(new SessionStateVariableEntry("VerbosePreference", System.Management.Automation.ActionPreference.Continue, "Set by CRAFT log level"));
         if (logLevel <= Microsoft.Extensions.Logging.LogLevel.Debug)

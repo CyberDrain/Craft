@@ -153,6 +153,33 @@ public class WorkerModuleSharingTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(null, "Continue", "Continue")]
+    [InlineData("Information", "SilentlyContinue", "SilentlyContinue")]
+    [InlineData("Debug", "SilentlyContinue", "Continue")]
+    public void PowerShellLogLevelDecidesWhichStreamsWorkersEmit(string? powerShellLogLevel, string verbose, string debug)
+    {
+        var settings = new CraftSettings();
+        settings.Worker.HttpPoolSize = 0;
+        settings.Worker.BgPoolSize = 1;
+        settings.FileLogging.LogLevel = "Trace";
+        settings.FileLogging.PowerShellLogLevel = powerShellLogLevel;
+
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        using var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance,
+            new ConfigurationBuilder().Build(), settings);
+        pool.Initialize(enableHttp: false, enableBg: true);
+        Assert.True(pool.WaitForBgReady(TimeSpan.FromMinutes(2)), "background pool never became ready");
+
+        var worker = pool.CheckoutBackground(CancellationToken.None);
+        try
+        {
+            Assert.Equal(verbose, Eval(worker, "$VerbosePreference.ToString()"));
+            Assert.Equal(debug, Eval(worker, "$DebugPreference.ToString()"));
+        }
+        finally { pool.Reclaim(worker, isHttp: false); }
+    }
+
     // ── Fixture ─────────────────────────────────────────────────────────────────────────────────
 
     private static SharedScriptModules Load(string manifest) =>
