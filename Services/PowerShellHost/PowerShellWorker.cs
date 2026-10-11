@@ -44,7 +44,7 @@ public class PowerShellWorker : IDisposable
     internal Runspace Runspace => _pwsh.Runspace;
 
     public void Initialize(ScriptRepository repo, string apiBasePath, CraftSettings settings,
-        IReadOnlyList<(string Name, ScriptBlock Body)>? sharedModules = null)
+        IReadOnlyList<SharedModule>? sharedModules = null)
     {
         if (_initialized) return;
 
@@ -55,8 +55,8 @@ public class PowerShellWorker : IDisposable
             _pwsh.Runspace.ThreadOptions = PSThreadOptions.ReuseThread;
 
         // Before the built-in globals are captured, so the runspace looks as it would had the ISS imported them.
-        foreach (var (name, body) in sharedModules ?? [])
-            ImportSharedModule(name, body);
+        foreach (var module in sharedModules ?? [])
+            ImportSharedModule(module);
 
         // Capture built-in globals for cleanup (once, thread-safe)
         if (s_builtinGlobalVars == null)
@@ -231,21 +231,29 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     }
 
     /// <summary>Instantiate a module from a parse shared by every worker (see <see cref="SharedScriptModules"/>).</summary>
-    private void ImportSharedModule(string name, ScriptBlock body)
+    private void ImportSharedModule(SharedModule module)
     {
+        var location = _pwsh.Runspace.SessionStateProxy.Path;
+        var previous = location.CurrentLocation.Path;
         try
         {
-            _pwsh.AddCommand("New-Module").AddParameter("Name", name).AddParameter("ScriptBlock", body)
+            location.SetLocation(WildcardPattern.Escape(module.Base));
+            _pwsh.AddCommand("New-Module").AddParameter("Name", module.Name).AddParameter("ScriptBlock", module.Body)
                  .AddCommand("Import-Module");
             _pwsh.Invoke();
             foreach (var err in _pwsh.Streams.Error)
-                _logger.LogError("Worker{Id}: module {Module} import error: {Error}", Id, name, err.ToString());
+                _logger.LogError("Worker{Id}: module {Module} import error: {Error}", Id, module.Name, err.ToString());
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Worker{Id}: module {Module} failed to import", Id, name);
+            _logger.LogError(ex, "Worker{Id}: module {Module} failed to import", Id, module.Name);
         }
-        finally { _pwsh.Commands.Clear(); _pwsh.Streams.ClearStreams(); }
+        finally
+        {
+            _pwsh.Commands.Clear();
+            _pwsh.Streams.ClearStreams();
+            location.SetLocation(WildcardPattern.Escape(previous));
+        }
     }
 
     /// <summary>Modules loaded in this worker's runspace.</summary>

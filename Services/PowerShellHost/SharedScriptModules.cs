@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Management.Automation;
 using System.Management.Automation.Language;
+using System.Management.Automation.Runspaces;
 
 namespace Craft.PowerShellHost;
 
@@ -14,7 +15,8 @@ namespace Craft.PowerShellHost;
 /// binary root module, nested or required modules, type or format data, ScriptsToProcess, or a root module that
 /// dot-sources other files (source layouts; each worker would re-parse them) — is imported through the
 /// InitialSessionState as before. Without a manifest every function in a shared module is exported, private ones
-/// included, as on the cloned workers this replaces.
+/// included, as on the cloned workers this replaces (CIPP calls helpers its manifests do not list). ModuleBase is the
+/// module's directory, as a manifest import would set it; Version reads 0.0.
 /// </para>
 /// </summary>
 internal sealed class SharedScriptModules
@@ -23,7 +25,7 @@ internal sealed class SharedScriptModules
         ["NestedModules", "RequiredModules", "TypesToProcess", "FormatsToProcess", "ScriptsToProcess"];
 
     /// <summary>Script modules every worker instantiates after its runspace opens, in import order.</summary>
-    public IReadOnlyList<(string Name, ScriptBlock Body)> Modules { get; }
+    public IReadOnlyList<SharedModule> Modules { get; }
 
     /// <summary>Module manifests imported through the InitialSessionState instead.</summary>
     public IReadOnlyList<string> NativeImports { get; }
@@ -31,7 +33,7 @@ internal sealed class SharedScriptModules
     /// <summary>RequiredAssemblies of the shared modules, registered on every InitialSessionState.</summary>
     public IReadOnlyList<string> Assemblies { get; }
 
-    private SharedScriptModules(List<(string, ScriptBlock)> modules, List<string> nativeImports, List<string> assemblies)
+    private SharedScriptModules(List<SharedModule> modules, List<string> nativeImports, List<string> assemblies)
     {
         Modules = modules;
         NativeImports = nativeImports;
@@ -42,14 +44,14 @@ internal sealed class SharedScriptModules
     /// <param name="parsed">Root module path → parse, shared across pools so a module in both lists is parsed once.</param>
     public static SharedScriptModules Load(IEnumerable<string> manifests, Dictionary<string, ScriptBlock> parsed, ILogger logger)
     {
-        var modules = new List<(string, ScriptBlock)>();
+        var modules = new List<SharedModule>();
         var nativeImports = new List<string>();
         var assemblies = new List<string>();
         foreach (var manifest in manifests)
         {
             var name = Path.GetFileNameWithoutExtension(manifest);
             if (TryShare(manifest, parsed, assemblies, out var body, out var reason))
-                modules.Add((name, body!));
+                modules.Add(new SharedModule(name, body!, Path.GetDirectoryName(manifest)!));
             else
             {
                 logger.LogInformation("[Pool] {Module}: imported per worker ({Reason})", name, reason);
@@ -107,13 +109,25 @@ internal sealed class SharedScriptModules
                 reason = $"{root} dot-sources other files";
                 return false;
             }
-            body = parsed[rootPath] = ast.GetScriptBlock();
+            body = parsed[rootPath] = GetScriptBlock(ast);
         }
 
         foreach (var assembly in data["RequiredAssemblies"] switch { string s => [s], object[] a => a.OfType<string>(), _ => [] })
             assemblies.Add(Path.GetFullPath(Path.Combine(dir, Normalize(assembly))));
         reason = "";
         return true;
+    }
+
+    // A ScriptBlock made outside a runspace has no language mode, and so would a module made from it, which then
+    // refuses `& $module { }` ("across language boundaries") — the call Worker:ModuleInjections makes.
+    private static ScriptBlock GetScriptBlock(ScriptBlockAst ast)
+    {
+        using var runspace = RunspaceFactory.CreateRunspace(InitialSessionState.CreateDefault2());
+        runspace.Open();
+        var previous = Runspace.DefaultRunspace;
+        Runspace.DefaultRunspace = runspace;
+        try { return ast.GetScriptBlock(); }
+        finally { Runspace.DefaultRunspace = previous; }
     }
 
     // Dot-sourcing inside a function runs when it is called, not at import, so it does not stop sharing.
@@ -127,3 +141,6 @@ internal sealed class SharedScriptModules
     // Manifests are written on Windows ('.\CIPPCore.psm1'); PowerShell accepts either separator, Path does not.
     private static string Normalize(string path) => path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
 }
+
+/// <param name="Base">The module's directory: New-Module takes ModuleBase from the current location.</param>
+public sealed record SharedModule(string Name, ScriptBlock Body, string Base);

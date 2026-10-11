@@ -53,9 +53,40 @@ public class WorkerModuleSharingTests : IDisposable
         }
     }
 
+    [Fact]
+    public void ASharedModuleLooksLikeAManifestImport()
+    {
+        // Worker:ModuleInjections writes module scope with `& $module { }`; CIPP reads ModuleBase and calls by module.
+        var manifest = WriteModule();
+        var worker = Open(Load(manifest));
+
+        var dir = Path.GetDirectoryName(manifest);
+
+        Assert.Equal("ok", Eval(worker, $"& (Get-Module {ModuleName}) {{ 'ok' }}"));
+        Assert.Equal(dir, Eval(worker, $"(Get-Module {ModuleName}).ModuleBase"));
+        Assert.Equal(dir, Eval(worker, "Get-CraftShareBase"));
+        Assert.Equal(dir, Eval(worker, "Get-CraftShareRoot"));
+        Assert.Equal(ModuleName, Eval(worker, $"(Get-Command {Exported}).ModuleName"));
+        Assert.Equal("True", Eval(worker, $"[bool](Get-Command -Module {ModuleName} -Name {Exported})"));
+        Assert.Equal("Gets the share thing.", Eval(worker, $"(Get-Help {Exported}).Synopsis"));
+        Assert.Equal(Directory.GetCurrentDirectory(), Eval(worker, "$PWD.Path"));
+    }
+
+    [Fact]
+    public void FunctionsTheManifestDoesNotListAreStillExported()
+    {
+        // CIPP defines helpers beside an exported function in one file and calls them from other modules; ModuleBuilder
+        // lists only one function per file, and the cloned workers this replaces exported every function.
+        var worker = Open(Load(WriteModule()));
+
+        Assert.Equal("helper", Eval(worker, "Get-CraftShareHelper"));
+        Assert.Equal(ModuleName, Eval(worker, "(Get-Command Get-CraftShareHelper).ModuleName"));
+    }
+
     [Theory]
     [InlineData("TypesToProcess = @('types.ps1xml')", "")]
     [InlineData("", ". $PSScriptRoot/extra.ps1")]
+    [InlineData("NestedModules = @('Inner.psm1')", "")]
     public void AModuleItsFileCannotCarryIsImportedPerWorker(string manifestLine, string psm1Line)
     {
         var shared = Load(WriteModule(manifestLine, psm1Line));
@@ -88,6 +119,7 @@ public class WorkerModuleSharingTests : IDisposable
         var settings = new CraftSettings();
         settings.Worker.HttpPoolSize = 0;
         settings.Worker.BgPoolSize = 2;
+        settings.Worker.ModuleInjections.Add(new ModuleInjection { Module = "CraftPoolFixture", Variable = "CraftPoolInjected" });
 
         var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
         using var pool = new PowerShellWorkerPool(repo, NullLogger<PowerShellWorkerPool>.Instance,
@@ -103,7 +135,14 @@ public class WorkerModuleSharingTests : IDisposable
                 workers.Add(pool.CheckoutBackground(CancellationToken.None));
 
             foreach (var worker in workers)
+            {
                 Assert.Equal("CraftPoolFixture", Eval(worker, "(Get-Command Get-CraftPoolFixtureThing).Module.ToString()"));
+                Assert.Equal("True", Eval(worker, "& (Get-Module CraftPoolFixture) { $null -ne $script:CraftPoolInjected }"));
+                Assert.EndsWith(Path.Combine("API", "Modules", "CraftPoolFixture"), Eval(worker, "(Get-Module CraftPoolFixture).ModuleBase"));
+                // NestedModules cannot be shared, so this one comes in through the InitialSessionState.
+                Assert.Equal("nested", Eval(worker, "Get-CraftPoolNestedThing"));
+                Assert.EndsWith(Path.Combine("API", "Modules", "CraftPoolNested"), Eval(worker, "(Get-Module CraftPoolNested).ModuleBase"));
+            }
             Assert.Same(FunctionAst(workers[0], "CraftPoolFixture", "Get-CraftPoolFixtureThing"),
                 FunctionAst(workers[1], "CraftPoolFixture", "Get-CraftPoolFixtureThing"));
         }
@@ -149,7 +188,15 @@ public class WorkerModuleSharingTests : IDisposable
             {{psm1Line}}
             $script:Count = 0
             function Get-CraftShareHelper { 'helper' }
-            function {{Exported}} { "thing:$(Get-CraftShareHelper)" }
+            function Get-CraftShareBase { $MyInvocation.MyCommand.Module.ModuleBase }
+            function Get-CraftShareRoot { $PSScriptRoot }
+            function {{Exported}} {
+                <#
+                .SYNOPSIS
+                    Gets the share thing.
+                #>
+                "thing:$(Get-CraftShareHelper)"
+            }
             function Add-CraftShareCount { $script:Count++; $script:Count }
             """);
         var manifest = Path.Combine(dir, $"{ModuleName}.psd1");

@@ -1,0 +1,1 @@
+function Get-PerfNestedThing { 'nested' }

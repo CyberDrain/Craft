@@ -30,6 +30,9 @@ services:
       - CRAFT_SERVE_API=true
       - CRAFT_RUN_BACKGROUND=true
       - App__Scripts__HttpModules__0=PerfApi
+      # Module fidelity check: a shared cache injected into PerfApi's module scope (`& $module { }`).
+      - App__Worker__ModuleInjections__0__Module=PerfApi
+      - App__Worker__ModuleInjections__0__Variable=PerfInjected
       - App__Worker__IgnoreSkuProfiles=true
       - App__Worker__HttpPoolSize=2
       - App__Worker__BgPoolSize=4
