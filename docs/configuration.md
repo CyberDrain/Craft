@@ -254,6 +254,14 @@ Controls the PowerShell runspace pools that execute all scripts.
 
 **Startup behavior:** The first HTTP worker initializes sequentially and runs `WarmupScripts` (which set process-level state like auth tokens and caches). All remaining workers (HTTP + BG) initialize **in parallel** afterward, benefiting from the process-level state already set. With source (non-compiled) modules, parallel init significantly reduces startup time.
 
+**How app modules load:** a script module (`.psm1` root, no binary root, nested or required modules, type/format data, `ScriptsToProcess` or top-level dot-sourcing) is parsed once per process and each worker builds it with `New-Module`. Anything else is imported per worker from its manifest. A shared module behaves like a manifest import with these differences, which modules can rely on:
+
+- every function in the `.psm1` is exported, including ones `FunctionsToExport` leaves out (ModuleBuilder lists one function per file, and apps call the rest across modules); aliases and variables are not exported;
+- `ModuleBase`, `Path` and `$PSScriptRoot` are the module's directory, and `& (Get-Module X) { }` works (ModuleInjections depend on it);
+- `Version` reads `0.0`.
+
+**PowerShell logging:** `powershell.config.json` next to `Craft.dll` (`$PSHOME`) sets `LogLevel` to `Warning`. Without it PowerShell formats a syslog entry for every command start and stop, which cost about 11% of all allocation in a CIPP cache collection.
+
 ---
 
 ### Auth
@@ -741,7 +749,7 @@ These are process-level variables read directly (not part of `App:*`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CRAFT_LOG_LEVEL` | `Information` | Minimum log level for file/console output and PowerShell stream capture. Values: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`. At `Debug`, Write-Debug is captured; at `Trace`, Write-Verbose is also captured. Overrides `App:FileLogging:LogLevel` in appsettings. |
+| `CRAFT_LOG_LEVEL` | `Information` | Minimum log level for file/console output and PowerShell stream capture. Values: `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`. At `Debug`, Write-Debug is captured; at `Trace`, Write-Verbose is also captured. Overrides `App:FileLogging:LogLevel` in appsettings. `App:FileLogging:PowerShellLogLevel` (or `App__FileLogging__PowerShellLogLevel`) narrows the PowerShell capture on its own, e.g. `Information` for no Write-Verbose/Write-Debug in production while the .NET log level stays at `Trace`. |
 | `CRAFT_ROOT` | *(auto-set)* | API base path — set automatically, available as `$env:CRAFT_ROOT` in PS |
 | `CRAFT_DEV_FRONTEND_URL` | `http://localhost:3000` | Dev mode: proxy frontend requests to this URL (hot-reload) |
 | `CRAFT_REALTIME_ENABLED` | *(unset)* | `true`/`false` — realtime SSE channel at `/.craft/events`. Overrides `App:Realtime:Enabled` (which defaults to **off**) |

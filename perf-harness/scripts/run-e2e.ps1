@@ -100,6 +100,17 @@ try {
   $echo = Api '/API/PerfEcho?hello=world'
   Add-Result 'api' 'dispatch-echo' ($echo.ok -eq $true -and $echo.query.hello -eq 'world') '-' "query round-tripped"
 
+  # ── Module fidelity ─────────────────────────────────────────────────────────
+  # Workers share one parse of each script module; what the code sees must match a manifest import.
+  $mi = Api '/API/PerfModuleInfo'
+  $modBase = '/app/API/Modules/PerfApi'
+  Add-Result 'modules' 'module-base' ($mi.moduleBase -eq $modBase -and $mi.commandModuleBase -eq $modBase -and $mi.scriptRoot -eq $modBase) '-' "ModuleBase=$($mi.moduleBase) PSScriptRoot=$($mi.scriptRoot)"
+  Add-Result 'modules' 'module-identity' ($mi.moduleType -eq 'Script' -and $mi.moduleName -eq 'PerfApi' -and $mi.listedByModule -eq $true) '-' "type=$($mi.moduleType) ModuleName=$($mi.moduleName)"
+  Add-Result 'modules' 'unlisted-helper' ($mi.helper -eq 'helper') '-' "helper outside FunctionsToExport -> $($mi.helper)"
+  Add-Result 'modules' 'get-help' ($mi.help -eq 'Reports what this worker sees of the PerfApi module.') '-' "synopsis=$($mi.help)"
+  Add-Result 'modules' 'module-scope' ($mi.callOperator -eq 'ok' -and $mi.injected -eq $true) '-' "& `$module {}=$($mi.callOperator) injected=$($mi.injected)"
+  Add-Result 'modules' 'nested-modules' ($mi.nestedThing -eq 'nested' -and $mi.nestedModuleBase -eq '/app/API/Modules/PerfNested') '-' "nested=$($mi.nestedThing) base=$($mi.nestedModuleBase)"
+
   # ── Orchestrator fan-out ────────────────────────────────────────────────────
   # Enqueue 100 small tasks; poll the allocation snapshot until the queue drains (active+queued == 0
   # sustained). taskms gives the work a visible window on Azurite's table-write latency.

@@ -358,29 +358,87 @@ public class ScriptRepository
     /// </summary>
     public bool IsModuleFunction(string name)
     {
-        if (_moduleFunctionNames != null)
-            return _moduleFunctionNames.Contains(name);
+        var known = _moduleFunctionNames;
+        if (known != null)
+            return known.Contains(name);
 
-        // Build the set lazily from all .psm1 files in Modules/
-        _moduleFunctionNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (_apiBasePath == null) return false;
-
-        var modulesPath = Path.Combine(_apiBasePath, "Modules");
-        if (!Directory.Exists(modulesPath)) return false;
-
-        foreach (var psm1 in Directory.GetFiles(modulesPath, "*.psm1", SearchOption.AllDirectories))
+        // Build the set lazily from all .psm1 files in Modules/. Published only once filled: a concurrent
+        // first caller must never see a partial set and report a real function as missing.
+        known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var modulesPath = _apiBasePath == null ? null : Path.Combine(_apiBasePath, "Modules");
+        if (modulesPath != null && Directory.Exists(modulesPath))
         {
-            try
+            foreach (var psm1 in Directory.GetFiles(modulesPath, "*.psm1", SearchOption.AllDirectories))
             {
-                var raw = File.ReadAllText(psm1);
-                foreach (Match m in FunctionBlockRegex.Matches(raw))
-                    _moduleFunctionNames.Add(m.Groups[1].Value);
+                try
+                {
+                    using var reader = new StreamReader(psm1);
+                    foreach (var function in ModuleFunctionNames(reader))
+                        known.Add(function);
+                }
+                catch { /* skip unreadable modules */ }
             }
-            catch { /* skip unreadable modules */ }
-        }
 
-        _logger.LogInformation("[System] Module function index: {Count} functions across all modules",
-            _moduleFunctionNames.Count);
-        return _moduleFunctionNames.Contains(name);
+            _logger.LogInformation("[System] Module function index: {Count} functions across all modules",
+                known.Count);
+        }
+        _moduleFunctionNames = known;
+        return known.Contains(name);
+    }
+
+    private static readonly Regex FunctionAtStart = new(@"\Afunction\s+([\w-]+)\s*\{", RegexOptions.IgnoreCase);
+    private static readonly Regex FunctionPrefix = new(@"\Afunction(\s*|\s+[\w-]+\s*)\z", RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// The names FunctionBlockRegex finds, read a line at a time: a built module is tens of MB, and reading it whole
+    /// put that much on the large object heap. Only lines that can start a match are materialised; a candidate takes
+    /// the following lines while it is still a prefix of a match, and gives them back if it fails.
+    /// </summary>
+    internal static IEnumerable<string> ModuleFunctionNames(TextReader reader)
+    {
+        var pushedBack = new List<string>();
+        var sb = new System.Text.StringBuilder();
+        while (true)
+        {
+            string? line;
+            if (pushedBack.Count > 0) { line = pushedBack[0]; pushedBack.RemoveAt(0); }
+            else if ((line = ReadLine(reader, candidatesOnly: true, sb)) == null) yield break;
+            if (!line.StartsWith("function", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var candidate = line;
+            var taken = new List<string>();
+            while (true)
+            {
+                var match = FunctionAtStart.Match(candidate);
+                if (match.Success) { yield return match.Groups[1].Value; taken.Clear(); break; }
+                if (!FunctionPrefix.IsMatch(candidate)) break;
+                string? next;
+                if (pushedBack.Count > 0) { next = pushedBack[0]; pushedBack.RemoveAt(0); }
+                else if ((next = ReadLine(reader, candidatesOnly: false, sb)) == null) break;
+                taken.Add(next);
+                candidate += "\n" + next;
+            }
+            pushedBack.InsertRange(0, taken);
+        }
+    }
+
+    // A line up to (not including) '\n', null at the end. With candidatesOnly, a line that cannot start with
+    // "function" is skipped without being built and comes back as "".
+    private static string? ReadLine(TextReader reader, bool candidatesOnly, System.Text.StringBuilder sb)
+    {
+        var c = reader.Read();
+        if (c < 0) return null;
+        sb.Clear();
+        while (c >= 0 && c != '\n')
+        {
+            if (candidatesOnly && sb.Length < 8 && char.ToLowerInvariant((char)c) != "function"[sb.Length])
+            {
+                while (c >= 0 && c != '\n') c = reader.Read();
+                return string.Empty;
+            }
+            sb.Append((char)c);
+            c = reader.Read();
+        }
+        return sb.ToString();
     }
 }

@@ -910,3 +910,33 @@ function Invoke-PerfHangRelease {
     }
     return @{ StatusCode = 200; Body = @{ ok = $true; released = $released } }
 }
+
+# Module fidelity: what a worker sees of the module its code runs in. The helper is deliberately left out of
+# FunctionsToExport, as apps define helpers beside an exported function in the same file and call them across modules.
+function Get-PerfModuleHelper { 'helper' }
+
+function Invoke-PerfModuleInfo {
+    <#
+    .SYNOPSIS
+        Reports what this worker sees of the PerfApi module.
+    #>
+    param($Request, $TriggerMetadata)
+    $Module = Get-Module PerfApi
+    $Nested = Get-Module PerfNested
+    $Body = [ordered]@{
+        ok                = $true
+        moduleType        = "$($Module.ModuleType)"
+        moduleBase        = $Module.ModuleBase
+        scriptRoot        = $PSScriptRoot
+        commandModuleBase = $MyInvocation.MyCommand.Module.ModuleBase
+        moduleName        = (Get-Command Invoke-PerfPing).ModuleName
+        listedByModule    = [bool](Get-Command -Module PerfApi -Name Invoke-PerfModuleInfo -ErrorAction SilentlyContinue)
+        helper            = $(try { Get-PerfModuleHelper } catch { $_.Exception.Message })
+        help              = (Get-Help Invoke-PerfModuleInfo).Synopsis
+        callOperator      = $(try { & $Module { 'ok' } } catch { $_.Exception.Message })
+        injected          = $null -ne $script:PerfInjected
+        nestedModuleBase  = $Nested.ModuleBase
+        nestedThing       = $(try { Get-PerfNestedThing } catch { $_.Exception.Message })
+    }
+    return @{ StatusCode = 200; Body = $Body }
+}
