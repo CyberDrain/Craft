@@ -172,6 +172,41 @@ public class OrchestrationRecoveryTests
     }
 
     [Fact]
+    public async Task HoldingTheLock_ACancelledRunsTaskLeftRunningByAStoppedProcess_IsTakenBackAndRunAgain()
+    {
+        var s = NewStore(new MemoryTableStore());
+        var run = await CreateAsync(s, "CancelledInherited", 3);
+        Assert.Single(await s.ClaimAsync(run.RunKey, 1, "old-host/7/aaaa", Lease, false));
+        await s.RequestCancelAsync(run.RunKey);
+        await s.CancelPendingAsync(run.RunKey);                                 // the running one is left to finish
+        var pump = NewPump(s);
+        await pump.AcquireLockAsync(CancellationToken.None);
+
+        // Only the interrupted task comes back; the two cancelled ones stay cancelled.
+        Assert.Equal(1, await pump.RefillAsync(CancellationToken.None));
+        var retried = Assert.Single(await s.GetTasksAsync(run.RunKey, 'R'));
+        Assert.Equal((0, 2), (retried.Seq, retried.Attempt));
+        Assert.Equal(2, (await s.GetRunAsync(run.RunKey))!.Cancelled);
+    }
+
+    [Fact]
+    public async Task ACancelledRunsLiveTask_IsLeftToFinish()
+    {
+        var s = NewStore(new MemoryTableStore());
+        var run = await CreateAsync(s, "CancelledLive", 3);
+        var pump = NewPump(s);
+        await pump.AcquireLockAsync(CancellationToken.None);
+        Assert.Equal(3, await pump.RefillAsync(CancellationToken.None));     // this process runs all three
+        await s.RequestCancelAsync(run.RunKey);
+        pump.ForgetBackoff();
+
+        await pump.RefillAsync(CancellationToken.None);
+
+        Assert.Equal(3, (await s.GetTasksAsync(run.RunKey, 'R')).Count);
+        Assert.False((await s.GetRunAsync(run.RunKey))!.IsFinished);
+    }
+
+    [Fact]
     public async Task HoldingTheLock_AStoppedProcesssSequentialDriver_IsTakenOverAtOnce()
     {
         var s = NewStore(new MemoryTableStore());

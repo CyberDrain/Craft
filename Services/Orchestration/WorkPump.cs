@@ -318,8 +318,9 @@ public class WorkPump : BackgroundService
                 var (cancelled, _) = _store.IsCancelling(header.RunKey)
                     ? (0, null)
                     : await _store.CancelPendingAsync(header.RunKey, maxPages: 1, ct: ct);
-                if (cancelled == 0) _skip[header.RunKey] = (entry.Done, entry.Total, DateTime.MaxValue, 0);
-                continue;
+                // With nothing pending left to cancel, claim as usual: a task a stopped process left running was not
+                // cancelled, so it is taken back and run again, and the run finishes once it does.
+                if (cancelled > 0 || _store.IsCancelling(header.RunKey)) continue;
             }
 
             IReadOnlyList<WorkStore.ClaimedTask> claims;

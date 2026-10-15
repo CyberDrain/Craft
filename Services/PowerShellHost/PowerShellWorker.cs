@@ -454,7 +454,8 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         _hungRun = run;
         _logger.LogError(
             "[Pool] W{Id} {Function} did not stop within {Grace:0}s of being cancelled: it is blocked in a call " +
-            "PowerShell cannot interrupt. Abandoning the worker.", Id, label, StopGrace.TotalSeconds);
+            "PowerShell cannot interrupt. Abandoning the worker. Blocked at: {CallStack}", Id, label, StopGrace.TotalSeconds,
+            BlockedCallStack());
         _ = run.ContinueWith(t =>
         {
             _ = t.Exception;
@@ -462,6 +463,29 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             _logger.LogWarning("[Pool] Abandoned W{Id} {Function} returned {Seconds:0}s after it was abandoned",
                 Id, label, System.Diagnostics.Stopwatch.GetElapsedTime(abandonedAt).TotalSeconds);
         }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// The script call stack of the blocked pipeline, innermost first. The stopped invocation's exception carries no
+    /// position, so this is the only record of which statement made the blocking call.
+    /// </summary>
+    private string BlockedCallStack()
+    {
+        try
+        {
+            var frames = _pwsh.Runspace.Debugger.GetCallStack().Select(frame =>
+            {
+                var statement = (frame.Position?.Text ?? string.Empty).Split('\n')[0].Trim();
+                if (statement.Length > 200) statement = statement[..200] + "...";
+                var where = string.IsNullOrEmpty(frame.ScriptName) ? string.Empty : $" ({Path.GetFileName(frame.ScriptName)}:{frame.ScriptLineNumber})";
+                return $"{frame.FunctionName}{where} {statement}";
+            }).ToList();
+            return frames.Count > 0 ? string.Join(" <- ", frames) : "unavailable";
+        }
+        catch (Exception ex)
+        {
+            return $"unavailable ({ex.GetType().Name})";
+        }
     }
 
     public PSDataStreams Streams => _pwsh.Streams;

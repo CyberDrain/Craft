@@ -6,6 +6,7 @@ using Craft.Configuration;
 using Craft.PowerShellHost;
 using Craft.Services;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -38,11 +39,11 @@ public sealed class HungWorkerRecycleTests : IDisposable
         return gate;
     }
 
-    private static PowerShellWorker NewWorker(TimeSpan grace)
+    private static PowerShellWorker NewWorker(TimeSpan grace, ILogger? logger = null)
     {
         var iss = InitialSessionState.CreateDefault2();
         iss.Commands.Add(new SessionStateFunctionEntry("Block", "param($Gate) $null = $Gate.Wait(); 'unblocked'"));
-        var worker = new PowerShellWorker(7, iss, NullLogger.Instance) { StopGrace = grace };
+        var worker = new PowerShellWorker(7, iss, logger ?? NullLogger.Instance) { StopGrace = grace };
         worker.Runspace.ThreadOptions = PSThreadOptions.ReuseThread;
         if (worker.Runspace.RunspaceStateInfo.State == RunspaceState.BeforeOpen) worker.Runspace.Open();
         return worker;
@@ -95,6 +96,19 @@ public sealed class HungWorkerRecycleTests : IDisposable
 
         await Assert.ThrowsAsync<WorkerHungException>(() => worker.InvokeAsync("Block", new()));
         await Assert.ThrowsAsync<WorkerHungException>(() => worker.InvokeScriptAsync(ScriptBlock.Create("'x'")));
+    }
+
+    [Fact]
+    public async Task TheAbandonLogNamesTheBlockedStatement()
+    {
+        var logger = new CapturingLogger<PowerShellWorker>();
+        var worker = NewWorker(TimeSpan.FromMilliseconds(300), logger);
+        using var cts = new CancellationTokenSource(100);
+
+        await Assert.ThrowsAsync<WorkerHungException>(() => worker.InvokeAsync("Block", new() { ["Gate"] = NewGate() }, cts.Token));
+
+        var line = Assert.Single(logger.Lines, l => l.Message.Contains("did not stop within")).Message;
+        Assert.Contains("Blocked at: <ScriptBlock> $null = $Gate.Wait()", line);
     }
 
     [Fact]
