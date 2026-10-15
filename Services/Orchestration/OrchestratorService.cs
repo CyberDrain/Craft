@@ -384,15 +384,16 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
         return header.Sequential
             ? BuildSequentialRunWork(header, descriptor, taskPath)
-            : jobCt => RunTaskAsync(header, descriptor.Seq, descriptor.TaskId, taskPath, jobCt);
+            : jobCt => RunTaskAsync(header, descriptor.Seq, descriptor.TaskId, descriptor.Attempt, taskPath, jobCt);
     }
 
     private Task<WorkStore.FinishOutcome?> FinishAsync(RunHeader h, int seq, string status, string? error = null) =>
         _finisher.FinishAsync(h.RunKey, new WorkStore.Finish(seq, status, error, Owner));
 
-    private async Task RunTaskAsync(RunHeader header, int seq, string taskId, string taskPath, CancellationToken ct)
+    private async Task RunTaskAsync(RunHeader header, int seq, string taskId, int attempt, string taskPath, CancellationToken ct)
     {
-        if (header.CancelRequested)
+        // A cancel leaves running tasks to finish, so a retry - the task was running when its process stopped - runs again.
+        if (header.CancelRequested && attempt <= 1)
         {
             await FinishAsync(header, seq, "Cancelled", "Cancelled by user");
             return;

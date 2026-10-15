@@ -55,6 +55,38 @@ public class OrchestrationAzuriteTests
     }
 
     [Fact]
+    public async Task ACancelledRun_WhoseProcessStoppedMidTask_RunsThatTaskAgainAndFinishes()
+    {
+        await using var first = await TryCreateAsync();
+        if (first == null) return;
+        var held = new TaskCompletionSource();
+        first.Svc.BeforeRun = t => FakeOrchestrator.IdOf(t) == "c0" ? held.Task : Task.CompletedTask;
+        Assert.True(await first.Start("AzCancelLapsed", Batch(3, "c"), maxConcurrency: 1));
+        var runKey = (await first.Store.GetRunByNameAsync("AzCancelLapsed"))!.RunKey;
+        Assert.True(await first.DriveUntil(async () => (await first.Store.GetTasksAsync(runKey, 'R')).Count == 1));
+
+        // Cancelled while c0 runs: the pending two are cancelled, c0 is left to finish. Then its process stops
+        // before it can - a restart - leaving the claim behind. The next process runs c0 again and the run finishes.
+        await first.Svc.CancelRunAsync("AzCancelLapsed");
+        var second = await OrchestrationHarness.CreateAsync(4, first.Tables, s => s.Orchestrator.TablePrefix = first.Prefix);
+        try
+        {
+            await second.Pump.AcquireLockAsync(CancellationToken.None);
+            Assert.True(await second.DriveUntilFinished("AzCancelLapsed", 30_000));
+
+            var header = (await second.Store.GetRunByNameAsync("AzCancelLapsed"))!;
+            Assert.Equal((3, 2, 0), (header.Done, header.Cancelled, header.Failed));
+            Assert.Empty(await second.Store.GetTasksAsync(runKey, 'R'));
+            Assert.Equal(["c0"], second.Svc.Started.ToArray());
+        }
+        finally
+        {
+            held.SetResult();
+            await second.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task AChildHoldsItsParentsAggregation_UntilItFinishes()
     {
         await using var h = await TryCreateAsync();
