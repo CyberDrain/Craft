@@ -141,6 +141,21 @@ public sealed class HungWorkerRecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task ADotNetCallGivenPipelineStopToken_IsCancelledWithoutAbandoningTheWorker()
+    {
+        // PowerShell 7.6 signals $PSCmdlet.PipelineStopToken on stop, so a .NET wait that takes it unwinds instead of hanging.
+        using var worker = NewWorker(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(200);
+        var script = ScriptBlock.Create(
+            "function Wait-Forever { [CmdletBinding()] param() [Threading.Tasks.Task]::Delay(-1, $PSCmdlet.PipelineStopToken).GetAwaiter().GetResult() }; Wait-Forever");
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.InvokeScriptAsync(script, ct: cts.Token));
+
+        Assert.IsNotType<WorkerHungException>(ex);
+        Assert.False(worker.IsHung);
+    }
+
+    [Fact]
     public async Task DisposingAHungWorkerDoesNotBlock_AndClosesItOnceTheCallReturns()
     {
         var gate = NewGate();
