@@ -152,6 +152,8 @@ ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
 ENV MALLOC_ARENA_MAX=2
 ENV POWERSHELL_TELEMETRY_OPTOUT=1
 ENV POWERSHELL_UPDATECHECK=Off
+# Skip the per-process Enter-PSHostProcess pipe (PS 7.6+); every runspace host creates one in /tmp.
+ENV POWERSHELL_DIAGNOSTICS_OPTOUT=1
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 # ── .NET GC tuning ──
