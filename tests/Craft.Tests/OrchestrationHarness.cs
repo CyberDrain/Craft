@@ -52,6 +52,7 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
         if (path == PostExecScript)
         {
             PostExecs.Enqueue((parameters, File.ReadAllLines((string)parameters["ResultsPath"])));
+            PostExecOn.Enqueue(worker);
             if (PostExecBody != null) await PostExecBody();
             return string.Empty;
         }
@@ -80,6 +81,7 @@ internal sealed class FakeOrchestrator(JobManager jobs, WorkStore store, ResultS
     /// <summary>The worker a sequential driver checks out; null unless a test supplies one.</summary>
     public Func<PowerShellWorker?>? NextWorker;
     public readonly ConcurrentQueue<PowerShellWorker?> RanOn = new();
+    public readonly ConcurrentQueue<PowerShellWorker?> PostExecOn = new();
     public readonly ConcurrentQueue<(PowerShellWorker? Worker, bool Faulted)> Reclaimed = new();
 
     internal override PowerShellWorker? CheckoutSequentialWorker(CancellationToken ct)

@@ -621,24 +621,38 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         if (settings.Worker.WarmupScripts.Count == 0) return;
 
         var combinedScript = string.Join("\n", settings.Worker.WarmupScripts);
-        _pwsh.AddScript($@"
+
+        // Log records as they are emitted so warmup lines keep their real time and order.
+        EventHandler<DataAddedEventArgs> onWarning = (s, e) =>
+            _logger?.LogWarning("[Warmup] {Message}", ((PSDataCollection<WarningRecord>)s!)[e.Index].Message);
+        EventHandler<DataAddedEventArgs> onInfo = (s, e) =>
+            _logger?.LogInformation("[Warmup] {Message}", ((PSDataCollection<InformationRecord>)s!)[e.Index].MessageData);
+        EventHandler<DataAddedEventArgs> onError = (s, e) =>
+        {
+            var err = ((PSDataCollection<ErrorRecord>)s!)[e.Index];
+            _logger?.LogError("[Warmup] {Error}", err.Exception?.Message ?? err.ToString());
+        };
+        _pwsh.Streams.Warning.DataAdded += onWarning;
+        _pwsh.Streams.Information.DataAdded += onInfo;
+        _pwsh.Streams.Error.DataAdded += onError;
+        try
+        {
+            _pwsh.AddScript($@"
 try {{
     {combinedScript}
 }} catch {{
     Write-Warning ""Warmup failed: $_""
 }}
 ").Invoke();
-
-        // Surface warmup diagnostics before clearing streams — RunScript discards them.
-        foreach (var warn in _pwsh.Streams.Warning)
-            _logger?.LogWarning("[Warmup] {Message}", warn.Message);
-        foreach (var info in _pwsh.Streams.Information)
-            _logger?.LogInformation("[Warmup] {Message}", info.MessageData);
-        foreach (var err in _pwsh.Streams.Error)
-            _logger?.LogError("[Warmup] {Error}", err.Exception?.Message ?? err.ToString());
-
-        _pwsh.Commands.Clear();
-        _pwsh.Streams.ClearStreams();
+        }
+        finally
+        {
+            _pwsh.Streams.Warning.DataAdded -= onWarning;
+            _pwsh.Streams.Information.DataAdded -= onInfo;
+            _pwsh.Streams.Error.DataAdded -= onError;
+            _pwsh.Commands.Clear();
+            _pwsh.Streams.ClearStreams();
+        }
     }
 
     public void Dispose()
