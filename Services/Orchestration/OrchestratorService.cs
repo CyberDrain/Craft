@@ -427,7 +427,8 @@ public class OrchestratorService : IJobDescriptorStateWriter
         _logger.LogDebug("[Scheduler] Task completed: {TaskId}", taskId);
     }
 
-    private async Task RunPostExecutionAsync(RunHeader header, JobDescriptor descriptor, CancellationToken ct)
+    private async Task RunPostExecutionAsync(RunHeader header, JobDescriptor descriptor, CancellationToken ct,
+        PowerShellWorker? worker = null)
     {
         var postExecScript = Script(_settings.Orchestrator.PostExecFunction);
         if (postExecScript == null)
@@ -455,7 +456,7 @@ public class OrchestratorService : IJobDescriptorStateWriter
             if (await _store.GetPostExecParametersAsync(header.RunKey, ct) is { Length: > 0 } postParameters)
                 parameters["ParametersJson"] = postParameters;
 
-            await RunScriptAsync(postExecScript, parameters, captureOutput: false);
+            await RunScriptAsync(postExecScript, parameters, captureOutput: false, worker);
             await OrchestratorBridge.DrainPendingAsync();
             _logger.LogInformation("[Orchestrator] PostExecution Push-{Function} completed for run {Name}",
                 header.PostExecFunctionName, header.Name);
@@ -521,19 +522,20 @@ public class OrchestratorService : IJobDescriptorStateWriter
                         await _store.CancelPendingAsync(header.RunKey, ct: jobCt);
                         break;
                     }
-                    if (step.Seq == WorkStore.AggregateSeq)
-                    {
-                        var aggregate = new JobDescriptor(header.Name, step.TaskId, header.Priority) { RunKey = header.RunKey, Seq = step.Seq, Attempt = step.Attempt };
-                        await RunPostExecutionAsync(current, aggregate, jobCt);
-                        break;
-                    }
-
                     if (worker is { IsHung: true })
                     {
                         // A step timed out on a worker that could not be stopped. Hand it back for replacement.
                         ReclaimSequentialWorker(worker, faulted: true);
                         worker = null;
                         worker = CheckoutSequentialWorker(jobCt);
+                    }
+
+                    if (step.Seq == WorkStore.AggregateSeq)
+                    {
+                        var aggregate = new JobDescriptor(header.Name, step.TaskId, header.Priority) { RunKey = header.RunKey, Seq = step.Seq, Attempt = step.Attempt };
+                        // On the pinned worker: asking the pool for another while holding this one deadlocks a full pool.
+                        await RunPostExecutionAsync(current, aggregate, jobCt, worker);
+                        break;
                     }
 
                     var parameters = nextPayload ?? await _store.GetPayloadAsync(header.RunKey, step.Seq, jobCt);

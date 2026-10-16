@@ -186,6 +186,20 @@ public sealed class HungWorkerRecycleTests : IDisposable
         Assert.Equal((1, 3), (run.Failed, run.Done));
     }
 
+    [Fact]
+    public async Task ASequentialRunsPostExecutionRunsOnItsPinnedWorker()
+    {
+        // The driver holds its worker until the post-execution returns, so asking the pool for another deadlocks a full pool.
+        await using var h = await OrchestrationHarness.CreateAsync();
+        using var pinned = NewWorker(TimeSpan.FromSeconds(5));
+        h.Svc.NextWorker = () => pinned;
+        Assert.True(await h.Start("SeqPost", OrchestrationHarness.Batch(2, "s"), postExec: "Done", sequential: true));
+
+        Assert.True(await h.DriveUntilFinished("SeqPost"));
+        Assert.Equal(new PowerShellWorker?[] { pinned }, h.Svc.PostExecOn.ToArray());
+        Assert.Equal(1, h.Svc.Checkouts);
+    }
+
     // ── The pool, through the runner ────────────────────────────────────────────────────────────
 
     private static (PowerShellWorkerPool Pool, PowerShellRunnerService Runner) StartPool()
