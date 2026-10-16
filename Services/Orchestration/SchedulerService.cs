@@ -56,6 +56,13 @@ public class SchedulerService : BackgroundService
         _services = services;
     }
 
+    // .NET 10 starts ExecuteAsync via Task.Run, so a stop before it is scheduled skips its finally below.
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        try { await base.StopAsync(cancellationToken); }
+        finally { _orchestrator.MarkRecoveryDone(); }
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // Every exit from startup — recovery done, recovery threw, storage never came up, shutdown mid-way —

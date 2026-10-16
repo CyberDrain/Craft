@@ -2,38 +2,34 @@
 
   <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings live in Directory.Build.props. -->
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>Craft</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
     <!--
-      Microsoft.PowerShell.SDK MUST stay on the 7.4.x line: 7.4 is the PowerShell release built on
-      .NET 8, 7.5 is .NET 9 and 7.6 is .NET 10. Moving off 7.4 means moving TargetFramework with it.
+      Microsoft.PowerShell.SDK is pinned to the .NET runtime line: 7.4 is the PowerShell release built
+      on .NET 8, 7.5 is .NET 9 and 7.6 is .NET 10. It moves in lockstep with TargetFramework above —
+      on net10.0 that is the 7.6.x line.
     -->
-    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.4.18" />
+    <PackageReference Include="Microsoft.PowerShell.SDK" Version="7.6.6" />
     <PackageReference Include="Cronos" Version="0.8.4" />
     <PackageReference Include="Azure.Data.Tables" Version="12.11.0" />
   </ItemGroup>
 
   <!--
-    Transitive security pins. Both of these arrive several levels down from the packages above, so the
-    only way to move them is to reference them directly — a direct reference wins over any transitive
-    version. Review these whenever the parent packages are bumped: once the parent pulls a version at
-    or above the pin, the pin is redundant and should be deleted rather than left to rot.
+    No transitive security pins are needed on net10.0. The two the net8.0 build carried —
+    System.Security.Cryptography.Xml (via Microsoft.PowerShell.SDK -> Microsoft.Windows.Compatibility)
+    and System.Text.Json (via Azure.Data.Tables -> Azure.Core) — are both provided by the shared
+    framework on net10.0 at 10.0.x, which already supersedes the old 8.0.x CVE pins; a direct
+    PackageReference to either is pruned (NU1510). If a future parent bump reintroduces an out-of-band
+    vulnerable transitive, re-add a direct pin here (the direct reference wins over any transitive).
 
-      System.Security.Cryptography.Xml  8.0.3 -> 8.0.4
-        via Microsoft.PowerShell.SDK -> Microsoft.Windows.Compatibility.
-        GHSA-g8r8-53c2-pm3f, GHSA-8q5v-6pqq-x66h, GHSA-cvvh-rhrc-wg4q, GHSA-23rf-6693-g89p,
-        GHSA-mmjf-rqrv-855v (all High).
-
-      System.Text.Json                 6.0.9 -> 8.0.6
-        via Azure.Data.Tables -> Azure.Core -> System.ClientModel.
-        GHSA-8g4q-xg66-9fp4 (High).
+    System.Security.Cryptography.Pkcs is out-of-band (not in the shared framework); Microsoft.PowerShell.SDK
+    7.6.6 brings 10.0.10, which GHSA-846f-f764-76mx / GHSA-2fmv-rv2c-59x7 cover up to 10.0.12.
   -->
   <ItemGroup>
-    <PackageReference Include="System.Security.Cryptography.Xml" Version="8.0.5" />
-    <PackageReference Include="System.Text.Json" Version="8.0.6" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
   </ItemGroup>
 
   <PropertyGroup>

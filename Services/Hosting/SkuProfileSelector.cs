@@ -14,29 +14,26 @@ namespace Craft.Hosting;
 /// two sizings and pick between them with a single env var — e.g. a smaller per-instance matrix for
 /// instances packed onto a shared App Service Plan.
 /// </para>
-/// <para>
-/// A per-instance escape hatch beats both matrices: <c>CRAFT_HTTP_POOL_SIZE</c> / <c>CRAFT_BG_POOL_SIZE</c>,
-/// when set to a non-negative integer, win over the matched profile (and baseline), following the same
-/// shape as <c>CRAFT_GC_HEAP_LIMIT_MB</c>.
-/// </para>
-/// <para>
-/// This runs as a <c>PostConfigure</c> on <see cref="CraftSettings"/>, so it must apply before any
-/// consumer resolves the options — a worker pool that reads its size before the profile lands would
-/// silently size itself for the wrong tier.
-/// </para>
-/// <para>
-/// Detection is best-effort by design: any failure logs and leaves the baseline sizes untouched
-/// rather than taking the host down over a pool-sizing hint. The returned profile may also carry a
-/// <see cref="SkuProfile.GCHeapHardLimitMB"/>; applying that is a process-wide side effect and lives in
-/// <see cref="GcHeapLimit"/>, not here.
-/// </para>
 /// </summary>
+// Implementation notes kept as plain comments rather than XML doc: the .NET 10 SDK's XML documentation
+// writer throws an NRE (CS1569) once a single member's doc comment grows past a certain size, so the
+// operational detail below lives here instead of bloating the <summary>/<remarks> above.
+//   * This runs as a PostConfigure on CraftSettings, so it must apply before any consumer resolves the
+//     options — a worker pool that reads its size before the profile lands sizes itself for the wrong tier.
+//   * Detection is best-effort by design: any failure logs and leaves the baseline sizes untouched rather
+//     than taking the host down over a pool-sizing hint. A matched profile may also carry a
+//     GCHeapHardLimitMB; applying that is a process-wide side effect and lives in GcHeapLimit, not here.
 public static class SkuProfileSelector
 {
     /// <summary>
     /// Applies the matching profile (and any pool-size env overrides) to <paramref name="settings"/>,
     /// mutating it in place.
     /// </summary>
+    /// <remarks>
+    /// A per-instance escape hatch beats both matrices: <c>CRAFT_HTTP_POOL_SIZE</c> / <c>CRAFT_BG_POOL_SIZE</c>,
+    /// when set to a non-negative integer, win over the matched profile (and baseline), following the same
+    /// shape as <c>CRAFT_GC_HEAP_LIMIT_MB</c>.
+    /// </remarks>
     /// <param name="settings">Settings to adjust.</param>
     /// <param name="processorCount">CPU count to match profiles against.</param>
     /// <param name="env">Environment lookup for SkuEnv, the second-matrix flag, and the pool-size overrides.</param>

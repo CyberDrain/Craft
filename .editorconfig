@@ -197,6 +197,7 @@ dotnet_diagnostic.IDE0060.severity = suggestion   # unused parameter
 
 # Permanently off — deliberate choices, not backlog.
 dotnet_diagnostic.CA1848.severity = none          # LoggerMessage source-gen delegates: not adopting
+dotnet_diagnostic.CA1873.severity = none          # IsEnabled-guard before an expensive log arg: same high-perf logging family as CA1848 above, not adopting (new in the .NET 10 SDK analyzers)
 dotnet_diagnostic.CA2007.severity = none          # ConfigureAwait: no SynchronizationContext in ASP.NET Core
 
 # ── Analyzer rules: cleared backlog ─────────────────────────────────────────────────────────────────

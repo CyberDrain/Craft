@@ -2,7 +2,7 @@
 
   <!-- LangVersion / Nullable / ImplicitUsings / analyzer settings come from Directory.Build.props. -->
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -16,9 +16,12 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="8.0.11" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.12" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Craft gets this from the ASP.NET shared framework; this plain-SDK project resolves Microsoft.PowerShell.SDK's
+         10.0.10 instead, which GHSA-7hqp-7c5m-4vq6 / GHSA-c399-9853-6jmj / GHSA-r955-8q5j-3h83 cover up to 10.0.12. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.13" />
   </ItemGroup>
 
   <ItemGroup>
