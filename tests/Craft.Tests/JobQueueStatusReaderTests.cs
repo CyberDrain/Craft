@@ -112,6 +112,23 @@ public class JobQueueStatusReaderTests
     }
 
     [Fact]
+    public async Task EachRun_CountsWhatWaitsAheadOfIt()
+    {
+        var (reader, store, jobs) = New();
+        var first = await Create(store, "First", 5, 0);
+        await Create(store, "Second", 4, 1);
+        await Create(store, "Third", 2, 2);
+        foreach (var c in await store.ClaimAsync(first.RunKey, 2, "me", TimeSpan.FromMinutes(5), false))
+            jobs.Enqueue(new JobDescriptor("First", c.TaskId, 4) { RunKey = c.RunKey, Seq = c.Seq }, $"First-{c.TaskId}");
+
+        var summaries = await reader.GetRunSummariesAsync();
+
+        Assert.Equal((0, 0), summaries.Where(r => r.Name == "First").Select(r => (r.Ahead, r.RunsAhead)).Single());
+        Assert.Equal((3, 1), summaries.Where(r => r.Name == "Second").Select(r => (r.Ahead, r.RunsAhead)).Single());
+        Assert.Equal((7, 2), summaries.Where(r => r.Name == "Third").Select(r => (r.Ahead, r.RunsAhead)).Single());
+    }
+
+    [Fact]
     public async Task AFinishedRun_LeavesTheBacklog()
     {
         var (reader, store, _) = New();

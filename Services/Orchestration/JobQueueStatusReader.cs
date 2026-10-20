@@ -39,9 +39,10 @@ public class JobQueueStatusReader : IDisposable
         string RunKey = "", int Seq = 0);
 
     /// <summary>A run name's durable counts (summed over runs sharing the name). Merged views subtract what this
-    /// process holds right now, never the counts held when the snapshot was taken.</summary>
+    /// process holds right now, never the counts held when the snapshot was taken. <see cref="Ahead"/> and
+    /// <see cref="RunsAhead"/> are the unclaimed tasks and runs listed before it in claim order: telemetry only.</summary>
     public sealed record RunQueueInfo(int Unclaimed, int Claimed, int MinPriority, DateTime? OldestQueuedUtc,
-        int Total, int Done, string? Reference, int Failed = 0)
+        int Total, int Done, string? Reference, int Failed = 0, int Ahead = 0, int RunsAhead = 0)
     {
         public int Outstanding => Math.Max(0, Total - Done);
     }
@@ -103,7 +104,7 @@ public class JobQueueStatusReader : IDisposable
 
         var byRun = new Dictionary<string, RunQueueInfo>(StringComparer.Ordinal);
         var head = new List<QueuedRow>();
-        int total = 0, unclaimed = 0, runsListed = 0;
+        int total = 0, unclaimed = 0, runsListed = 0, runsWaiting = 0;
         DateTime? oldest = null;
 
         await foreach (var e in _store.ReadReadyAsync(1000, ct))
@@ -111,13 +112,19 @@ public class JobQueueStatusReader : IDisposable
             var outstanding = Math.Max(0, e.Total - e.Done);
             var claimed = Math.Min(outstanding, local.GetValueOrDefault(e.Name));
             local[e.Name] = local.GetValueOrDefault(e.Name) - claimed;
+            // Ready order is claim order (best band, then oldest), so what waits before this entry is ahead of it.
+            var ahead = unclaimed;
+            var runsAhead = runsWaiting;
+            if (outstanding > claimed) runsWaiting++;
             total += outstanding;
             unclaimed += outstanding - claimed;
             if (outstanding > claimed && (oldest == null || e.StartedUtc < oldest)) oldest = e.StartedUtc;
             byRun[e.Name] = byRun.TryGetValue(e.Name, out var same)
                 ? new RunQueueInfo(same.Unclaimed + outstanding - claimed, same.Claimed + claimed, Math.Min(same.MinPriority, e.Band),
-                    same.OldestQueuedUtc, same.Total + e.Total, same.Done + e.Done, same.Reference ?? e.Reference, same.Failed + e.Failed)
-                : new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference, e.Failed);
+                    same.OldestQueuedUtc, same.Total + e.Total, same.Done + e.Done, same.Reference ?? e.Reference, same.Failed + e.Failed,
+                    same.Ahead, same.RunsAhead)
+                : new RunQueueInfo(outstanding - claimed, claimed, e.Band, e.StartedUtc, e.Total, e.Done, e.Reference, e.Failed,
+                    ahead, runsAhead);
 
             if (head.Count < HeadRows && runsListed < HeadRuns && outstanding > claimed)
             {
@@ -213,6 +220,8 @@ public class JobQueueStatusReader : IDisposable
             summary.Failed = info.Failed;
             summary.Completed = Math.Max(0, info.Done - info.Failed);
             summary.CompletedUtc = null;
+            summary.Ahead = info.Ahead;
+            summary.RunsAhead = info.RunsAhead;
         }
 
         return summaries.OrderBy(r => r.Priority).ThenByDescending(r => r.StartedUtc).ToList();

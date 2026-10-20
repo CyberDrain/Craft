@@ -18,4 +18,8 @@ public class JobRunSummary
     public int Failed { get; set; }
     public DateTime? StartedUtc { get; set; }
     public DateTime? CompletedUtc { get; set; }
+    /// <summary>Unclaimed tasks queued before this run in claim order (durable backlog only).</summary>
+    public int Ahead { get; set; }
+    /// <summary>Runs with unclaimed tasks queued before this one in claim order.</summary>
+    public int RunsAhead { get; set; }
 }

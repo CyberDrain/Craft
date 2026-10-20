@@ -142,8 +142,14 @@ public static class QueueStatusBridge
         var first = runs[0].Counts;
         var reference = s_orchestratorService?.GetRunReference(first.Name) ?? first.Name;
         JobRunSummary counts = new(), storage = new();
+        int? ahead = null, runsAhead = null;
         foreach (var (st, c, _) in runs)
         {
+            if (st.Queued > 0)
+            {
+                ahead = Math.Min(ahead ?? int.MaxValue, st.Ahead);
+                runsAhead = Math.Min(runsAhead ?? int.MaxValue, st.RunsAhead);
+            }
             counts.Total += c.Total;
             counts.Queued += c.Queued;
             counts.Running += c.Running;
@@ -167,18 +173,23 @@ public static class QueueStatusBridge
             Running = counts.Running,
             Completed = counts.Completed,
             Failed = counts.Failed,
+            Ahead = ahead ?? 0,
+            RunsAhead = runsAhead ?? 0,
             StartedUtc = runs.Min(r => r.Counts.StartedUtc),
             Tasks = runs.SelectMany(r => r.Tasks).ToList()
         };
     }
 
-    /// <summary>The label registered for a run: by its reference, its name, or the queue id its name ends with.</summary>
-    private static RunLabel? FindLabel(string reference, string runName)
+    /// <summary>
+    /// The label registered for a run: by its name, the queue id its name ends with, then its reference. A reference is
+    /// shared by every run of the same query, which other users may have started since, so a run's own id comes first.
+    /// </summary>
+    internal static RunLabel? FindLabel(string reference, string runName)
     {
-        if (s_labels.TryGetValue(reference, out var label) || s_labels.TryGetValue(runName, out label)) return label;
-        return runName.Length > 36 && Guid.TryParse(runName[^36..], out _) && s_labels.TryGetValue(runName[^36..], out label)
-            ? label
-            : null;
+        if (s_labels.TryGetValue(runName, out var label)) return label;
+        if (runName.Length > 36 && Guid.TryParse(runName[^36..], out _) && s_labels.TryGetValue(runName[^36..], out label))
+            return label;
+        return s_labels.TryGetValue(reference, out label) ? label : null;
     }
 
     /// <summary>
@@ -231,7 +242,8 @@ public static class QueueStatusBridge
             var status = ToStatus(runs.Select(Load).ToList());
             var state = new StringBuilder()
                 .Append(status.Status).Append('|').Append(status.Total).Append('|').Append(status.Queued)
-                .Append('|').Append(status.Running).Append('|').Append(status.Completed).Append('|').Append(status.Failed);
+                .Append('|').Append(status.Running).Append('|').Append(status.Completed).Append('|').Append(status.Failed)
+                .Append('|').Append(status.Ahead);
             foreach (var t in status.Tasks) state.Append('|').Append(t.Name).Append(':').Append(t.Status);
             result[id] = new RunRollup(status.Status, JsonSerializer.SerializeToElement(status, s_json), state.ToString());
         }
@@ -306,6 +318,9 @@ public static class QueueStatusBridge
         public int Running { get; set; }
         public int Completed { get; set; }
         public int Failed { get; set; }
+        /// <summary>Tasks and runs waiting before this queue's own waiting tasks; 0 once none of it waits.</summary>
+        public int Ahead { get; set; }
+        public int RunsAhead { get; set; }
         public DateTime? StartedUtc { get; set; }
         public List<RunTask> Tasks { get; set; } = [];
     }
@@ -317,7 +332,7 @@ public static class QueueStatusBridge
         public DateTime At { get; set; }
     }
 
-    private sealed record RunLabel(string Label, string Link);
+    internal sealed record RunLabel(string Label, string Link);
 
     private static readonly JsonSerializerOptions s_json = new()
     {
