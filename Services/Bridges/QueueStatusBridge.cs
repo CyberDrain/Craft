@@ -180,13 +180,16 @@ public static class QueueStatusBridge
         };
     }
 
-    /// <summary>The label registered for a run: by its reference, its name, or the queue id its name ends with.</summary>
-    private static RunLabel? FindLabel(string reference, string runName)
+    /// <summary>
+    /// The label registered for a run: by its name, the queue id its name ends with, then its reference. A reference is
+    /// shared by every run of the same query, which other users may have started since, so a run's own id comes first.
+    /// </summary>
+    internal static RunLabel? FindLabel(string reference, string runName)
     {
-        if (s_labels.TryGetValue(reference, out var label) || s_labels.TryGetValue(runName, out label)) return label;
-        return runName.Length > 36 && Guid.TryParse(runName[^36..], out _) && s_labels.TryGetValue(runName[^36..], out label)
-            ? label
-            : null;
+        if (s_labels.TryGetValue(runName, out var label)) return label;
+        if (runName.Length > 36 && Guid.TryParse(runName[^36..], out _) && s_labels.TryGetValue(runName[^36..], out label))
+            return label;
+        return s_labels.TryGetValue(reference, out label) ? label : null;
     }
 
     /// <summary>
@@ -329,7 +332,7 @@ public static class QueueStatusBridge
         public DateTime At { get; set; }
     }
 
-    private sealed record RunLabel(string Label, string Link);
+    internal sealed record RunLabel(string Label, string Link);
 
     private static readonly JsonSerializerOptions s_json = new()
     {
