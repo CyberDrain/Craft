@@ -1,4 +1,7 @@
+using System.Buffers.Binary;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Craft.Configuration;
 using Craft.Endpoints;
@@ -73,16 +76,7 @@ public class SchedulerService : BackgroundService
             }
             _logger.LogInformation("[Scheduler] Worker pool ready — service starting");
 
-            LoadConfig();
-            ResolveTimezone();
-
-            // Seed all tasks with "now" so we never catch up on missed runs from before startup.
-            // Only cron ticks that occur AFTER this moment will fire.
-            var startup = DateTimeOffset.UtcNow;
-            foreach (var task in _tasks)
-            {
-                _lastRun[task.Id] = startup;
-            }
+            Start(DateTimeOffset.UtcNow);
 
             // Wait for the storage backend to accept connections before the first orchestrator store access.
             // Avoids a startup error when storage becomes reachable a moment after the app.
@@ -115,77 +109,68 @@ public class SchedulerService : BackgroundService
         {
             var now = DateTimeOffset.UtcNow;
 
-            foreach (var task in _tasks.OrderBy(t => t.Priority))
+            foreach (var task in CollectDue(now))
             {
                 try
                 {
-                    var cronExpression = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
-                    var lastRun = _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue);
-                    var tz = (task.TZOffset || _settings.Scheduler.ApplyTZOffset) ? _configuredTz : TimeZoneInfo.Utc;
-                    var nextOccurrence = cronExpression.GetNextOccurrence(lastRun, tz);
+                    _logger.LogInformation("[Scheduler] Firing: {Command}", task.Command);
 
-                    if (nextOccurrence.HasValue && nextOccurrence.Value <= now)
+                    if (_nativeTasks.TryGet(task.Command, out var native))
                     {
-                        _logger.LogInformation("[Scheduler] Firing: {Command}", task.Command);
-                        _lastRun[task.Id] = now;
-
-                        if (_nativeTasks.TryGet(task.Command, out var native))
+                        if (task.IsOrchestrator)
                         {
-                            if (task.IsOrchestrator)
-                            {
-                                // Also reported once at load; repeated here because LoadConfig's
-                                // report is easy to scroll past and this timer will otherwise look
-                                // like it silently never runs.
-                                _logger.LogWarning(
-                                    "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — skipped",
-                                    task.Command);
-                            }
-                            else
-                            {
-                                EnqueueNativeTask(task, native, now);
-                            }
-                        }
-                        else if (task.IsOrchestrator)
-                        {
-                            // Fan-out/fan-in: planner = Command, task script derived from Command
-                            // Convention: strip "Start-" prefix → "Invoke-{rest}Task"
-                            var plannerFunc = FindScript(task.Command);
-                            var baseName = task.Command.StartsWith("Start-", StringComparison.OrdinalIgnoreCase)
-                                ? task.Command[6..]
-                                : task.Command;
-                            var taskScriptName = $"Invoke-{baseName}Task";
-                            var taskFunc = FindScript(taskScriptName);
-
-                            if (plannerFunc != null && taskFunc != null)
-                            {
-                                _ = _orchestrator.StartOrResumeRun(task.Command, plannerFunc, taskFunc, task.Priority, stoppingToken);
-                                _logger.LogInformation("[Scheduler] Orchestrator started: {Command} P{Priority}", task.Command, task.Priority);
-                            }
-                            else
-                            {
-                                _logger.LogWarning("[Scheduler] Orchestrator scripts not deployed: {Command} planner={Planner} task={Task}",
-                                    task.Command, task.Command, taskScriptName);
-                            }
+                            // Also reported once at load; repeated here because LoadConfig's
+                            // report is easy to scroll past and this timer will otherwise look
+                            // like it silently never runs.
+                            _logger.LogWarning(
+                                "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — skipped",
+                                task.Command);
                         }
                         else
                         {
-                            // Simple scheduled script — dispatch through JobManager for priority ordering
-                            var scriptFunc = FindScript(task.Command);
-                            if (scriptFunc != null)
-                            {
-                                var capturedFunc = scriptFunc;
-                                var capturedParams = task.Parameters;
-                                _jobManager.Enqueue(
-                                    name: task.Command,
-                                    priority: task.Priority,
-                                    work: (ct) => _psRunner.ExecuteScript(capturedFunc, capturedParams)
-                                );
-                                _logger.LogInformation("[Scheduler] Enqueued: {Command} P{Priority}", task.Command, task.Priority);
-                            }
-                            else
-                            {
-                                _logger.LogWarning("[Scheduler] Script not deployed: {Command}", task.Command);
-                            }
+                            EnqueueNativeTask(task, native, now);
+                        }
+                    }
+                    else if (task.IsOrchestrator)
+                    {
+                        // Fan-out/fan-in: planner = Command, task script derived from Command
+                        // Convention: strip "Start-" prefix → "Invoke-{rest}Task"
+                        var plannerFunc = FindScript(task.Command);
+                        var baseName = task.Command.StartsWith("Start-", StringComparison.OrdinalIgnoreCase)
+                            ? task.Command[6..]
+                            : task.Command;
+                        var taskScriptName = $"Invoke-{baseName}Task";
+                        var taskFunc = FindScript(taskScriptName);
+
+                        if (plannerFunc != null && taskFunc != null)
+                        {
+                            _ = _orchestrator.StartOrResumeRun(task.Command, plannerFunc, taskFunc, task.Priority, stoppingToken);
+                            _logger.LogInformation("[Scheduler] Orchestrator started: {Command} P{Priority}", task.Command, task.Priority);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("[Scheduler] Orchestrator scripts not deployed: {Command} planner={Planner} task={Task}",
+                                task.Command, task.Command, taskScriptName);
+                        }
+                    }
+                    else
+                    {
+                        // Simple scheduled script — dispatch through JobManager for priority ordering
+                        var scriptFunc = FindScript(task.Command);
+                        if (scriptFunc != null)
+                        {
+                            var capturedFunc = scriptFunc;
+                            var capturedParams = task.Parameters;
+                            _jobManager.Enqueue(
+                                name: task.Command,
+                                priority: task.Priority,
+                                work: (ct) => _psRunner.ExecuteScript(capturedFunc, capturedParams)
+                            );
+                            _logger.LogInformation("[Scheduler] Enqueued: {Command} P{Priority}", task.Command, task.Priority);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("[Scheduler] Script not deployed: {Command}", task.Command);
                         }
                     }
                 }
@@ -316,7 +301,9 @@ public class SchedulerService : BackgroundService
     /// Reseeds _lastRun for TZOffset tasks to prevent spurious fires after the switch.
     /// Callable from PowerShell via [Craft.Services.SchedulerBridge]::SetTimezone("America/New_York")
     /// </summary>
-    public void SetTimezone(string timezoneId)
+    public void SetTimezone(string timezoneId) => SetTimezone(timezoneId, DateTimeOffset.UtcNow);
+
+    internal void SetTimezone(string timezoneId, DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(timezoneId))
             throw new ArgumentException("Timezone ID cannot be empty.", nameof(timezoneId));
@@ -330,12 +317,113 @@ public class SchedulerService : BackgroundService
 
         // Reseed affected tasks to "now" so the next evaluation uses the new timezone
         // without double-firing or skipping.
-        var now = DateTimeOffset.UtcNow;
+        ApplyJitter();
         foreach (var task in _tasks.Where(t => t.TZOffset || _settings.Scheduler.ApplyTZOffset))
         {
-            _lastRun[task.Id] = now;
+            _lastRun[task.Id] = now - task.JitterOffset;
         }
     }
+
+    /// <summary>Loads the timer file, resolves the timezone and jitter, and seeds every timer at <paramref name="startup"/>.</summary>
+    internal void Start(DateTimeOffset startup)
+    {
+        LoadConfig();
+        ResolveTimezone();
+        ApplyJitter();
+
+        // Seed all tasks with "now" so we never catch up on missed runs from before startup.
+        // Only firings due AFTER this moment will fire: a slot still inside its jitter window has not
+        // fired yet, so a restart within that window must not drop it.
+        foreach (var task in _tasks)
+        {
+            _lastRun[task.Id] = startup - task.JitterOffset;
+        }
+    }
+
+    /// <summary>The timers due at <paramref name="now"/>, in priority order, each marked as run.</summary>
+    internal List<SchedulerTask> CollectDue(DateTimeOffset now)
+    {
+        var due = new List<SchedulerTask>();
+        foreach (var task in _tasks.OrderBy(t => t.Priority))
+        {
+            try
+            {
+                var cronExpression = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
+                if (IsDue(cronExpression, TimeZoneFor(task), _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue), task.JitterOffset, now))
+                {
+                    _lastRun[task.Id] = now;
+                    due.Add(task);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Scheduler] Error: {Command}", task.Command);
+            }
+        }
+        return due;
+    }
+
+    private TimeZoneInfo TimeZoneFor(SchedulerTask task) =>
+        (task.TZOffset || _settings.Scheduler.ApplyTZOffset) ? _configuredTz : TimeZoneInfo.Utc;
+
+    private void ApplyJitter()
+    {
+        // The site name is stable across restarts and worker moves and differs per app on a shared plan
+        var fraction = JitterFraction(Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME") ?? Environment.MachineName);
+        var now = DateTimeOffset.UtcNow;
+        foreach (var task in _tasks.Where(t => t.JitterMinutes > 0))
+        {
+            try
+            {
+                var cron = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
+                task.JitterOffset = JitterOffset(cron, TimeZoneFor(task), task.JitterMinutes, fraction, now, out var clamped);
+                if (clamped)
+                {
+                    _logger.LogWarning("[Scheduler] {Command}: JitterMinutes {Jitter} is not shorter than the gap between its slots — clamped",
+                        task.Command, task.JitterMinutes);
+                }
+                _logger.LogInformation("[Scheduler] {Command}: fires {Offset:mm\\:ss} after each slot (jitter {Jitter}m)",
+                    task.Command, task.JitterOffset, task.JitterMinutes);
+            }
+            catch (CronFormatException)
+            {
+                // The scheduler loop reports the bad expression on every tick.
+            }
+        }
+    }
+
+    /// <summary>This instance's place in [0, 1) within every timer's jitter window.</summary>
+    internal static double JitterFraction(string instanceKey) =>
+        BinaryPrimitives.ReadUInt32LittleEndian(SHA256.HashData(Encoding.UTF8.GetBytes(instanceKey))) / (uint.MaxValue + 1.0);
+
+    /// <summary>
+    /// The delay after each slot: <paramref name="fraction"/> of the window, with the window kept below the
+    /// shortest gap between slots so a delayed firing can never reach the next slot and skip it.
+    /// </summary>
+    internal static TimeSpan JitterOffset(CronExpression cron, TimeZoneInfo tz, int jitterMinutes, double fraction, DateTimeOffset from, out bool clamped)
+    {
+        clamped = false;
+        if (jitterMinutes <= 0) return TimeSpan.Zero;
+
+        var window = TimeSpan.FromMinutes(jitterMinutes);
+        var shortestGap = TimeSpan.MaxValue;
+        DateTimeOffset? previous = null;
+        // 15 days covers a weekly cron twice; the cap bounds sub-minute crons
+        foreach (var slot in cron.GetOccurrences(from, from.AddDays(15), tz).Take(5000))
+        {
+            if (previous is { } p && slot - p < shortestGap) shortestGap = slot - p;
+            previous = slot;
+        }
+        if (window >= shortestGap)
+        {
+            window = shortestGap - TimeSpan.FromMinutes(1);
+            clamped = true;
+        }
+        return window <= TimeSpan.Zero ? TimeSpan.Zero : TimeSpan.FromSeconds(Math.Floor(window.TotalSeconds * fraction));
+    }
+
+    internal static bool IsDue(CronExpression cron, TimeZoneInfo tz, DateTimeOffset lastRun, TimeSpan jitter, DateTimeOffset now) =>
+        cron.GetNextOccurrence(lastRun, tz) is { } next && next + jitter <= now;
 
     /// <summary>Returns the current timezone ID, or empty string if UTC.</summary>
     public string GetTimezone() =>
