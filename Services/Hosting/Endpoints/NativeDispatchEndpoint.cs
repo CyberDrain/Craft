@@ -29,7 +29,8 @@ public static class NativeDispatchEndpoint
         IReadOnlyList<NativeEndpointDescriptor> endpoints,
         RequestCounter activeRequests,
         ILogger logger,
-        EndpointSettings? settings = null)
+        EndpointSettings? settings = null,
+        string? meRoute = null)
     {
         ArgumentNullException.ThrowIfNull(app);
         ArgumentNullException.ThrowIfNull(endpoints);
@@ -91,6 +92,13 @@ public static class NativeDispatchEndpoint
 
             app.MapMethods(path, descriptor.Metadata.Methods,
                 (HttpContext context) => Handle(context, descriptor, handler, activeRequests, logger));
+
+            // The SPA asks /api/me who is signed in; an endpoint on the configured route answers it,
+            // through the same gate, filters and central handler as its own path (which for a route
+            // named "me" already is /api/me: routes ignore case, so mapping it twice would be ambiguous)
+            if (string.Equals(descriptor.Route, meRoute, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(path, "/api/me", StringComparison.OrdinalIgnoreCase))
+                app.MapGet("/api/me", (HttpContext context) => Handle(context, descriptor, handler, activeRequests, logger));
         }
 
         if (endpoints.Count > 0)
