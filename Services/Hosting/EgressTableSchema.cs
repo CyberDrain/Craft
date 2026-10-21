@@ -53,6 +53,8 @@ internal static class EgressTableSchema
     // JSON object of endpoint label -> [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed]. Arrays rather
     // than named fields keep a full map under the 32K-char property limit; CIPP can't reassemble Craft splits.
     public const string PropEndpoints = "Endpoints";
+    // Same layout as Endpoints, keyed by caller IP. Daily rows only.
+    public const string PropIps = "Ips";
 
     /// <summary>Endpoints kept per map; the rest fold into <see cref="OtherEndpoint"/>.</summary>
     public const int MaxEndpoints = 100;
@@ -111,10 +113,11 @@ internal static class EgressTableSchema
     }
 
     public static StoreRow ClientDailyRow(string appId, DateOnly dayUtc,
-        long bytes, long requests, long shed, long capBytes, IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
+        long bytes, long requests, long shed, long capBytes, IReadOnlyDictionary<string, EndpointStats>? endpoints = null,
+        IReadOnlyDictionary<string, EndpointStats>? ips = null)
     {
         var row = new StoreRow(appId, DailyRowKey(dayUtc));
-        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints, ips);
         row[PropDateUtc] = dayUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         row[PropAppId] = appId;
         return row;
@@ -122,10 +125,10 @@ internal static class EgressTableSchema
 
     public static StoreRow SystemDailyRow(DateOnly dayUtc,
         long bytes, long requests, long shed, long capBytes, DateTime? capReachedUtc, bool enforcing,
-        IReadOnlyDictionary<string, EndpointStats>? endpoints = null)
+        IReadOnlyDictionary<string, EndpointStats>? endpoints = null, IReadOnlyDictionary<string, EndpointStats>? ips = null)
     {
         var row = new StoreRow(SystemPartition, DailyRowKey(dayUtc));
-        FillCounts(row, bytes, requests, shed, capBytes, endpoints);
+        FillCounts(row, bytes, requests, shed, capBytes, endpoints, ips);
         row[PropDateUtc] = dayUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         row[PropEnforcing] = enforcing;
         if (capReachedUtc.HasValue) row[PropCapReachedUtc] = capReachedUtc.Value;
@@ -133,13 +136,14 @@ internal static class EgressTableSchema
     }
 
     private static void FillCounts(StoreRow row, long bytes, long requests, long shed, long capBytes,
-        IReadOnlyDictionary<string, EndpointStats>? endpoints)
+        IReadOnlyDictionary<string, EndpointStats>? endpoints, IReadOnlyDictionary<string, EndpointStats>? ips = null)
     {
         row[PropBytes] = bytes;
         row[PropRequests] = requests;
         row[PropShed] = shed;
         row[PropCapBytes] = capBytes;
         if (endpoints is { Count: > 0 }) row[PropEndpoints] = SerializeEndpoints(endpoints);
+        if (ips is { Count: > 0 }) row[PropIps] = SerializeEndpoints(ips);
     }
 
     /// <summary>Clamps an endpoint label to a bounded, table-safe form; blank is <see cref="UnmatchedEndpoint"/>.</summary>

@@ -103,6 +103,22 @@ public class RateLimitPartitionKeyTests
     {
         Assert.Equal("anonymous", RateLimitPartitionKey.Resolve(new DefaultHttpContext()));
     }
+
+    [Theory]
+    [InlineData("203.0.113.7:54321", "203.0.113.7")]
+    [InlineData("[2001:db8::1]:443, 10.0.0.9", "2001:db8::1")]
+    [InlineData("2001:db8::1", "2001:db8::1")]
+    [InlineData("not-an-address, 10.0.0.9", "10.0.0.1")]
+    public void ClientAddress_DropsThePort_AndIgnoresAHopThatIsNotAnAddress(string forwardedFor, string expected)
+    {
+        Assert.Equal(expected, RateLimitPartitionKey.ClientAddress(Request(forwardedFor: forwardedFor, remoteIp: "10.0.0.1")));
+    }
+
+    [Fact]
+    public void ClientAddress_NullWhenNothingIsKnown()
+    {
+        Assert.Null(RateLimitPartitionKey.ClientAddress(new DefaultHttpContext()));
+    }
 }
 
 /// <summary>

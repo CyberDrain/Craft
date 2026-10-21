@@ -61,7 +61,7 @@ public sealed class ApiEgressLimiterMiddleware
         // concurrency cap, the overshoot is bounded to (concurrency × largest response).
         if (_ledger.ShouldReject())
         {
-            _ledger.RecordShed(appId, context.GetRouteValue("endpoint") as string);
+            _ledger.RecordShed(appId, context.GetRouteValue("endpoint") as string, RateLimitPartitionKey.ClientAddress(context));
             await RejectAsync(context);
             return;
         }
