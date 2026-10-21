@@ -177,7 +177,8 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 # ── .NET GC tuning ──
 ENV DOTNET_gcServer=0
 ENV DOTNET_GCDynamicAdaptationMode=1
-ENV DOTNET_GCHeapHardLimit=0x95E00000
+# Downstream images should set their own GC heap hard limit if needed.
+#ENV DOTNET_GCHeapHardLimit=0x95E00000
 ENV DOTNET_GCConserveMemory=7
 
 # App port only. Runs as the image's default non-root user (APP_UID=1654).
