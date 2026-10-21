@@ -53,6 +53,7 @@ public class GcHeapLimitTests
         Assert.True(applied);
         Assert.Equal(0UL, requested);
         Assert.Contains(logs, l => l.Contains("disabled by SkuProfile", StringComparison.Ordinal));
+        Assert.Equal("disabled by SkuProfile", GcHeapLimit.Applied);
     }
 
     [Fact]
@@ -67,6 +68,7 @@ public class GcHeapLimitTests
         Assert.True(applied);
         Assert.Equal(5120UL * 1024 * 1024, requested);
         Assert.Contains(logs, l => l.Contains("GC heap hard limit set to 5120 MB", StringComparison.Ordinal));
+        Assert.Equal("set by SkuProfile", GcHeapLimit.Applied);
     }
 
     [Fact]

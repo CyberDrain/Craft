@@ -102,6 +102,10 @@ app.Lifetime.ApplicationStopping.Register(() => httpListener.Dispose());
 var repo = app.Services.GetRequiredService<ScriptRepository>();
 var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+// The limit is applied before the file logger exists, so its own line only reaches the console: record what took effect
+_ = app.Services.GetRequiredService<CraftSettings>();
+logger.LogInformation("[System] GC heap limit: {LimitMB} MB available to the GC ({Source})",
+    GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024), GcHeapLimit.Applied ?? "image default");
 try
 {
     using var keyTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));

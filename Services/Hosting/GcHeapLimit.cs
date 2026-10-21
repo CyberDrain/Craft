@@ -31,6 +31,12 @@ namespace Craft.Hosting;
 public static class GcHeapLimit
 {
     /// <summary>
+    /// What the last successful <see cref="Apply(SkuProfile?, Action{string}, Action{ulong}?, Func{string?}?)"/> did
+    /// ("set by SkuProfile", "disabled by CRAFT_GC_HEAP_LIMIT_MB"), or null when nothing changed the image default.
+    /// </summary>
+    public static string? Applied { get; private set; }
+
+    /// <summary>
     /// Applies a GC heap hard limit: the <c>CRAFT_GC_HEAP_LIMIT_MB</c> env override if set, otherwise
     /// <see cref="SkuProfile.GCHeapHardLimitMB"/> from the matched profile.
     /// </summary>
@@ -88,6 +94,7 @@ public static class GcHeapLimit
                 ? $"GC heap hard limit disabled by {source} — deferring to container/physical memory"
                 : $"GC heap hard limit set to {mb} MB by {source}";
             log($"[System] {what} (TotalAvailableMemory {beforeMB} MB -> {afterMB} MB)");
+            Applied = mb == 0 ? $"disabled by {source}" : $"set by {source}";
             return true;
         }
         catch (Exception ex)
