@@ -61,7 +61,7 @@ public static class PowerShellDispatchEndpoint
                 logger.LogInformation("[HTTP] {Method} /API/{Endpoint} start concurrent={Concurrent}",
                     context.Request.Method, endpoint, concurrent);
 
-                ApplyRequestedInvalidation(context, cache);
+                cache.ApplyRequestedInvalidation(context);
 
                 // Two separate gates. IsCacheableRead is about the handler — does its name promise a
                 // side-effect-free read. The policy is about this request — is caching it worthwhile
@@ -102,7 +102,7 @@ public static class PowerShellDispatchEndpoint
                 // Writes can invalidate anything, so they clear the cache regardless of endpoint name.
                 // Do this even on a client abort: a write may have partially applied before the
                 // connection dropped, so dropping the possibly-stale cache is the safe choice.
-                if (context.Request.Method != "GET") InvalidateForWrite(context, cache);
+                if (context.Request.Method != "GET") cache.InvalidateScopedOrAll(context);
 
                 // Client hung up mid-request (navigated away / hit Cancel). The pipeline was already
                 // stopped and the worker reclaimed; there is no live connection to write to, and a
@@ -152,34 +152,6 @@ public static class PowerShellDispatchEndpoint
         });
 
         return app;
-    }
-
-    /// <summary>Honours an explicit <c>?{InvalidateParam}=true</c> on the request.</summary>
-    private static void ApplyRequestedInvalidation(HttpContext context, CacheService cache)
-    {
-        if (!context.Request.Query.ContainsKey(cache.InvalidateParam)) return;
-        if (!string.Equals(context.Request.Query[cache.InvalidateParam], "true", StringComparison.OrdinalIgnoreCase))
-            return;
-
-        InvalidateScopedOrAll(context, cache);
-    }
-
-    private static void InvalidateForWrite(HttpContext context, CacheService cache) =>
-        InvalidateScopedOrAll(context, cache);
-
-    /// <summary>
-    /// Invalidates just the caller's scope when one is present, otherwise everything — without a scope
-    /// there is no way to know which entries a write affected.
-    /// </summary>
-    private static void InvalidateScopedOrAll(HttpContext context, CacheService cache)
-    {
-        var scopeParam = cache.ScopeParam;
-        var scopeValue = !string.IsNullOrEmpty(scopeParam)
-            ? context.Request.Query[scopeParam].ToString()
-            : "";
-
-        if (!string.IsNullOrEmpty(scopeValue)) cache.InvalidateByScope(scopeValue);
-        else cache.InvalidateAll();
     }
 
     private static async Task<(string? Key, CachedResponse? Response)> TryReadCacheAsync(
