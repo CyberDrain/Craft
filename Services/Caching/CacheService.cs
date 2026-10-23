@@ -182,6 +182,30 @@ public class CacheService : IDisposable
             ? el.GetString()
             : null;
 
+    /// <summary>Honours an explicit <c>?{InvalidateParam}=true</c> on the request.</summary>
+    public void ApplyRequestedInvalidation(HttpContext context)
+    {
+        if (!context.Request.Query.ContainsKey(InvalidateParam)) return;
+        if (!string.Equals(context.Request.Query[InvalidateParam], "true", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        InvalidateScopedOrAll(context);
+    }
+
+    /// <summary>
+    /// Invalidates just the caller's scope when one is present, otherwise everything — without a scope
+    /// there is no way to know which entries a write affected.
+    /// </summary>
+    public void InvalidateScopedOrAll(HttpContext context)
+    {
+        var scopeValue = !string.IsNullOrEmpty(ScopeParam)
+            ? context.Request.Query[ScopeParam].ToString()
+            : "";
+
+        if (!string.IsNullOrEmpty(scopeValue)) InvalidateByScope(scopeValue);
+        else InvalidateAll();
+    }
+
     /// <summary>
     /// Get the TTL for a given endpoint.
     /// </summary>

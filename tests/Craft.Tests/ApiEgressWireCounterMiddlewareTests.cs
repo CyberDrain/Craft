@@ -248,6 +248,29 @@ public class ApiEgressWireCounterMiddlewareTests : IDisposable
     }
 
     [Fact]
+    public async Task RecordsTheResponseContentEncoding()
+    {
+        var (ledger, store) = TableLedger();
+        var mw = WireCounter(async ctx =>
+        {
+            Flag(ctx);
+            ApiEgressWireCounterMiddleware.TagEndpoint(ctx, "ListUsers");
+            ctx.Response.Headers.ContentEncoding = "br";
+            await ctx.Response.Body.WriteAsync(new byte[40]);
+        }, ledger);
+        await mw.InvokeAsync(Context());
+        await WireCounter(async ctx =>
+        {
+            Flag(ctx);
+            ApiEgressWireCounterMiddleware.TagEndpoint(ctx, "ListUsers");
+            await ctx.Response.Body.WriteAsync(new byte[100]);
+        }, ledger).InvokeAsync(Context());
+
+        var stats = (await DailyEndpoints(ledger, store, App))["ListUsers"];
+        Assert.Equal((2L, 1L, 40L, 0L, 0L), (stats.Requests, stats.BrRequests, stats.BrBytes, stats.GzipRequests, stats.GzipBytes));
+    }
+
+    [Fact]
     public async Task InteractiveCaller_IsRecordedForReporting_ButNeverBilled()
     {
         var (ledger, store) = TableLedger();

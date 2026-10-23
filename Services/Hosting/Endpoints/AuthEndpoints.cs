@@ -15,14 +15,17 @@ namespace Craft.Hosting.Endpoints;
 public static class AuthEndpoints
 {
     /// <summary>Maps <c>/.auth/me</c> and <c>/api/me</c>.</summary>
+    /// <param name="meIsNative">
+    /// A native endpoint answers /api/me (see <see cref="MeRoute"/>), so it is not mapped here: an
+    /// application without PowerShell workers has nothing to run the PowerShell <c>me</c> function on.
+    /// </param>
     public static WebApplication MapCraftAuthEndpoints(
-        this WebApplication app, CraftSettings settings, ILogger logger)
+        this WebApplication app, CraftSettings settings, ILogger logger, bool meIsNative = false)
     {
         ArgumentNullException.ThrowIfNull(app);
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(logger);
 
-        var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
         var isDevelopment = app.Environment.IsDevelopment();
 
         // In production EasyAuth serves /.auth/me at the edge, so this handler is shadowed and only
@@ -40,11 +43,16 @@ public static class AuthEndpoints
                 : null,
         }));
 
+        if (meIsNative)
+        {
+            logger.LogInformation("[Auth] /api/me is answered by the native endpoint {Route}", MeRoute(settings));
+            return app;
+        }
+
+        var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
         app.MapGet("/api/me", async (HttpContext context) =>
         {
-            var meFunction = string.IsNullOrEmpty(settings.Auth.MeEndpointFunction)
-                ? "me"
-                : settings.Auth.MeEndpointFunction;
+            var meFunction = MeRoute(settings);
 
             var request = await PowerShellRunnerService.SnapshotRequest(context);
             var parameters = (Hashtable)request["Params"]!;
@@ -90,4 +98,11 @@ public static class AuthEndpoints
 
         return app;
     }
+
+    /// <summary>
+    /// The endpoint behind /api/me: <see cref="AuthSettings.MeEndpointFunction"/>, or "me". A native
+    /// endpoint on this route answers /api/me itself; otherwise the PowerShell function of that name does.
+    /// </summary>
+    public static string MeRoute(CraftSettings settings) =>
+        string.IsNullOrEmpty(settings.Auth.MeEndpointFunction) ? "me" : settings.Auth.MeEndpointFunction;
 }

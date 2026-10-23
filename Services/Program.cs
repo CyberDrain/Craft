@@ -102,6 +102,10 @@ app.Lifetime.ApplicationStopping.Register(() => httpListener.Dispose());
 var repo = app.Services.GetRequiredService<ScriptRepository>();
 var pool = app.Services.GetRequiredService<PowerShellWorkerPool>();
 var logger = app.Services.GetRequiredService<ILogger<Program>>();
+// The limit is applied before the file logger exists, so its own line only reaches the console: record what took effect
+_ = app.Services.GetRequiredService<CraftSettings>();
+logger.LogInformation("[System] GC heap limit: {LimitMB} MB available to the GC ({Source})",
+    GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024), GcHeapLimit.Applied ?? "image default");
 try
 {
     using var keyTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
@@ -415,6 +419,12 @@ app.MapCraftRealtimeEndpoint(roles, CraftSettings, logger);
 // the feature switch). See Services/Hosting/Endpoints/PrmEndpoint.cs.
 app.MapCraftPrmEndpoint(CraftSettings, logger);
 
+// Native endpoints that will be mapped, collisions with PowerShell routes resolved: decided here because the
+// auth routes below need to know whether one of them answers /api/me.
+var mappableNative = nativeCatalog.Endpoints.Count > 0
+    ? NativeEndpointRegistry.ResolveCollisions(nativeCatalog.Endpoints, endpoints.Keys, CraftSettings.Endpoints.OnCollision, logger)
+    : [];
+
 // ── HTTP-role endpoints + middleware ──────────────────────────────────────────────────────────────
 // A node without the Http role maps NONE of these, so /api and auth paths fall through to static serving
 // (a Frontend node can expose them from its own static dir) and finally to MapFallback (404 for /api|/.auth).
@@ -429,7 +439,8 @@ if (capHttp)
     // Normalise the EasyAuth principal into the SWA shape the hosted PS app expects, then map the two
     // auth-adjacent routes. See Services/Hosting/CraftAuthMiddleware.cs and Endpoints/AuthEndpoints.cs.
     app.UseCraftAuth(CraftSettings, authService, logger);
-    app.MapCraftAuthEndpoints(CraftSettings, logger);
+    app.MapCraftAuthEndpoints(CraftSettings, logger, mappableNative.Any(e =>
+        string.Equals(e.Route, AuthEndpoints.MeRoute(CraftSettings), StringComparison.OrdinalIgnoreCase)));
 
 } // end HTTP-role block (auth middleware). Bridges below run for any PS role; the
   // setup/jobs/PS-dispatch routes are re-gated in a second `if (capHttp)` block further down.
@@ -490,12 +501,8 @@ if (capHttp)
     // Native C# endpoints. Mapped before the PowerShell dispatcher, though ASP.NET route precedence
     // would put a literal segment ahead of /API/{endpoint} regardless — which is what lets an app
     // migrate one endpoint at a time with the PowerShell function still loaded as the rollback.
-    if (nativeCatalog.Endpoints.Count > 0)
-    {
-        var mappable = NativeEndpointRegistry.ResolveCollisions(
-            nativeCatalog.Endpoints, endpoints.Keys, CraftSettings.Endpoints.OnCollision, logger);
-        app.MapCraftNativeEndpoints(mappable, activeRequests, logger, CraftSettings.Endpoints);
-    }
+    if (mappableNative.Count > 0)
+        app.MapCraftNativeEndpoints(mappableNative, activeRequests, logger, CraftSettings.Endpoints, AuthEndpoints.MeRoute(CraftSettings));
 
     // Dispatch /API/{endpoint} to the discovered PowerShell function. Owns the response cache,
     // stale-while-revalidate, and post-response trigger handling.

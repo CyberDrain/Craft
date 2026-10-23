@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Craft.Configuration;
+using Craft.Orchestration;
 using Craft.Services;
 
 namespace Craft.Hosting;
@@ -8,7 +9,7 @@ namespace Craft.Hosting;
 /// <summary>
 /// Background service that periodically samples worker metrics and maintains
 /// a rolling history for trend visualization. Data is kept in memory and
-/// flushed to disk for persistence across container restarts.
+/// flushed to stats-history.jsonl in the log directory for persistence across container restarts.
 ///
 /// Default: 60-second sample interval, 7-day retention (~10,080 data points).
 /// </summary>
@@ -17,6 +18,8 @@ public class StatsHistoryService : BackgroundService
     private readonly ILogger<StatsHistoryService> _logger;
     private readonly CraftSettings _settings;
     private readonly string _dataFilePath;
+    private readonly JobQueueStatusReader _queueReader;
+    private readonly string _queueTelemetryPath;
 
     // Circular buffer — newest at the end
     private readonly List<StatsDataPoint> _history = new();
@@ -44,13 +47,14 @@ public class StatsHistoryService : BackgroundService
         WriteIndented = false,
     };
 
-    public StatsHistoryService(ILogger<StatsHistoryService> logger, CraftSettings settings)
+    public StatsHistoryService(ILogger<StatsHistoryService> logger, CraftSettings settings, JobQueueStatusReader queueReader)
     {
         _logger = logger;
         _settings = settings;
-
-        var dataDir = Path.Combine(AppContext.BaseDirectory, "_data");
-        _dataFilePath = Path.Combine(dataDir, "stats-history.jsonl");
+        _queueReader = queueReader;
+        // Beside egress-ledger.json: survives restarts, and external monitoring reads files there without storage access.
+        _queueTelemetryPath = Path.Combine(settings.FileLogging.ResolvedDirectory, "queue-telemetry.json");
+        _dataFilePath = Path.Combine(settings.FileLogging.ResolvedDirectory, "stats-history.jsonl");
     }
 
     public int SampleIntervalSeconds => _settings.StatsHistory.SampleIntervalSeconds;
@@ -75,8 +79,10 @@ public class StatsHistoryService : BackgroundService
             {
                 try
                 {
-                    var point = CollectSample();
+                    var snapshot = WorkerMetricsBridge.GetSnapshot();
+                    var point = CollectSample(snapshot);
                     AppendPointToDisk(point);
+                    await WriteQueueTelemetryAsync(snapshot, stoppingToken);
 
                     _ticksSinceCompact++;
                     if (_ticksSinceCompact >= CompactEveryNTicks)
@@ -102,9 +108,8 @@ public class StatsHistoryService : BackgroundService
     }
 
     /// <summary>Take a metrics snapshot and record a data point with delta computation.</summary>
-    private StatsDataPoint CollectSample()
+    private StatsDataPoint CollectSample(WorkerMetricsSnapshot snapshot)
     {
-        var snapshot = WorkerMetricsBridge.GetSnapshot();
         var now = DateTime.UtcNow;
 
         var httpPool = snapshot.HttpPool;
@@ -245,6 +250,36 @@ public class StatsHistoryService : BackgroundService
         lock (_lock)
         {
             return _history.Count;
+        }
+    }
+
+    /// <summary>
+    /// Rewrite the read-only queue telemetry file: the current pool, limiter, job and memory metrics plus every
+    /// run's queued/running/completed/failed counts. Temp file + atomic move, so a reader never sees a torn file.
+    /// </summary>
+    internal async Task WriteQueueTelemetryAsync(WorkerMetricsSnapshot snapshot, CancellationToken ct)
+    {
+        try
+        {
+            var telemetry = new
+            {
+                Version = 1,
+                UpdatedUtc = snapshot.TimestampUtc,
+                Metrics = snapshot,
+                Runs = await _queueReader.GetRunSummariesAsync(ct),
+            };
+            Directory.CreateDirectory(Path.GetDirectoryName(_queueTelemetryPath)!);
+            var tmp = _queueTelemetryPath + ".tmp";
+            await File.WriteAllTextAsync(tmp, JsonSerializer.Serialize(telemetry, s_jsonOptions), ct);
+            File.Move(tmp, _queueTelemetryPath, overwrite: true);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "[StatsHistory] Failed to write queue telemetry");
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down.
         }
     }
 

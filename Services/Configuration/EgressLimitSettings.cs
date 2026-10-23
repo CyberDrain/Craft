@@ -69,8 +69,8 @@ public class EgressLimitSettings
 
     /// <summary>
     /// Days of bucketed rows to retain in the table before a periodic purge deletes them. Default 7.
-    /// Floored at 1. Env override: <c>CRAFT_API_EGRESS_RETENTION_DAYS</c>. Does not affect the local file,
-    /// which only ever holds the current UTC day.
+    /// Floored at 1. Env override: <c>CRAFT_API_EGRESS_RETENTION_DAYS</c>. Also the number of days (today
+    /// included) the local ledger file keeps.
     /// </summary>
     public int RetentionDays { get; set; } = 7;
 

@@ -149,7 +149,7 @@ public class EgressLedgerTableTests : IDisposable
         await ledger.SyncToTableAsync(CancellationToken.None);
 
         var users = Endpoints(Row(store, App, EgressTableSchema.DailyPrefix))["ListUsers"];
-        Assert.Equal([400L, 2, 300, 1, 0, 0], users.ToArray());   // Bytes, Requests, MaxBytes, CacheHits, Errors, Shed
+        Assert.Equal([400L, 2, 300, 1, 0, 0, 0, 0, 0, 0], users.ToArray());   // Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, Br/Gzip requests+bytes
 
         var instanceDay = Endpoints(Row(store, EgressTableSchema.SystemPartition, EgressTableSchema.DailyPrefix));
         Assert.Equal(1L, instanceDay["ListUsers"].Shed);
@@ -160,6 +160,30 @@ public class EgressLedgerTableTests : IDisposable
         Assert.Equal(50L, instanceBucket["ListGraphRequest:users"].Bytes);
 
         Assert.Null(Row(store, App, EgressTableSchema.BucketPrefix)[EgressTableSchema.PropEndpoints]);
+    }
+
+    [Fact]
+    public async Task Ips_OnDailyRows_PerClient_Interactive_AndInstanceMerge_NotBuckets()
+    {
+        var store = new FakeTableStore();
+        var clock = new DateTime(2026, 9, 13, 14, 22, 0, DateTimeKind.Utc);
+        var ledger = New(store, cap: 1_000_000, () => clock);
+
+        ledger.Record(100, App, "ListUsers", ip: "203.0.113.7");
+        ledger.Record(50, App2, "ListUsers", ip: "203.0.113.7");
+        ledger.Record(25, App2, "ListUsers", ip: "198.51.100.1");
+        ledger.RecordInteractive(10, "ListLogs", ip: "192.0.2.9");
+        await ledger.SyncToTableAsync(CancellationToken.None);
+
+        Dictionary<string, EndpointStats> Ips(StoreRow row) => EgressTableSchema.ParseEndpoints(row.GetString(EgressTableSchema.PropIps));
+        Assert.Equal(100L, Ips(Row(store, App, EgressTableSchema.DailyPrefix))["203.0.113.7"].Bytes);
+        Assert.Equal(25L, Ips(Row(store, App2, EgressTableSchema.DailyPrefix))["198.51.100.1"].Bytes);
+        var instance = Ips(Row(store, EgressTableSchema.SystemPartition, EgressTableSchema.DailyPrefix));
+        Assert.Equal([150L, 2, 100, 0, 0, 0, 0, 0, 0, 0], instance["203.0.113.7"].ToArray());
+        Assert.DoesNotContain("192.0.2.9", instance.Keys);   // user traffic stays in its own partition
+        Assert.Equal(10L, Ips(Row(store, EgressTableSchema.InteractivePartition, EgressTableSchema.DailyPrefix))["192.0.2.9"].Bytes);
+        Assert.All(store.All(Table).Where(r => r.RowKey.StartsWith(EgressTableSchema.BucketPrefix, StringComparison.Ordinal)),
+            r => Assert.Null(r[EgressTableSchema.PropIps]));
     }
 
     [Fact]

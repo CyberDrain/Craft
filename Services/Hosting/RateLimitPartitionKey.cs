@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace Craft.Hosting;
 
 /// <summary>
@@ -34,13 +36,20 @@ public static class RateLimitPartitionKey
         var principal = context.Request.Headers["x-ms-client-principal-name"].ToString();
         if (!string.IsNullOrEmpty(principal)) return principal;
 
-        var forwardedFor = context.Request.Headers["X-Forwarded-For"].ToString();
-        if (!string.IsNullOrEmpty(forwardedFor))
-        {
-            var firstHop = forwardedFor.Split(',')[0].Trim();
-            if (!string.IsNullOrEmpty(firstHop)) return firstHop;
-        }
+        return ClientAddress(context) ?? "anonymous";
+    }
 
-        return context.Connection.RemoteIpAddress?.ToString() ?? "anonymous";
+    /// <summary>
+    /// The originating client address: the first <c>X-Forwarded-For</c> hop when it parses as an address
+    /// (any <c>:port</c> App Service appends dropped), else the socket peer; null when neither is known.
+    /// </summary>
+    public static string? ClientAddress(HttpContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        var firstHop = context.Request.Headers["X-Forwarded-For"].ToString().Split(',')[0].Trim();
+        if (IPEndPoint.TryParse(firstHop, out var forwarded)) return forwarded.Address.ToString();
+
+        return context.Connection.RemoteIpAddress?.ToString();
     }
 }

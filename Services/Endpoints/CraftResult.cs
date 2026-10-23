@@ -2,6 +2,7 @@ using System.IO.Pipelines;
 using System.Text;
 using System.Text.Json;
 using Craft.Hosting;
+using Craft.Services;
 
 namespace Craft.Endpoints;
 
@@ -104,6 +105,25 @@ public readonly struct CraftResult
     /// closed result set cannot express — server-sent events, a custom protocol, direct BodyWriter use.
     /// </summary>
     public static CraftResult Handled { get; } = new(Kind.Handled, 0, null, null);
+
+    /// <summary>
+    /// This result as the response cache stores it, or null when it can't be: only a JSON body with a 2xx or 3xx
+    /// status, as the PowerShell path caches. Bytes, streams and endpoint-written responses are never cached.
+    /// </summary>
+    internal ScriptResult? ToCacheable() =>
+        _kind == Kind.Json && StatusCode is >= 200 and < 400
+            ? new ScriptResult
+            {
+                StatusCode = StatusCode,
+                Body = _text ?? "null",
+                ContentType = ContentType,
+                Headers = Headers?.ToDictionary(h => h.Key, h => h.Value),
+            }
+            : null;
+
+    /// <summary>A cached response, written back exactly as it was stored.</summary>
+    internal static CraftResult FromCached(ScriptResult cached) =>
+        new(Kind.Json, cached.StatusCode, cached.ContentType ?? "application/json", cached.Headers, text: cached.Body);
 
     /// <summary>Writes this result to the response.</summary>
     internal async Task WriteAsync(HttpContext context, CancellationToken ct)

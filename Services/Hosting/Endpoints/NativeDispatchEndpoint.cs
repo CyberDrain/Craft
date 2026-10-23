@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using Craft.Caching;
 using Craft.Configuration;
 using Craft.Endpoints;
 
@@ -29,7 +30,8 @@ public static class NativeDispatchEndpoint
         IReadOnlyList<NativeEndpointDescriptor> endpoints,
         RequestCounter activeRequests,
         ILogger logger,
-        EndpointSettings? settings = null)
+        EndpointSettings? settings = null,
+        string? meRoute = null)
     {
         ArgumentNullException.ThrowIfNull(app);
         ArgumentNullException.ThrowIfNull(endpoints);
@@ -42,6 +44,7 @@ public static class NativeDispatchEndpoint
         // startup-time fact — resolve it once here rather than per request.
         var handler = app.Services.GetService<ICraftEndpointHandler>();
         EnsureHandlerRequirement(settings, handler is not null, endpoints);
+        var cache = app.Services.GetService<CacheService>();
 
         if (handler is not null)
         {
@@ -90,7 +93,14 @@ public static class NativeDispatchEndpoint
             }
 
             app.MapMethods(path, descriptor.Metadata.Methods,
-                (HttpContext context) => Handle(context, descriptor, handler, activeRequests, logger));
+                (HttpContext context) => Handle(context, descriptor, handler, cache, activeRequests, logger));
+
+            // The SPA asks /api/me who is signed in; an endpoint on the configured route answers it,
+            // through the same gate, filters and central handler as its own path (which for a route
+            // named "me" already is /api/me: routes ignore case, so mapping it twice would be ambiguous)
+            if (string.Equals(descriptor.Route, meRoute, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(path, "/api/me", StringComparison.OrdinalIgnoreCase))
+                app.MapGet("/api/me", (HttpContext context) => Handle(context, descriptor, handler, cache, activeRequests, logger));
         }
 
         if (endpoints.Count > 0)
@@ -136,18 +146,107 @@ public static class NativeDispatchEndpoint
         CraftRequest request,
         ICraftEndpoint endpoint,
         ICraftEndpointHandler? handler,
+        CancellationToken ct) =>
+        ExecuteAsync(request, () => endpoint.HandleAsync(request, ct), handler, ct);
+
+    /// <summary>As above, with <paramref name="invokeEndpoint"/> standing in for the endpoint (the response cache).</summary>
+    internal static ValueTask<CraftResult> ExecuteAsync(
+        CraftRequest request,
+        CraftEndpointNext invokeEndpoint,
+        ICraftEndpointHandler? handler,
         CancellationToken ct)
     {
         if (handler is null || request.Endpoint.Dispatch != EndpointDispatch.Central)
-            return endpoint.HandleAsync(request, ct);
+            return invokeEndpoint();
 
-        return handler.HandleAsync(request, () => endpoint.HandleAsync(request, ct), ct);
+        return handler.HandleAsync(request, invokeEndpoint, ct);
+    }
+
+    /// <summary>Whether this request's response may come from, and go into, the response cache.</summary>
+    internal static bool IsCacheable(NativeEndpointDescriptor descriptor, string method) =>
+        HttpMethods.IsGet(method) && descriptor.Metadata.Caching switch
+        {
+            EndpointCaching.Cached => true,
+            EndpointCaching.Uncached => false,
+            _ => descriptor.Route.StartsWith("List", StringComparison.OrdinalIgnoreCase),
+        };
+
+    /// <summary>
+    /// The endpoint's result through the cache: a hit is served as stored and refreshed in the background (the
+    /// PowerShell path's stale-while-revalidate); a miss runs the endpoint and stores a cacheable result.
+    /// </summary>
+    private static async ValueTask<CraftResult> FromCacheAsync(
+        HttpContext context, CraftRequest request, ICraftEndpoint endpoint, NativeEndpointDescriptor descriptor,
+        ICraftEndpointHandler? handler, CacheService cache, ILogger logger, CancellationToken ct)
+    {
+        var key = cache.BuildCacheKey(descriptor.Route, context.Request.Query, CacheService.GetUserKey(context));
+        if (await cache.Get(key, descriptor.Route) is { } hit)
+        {
+            cache.Touch(key);
+            context.Response.Headers["X-Cache"] = hit.IsStale ? "HIT-STALE" : "HIT";
+            context.Response.Headers["X-Cache-Age"] = $"{hit.Age.TotalSeconds:F0}s";
+            context.Response.Headers["X-Cache-TTL"] = $"{cache.GetTtl(descriptor.Route).TotalSeconds:F0}s";
+            if (cache.TryStartRefresh(key)) StartBackgroundRefresh(context, descriptor, handler, cache, key, logger);
+            return CraftResult.FromCached(hit.Result);
+        }
+
+        var result = await endpoint.HandleAsync(request, ct);
+        if (!ct.IsCancellationRequested && result.ToCacheable() is { } cacheable) await cache.Set(key, cacheable);
+        context.Response.Headers["X-Cache"] = "MISS";
+        return result;
+    }
+
+    /// <summary>
+    /// Re-runs the request off the request path and replaces the entry. Rebuilt from a snapshot in a scope of its own
+    /// (the caller's context is gone by then), and back through the central handler, so a caller who has since lost
+    /// access refreshes nothing.
+    /// </summary>
+    private static void StartBackgroundRefresh(
+        HttpContext context, NativeEndpointDescriptor descriptor, ICraftEndpointHandler? handler,
+        CacheService cache, string key, ILogger logger)
+    {
+        var scopes = context.RequestServices.GetRequiredService<IServiceScopeFactory>();
+        var path = context.Request.Path;
+        var query = context.Request.QueryString;
+        var headers = context.Request.Headers.ToDictionary(h => h.Key, h => h.Value, StringComparer.OrdinalIgnoreCase);
+        var user = context.User;
+        var generation = cache.Generation;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await cache.WaitForBgRefreshSlot(descriptor.Route);
+                await using var scope = scopes.CreateAsyncScope();
+                var replay = new DefaultHttpContext { RequestServices = scope.ServiceProvider, User = user };
+                replay.Request.Method = HttpMethods.Get;
+                replay.Request.Path = path;
+                replay.Request.QueryString = query;
+                foreach (var (name, value) in headers) replay.Request.Headers[name] = value;
+
+                var endpoint = (ICraftEndpoint)scope.ServiceProvider.GetRequiredService(descriptor.ImplementationType);
+                var request = new CraftRequest(replay, descriptor.Route, descriptor.Metadata);
+                var fresh = await ExecuteAsync(request, () => endpoint.HandleAsync(request, CancellationToken.None), handler, CancellationToken.None);
+                // An invalidation may have landed meanwhile, and writing back would undo it
+                if (fresh.ToCacheable() is { } cacheable) cache.SetIfSameGeneration(key, cacheable, generation);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Background refresh failed: /API/{Endpoint}", descriptor.Route);
+            }
+            finally
+            {
+                cache.ReleaseBgRefreshSlot(descriptor.Route);
+                cache.FinishRefresh(key);
+            }
+        });
     }
 
     private static async Task Handle(
         HttpContext context,
         NativeEndpointDescriptor descriptor,
         ICraftEndpointHandler? handler,
+        CacheService? cache,
         RequestCounter activeRequests,
         ILogger logger)
     {
@@ -198,7 +297,24 @@ public static class NativeDispatchEndpoint
                 }
             }
 
-            var result = await ExecuteAsync(request, endpoint, handler, ct);
+            // As on the PowerShell path: any write can change what any read returns
+            if (cache is not null)
+            {
+                cache.ApplyRequestedInvalidation(context);
+                if (!HttpMethods.IsGet(context.Request.Method)) cache.InvalidateScopedOrAll(context);
+            }
+
+            string? bypass = null;
+            var useCache = cache is not null && IsCacheable(descriptor, context.Request.Method)
+                && cache.Policy.Allows(descriptor.Route, context.Request, out bypass);
+            if (bypass is not null) context.Response.Headers["X-Cache-Bypass"] = bypass;
+
+            // The cache stands in for the endpoint only, so filters and the central handler still run on a hit
+            var result = await ExecuteAsync(request,
+                useCache
+                    ? () => FromCacheAsync(context, request, endpoint, descriptor, handler, cache!, logger, ct)
+                    : () => endpoint.HandleAsync(request, ct),
+                handler, ct);
             await result.WriteAsync(context, ct);
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)

@@ -78,9 +78,9 @@ public sealed class ApiEgressWireCounterMiddleware
         {
             context.Response.Body = original;
             if (context.Items.TryGetValue(ChargeItemKey, out var charge) && charge is string appId && appId.Length > 0)
-                _ledger.Record(counting.BytesWritten, appId, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode);
+                _ledger.Record(counting.BytesWritten, appId, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode, RateLimitPartitionKey.ClientAddress(context), context.Response.Headers.ContentEncoding.ToString());
             else if (context.Items.ContainsKey(InteractiveItemKey))
-                _ledger.RecordInteractive(counting.BytesWritten, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode);
+                _ledger.RecordInteractive(counting.BytesWritten, ResolveEndpoint(context), IsCacheHit(context), context.Response.StatusCode, RateLimitPartitionKey.ClientAddress(context), context.Response.Headers.ContentEncoding.ToString());
         }
     }
 

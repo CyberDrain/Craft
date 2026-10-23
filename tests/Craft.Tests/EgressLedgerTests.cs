@@ -249,6 +249,98 @@ public class EgressLedgerTests : IDisposable
         Assert.Equal(0L, ledger.CurrentBytes);   // a corrupt/negative total can't unlock a false budget
     }
 
+    // ── Caller addresses + finished-day history (v4) ───────────────────────────────────────────────
+
+    [Fact]
+    public void Record_TracksCallerAddresses_PerClient_InFile()
+    {
+        var ledger = New(cap: 0);
+        ledger.Record(100, App, "ListUsers", ip: "203.0.113.7", encoding: "br");
+        ledger.Record(50, App, "ListUsers", ip: "203.0.113.7", encoding: "gzip");
+        ledger.Record(25, App, "ListUsers", ip: "198.51.100.1");
+        ledger.RecordShed(App, "ListUsers", ip: "203.0.113.7");
+        ledger.RecordInteractive(10, "ListLogs", ip: "192.0.2.9");
+        ledger.Flush();
+
+        var root = ReadFile().RootElement;
+        Assert.Equal(4, root.GetProperty("version").GetInt32());
+        var ips = root.GetProperty("clients").GetProperty(App).GetProperty("ips");
+        // [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, BrRequests, BrBytes, GzipRequests, GzipBytes]
+        Assert.Equal([150L, 2L, 100L, 0L, 0L, 1L, 1L, 100L, 1L, 50L], ips.GetProperty("203.0.113.7").EnumerateArray().Select(v => v.GetInt64()));
+        Assert.Equal(25L, ips.GetProperty("198.51.100.1")[0].GetInt64());
+        Assert.Equal(10L, root.GetProperty("interactive").GetProperty("ips").GetProperty("192.0.2.9")[0].GetInt64());
+    }
+
+    [Fact]
+    public void CallerAddresses_RestoredAcrossRestart_SameDay()
+    {
+        var clock = new DateTime(2026, 9, 11, 6, 0, 0, DateTimeKind.Utc);
+        var first = New(cap: 0, () => clock);
+        first.Record(100, App, ip: "203.0.113.7");
+        first.Flush();
+
+        var restarted = New(cap: 0, () => clock);
+        restarted.Record(1, App, ip: "203.0.113.7");
+        restarted.Flush();
+        Assert.Equal(101L, ReadFile().RootElement.GetProperty("clients").GetProperty(App).GetProperty("ips").GetProperty("203.0.113.7")[0].GetInt64());
+    }
+
+    [Fact]
+    public void Rollover_KeepsFinishedDays_NewestFirst_WithinRetention()
+    {
+        var clock = new DateTime(2026, 9, 1, 12, 0, 0, DateTimeKind.Utc);
+        var ledger = New(cap: 0, () => clock);
+        for (var day = 1; day <= 10; day++)
+        {
+            ledger.Record(day, App, ip: "203.0.113.7");
+            ledger.Flush();
+            if (day < 10) clock = clock.AddDays(1);
+        }
+
+        var root = ReadFile().RootElement;
+        Assert.Equal("2026-09-10", root.GetProperty("dateUtc").GetString());
+        Assert.Equal(10L, root.GetProperty("bytes").GetInt64());
+        var days = root.GetProperty("days").EnumerateArray().ToList();
+        // 7-day retention = today + six finished days.
+        Assert.Equal(["2026-09-09", "2026-09-08", "2026-09-07", "2026-09-06", "2026-09-05", "2026-09-04"],
+            days.Select(d => d.GetProperty("dateUtc").GetString()));
+        Assert.Equal(9L, days[0].GetProperty("bytes").GetInt64());
+        Assert.Equal(9L, days[0].GetProperty("clients").GetProperty(App).GetProperty("ips").GetProperty("203.0.113.7")[0].GetInt64());
+        Assert.All(days, d => Assert.False(d.TryGetProperty("days", out var nested) && nested.ValueKind != JsonValueKind.Null));
+    }
+
+    [Fact]
+    public void Reload_OnNewUtcDay_MovesStoredDayIntoHistory()
+    {
+        var day1 = new DateTime(2026, 9, 11, 6, 0, 0, DateTimeKind.Utc);
+        var first = New(cap: 0, () => day1);
+        first.Record(1234, App);
+        first.Flush();
+
+        var restarted = New(cap: 0, () => day1.AddDays(2));   // down over a whole day
+        Assert.Equal(0L, restarted.CurrentBytes);
+        restarted.Flush();                                     // the reload alone makes the file worth rewriting
+
+        var root = ReadFile().RootElement;
+        Assert.Equal("2026-09-13", root.GetProperty("dateUtc").GetString());
+        var stored = Assert.Single(root.GetProperty("days").EnumerateArray());
+        Assert.Equal("2026-09-11", stored.GetProperty("dateUtc").GetString());
+        Assert.Equal(1234L, stored.GetProperty("bytes").GetInt64());
+    }
+
+    [Fact]
+    public void Reload_DropsHistoryPastRetention()
+    {
+        var day1 = new DateTime(2026, 9, 1, 6, 0, 0, DateTimeKind.Utc);
+        var first = New(cap: 0, () => day1);
+        first.Record(1, App);
+        first.Flush();
+
+        var restarted = New(cap: 0, () => day1.AddDays(7));   // day1 is now outside today + six days
+        restarted.Flush();
+        Assert.Empty(ReadFile().RootElement.GetProperty("days").EnumerateArray());
+    }
+
     // ── Thread-safety + hosted-service lifecycle ────────────────────────────────────────────────────
 
     [Fact]

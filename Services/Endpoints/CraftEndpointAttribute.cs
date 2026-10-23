@@ -24,6 +24,25 @@ public enum EndpointDispatch
 }
 
 /// <summary>
+/// Whether a native endpoint's GET responses go through the response cache (<c>App:Cache</c>).
+/// </summary>
+public enum EndpointCaching
+{
+    /// <summary>
+    /// The PowerShell path's rule: GETs to a route named <c>List…</c> are cached, the name being the
+    /// endpoint's promise that it is a side-effect-free read. The default, so native and PowerShell
+    /// endpoints of the same name cache alike.
+    /// </summary>
+    Convention,
+
+    /// <summary>Every GET is cached, whatever the route is called — a read that isn't named List….</summary>
+    Cached,
+
+    /// <summary>Never cached: a read whose answer must be live (a status view, a log tail).</summary>
+    Uncached,
+}
+
+/// <summary>
 /// Marks a class as a native endpoint and declares its route and metadata. The C# counterpart of the
 /// PowerShell convention where <c>Invoke-GetIPInfo</c> becomes <c>/API/GetIPInfo</c> and the
 /// <c>.ROLE</c> / <c>.FUNCTIONALITY</c> doc tags feed the permission map.
@@ -87,4 +106,11 @@ public sealed class CraftEndpointAttribute : Attribute
     /// unaffected until they ship one.
     /// </summary>
     public EndpointDispatch Dispatch { get; init; } = EndpointDispatch.Central;
+
+    /// <summary>
+    /// Whether this endpoint's GET responses are cached. Defaults to <see cref="EndpointCaching.Convention"/>
+    /// (GETs to List… routes), as the PowerShell path does; <c>App:Cache:ExcludedEndpoints</c> and the rest of
+    /// the cache policy still apply on top of it.
+    /// </summary>
+    public EndpointCaching Caching { get; init; } = EndpointCaching.Convention;
 }

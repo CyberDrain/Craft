@@ -108,10 +108,11 @@
     //   //      so you can run accounting-only first and watch real numbers before rejecting anything.
     //   // The counter lives in memory (no per-request IO) and is flushed to egress-ledger.json in the same
     //   // directory as the log files every FlushSeconds and on shutdown, so a restart doesn't reset the day.
-    //   // The file holds per-client daily totals + the cap-hit state (the source of truth for the cap).
+    //   // The file holds per-client daily totals (per endpoint and per caller IP) + the cap-hit state (the
+    //   // source of truth for the cap), plus the finished days within RetentionDays under "days".
     //   // In addition, per-client + instance rows are mirrored to the TableName table — 15-minute buckets
     //   // (the time-series) and a daily audit row (cap in force, when the cap was first hit, how many
-    //   // requests were shed) — so the product can chart usage and show cap hits. The table is the same
+    //   // requests were shed, top endpoints and caller IPs) — so the product can chart usage and show cap hits. The table is the same
     //   // storage account the hosted app reads with Get-CIPPTable, retained RetentionDays and purged
     //   // periodically. A restart reseeds the current bucket from the table so its row doesn't regress.
     //   // Env overrides: CRAFT_API_EGRESS_LIMIT_BYTES, CRAFT_API_EGRESS_FLUSH_SECONDS, CRAFT_API_EGRESS_TABLE
@@ -122,7 +123,7 @@
     //     "FlushSeconds": 60,         // how often the counter is written to disk + mirrored to the table (also on shutdown)
     //     "TableName": "CraftEgressAccounting", // table for the bucketed history + daily audit ("" = file only)
     //     "BucketMinutes": 15,        // width of each history bucket (→ 96 buckets/day)
-    //     "RetentionDays": 7          // days of table rows kept before the periodic purge
+    //     "RetentionDays": 7          // days of table rows (and of file history, today included) kept
     //   }
     // },
 
