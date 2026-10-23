@@ -137,7 +137,7 @@ public sealed class EgressLedger : BackgroundService
 
     /// <summary>Add the outbound bytes of one API-client response to today's running totals, attributed to
     /// the client and, in its daily and the instance bucket breakdowns, to <paramref name="endpoint"/>.</summary>
-    public void Record(long bytes, string appId, string? endpoint = null, bool cacheHit = false, int statusCode = 200, string? ip = null)
+    public void Record(long bytes, string appId, string? endpoint = null, bool cacheHit = false, int statusCode = 200, string? ip = null, string? encoding = null)
     {
         if (bytes <= 0) return;
         appId = Normalize(appId);
@@ -150,15 +150,15 @@ public sealed class EgressLedger : BackgroundService
             client.Bytes += bytes;
             client.Requests += 1;
             client.LastSeenUtc = _utcNow();
-            EndpointStats.In(client.Endpoints, label).Add(bytes, cacheHit, statusCode);
-            if (!string.IsNullOrEmpty(ip)) EndpointStats.In(client.Ips, ip).Add(bytes, cacheHit, statusCode);
+            EndpointStats.In(client.Endpoints, label).Add(bytes, cacheHit, statusCode, encoding);
+            if (!string.IsNullOrEmpty(ip)) EndpointStats.In(client.Ips, ip).Add(bytes, cacheHit, statusCode, encoding);
             var bucket = Bucket(appId);
             bucket.Bytes += bytes;
             bucket.Requests += 1;
             var system = Bucket(EgressTableSchema.SystemPartition);
             system.Bytes += bytes;
             system.Requests += 1;
-            EndpointStats.In(system.Endpoints, label).Add(bytes, cacheHit, statusCode);
+            EndpointStats.In(system.Endpoints, label).Add(bytes, cacheHit, statusCode, encoding);
             _dirty = true;
             _tableDirty = true;
         }
@@ -166,7 +166,7 @@ public sealed class EgressLedger : BackgroundService
 
     /// <summary>Add the outbound bytes of one interactive (user) response. Reported under
     /// <see cref="EgressTableSchema.InteractivePartition"/>; never counts toward the cap.</summary>
-    public void RecordInteractive(long bytes, string? endpoint = null, bool cacheHit = false, int statusCode = 200, string? ip = null)
+    public void RecordInteractive(long bytes, string? endpoint = null, bool cacheHit = false, int statusCode = 200, string? ip = null, string? encoding = null)
     {
         if (bytes <= 0) return;
         var label = EgressTableSchema.EndpointLabel(endpoint);
@@ -176,12 +176,12 @@ public sealed class EgressLedger : BackgroundService
             _interactive.Bytes += bytes;
             _interactive.Requests += 1;
             _interactive.LastSeenUtc = _utcNow();
-            EndpointStats.In(_interactive.Endpoints, label).Add(bytes, cacheHit, statusCode);
-            if (!string.IsNullOrEmpty(ip)) EndpointStats.In(_interactive.Ips, ip).Add(bytes, cacheHit, statusCode);
+            EndpointStats.In(_interactive.Endpoints, label).Add(bytes, cacheHit, statusCode, encoding);
+            if (!string.IsNullOrEmpty(ip)) EndpointStats.In(_interactive.Ips, ip).Add(bytes, cacheHit, statusCode, encoding);
             var bucket = Bucket(EgressTableSchema.InteractivePartition);
             bucket.Bytes += bytes;
             bucket.Requests += 1;
-            EndpointStats.In(bucket.Endpoints, label).Add(bytes, cacheHit, statusCode);
+            EndpointStats.In(bucket.Endpoints, label).Add(bytes, cacheHit, statusCode, encoding);
             _dirty = true;
             _tableDirty = true;
         }
@@ -624,7 +624,7 @@ public sealed class EgressLedger : BackgroundService
         public long Requests { get; set; }
         public long Shed { get; set; }
         public DateTime LastSeenUtc { get; set; }
-        // Same [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed] layout as the table column.
+        // Same layout as the table column (EgressTableSchema.PropEndpoints).
         public Dictionary<string, long[]>? Endpoints { get; set; }
         // Same layout, keyed by the caller's address (v4+).
         public Dictionary<string, long[]>? Ips { get; set; }

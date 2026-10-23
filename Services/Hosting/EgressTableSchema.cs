@@ -50,7 +50,8 @@ internal static class EgressTableSchema
     public const string PropCapReachedUtc = "CapReachedUtc";
     public const string PropEnforcing = "Enforcing";
     public const string PropAppId = "AppId";
-    // JSON object of endpoint label -> [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed]. Arrays rather
+    // JSON object of endpoint label -> [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, BrRequests, BrBytes,
+    // GzipRequests, GzipBytes]; uncompressed is the remainder. Arrays rather
     // than named fields keep a full map under the 32K-char property limit; CIPP can't reassemble Craft splits.
     public const string PropEndpoints = "Endpoints";
     // Same layout as Endpoints, keyed by caller IP. Daily rows only.
@@ -195,15 +196,17 @@ internal static class EgressTableSchema
 /// <summary>Per-endpoint counters within one client-day or one bucket.</summary>
 internal sealed class EndpointStats
 {
-    public long Bytes, Requests, MaxBytes, CacheHits, Errors, Shed;
+    public long Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, BrRequests, BrBytes, GzipRequests, GzipBytes;
 
-    public void Add(long bytes, bool cacheHit, int statusCode)
+    public void Add(long bytes, bool cacheHit, int statusCode, string? encoding = null)
     {
         Bytes += bytes;
         Requests += 1;
         if (bytes > MaxBytes) MaxBytes = bytes;
         if (cacheHit) CacheHits += 1;
         if (statusCode >= 400) Errors += 1;
+        if (encoding == "br") { BrRequests += 1; BrBytes += bytes; }
+        else if (encoding == "gzip") { GzipRequests += 1; GzipBytes += bytes; }
     }
 
     public void Merge(EndpointStats other)
@@ -214,6 +217,10 @@ internal sealed class EndpointStats
         CacheHits += other.CacheHits;
         Errors += other.Errors;
         Shed += other.Shed;
+        BrRequests += other.BrRequests;
+        BrBytes += other.BrBytes;
+        GzipRequests += other.GzipRequests;
+        GzipBytes += other.GzipBytes;
     }
 
     public EndpointStats Clone() => (EndpointStats)MemberwiseClone();
@@ -231,11 +238,23 @@ internal sealed class EndpointStats
     public static Dictionary<string, EndpointStats> CloneMap(Dictionary<string, EndpointStats> map) =>
         map.ToDictionary(kv => kv.Key, kv => kv.Value.Clone(), StringComparer.OrdinalIgnoreCase);
 
-    public long[] ToArray() => [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed];
+    public long[] ToArray() => [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, BrRequests, BrBytes, GzipRequests, GzipBytes];
 
     public static EndpointStats FromArray(long[]? v)
     {
         long At(int i) => v is not null && i < v.Length ? v[i] : 0;
-        return new EndpointStats { Bytes = At(0), Requests = At(1), MaxBytes = At(2), CacheHits = At(3), Errors = At(4), Shed = At(5) };
+        return new EndpointStats
+        {
+            Bytes = At(0),
+            Requests = At(1),
+            MaxBytes = At(2),
+            CacheHits = At(3),
+            Errors = At(4),
+            Shed = At(5),
+            BrRequests = At(6),
+            BrBytes = At(7),
+            GzipRequests = At(8),
+            GzipBytes = At(9)
+        };
     }
 }

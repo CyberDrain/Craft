@@ -255,8 +255,8 @@ public class EgressLedgerTests : IDisposable
     public void Record_TracksCallerAddresses_PerClient_InFile()
     {
         var ledger = New(cap: 0);
-        ledger.Record(100, App, "ListUsers", ip: "203.0.113.7");
-        ledger.Record(50, App, "ListUsers", ip: "203.0.113.7");
+        ledger.Record(100, App, "ListUsers", ip: "203.0.113.7", encoding: "br");
+        ledger.Record(50, App, "ListUsers", ip: "203.0.113.7", encoding: "gzip");
         ledger.Record(25, App, "ListUsers", ip: "198.51.100.1");
         ledger.RecordShed(App, "ListUsers", ip: "203.0.113.7");
         ledger.RecordInteractive(10, "ListLogs", ip: "192.0.2.9");
@@ -265,8 +265,8 @@ public class EgressLedgerTests : IDisposable
         var root = ReadFile().RootElement;
         Assert.Equal(4, root.GetProperty("version").GetInt32());
         var ips = root.GetProperty("clients").GetProperty(App).GetProperty("ips");
-        // [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed]
-        Assert.Equal([150L, 2L, 100L, 0L, 0L, 1L], ips.GetProperty("203.0.113.7").EnumerateArray().Select(v => v.GetInt64()));
+        // [Bytes, Requests, MaxBytes, CacheHits, Errors, Shed, BrRequests, BrBytes, GzipRequests, GzipBytes]
+        Assert.Equal([150L, 2L, 100L, 0L, 0L, 1L, 1L, 100L, 1L, 50L], ips.GetProperty("203.0.113.7").EnumerateArray().Select(v => v.GetInt64()));
         Assert.Equal(25L, ips.GetProperty("198.51.100.1")[0].GetInt64());
         Assert.Equal(10L, root.GetProperty("interactive").GetProperty("ips").GetProperty("192.0.2.9")[0].GetInt64());
     }
