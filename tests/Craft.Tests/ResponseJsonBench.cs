@@ -64,17 +64,17 @@ public class ResponseJsonBench
                     var sampler = new Thread(() => { while (!stop.IsCancellationRequested) { peak = Math.Max(peak, GC.GetTotalMemory(false)); Thread.Sleep(2); } }) { IsBackground = true };
                     sampler.Start();
                     var sw = Stopwatch.StartNew();
-                    string? text = null;
+                    object? output = null;
                     switch (variant)
                     {
-                        case "old": text = PowerShellRunnerService.ConvertPsObjectToJson(body); break;
-                        case "new": text = PsJsonWriter.TrySerialize(body, s_options); break;
+                        case "old": output = PowerShellRunnerService.ConvertPsObjectToJson(body); break;
+                        case "new": output = PsJsonWriter.TrySerialize(body, s_options); break;
                     }
                     sw.Stop();
                     stop.Cancel(); sampler.Join();
                     peak = Math.Max(peak, GC.GetTotalMemory(false));
                     var alloc = GC.GetTotalAllocatedBytes(true) - alloc0;
-                    text ??= "";
+                    var text = output switch { string t => t, byte[] b => Encoding.UTF8.GetString(b), _ => "" };
                     reference ??= text;
                     if (run > 0) samples.Add((sw.Elapsed.TotalMilliseconds, alloc / 1048576.0, (peak - baseline) / 1048576.0, Encoding.UTF8.GetByteCount(text), string.Equals(text, reference, StringComparison.Ordinal)));
                     GC.KeepAlive(results);

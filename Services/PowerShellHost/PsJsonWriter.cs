@@ -4,7 +4,6 @@ using System.Collections.ObjectModel;
 using System.Linq.Expressions;
 using System.Management.Automation;
 using System.Reflection;
-using System.Text;
 using System.Text.Json;
 
 namespace Craft.Services;
@@ -16,9 +15,9 @@ namespace Craft.Services;
 /// </summary>
 internal static class PsJsonWriter
 {
-    /// <summary>The JSON text, or null when the body has a shape this writer does not reproduce exactly (the caller
+    /// <summary>The UTF-8 JSON, or null when the body has a shape this writer does not reproduce exactly (the caller
     /// then serializes it the old way) or serializing failed (the old way fails the same).</summary>
-    internal static string? TrySerialize(object? obj, JsonSerializerOptions options)
+    internal static byte[]? TrySerialize(object? obj, JsonSerializerOptions options)
     {
         using var buffer = new ChunkWriter();
         try
@@ -30,12 +29,12 @@ internal static class PsJsonWriter
         {
             return null;
         }
-        return buffer.Decode();
+        return buffer.ToArray();
     }
 
     /// <summary>
     /// Pooled 1 MB chunks. A doubling buffer holds up to twice the output, and both old and new arrays while it
-    /// grows, on top of the final string.
+    /// grows, on top of the final array.
     /// </summary>
     private sealed class ChunkWriter : IBufferWriter<byte>, IDisposable
     {
@@ -58,19 +57,15 @@ internal static class PsJsonWriter
             _used = 0;
         }
 
-        public string Decode()
+        public byte[] ToArray()
         {
-            var decoder = Encoding.UTF8.GetDecoder();
-            var length = 0;
-            foreach (var (array, used) in _full) length += decoder.GetCharCount(array.AsSpan(0, used), flush: false);
-            length += decoder.GetCharCount(_current.AsSpan(0, _used), flush: true);
-            return string.Create(length, this, static (chars, self) =>
-            {
-                var decoder = Encoding.UTF8.GetDecoder();
-                var at = 0;
-                foreach (var (array, used) in self._full) at += decoder.GetChars(array.AsSpan(0, used), chars[at..], flush: false);
-                decoder.GetChars(self._current.AsSpan(0, self._used), chars[at..], flush: true);
-            });
+            var length = _used;
+            foreach (var (_, used) in _full) length += used;
+            var bytes = GC.AllocateUninitializedArray<byte>(length);
+            var at = 0;
+            foreach (var (array, used) in _full) { array.AsSpan(0, used).CopyTo(bytes.AsSpan(at)); at += used; }
+            _current.AsSpan(0, _used).CopyTo(bytes.AsSpan(at));
+            return bytes;
         }
 
         public void Dispose()

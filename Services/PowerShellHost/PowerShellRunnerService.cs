@@ -4,6 +4,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Management.Automation;
+using System.Text;
 using System.Text.Json;
 using Craft.Configuration;
 using Craft.Hosting;
@@ -934,7 +935,6 @@ public class PowerShellRunnerService : IDisposable
                     return new ScriptResult
                     {
                         StatusCode = statusCode ?? 200,
-                        Body = string.Empty,
                         BodyBytes = bodyBytes,
                         Headers = HandlerHeaders.FromPowerShell(AsDictionary(headers)),
                         ContentType = string.IsNullOrWhiteSpace(declaredType)
@@ -958,37 +958,39 @@ public class PowerShellRunnerService : IDisposable
                     };
                 }
 
-                string jsonBody;
+                byte[] jsonBody;
                 if (body is string strBody)
                 {
+                    jsonBody = Encoding.UTF8.GetBytes(strBody);
                     try
                     {
-                        using var doc = JsonDocument.Parse(strBody);
-                        jsonBody = strBody;
+                        using var doc = JsonDocument.Parse(jsonBody);
                     }
                     catch
                     {
-                        jsonBody = JsonSerializer.Serialize(body, s_jsonOptions);
+                        jsonBody = JsonSerializer.SerializeToUtf8Bytes(body, s_jsonOptions);
                     }
                 }
                 else
                 {
-                    jsonBody = PsJsonWriter.TrySerialize(body, s_jsonOptions) ?? ConvertPsObjectToJson(body);
+                    jsonBody = PsJsonWriter.TrySerialize(body, s_jsonOptions) ?? Encoding.UTF8.GetBytes(ConvertPsObjectToJson(body));
                 }
                 return new ScriptResult
                 {
                     StatusCode = statusCode ?? 200,
-                    Body = jsonBody,
+                    BodyBytes = jsonBody,
                     Headers = HandlerHeaders.FromPowerShell(AsDictionary(headers)),
                     ContentType = Unwrap(contentType) as string,
                 };
             }
         }
 
-        var fallbackBody = results.Count > 0
-            ? PsJsonWriter.TrySerialize(results.Last().BaseObject, s_jsonOptions) ?? ConvertPsObjectToJson(results.Last().BaseObject)
-            : "{}";
-        return new ScriptResult { StatusCode = 200, Body = fallbackBody };
+        var last = results.Last().BaseObject;
+        return new ScriptResult
+        {
+            StatusCode = 200,
+            BodyBytes = PsJsonWriter.TrySerialize(last, s_jsonOptions) ?? Encoding.UTF8.GetBytes(ConvertPsObjectToJson(last)),
+        };
     }
 
     /// <summary>

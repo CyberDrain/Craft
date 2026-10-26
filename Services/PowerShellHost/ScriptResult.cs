@@ -4,20 +4,26 @@
 // Renaming the namespace compiles fine and then fails at runtime in the hosted app
 // ("Unable to find type"). Type forwarding cannot help — it only works across assemblies.
 // The folder is free to move; the namespace is a published contract.
+using System.Text;
+
 namespace Craft.Services;
 
 public class ScriptResult
 {
     public int StatusCode { get; set; } = 200;
-    public string Body { get; set; } = "{}";
 
     /// <summary>
-    /// Raw response bytes for a handler that returned a <c>byte[]</c> body (e.g. an image).
-    /// When set, <see cref="Body"/> is empty and the response writer must send these bytes
-    /// unserialized — pushing them through the JSON path is how images came back as
-    /// integer arrays.
+    /// The response body exactly as it goes on the wire: UTF-8 JSON or text, or a handler's raw
+    /// <c>byte[]</c> (an image). Held as bytes so a large body is never also kept as a UTF-16 string.
     /// </summary>
-    public byte[]? BodyBytes { get; set; }
+    public byte[] BodyBytes { get; set; } = "{}"u8.ToArray();
+
+    /// <summary>The body as text, decoded on every read. Hot paths use <see cref="BodyBytes"/>.</summary>
+    public string Body
+    {
+        get => Encoding.UTF8.GetString(BodyBytes);
+        set => BodyBytes = Encoding.UTF8.GetBytes(value);
+    }
 
     /// <summary>
     /// Response headers the handler asked for, already normalised by

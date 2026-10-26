@@ -62,7 +62,7 @@ public class ApiCompressionPipelineTests : IDisposable
 
     private async Task<(string encoding, byte[] body)> RequestBody(
         Action<WebApplication> configure, string contentType = "application/json", bool routed = false,
-        string acceptEncoding = "gzip", string? payload = null)
+        string acceptEncoding = "gzip", string? payload = null, bool asBytes = false)
     {
         payload ??= Payload;
         var builder = WebApplication.CreateBuilder();
@@ -80,7 +80,9 @@ public class ApiCompressionPipelineTests : IDisposable
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = contentType;
             ctx.Response.Headers["X-Cache"] = "MISS";
-            await ctx.Response.WriteAsync(payload);
+            // asBytes = the dispatcher's write: the whole UTF-8 body in one Body.WriteAsync.
+            if (asBytes) await ctx.Response.Body.WriteAsync(Encoding.UTF8.GetBytes(payload));
+            else await ctx.Response.WriteAsync(payload);
         }
 
         // routed = the real shape: a mapped endpoint (MapMethods) executed by the endpoint middleware,
@@ -145,6 +147,55 @@ public class ApiCompressionPipelineTests : IDisposable
             $"br Fastest wire {body.Length} B vs one-shot {oneShotLength} B — encoder is being fed fragments");
         using var decoded = new StreamReader(new BrotliStream(new MemoryStream(body), CompressionMode.Decompress));
         Assert.Equal(varied, await decoded.ReadToEndAsync());
+    }
+
+    private static string VariedJson(int rows) => "[" + string.Join(",", Enumerable.Range(0, rows).Select(i =>
+        $"{{\"id\":{i},\"tenant\":\"t{i % 97}.onmicrosoft.com\",\"msg\":\"event {i * 7919 % 10007} on {i % 13}\"}}")) + "]";
+
+    [Theory]
+    [InlineData("br", 40)]
+    [InlineData("br", 6000)]
+    [InlineData("br", 60000)]
+    [InlineData("gzip", 40)]
+    [InlineData("gzip", 6000)]
+    [InlineData("gzip", 60000)]
+    public async Task BytesBody_InOneWrite_IsReallyCompressed_AndRoundTrips(string encoding, int rows)
+    {
+        // The dispatcher writes the whole body as one byte[]: under the 64 KiB block it is buffered, above it the
+        // write goes straight to the encoder. Either way the wire must be the encoded body, not the raw bytes under a
+        // Content-Encoding header, and no bigger than compressing it in one go.
+        var json = VariedJson(rows);
+        var raw = Encoding.UTF8.GetBytes(json);
+        using var oneShot = new MemoryStream();
+        using (Stream encoder = encoding == "br"
+            ? new BrotliStream(oneShot, CompressionLevel.Fastest, leaveOpen: true)
+            : new GZipStream(oneShot, CompressionLevel.Fastest, leaveOpen: true))
+            encoder.Write(raw);
+
+        var (enc, body) = await RequestBody(app => app.UseWhen(IsApiPath, api =>
+        {
+            api.UseMiddleware<ApiEgressWireCounterMiddleware>();
+            api.UseResponseCompression();
+        }), acceptEncoding: encoding, payload: json, asBytes: true);
+
+        Assert.Equal(encoding, enc);
+        Assert.True(body.Length <= oneShot.Length * 1.05 + 64,
+            $"{encoding} wire {body.Length} B vs one-shot {oneShot.Length} B for {raw.Length} raw");
+        using Stream decoder = encoding == "br"
+            ? new BrotliStream(new MemoryStream(body), CompressionMode.Decompress)
+            : new GZipStream(new MemoryStream(body), CompressionMode.Decompress);
+        using var decoded = new MemoryStream();
+        await decoder.CopyToAsync(decoded);
+        Assert.Equal(raw, decoded.ToArray());
+    }
+
+    [Fact]
+    public async Task BytesBody_WithoutAcceptEncoding_IsSentAsIs()
+    {
+        var json = VariedJson(6000);
+        var (enc, body) = await RequestBody(app => app.UseResponseCompression(), acceptEncoding: "identity", payload: json, asBytes: true);
+        Assert.Equal("", enc);
+        Assert.Equal(Encoding.UTF8.GetBytes(json), body);
     }
 
     [Fact]

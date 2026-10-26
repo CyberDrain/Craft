@@ -1,4 +1,5 @@
 using System.Management.Automation;
+using System.Text;
 using System.Text.Json;
 using Craft.Services;
 
@@ -47,8 +48,8 @@ public class PsJsonWriterTests
         var oldFirst = BodyFrom(ps, script);
         var expected = OldJson(oldFirst);
         var newFirst = BodyFrom(ps, script);
-        var actual = PsJsonWriter.TrySerialize(newFirst, s_options);
-        var afterOld = PsJsonWriter.TrySerialize(oldFirst, s_options);
+        var actual = Text(PsJsonWriter.TrySerialize(newFirst, s_options));
+        var afterOld = Text(PsJsonWriter.TrySerialize(oldFirst, s_options));
 
         if (expected.Error != null)
         {
@@ -78,6 +79,8 @@ public class PsJsonWriterTests
         Assert.Equal(207, result.StatusCode);
         Assert.Equal("""[{"resultText":"ok","state":"success"}]""", result.Body);
     }
+
+    private static string? Text(byte[]? utf8) => utf8 is null ? null : Encoding.UTF8.GetString(utf8);
 
     private static (string? Json, Exception? Error) OldJson(object? body)
     {

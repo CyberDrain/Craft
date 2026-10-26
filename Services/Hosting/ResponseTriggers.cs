@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 
 namespace Craft.Hosting;
@@ -39,8 +40,13 @@ public static class ResponseTriggers
     /// a substring scan is far cheaper than parsing a potentially large JSON document to discover
     /// there was nothing to find.
     /// </remarks>
-    public static bool MayContain(string? body, string marker) =>
-        !string.IsNullOrEmpty(body) && body.Contains(marker, StringComparison.Ordinal);
+    public static bool MayContain(ReadOnlySpan<byte> body, string marker)
+    {
+        // The markers are ASCII, so their UTF-8 form is one byte per char.
+        Span<byte> needle = stackalloc byte[marker.Length];
+        Encoding.UTF8.GetBytes(marker, needle);
+        return body.IndexOf(needle) >= 0;
+    }
 
     /// <summary>
     /// Parses an orchestrator trigger, or returns <see langword="null"/> when the marker is absent or
@@ -48,7 +54,7 @@ public static class ResponseTriggers
     /// </summary>
     /// <exception cref="JsonException">The body is not valid JSON.</exception>
     /// <exception cref="KeyNotFoundException">A required property is missing.</exception>
-    public static OrchestratorTrigger? ParseOrchestrator(string body)
+    public static OrchestratorTrigger? ParseOrchestrator(ReadOnlyMemory<byte> body)
     {
         using var document = JsonDocument.Parse(body);
         var root = document.RootElement;
@@ -63,7 +69,7 @@ public static class ResponseTriggers
     }
 
     /// <inheritdoc cref="ParseOrchestrator"/>
-    public static ScriptTrigger? ParseScript(string body)
+    public static ScriptTrigger? ParseScript(ReadOnlyMemory<byte> body)
     {
         using var document = JsonDocument.Parse(body);
         var root = document.RootElement;
@@ -77,7 +83,7 @@ public static class ResponseTriggers
     }
 
     /// <inheritdoc cref="ParseOrchestrator"/>
-    public static CancelTrigger? ParseCancel(string body)
+    public static CancelTrigger? ParseCancel(ReadOnlyMemory<byte> body)
     {
         using var document = JsonDocument.Parse(body);
         var root = document.RootElement;

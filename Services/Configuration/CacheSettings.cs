@@ -19,7 +19,7 @@ public class CacheSettings
 
     /// <summary>
     /// Budget (bytes) for keeping cached response bodies in memory (an LRU tier over the disk cache) so a
-    /// cache HIT returns from RAM instead of re-reading + re-decoding the file every time. Default 64 MiB.
+    /// cache HIT returns from RAM instead of re-reading the file every time. Default 64 MiB.
     /// 0 disables the in-memory tier (disk-only — every hit reads the file). The index is always in memory;
     /// this only governs the hot bodies. See docs/cache-analysis.md.
     /// </summary>

@@ -123,7 +123,7 @@ public readonly struct CraftResult
 
     /// <summary>A cached response, written back exactly as it was stored.</summary>
     internal static CraftResult FromCached(ScriptResult cached) =>
-        new(Kind.Json, cached.StatusCode, cached.ContentType ?? "application/json", cached.Headers, text: cached.Body);
+        new(Kind.Bytes, cached.StatusCode, cached.ContentType ?? "application/json", cached.Headers, bytes: cached.BodyBytes);
 
     /// <summary>Writes this result to the response.</summary>
     internal async Task WriteAsync(HttpContext context, CancellationToken ct)

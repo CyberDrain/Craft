@@ -473,7 +473,7 @@ In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET en
   // "Enabled": true,
 
   // Bytes budget for the in-memory body tier (LRU over the disk cache) — a HIT returns the body from RAM
-  // instead of re-reading + re-decoding the file. Default 64 MiB; 0 = disk-only. Gain scales with response
+  // instead of re-reading the file. Default 64 MiB; 0 = disk-only. Gain scales with response
   // size (+44% throughput for small List* responses, +157% at ~150KB; see docs/cache-analysis.md).
   "MaxMemoryBytes": 67108864,
 

@@ -17,6 +17,7 @@ namespace Craft.Tests;
 /// Native GETs share the PowerShell path's response cache: per caller, stale-while-revalidate, cleared by writes,
 /// and never in front of the central handler.
 /// </summary>
+[Collection(CacheBodyBytesTests.Name)]
 public class NativeEndpointCacheTests
 {
     internal abstract class Counting : ICraftEndpoint

@@ -27,7 +27,7 @@ public class CacheEntry
     public string? ContentType { get; set; }
 
     /// <summary>In-memory copy of the body (null = not resident; read from FilePath). Guarded by the mem tier.</summary>
-    public volatile string? Body;
-    /// <summary>Approx bytes charged to the memory budget for <see cref="Body"/> (chars × 2).</summary>
+    public volatile byte[]? Body;
+    /// <summary>Bytes charged to the memory budget for <see cref="Body"/>.</summary>
     public int BodyBytes;
 }
