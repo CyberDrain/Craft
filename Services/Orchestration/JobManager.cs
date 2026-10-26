@@ -105,7 +105,12 @@ public class JobManager : BackgroundService
         _limiter = limiter;
         MaxConcurrency = Math.Max(1, settings.Worker.BgPoolSize);
 
-        _cleanupTimer = new Timer(_ => CleanupOldJobs(), null, CleanupInterval, CleanupInterval);
+        // An exception escaping a timer callback terminates the process.
+        _cleanupTimer = new Timer(_ =>
+        {
+            try { CleanupOldJobs(); }
+            catch (Exception ex) { try { _logger.LogWarning(ex, "[JobManager] Job cleanup failed"); } catch { } }
+        }, null, CleanupInterval, CleanupInterval);
 
         _logger.LogInformation("[JobManager] Initialized: maxConcurrency={Max} (gated by BackgroundTaskLimiter)", MaxConcurrency);
     }

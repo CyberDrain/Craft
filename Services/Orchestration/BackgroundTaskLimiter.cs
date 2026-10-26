@@ -170,7 +170,12 @@ public class BackgroundTaskLimiter : IDisposable
         _currentMax = Math.Min(BaseConcurrency, CeilingConcurrency);
 
         // Monitor timer: checks queue and HTTP pressure every 10s
-        _monitorTimer = new Timer(MonitorCallback, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        // An exception escaping a timer callback terminates the process.
+        _monitorTimer = new Timer(state =>
+        {
+            try { MonitorCallback(state); }
+            catch (Exception ex) { try { _logger.LogWarning(ex, "[System] Limiter check failed"); } catch { } }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
 
         _logger.LogInformation("[System] Limiter init: baseline={Base} ceiling={Ceiling} scaleAfter={ScaleAfter}s " +
             "burstToCeiling={Burst} overSubscribe={Over} httpPressureThreshold={HttpThreshold} httpPressureConcurrency={HttpConc} httpPressureAfter={HttpAfter}s cpus={Cpus}",

@@ -17,10 +17,18 @@ public class MemoryTrimService(ILogger<MemoryTrimService> logger, CraftSettings 
             using var timer = new PeriodicTimer(TimeSpan.FromMinutes(minutes));
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                var reclaimed = WorkerMetricsBridge.TrimMemory();
-                if (reclaimed >= 0)
-                    logger.LogInformation("[System] Memory trim (timer): reclaimed ~{MB}MB {Memory}",
-                        reclaimed, BackgroundTaskLimiter.GetMemorySnapshot());
+                // An exception escaping ExecuteAsync stops the host; a failed trim waits for the next tick.
+                try
+                {
+                    var reclaimed = WorkerMetricsBridge.TrimMemory();
+                    if (reclaimed >= 0)
+                        logger.LogInformation("[System] Memory trim (timer): reclaimed ~{MB}MB {Memory}",
+                            reclaimed, BackgroundTaskLimiter.GetMemorySnapshot());
+                }
+                catch (Exception ex)
+                {
+                    try { logger.LogWarning(ex, "[System] Memory trim (timer) failed; retrying next tick"); } catch { }
+                }
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }

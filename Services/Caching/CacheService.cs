@@ -112,7 +112,12 @@ public class CacheService : IDisposable
         CleanupOrphanFiles();
 
         // Eviction timer runs every 60 seconds to purge expired entries
-        _evictionTimer = new Timer(_ => EvictExpired(), null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+        // An exception escaping a timer callback terminates the process.
+        _evictionTimer = new Timer(_ =>
+        {
+            try { EvictExpired(); }
+            catch (Exception ex) { try { _logger.LogWarning(ex, "[Cache] Eviction sweep failed"); } catch { } }
+        }, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
     }
 
     /// <summary>
