@@ -973,7 +973,7 @@ public class PowerShellRunnerService : IDisposable
                 }
                 else
                 {
-                    jsonBody = ConvertPsObjectToJson(body);
+                    jsonBody = PsJsonWriter.TrySerialize(body, s_jsonOptions) ?? ConvertPsObjectToJson(body);
                 }
                 return new ScriptResult
                 {
@@ -986,7 +986,7 @@ public class PowerShellRunnerService : IDisposable
         }
 
         var fallbackBody = results.Count > 0
-            ? ConvertPsObjectToJson(results.Last().BaseObject)
+            ? PsJsonWriter.TrySerialize(results.Last().BaseObject, s_jsonOptions) ?? ConvertPsObjectToJson(results.Last().BaseObject)
             : "{}";
         return new ScriptResult { StatusCode = 200, Body = fallbackBody };
     }
@@ -1017,7 +1017,7 @@ public class PowerShellRunnerService : IDisposable
 
     // ─── JSON serialization (carried over, with static JsonSerializerOptions) ───
 
-    private static string ConvertPsObjectToJson(object? obj)
+    internal static string ConvertPsObjectToJson(object? obj)
     {
         if (obj == null) return "null";
 
