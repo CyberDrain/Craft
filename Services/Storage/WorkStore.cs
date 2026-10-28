@@ -41,6 +41,8 @@ public sealed class WorkStore
     private readonly int MaxAttempts;
     private const int ConflictRetries = 16;
     private const int MaxRunningScan = 500;
+    // LastError goes into the finish transaction, which cannot split a property over 64 KiB.
+    public const int MaxErrorChars = 8000;
 
     private readonly ICraftTableStore _store;
     private readonly ILogger<WorkStore> _logger;
@@ -632,7 +634,7 @@ public sealed class WorkStore
                         {
                             ["TaskId"] = row.GetString("TaskId"),
                             ["Status"] = f.Status,
-                            ["LastError"] = f.Error,
+                            ["LastError"] = f.Error is { Length: > MaxErrorChars } e ? e[..MaxErrorChars] : f.Error,
                             ["Attempt"] = row.GetInt32("Attempt") ?? 0,
                             ["CompletedUtc"] = DateTimeOffset.UtcNow,
                         }

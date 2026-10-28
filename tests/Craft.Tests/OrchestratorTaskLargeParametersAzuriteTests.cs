@@ -97,4 +97,38 @@ public class OrchestratorTaskLargeParametersAzuriteTests
             await store.DeleteRunAsync(header.RunKey);
         }
     }
+
+    [Fact]
+    public async Task ATaskFailingWithAnErrorOverTheLimit_FinishesWithTheErrorTruncated()
+    {
+        var store = await TryConnectAsync();
+        if (store == null) return;
+
+        var started = DateTime.UtcNow;
+        var header = new RunHeader
+        {
+            RunKey = WorkStore.RunKeyFor("LongErrorOrchestrator", started),
+            Name = "LongErrorOrchestrator",
+            Priority = 4,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+        };
+
+        try
+        {
+            await store.CreateRunAsync(header, [new WorkStore.NewTask("task-0", new() { ["Tenant"] = "contoso.com" })]);
+            var claim = Assert.Single(await store.ClaimAsync(header.RunKey, 10, "w", TimeSpan.FromMinutes(5), true));
+
+            var error = new string('E', 100_000);
+            var done = await store.FinishAsync(header.RunKey, [new WorkStore.Finish(claim.Seq, "Failed", error, "w")]);
+            Assert.True(done!.Completed);
+
+            var failed = Assert.Single(await store.GetTasksAsync(header.RunKey, 'D'));
+            Assert.Equal(error[..WorkStore.MaxErrorChars], failed.LastError);
+        }
+        finally
+        {
+            await store.DeleteRunAsync(header.RunKey);
+        }
+    }
 }
