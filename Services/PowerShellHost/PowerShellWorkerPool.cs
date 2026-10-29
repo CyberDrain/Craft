@@ -374,14 +374,14 @@ public class PowerShellWorkerPool : IDisposable
 
     /// <summary>
     /// A user request found every HTTP worker busy: build one more in the background, within HttpBurstMax, two at a
-    /// time and only while the GC heap is under three quarters of its limit. The waiting request takes whichever
+    /// time and only while the GC heap is under 80% of its limit. The waiting request takes whichever
     /// worker frees first, so it never waits on the build itself.
     /// </summary>
     private void GrowHttpBurst()
     {
         Volatile.Write(ref _lastUserWait, Environment.TickCount64);
         var memory = GC.GetGCMemoryInfo();
-        if (memory.HeapSizeBytes > memory.TotalAvailableMemoryBytes / 4 * 3) return;
+        if (memory.HeapSizeBytes > memory.TotalAvailableMemoryBytes / 5 * 4) return;
         if (Interlocked.Increment(ref _httpWorkersPlanned) > _httpPoolSize + _httpBurstMax)
         {
             Interlocked.Decrement(ref _httpWorkersPlanned);

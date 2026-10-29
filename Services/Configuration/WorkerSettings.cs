@@ -22,7 +22,7 @@ public class WorkerSettings
     /// more is built in the background, up to this many beyond <see cref="HttpPoolSize"/>; they are disposed again,
     /// one a minute, once no user request has waited for <see cref="HttpBurstIdleSeconds"/>, so an idle instance
     /// holds none. API clients never hold more than <see cref="HttpPoolSize"/> workers at once, so this capacity is
-    /// always free for users. 0 = off (default). Building stops while the GC heap is above three quarters of its limit.
+    /// always free for users. 0 = off (default). Building stops while the GC heap is above 80% of its limit.
     /// Env override: <c>CRAFT_HTTP_BURST_MAX</c>.
     /// </summary>
     public int HttpBurstMax { get; set; }

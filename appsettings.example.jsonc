@@ -171,7 +171,7 @@
       // Extra HTTP workers built only for interactive (non-API-client) requests that find every HTTP
       // worker busy, up to this many beyond HttpPoolSize. Disposed again, one per tick, once no user
       // request has waited for HttpBurstIdleSeconds, so an idle instance holds none. API clients never
-      // hold more than HttpPoolSize workers at once. Not built while the GC heap is above 75% of its
+      // hold more than HttpPoolSize workers at once. Not built while the GC heap is above 80% of its
       // limit. 0 = off. Per-instance override: CRAFT_HTTP_BURST_MAX. SkuProfiles take HttpBurstMax too.
       "HttpBurstMax": 0,
       "HttpBurstIdleSeconds": 600,
