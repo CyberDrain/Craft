@@ -127,10 +127,11 @@ public static class SkuProfileSelector
 
             log($"[System] SkuProfile matched [{matrix}] (SkuEnv='{profile.SkuEnv}' Sku='{profile.Sku}' " +
                 $"Cpu={profile.Cpu}) for runtime ({profile.SkuEnv}='{skuValue}' ProcessorCount={processorCount}); " +
-                $"applying HttpPoolSize={profile.HttpPoolSize} BgPoolSize={profile.BgPoolSize}");
+                $"applying HttpPoolSize={profile.HttpPoolSize} BgPoolSize={profile.BgPoolSize} HttpBurstMax={profile.HttpBurstMax ?? worker.HttpBurstMax}");
 
             worker.HttpPoolSize = profile.HttpPoolSize;
             worker.BgPoolSize = profile.BgPoolSize;
+            worker.HttpBurstMax = profile.HttpBurstMax ?? worker.HttpBurstMax;
             return profile;
         }
 
@@ -150,6 +151,11 @@ public static class SkuProfileSelector
         {
             log($"[System] BgPoolSize overridden to {bg} by CRAFT_BG_POOL_SIZE (was {worker.BgPoolSize})");
             worker.BgPoolSize = bg;
+        }
+        if (TryReadEnvInt(env, "CRAFT_HTTP_BURST_MAX", out var burst))
+        {
+            log($"[System] HttpBurstMax overridden to {burst} by CRAFT_HTTP_BURST_MAX (was {worker.HttpBurstMax})");
+            worker.HttpBurstMax = burst;
         }
     }
 

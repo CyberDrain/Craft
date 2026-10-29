@@ -38,6 +38,9 @@ public class PowerShellWorker : IDisposable
     /// <summary>Number of completed invocations on this worker (incremented at reclaim).</summary>
     internal int InvocationCount;
 
+    /// <summary>Checked out by an API client under the pool's API-client cap; released on reclaim.</summary>
+    internal bool HoldsApiClientSlot;
+
     public PowerShellWorker(int id, InitialSessionState iss, ILogger logger)
     {
         Id = id;

@@ -59,6 +59,19 @@ public class SkuProfileSelectorTests
         Assert.Equal(16, settings.Worker.BgPoolSize);
     }
 
+    [Theory]
+    [InlineData(6, 6)]
+    [InlineData(null, 3)]
+    public void MatchingProfile_SetsHttpBurstMaxOnlyWhenItNamesOne(int? profileBurst, int expected)
+    {
+        var settings = WithProfiles(new SkuProfile { Cpu = 4, HttpPoolSize = 8, BgPoolSize = 16, HttpBurstMax = profileBurst });
+        settings.Worker.HttpBurstMax = 3;
+
+        SkuProfileSelector.Apply(settings, processorCount: 4, Env(), _ => { });
+
+        Assert.Equal(expected, settings.Worker.HttpBurstMax);
+    }
+
     [Fact]
     public void SkuComparison_IsCaseInsensitive()
     {

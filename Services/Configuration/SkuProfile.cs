@@ -30,6 +30,9 @@ public class SkuProfile
     /// <summary>HTTP worker pool size to apply when this profile matches.</summary>
     public int HttpPoolSize { get; set; }
 
+    /// <summary>HttpBurstMax to apply when this profile matches. Null keeps the configured value.</summary>
+    public int? HttpBurstMax { get; set; }
+
     /// <summary>Background worker pool size to apply when this profile matches.</summary>
     public int BgPoolSize { get; set; }
 

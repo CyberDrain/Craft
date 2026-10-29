@@ -17,6 +17,19 @@ public class WorkerSettings
     /// </summary>
     public int HttpPoolSize { get; set; } = 2;
 
+    /// <summary>
+    /// Extra HTTP workers built only for interactive callers. When a user request finds every HTTP worker busy, one
+    /// more is built in the background, up to this many beyond <see cref="HttpPoolSize"/>; they are disposed again,
+    /// one a minute, once no user request has waited for <see cref="HttpBurstIdleSeconds"/>, so an idle instance
+    /// holds none. API clients never hold more than <see cref="HttpPoolSize"/> workers at once, so this capacity is
+    /// always free for users. 0 = off (default). Building stops while the GC heap is above three quarters of its limit.
+    /// Env override: <c>CRAFT_HTTP_BURST_MAX</c>.
+    /// </summary>
+    public int HttpBurstMax { get; set; }
+
+    /// <summary>Seconds without a user request waiting before burst workers are disposed. Default 600.</summary>
+    public int HttpBurstIdleSeconds { get; set; } = 600;
+
     /// <summary>Number of workers reserved for background jobs (scheduler, orchestrator, queue).</summary>
     public int BgPoolSize { get; set; } = 4;
 

@@ -24,7 +24,9 @@ param(
   [switch]$OrchOnly,
   [string[]]$OrchChecks,
   # Run only the hung-worker section (run-e2e-hung-workers.ps1).
-  [switch]$HungOnly
+  [switch]$HungOnly,
+  # Run only the HTTP burst section (run-e2e-http-burst.ps1).
+  [switch]$BurstOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,7 +95,7 @@ try {
   Add-Result 'storage' 'azurite-ready' ($h.ready.storage -eq $true) '-' "storageReady=$($h.ready.storage)"
 
   $suiteSw = [Diagnostics.Stopwatch]::StartNew()
-  if (-not $OrchOnly -and -not $HungOnly) {
+  if (-not $OrchOnly -and -not $HungOnly -and -not $BurstOnly) {
   # ── API dispatch ────────────────────────────────────────────────────────────
   $sw = [Diagnostics.Stopwatch]::StartNew(); $ping = Api '/API/PerfPing'; $sw.Stop()
   Add-Result 'api' 'dispatch-ping' ($ping.ok -eq $true) ("{0}ms" -f $sw.ElapsedMilliseconds) "endpoint=$($ping.endpoint)"
@@ -304,10 +306,13 @@ try {
   }
 
   # -- Hung workers (run-e2e-hung-workers.ps1) ----------------------------------------
-  if (-not $OrchOnly) { . (Join-Path $here 'run-e2e-hung-workers.ps1') }
+  if (-not $OrchOnly -and -not $BurstOnly) { . (Join-Path $here 'run-e2e-hung-workers.ps1') }
+
+  # -- HTTP burst workers (run-e2e-http-burst.ps1) -----------------------------------
+  if (-not $OrchOnly -and -not $HungOnly) { . (Join-Path $here 'run-e2e-http-burst.ps1') }
 
   # -- Orchestration engine (run-e2e-orchestration.ps1) ------------------------------
-  if (-not $HungOnly) {
+  if (-not $HungOnly -and -not $BurstOnly) {
     if ($ready) { . (Join-Path $here 'run-e2e-orchestration.ps1') }
     else { Add-Result 'orchestration' 'not-run' $false '-' 'SUT never became ready' }
   }
