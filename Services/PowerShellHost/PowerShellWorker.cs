@@ -18,6 +18,8 @@ public class PowerShellWorker : IDisposable
         new[] { typeof(Cmdlet), typeof(bool), typeof(bool), typeof(string[]) },
         null);
     private static readonly object[] s_getJobsArgs = { null!, false, false, null! };
+    // New-Module has no -Version; without this a shared module reads 0.0 where a manifest import reads ModuleVersion.
+    private static readonly MethodInfo? s_setModuleVersion = typeof(PSModuleInfo).GetMethod("SetVersion", NonPublicInstance);
     private static HashSet<string>? s_builtinGlobalVars;
 
     // Global JSON preloads are parsed by the first worker and the same object is handed to the rest: the values
@@ -252,8 +254,24 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         try
         {
             location.SetLocation(WildcardPattern.Escape(module.Base));
-            _pwsh.AddCommand("New-Module").AddParameter("Name", module.Name).AddParameter("ScriptBlock", module.Body)
-                 .AddCommand("Import-Module");
+            _pwsh.AddCommand("New-Module").AddParameter("Name", module.Name).AddParameter("ScriptBlock", module.Body);
+            if (module.Functions != null)
+                _pwsh.AddParameter("Function", module.Functions);
+            var info = _pwsh.Invoke<PSModuleInfo>().Single();
+            _pwsh.Commands.Clear();
+
+            if (module.Version != null)
+                s_setModuleVersion?.Invoke(info, [module.Version]);
+            // New-Module exports no aliases where a .psm1 exports them all; adding them leaves the function exports as they are.
+            if (module.Aliases?.Length > 0)
+            {
+                _pwsh.AddScript("& $args[0] { Export-ModuleMember -Alias $args[0] } $args[1]", useLocalScope: true)
+                     .AddArgument(info).AddArgument(module.Aliases);
+                _pwsh.Invoke();
+                _pwsh.Commands.Clear();
+            }
+
+            _pwsh.AddCommand("Import-Module").AddParameter("ModuleInfo", info);
             _pwsh.Invoke();
             foreach (var err in _pwsh.Streams.Error)
                 _logger.LogError("Worker{Id}: module {Module} import error: {Error}", Id, module.Name, err.ToString());

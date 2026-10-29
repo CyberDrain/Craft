@@ -26,6 +26,10 @@ public class PowerShellWorkerPool : IDisposable
     private readonly ManualResetEventSlim _bgReady = new(false);
     private SharedScriptModules? _httpModules;
     private SharedScriptModules? _bgModules;
+    // A module in both lists is parsed once. Only the pools this node runs are parsed, the HTTP pool's first, so
+    // background-only modules never hold up HTTP ready.
+    private readonly ConcurrentDictionary<string, System.Management.Automation.ScriptBlock> _parsed =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public bool IsReady => _httpReady.IsSet;
     /// <summary>True once the background worker pool has finished initializing.</summary>
@@ -138,13 +142,17 @@ public class PowerShellWorkerPool : IDisposable
             var shared = httpModuleList.Intersect(bgModuleList, StringComparer.OrdinalIgnoreCase).Count();
             StartupInfoBridge.SetModuleCounts(shared, httpModuleList.Count - shared, bgModuleList.Count - shared);
         }
-        // Parse the app's script modules once; a module in both lists is parsed once.
-        var parsed = new Dictionary<string, System.Management.Automation.ScriptBlock>(StringComparer.OrdinalIgnoreCase);
-        _httpModules = SharedScriptModules.Load(ModuleManifests(httpModuleList.Count > 0 ? httpModuleList : null), parsed, _logger);
-        _bgModules = SharedScriptModules.Load(ModuleManifests(bgModuleList.Count > 0 ? bgModuleList : null), parsed, _logger);
-        _logger.LogInformation("[System] Script modules parsed once and shared by every worker: {Count} ({Ms}ms)", parsed.Count, sw.ElapsedMilliseconds);
-
         BuildPools(sw, warmupMode, enableHttp, enableBg);
+    }
+
+    private SharedScriptModules LoadModules(List<string> moduleList, string pool)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var before = _parsed.Count;
+        var modules = SharedScriptModules.Load(ModuleManifests(moduleList.Count > 0 ? moduleList : null), _parsed, _logger);
+        _logger.LogInformation("[System] {Pool} script modules parsed once and shared by every worker: {Count} ({Ms}ms)",
+            pool, _parsed.Count - before, sw.ElapsedMilliseconds);
+        return modules;
     }
 
     /// <summary>
@@ -160,6 +168,7 @@ public class PowerShellWorkerPool : IDisposable
 
         if (enableHttp)
         {
+            _httpModules = LoadModules(_settings.Worker.HttpModules, "HTTP");
             var first = BuildWorker(isHttp: true);
             if (warmupOnHttp)
                 RunWarmup(first, sw);
@@ -193,6 +202,7 @@ public class PowerShellWorkerPool : IDisposable
         if (enableBg)
         {
             var bgSw = System.Diagnostics.Stopwatch.StartNew();
+            _bgModules = LoadModules(_settings.Worker.BgModules, "BG");
             var first = BuildWorker(isHttp: false);
             if (warmupOnBg)
                 RunWarmup(first, sw);
@@ -396,10 +406,8 @@ public class PowerShellWorkerPool : IDisposable
         WorkerMetricsBridge.DeregisterWorker(oldId);
         worker.Dispose();
 
-        // Build the replacement off the calling thread so the dispatch loop is not held
-        // for the 6-13s ISS rebuild + Initialize() cost. Capacity briefly drops by 1 (the
-        // pool is short one worker until this Task completes), but the thread that just
-        // finished a task returns to the dispatch loop immediately.
+        // Build the replacement off the calling thread so the dispatch loop is not held for it. Capacity briefly drops
+        // by 1 until this Task completes, but the thread that just finished a task returns to the dispatch loop.
         _ = Task.Run(() =>
         {
             try

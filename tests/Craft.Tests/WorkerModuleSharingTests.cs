@@ -73,19 +73,79 @@ public class WorkerModuleSharingTests : IDisposable
     }
 
     [Fact]
-    public void FunctionsTheManifestDoesNotListAreStillExported()
+    public void FunctionsTheManifestDoesNotListStayInsideTheModule()
     {
-        // CIPP defines helpers beside an exported function in one file and calls them from other modules; ModuleBuilder
-        // lists only one function per file, and the cloned workers this replaces exported every function.
         var worker = Open(Load(WriteModule()));
 
-        Assert.Equal("helper", Eval(worker, "Get-CraftShareHelper"));
-        Assert.Equal(ModuleName, Eval(worker, "(Get-Command Get-CraftShareHelper).ModuleName"));
+        Assert.Equal("False", Eval(worker, "[bool](Get-Command Get-CraftShareHelper -ErrorAction SilentlyContinue)"));
+        Assert.Equal("thing:helper", Eval(worker, Exported));
+    }
+
+    public static TheoryData<string, string, string, string> ExportKeys()
+    {
+        var data = new TheoryData<string, string, string, string>();
+        foreach (var functions in new[] { "", "FunctionsToExport = @('Get-Pub', 'Get-Aliased')", "FunctionsToExport = '*'", "FunctionsToExport = @()" })
+            foreach (var aliases in new[] { "", "AliasesToExport = @('PubAlias')", "AliasesToExport = '*'", "AliasesToExport = @()" })
+                foreach (var variables in new[] { "", "VariablesToExport = @('ModVar')", "VariablesToExport = '*'" })
+                    foreach (var exportCall in new[] { "", "Export-ModuleMember -Function Get-Pub, Get-Priv -Alias PubAlias -Variable ModVar" })
+                        data.Add(functions, aliases, variables, exportCall);
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(ExportKeys))]
+    public void ASharedModuleExportsWhatAManifestImportExports(string functions, string aliases, string variables, string exportCall)
+    {
+        var dir = Path.Combine(_root, "CraftExports");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "CraftExports.psm1"), $$"""
+            function Get-Pub { 'pub' }
+            function Get-PubExtra { 'extra' }
+            function Get-Priv { 'priv' }
+            function Get-Aliased { [Alias('AttrAlias')] param() 'aliased' }
+            Set-Alias PubAlias Get-Pub
+            $ModVar = 'v'
+            $script:OtherVar = 'o'
+            {{exportCall}}
+            """);
+        var manifest = Path.Combine(dir, "CraftExports.psd1");
+        File.WriteAllText(manifest, $$"""
+            @{
+                ModuleVersion = '2.3.4'
+                RootModule    = 'CraftExports.psm1'
+                {{functions}}
+                {{aliases}}
+                {{variables}}
+            }
+            """);
+
+        var iss = InitialSessionState.CreateDefault();
+        if (OperatingSystem.IsWindows())
+            iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+        iss.ImportPSModule([manifest]);
+        var native = new PowerShellWorker(_workers.Count + 1, iss, NullLogger.Instance);
+        _workers.Add(native);
+        native.Initialize(new ScriptRepository(NullLogger<ScriptRepository>.Instance, new CraftSettings()), _root, new CraftSettings());
+        var shared = Open(Load(manifest));
+
+        const string probe = """
+            $m = Get-Module CraftExports
+            @(
+                ($m.ExportedFunctions.Keys | Sort-Object) -join ','
+                ($m.ExportedAliases.Keys | Sort-Object) -join ','
+                ($m.ExportedVariables.Keys | Sort-Object) -join ','
+                $m.Version
+                [bool](Get-Command PubAlias -ErrorAction SilentlyContinue)
+                (Get-Variable ModVar -ValueOnly -ErrorAction SilentlyContinue)
+            ) -join ' | '
+            """;
+        Assert.Equal(Eval(native, probe), Eval(shared, probe));
     }
 
     [Theory]
     [InlineData("TypesToProcess = @('types.ps1xml')", "")]
     [InlineData("", ". $PSScriptRoot/extra.ps1")]
+    [InlineData("", "Export-ModuleMember -Function Get-CraftShareThing")]
     [InlineData("NestedModules = @('Inner.psm1')", "")]
     public void AModuleItsFileCannotCarryIsImportedPerWorker(string manifestLine, string psm1Line)
     {
@@ -190,6 +250,8 @@ public class WorkerModuleSharingTests : IDisposable
         var iss = InitialSessionState.CreateDefault();
         if (OperatingSystem.IsWindows())
             iss.ExecutionPolicy = Microsoft.PowerShell.ExecutionPolicy.Bypass;
+        if (shared.NativeImports.Count > 0)
+            iss.ImportPSModule([.. shared.NativeImports]);
         var worker = new PowerShellWorker(_workers.Count + 1, iss, NullLogger.Instance);
         _workers.Add(worker);
         var settings = new CraftSettings();
@@ -232,7 +294,7 @@ public class WorkerModuleSharingTests : IDisposable
                 ModuleVersion     = '1.0.0'
                 GUID              = '{{Guid.NewGuid()}}'
                 RootModule        = '.\{{ModuleName}}.psm1'
-                FunctionsToExport = @('{{Exported}}', 'Add-CraftShareCount')
+                FunctionsToExport = @('{{Exported}}', 'Add-CraftShareCount', 'Get-CraftShareBase', 'Get-CraftShareRoot')
                 {{manifestLine}}
             }
             """);

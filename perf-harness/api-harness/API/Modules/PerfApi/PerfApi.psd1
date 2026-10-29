@@ -8,5 +8,5 @@
     FunctionsToExport = @('Invoke-PerfPing', 'Invoke-PerfEcho', 'Invoke-PerfCpu', 'Invoke-PerfSleep', 'Invoke-PerfJson', 'Invoke-PerfFile', 'Invoke-PerfBgEnqueue', 'Push-PerfBg', 'Push-PerfBgLeaf', 'Invoke-PerfManyRuns', 'Push-PerfHold', 'Invoke-PerfThreads', 'Invoke-PerfTableOp', 'Push-PerfCheck', 'Invoke-PerfCheckCounts', 'Push-PerfSeq', 'Invoke-PerfSeqResult', 'Push-PerfSeqWorker', 'Invoke-PerfSeqWorkerEnqueue', 'Invoke-PerfSeqWorkerResult', 'Invoke-PerfThreadBreakdown', 'Invoke-PerfSeedRuns', 'Invoke-ListPerf', 'Invoke-PerfWhoami', 'Invoke-PerfTimerTick', 'Invoke-PerfTimerCount', 'Invoke-PerfPublish', 'Invoke-PerfWatchRun', 'Invoke-PerfAllocation', 'Invoke-PerfRuns', 'Push-PerfE2E', 'Push-PerfE2EPost', 'Invoke-PerfE2EStart', 'Invoke-PerfE2EState', 'Invoke-PerfE2ERuns', 'Invoke-PerfE2EBridge', 'Invoke-PerfE2ELegacy', 'Invoke-PerfHang', 'Invoke-PerfBgHangEnqueue', 'Push-PerfBgHang', 'Invoke-PerfHangRelease', 'Invoke-PerfModuleInfo')
     CmdletsToExport   = @()
     VariablesToExport = @()
-    AliasesToExport   = @()
+    AliasesToExport   = @('Get-PerfPingAlias')
 }

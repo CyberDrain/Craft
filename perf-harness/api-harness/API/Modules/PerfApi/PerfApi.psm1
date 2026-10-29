@@ -932,6 +932,9 @@ function Invoke-PerfModuleInfo {
         moduleName        = (Get-Command Invoke-PerfPing).ModuleName
         listedByModule    = [bool](Get-Command -Module PerfApi -Name Invoke-PerfModuleInfo -ErrorAction SilentlyContinue)
         helper            = $(try { Get-PerfModuleHelper } catch { $_.Exception.Message })
+        helperExported    = $Module.ExportedFunctions.ContainsKey('Get-PerfModuleHelper')
+        aliasExported     = $Module.ExportedAliases.ContainsKey('Get-PerfPingAlias')
+        version           = "$($Module.Version)"
         help              = (Get-Help Invoke-PerfModuleInfo).Synopsis
         callOperator      = $(try { & $Module { 'ok' } } catch { $_.Exception.Message })
         injected          = $null -ne $script:PerfInjected
@@ -940,3 +943,5 @@ function Invoke-PerfModuleInfo {
     }
     return @{ StatusCode = 200; Body = $Body }
 }
+
+Set-Alias -Name Get-PerfPingAlias -Value Invoke-PerfPing

@@ -106,7 +106,9 @@ try {
   $modBase = '/app/API/Modules/PerfApi'
   Add-Result 'modules' 'module-base' ($mi.moduleBase -eq $modBase -and $mi.commandModuleBase -eq $modBase -and $mi.scriptRoot -eq $modBase) '-' "ModuleBase=$($mi.moduleBase) PSScriptRoot=$($mi.scriptRoot)"
   Add-Result 'modules' 'module-identity' ($mi.moduleType -eq 'Script' -and $mi.moduleName -eq 'PerfApi' -and $mi.listedByModule -eq $true) '-' "type=$($mi.moduleType) ModuleName=$($mi.moduleName)"
-  Add-Result 'modules' 'unlisted-helper' ($mi.helper -eq 'helper') '-' "helper outside FunctionsToExport -> $($mi.helper)"
+  Add-Result 'modules' 'unlisted-helper' ($mi.helper -eq 'helper') '-' "helper outside FunctionsToExport, called inside the module -> $($mi.helper)"
+  Add-Result 'modules' 'manifest-exports' ($mi.helperExported -eq $false -and $mi.aliasExported -eq $true) '-' "unlisted helper exported=$($mi.helperExported), AliasesToExport alias exported=$($mi.aliasExported)"
+  Add-Result 'modules' 'module-version' ($mi.version -eq '1.0.0') '-' "Version=$($mi.version) (manifest ModuleVersion 1.0.0)"
   Add-Result 'modules' 'get-help' ($mi.help -eq 'Reports what this worker sees of the PerfApi module.') '-' "synopsis=$($mi.help)"
   Add-Result 'modules' 'module-scope' ($mi.callOperator -eq 'ok' -and $mi.injected -eq $true) '-' "& `$module {}=$($mi.callOperator) injected=$($mi.injected)"
   Add-Result 'modules' 'nested-modules' ($mi.nestedThing -eq 'nested' -and $mi.nestedModuleBase -eq '/app/API/Modules/PerfNested') '-' "nested=$($mi.nestedThing) base=$($mi.nestedModuleBase)"
