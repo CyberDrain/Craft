@@ -168,6 +168,13 @@
       // (they run on the .NET thread pool; the scheduler and JobManager still start). With both
       // sizes 0 the container hosts no PowerShell whatsoever.
       "BgPoolSize": 4,
+      // Extra HTTP workers built only for interactive (non-API-client) requests that find every HTTP
+      // worker busy, up to this many beyond HttpPoolSize. Disposed again, one per tick, once no user
+      // request has waited for HttpBurstIdleSeconds, so an idle instance holds none. API clients never
+      // hold more than HttpPoolSize workers at once. Not built while the GC heap is above 80% of its
+      // limit. 0 = off. Per-instance override: CRAFT_HTTP_BURST_MAX. SkuProfiles take HttpBurstMax too.
+      "HttpBurstMax": 0,
+      "HttpBurstIdleSeconds": 600,
 
       // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
       // Default true — the biggest per-request dispatch win (~50% of PS-invoke cost; see
@@ -185,6 +192,7 @@
       //           (e.g. "Basic", "PremiumV3"). Ignored when SkuEnv is empty.
       //   Cpu:    compared to Environment.ProcessorCount (respects cgroup limits in
       //           Docker). Omit or 0 = match any CPU count.
+      //   HttpBurstMax: optional HttpBurstMax for this tier; omit to keep the value above.
       //   GCHeapHardLimitMB: optional GC heap hard limit (MB) for this tier. The
       //           DOTNET_GCHeapHardLimit env var is consumed before managed code runs,
       //           so this lands via GC.RefreshMemoryLimit at startup instead. Three-way,

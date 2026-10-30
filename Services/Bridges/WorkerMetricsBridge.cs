@@ -177,9 +177,9 @@ public static class WorkerMetricsBridge
 
             snapshot.HttpPool = new PoolMetrics
             {
-                PoolSize = s_pool.HttpPoolSize,
+                PoolSize = s_pool.HttpWorkers,
                 Available = s_pool.HttpAvailable,
-                BusyCount = s_pool.HttpPoolSize - s_pool.HttpAvailable,
+                BusyCount = s_pool.HttpWorkers - s_pool.HttpAvailable,
                 Workers = httpWorkers,
             };
 
@@ -504,7 +504,7 @@ public static class WorkerMetricsBridge
         }
 
         // Pool memory estimates (each runspace holds modules, function table, variable table)
-        var httpPoolSize = s_pool?.HttpPoolSize ?? 0;
+        var httpPoolSize = s_pool?.HttpWorkers ?? 0;
         var bgPoolSize = s_pool?.BgPoolSize ?? 0;
         var totalWorkers = httpPoolSize + bgPoolSize;
 
@@ -597,9 +597,9 @@ public static class WorkerMetricsBridge
 
         return new WorkerSummary
         {
-            HttpBusy = s_pool != null ? s_pool.HttpPoolSize - s_pool.HttpAvailable : 0,
+            HttpBusy = s_pool != null ? s_pool.HttpWorkers - s_pool.HttpAvailable : 0,
             HttpAvailable = s_pool?.HttpAvailable ?? 0,
-            HttpPoolSize = s_pool?.HttpPoolSize ?? 0,
+            HttpPoolSize = s_pool?.HttpWorkers ?? 0,
             BgBusy = s_pool != null ? s_pool.BgPoolSize - s_pool.BgAvailable : 0,
             BgAvailable = s_pool?.BgAvailable ?? 0,
             BgPoolSize = s_pool?.BgPoolSize ?? 0,

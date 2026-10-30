@@ -109,7 +109,17 @@ public class SchedulerService : BackgroundService
         {
             var now = DateTimeOffset.UtcNow;
 
-            foreach (var task in CollectDue(now))
+            // An exception escaping ExecuteAsync stops the host, and CollectDue allocates outside its per-timer catch
+            // (an OutOfMemoryException there took the host down), so a failed check waits for the next interval.
+            List<SchedulerTask> due;
+            try { due = CollectDue(now); }
+            catch (Exception ex)
+            {
+                try { _logger.LogError(ex, "[Scheduler] Timer check failed; retrying next interval"); } catch { }
+                due = [];
+            }
+
+            foreach (var task in due)
             {
                 try
                 {
@@ -176,7 +186,7 @@ public class SchedulerService : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[Scheduler] Error: {Command}", task.Command);
+                    try { _logger.LogError(ex, "[Scheduler] Error: {Command}", task.Command); } catch { }
                 }
             }
 

@@ -76,6 +76,31 @@ public class OrchestrationLifecycleTests
     }
 
     [Fact]
+    public async Task AStorageFailure_TakingTheInstanceLockAtStartup_IsRetried_InsteadOfFaultingThePump()
+    {
+        var settings = new CraftSettings();
+        settings.Worker.BgPoolSize = 4;
+        var failures = 1;
+        var faulty = new FaultyTableStore(new MemoryTableStore()) { FailSubmit = (_, _) => Interlocked.Decrement(ref failures) >= 0 };
+        var store = new WorkStore(NullLogger<WorkStore>.Instance, settings, faulty);
+        var pump = new WorkPump(NullLogger<WorkPump>.Instance, store, NewJobs(), new ConfigurationBuilder().AddInMemoryCollection([]).Build(), settings);
+
+        await pump.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(20);
+            while (await store.GetInstanceLockAsync() == null && DateTime.UtcNow < deadline) await Task.Delay(100);
+
+            Assert.NotNull(await store.GetInstanceLockAsync());
+            Assert.False(pump.ExecuteTask!.IsFaulted);
+        }
+        finally
+        {
+            await pump.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task OnShutdown_ClaimsThatNeverStarted_AreHandedBack_WithTheirAttemptRefunded()
     {
         var (store, pump, _) = NewIdlePump();

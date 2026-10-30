@@ -32,7 +32,6 @@ public class BinaryResponseTests
 
         Assert.Equal(PngHeader, result.BodyBytes);
         Assert.Equal("image/png", result.ContentType);
-        Assert.Equal(string.Empty, result.Body);
     }
 
     [Fact]
@@ -76,7 +75,6 @@ public class BinaryResponseTests
         // the old path JSON-quoted this into "<html>..."
         Assert.Equal("<html><body>hi</body></html>", result.Body);
         Assert.Equal("text/html", result.ContentType);
-        Assert.Null(result.BodyBytes);
     }
 
     [Fact]
@@ -90,7 +88,6 @@ public class BinaryResponseTests
         });
 
         Assert.Equal("""{"Results":"ok"}""", result.Body);
-        Assert.Null(result.BodyBytes);
     }
 
     [Fact]

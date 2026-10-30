@@ -66,6 +66,8 @@ public class ConfigurationReferenceTests
             { "App:Realtime:Enabled",                  settings.Realtime.Enabled },
             { "App:Worker:HttpPoolSize",               settings.Worker.HttpPoolSize },
             { "App:Worker:BgPoolSize",                 settings.Worker.BgPoolSize },
+            { "App:Worker:HttpBurstMax",               settings.Worker.HttpBurstMax },
+            { "App:Worker:HttpBurstIdleSeconds",       settings.Worker.HttpBurstIdleSeconds },
             { "App:Auth:CookieName",                   settings.Auth.CookieName },
             { "App:Auth:UserTableName",                settings.Auth.UserTableName },
             { "App:Scheduler:ConfigFile",              settings.Scheduler.ConfigFile },

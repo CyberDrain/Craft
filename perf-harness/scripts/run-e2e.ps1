@@ -24,7 +24,9 @@ param(
   [switch]$OrchOnly,
   [string[]]$OrchChecks,
   # Run only the hung-worker section (run-e2e-hung-workers.ps1).
-  [switch]$HungOnly
+  [switch]$HungOnly,
+  # Run only the HTTP burst section (run-e2e-http-burst.ps1).
+  [switch]$BurstOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,7 +95,7 @@ try {
   Add-Result 'storage' 'azurite-ready' ($h.ready.storage -eq $true) '-' "storageReady=$($h.ready.storage)"
 
   $suiteSw = [Diagnostics.Stopwatch]::StartNew()
-  if (-not $OrchOnly -and -not $HungOnly) {
+  if (-not $OrchOnly -and -not $HungOnly -and -not $BurstOnly) {
   # ── API dispatch ────────────────────────────────────────────────────────────
   $sw = [Diagnostics.Stopwatch]::StartNew(); $ping = Api '/API/PerfPing'; $sw.Stop()
   Add-Result 'api' 'dispatch-ping' ($ping.ok -eq $true) ("{0}ms" -f $sw.ElapsedMilliseconds) "endpoint=$($ping.endpoint)"
@@ -106,7 +108,9 @@ try {
   $modBase = '/app/API/Modules/PerfApi'
   Add-Result 'modules' 'module-base' ($mi.moduleBase -eq $modBase -and $mi.commandModuleBase -eq $modBase -and $mi.scriptRoot -eq $modBase) '-' "ModuleBase=$($mi.moduleBase) PSScriptRoot=$($mi.scriptRoot)"
   Add-Result 'modules' 'module-identity' ($mi.moduleType -eq 'Script' -and $mi.moduleName -eq 'PerfApi' -and $mi.listedByModule -eq $true) '-' "type=$($mi.moduleType) ModuleName=$($mi.moduleName)"
-  Add-Result 'modules' 'unlisted-helper' ($mi.helper -eq 'helper') '-' "helper outside FunctionsToExport -> $($mi.helper)"
+  Add-Result 'modules' 'unlisted-helper' ($mi.helper -eq 'helper') '-' "helper outside FunctionsToExport, called inside the module -> $($mi.helper)"
+  Add-Result 'modules' 'manifest-exports' ($mi.helperExported -eq $false -and $mi.aliasExported -eq $true) '-' "unlisted helper exported=$($mi.helperExported), AliasesToExport alias exported=$($mi.aliasExported)"
+  Add-Result 'modules' 'module-version' ($mi.version -eq '1.0.0') '-' "Version=$($mi.version) (manifest ModuleVersion 1.0.0)"
   Add-Result 'modules' 'get-help' ($mi.help -eq 'Reports what this worker sees of the PerfApi module.') '-' "synopsis=$($mi.help)"
   Add-Result 'modules' 'module-scope' ($mi.callOperator -eq 'ok' -and $mi.injected -eq $true) '-' "& `$module {}=$($mi.callOperator) injected=$($mi.injected)"
   Add-Result 'modules' 'nested-modules' ($mi.nestedThing -eq 'nested' -and $mi.nestedModuleBase -eq '/app/API/Modules/PerfNested') '-' "nested=$($mi.nestedThing) base=$($mi.nestedModuleBase)"
@@ -302,10 +306,13 @@ try {
   }
 
   # -- Hung workers (run-e2e-hung-workers.ps1) ----------------------------------------
-  if (-not $OrchOnly) { . (Join-Path $here 'run-e2e-hung-workers.ps1') }
+  if (-not $OrchOnly -and -not $BurstOnly) { . (Join-Path $here 'run-e2e-hung-workers.ps1') }
+
+  # -- HTTP burst workers (run-e2e-http-burst.ps1) -----------------------------------
+  if (-not $OrchOnly -and -not $HungOnly) { . (Join-Path $here 'run-e2e-http-burst.ps1') }
 
   # -- Orchestration engine (run-e2e-orchestration.ps1) ------------------------------
-  if (-not $HungOnly) {
+  if (-not $HungOnly -and -not $BurstOnly) {
     if ($ready) { . (Join-Path $here 'run-e2e-orchestration.ps1') }
     else { Add-Result 'orchestration' 'not-run' $false '-' 'SUT never became ready' }
   }

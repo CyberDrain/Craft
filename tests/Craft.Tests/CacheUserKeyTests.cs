@@ -14,6 +14,7 @@ namespace Craft.Tests;
 /// the same request, the second is served the first one's response — the exact leak that made the cache
 /// key user-scoped in the first place. Every test here is a direction that leak could come back from.
 /// </summary>
+[Collection(CacheBodyBytesTests.Name)]
 public class CacheUserKeyTests
 {
     // A disabled cache still builds keys the same way (BuildCacheKey does not consult _enabled); disabled
@@ -150,6 +151,7 @@ public class CacheUserKeyTests
 /// This is the end-to-end proof that the key isolation actually gates what <see cref="CacheService"/>
 /// serves, not just what strings <c>BuildCacheKey</c> emits.
 /// </summary>
+[Collection(CacheBodyBytesTests.Name)]
 public class CacheUserIsolationTests
 {
     private static readonly string[] EditorRole = ["editor"];

@@ -48,7 +48,7 @@ public static class CraftHostBuilderExtensions
     /// <c>CRAFT_MIN_THREADS</c>) wins, otherwise it is derived from the worker pools.
     /// </summary>
     /// <remarks>
-    /// The derived floor is <c>HttpPoolSize + BgPoolSize + 16</c>, never below the old
+    /// The derived floor is <c>HttpPoolSize + HttpBurstMax + BgPoolSize + 16</c>, never below the old
     /// <c>max(ProcessorCount * 4, 32)</c>.
     /// <para>
     /// The pool term is the important part. PowerShell blocks a thread for the duration of every
@@ -71,7 +71,7 @@ public static class CraftHostBuilderExtensions
         if (settings.Worker.MinThreads > 0) return settings.Worker.MinThreads;
 
         var baseline = Math.Max(Environment.ProcessorCount * 4, 32);
-        var forPools = settings.Worker.HttpPoolSize + settings.Worker.BgPoolSize + 16;
+        var forPools = settings.Worker.HttpPoolSize + Math.Max(0, settings.Worker.HttpBurstMax) + settings.Worker.BgPoolSize + 16;
         return Math.Max(baseline, forPools);
     }
 

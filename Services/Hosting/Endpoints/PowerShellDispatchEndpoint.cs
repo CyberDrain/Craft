@@ -129,18 +129,13 @@ public static class PowerShellDispatchEndpoint
 
                 if (result.StatusCode is >= 200 and < 300)
                 {
-                    HandleOrchestratorTrigger(result.Body, psRunner, orchestrator, logger, "[API] Orchestrator triggered");
-                    HandleScriptTrigger(result.Body, psRunner, jobManager, logger);
+                    HandleOrchestratorTrigger(result.BodyBytes, psRunner, orchestrator, logger, "[API] Orchestrator triggered");
+                    HandleScriptTrigger(result.BodyBytes, psRunner, jobManager, logger);
                     result = await HandleCancelTriggerAsync(result, orchestrator, logger, context);
                 }
 
                 if (HandlerHeaders.AllowsBody(result.StatusCode))
-                {
-                    if (result.BodyBytes is { } bodyBytes)
-                        await context.Response.Body.WriteAsync(bodyBytes);
-                    else
-                        await context.Response.WriteAsync(result.Body);
-                }
+                    await context.Response.Body.WriteAsync(result.BodyBytes);
             }
             finally
             {
@@ -201,12 +196,7 @@ public static class PowerShellDispatchEndpoint
         context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
         if (HandlerHeaders.AllowsBody(cached.Result.StatusCode))
-        {
-            if (cached.Result.BodyBytes is { } cachedBytes)
-                await context.Response.Body.WriteAsync(cachedBytes);
-            else
-                await context.Response.WriteAsync(cached.Result.Body);
-        }
+            await context.Response.Body.WriteAsync(cached.Result.BodyBytes);
 
         if (requestSnapshot is null) return;
 
@@ -236,7 +226,7 @@ public static class PowerShellDispatchEndpoint
                     // writing back then would resurrect data the invalidation was meant to drop.
                     cache.SetIfSameGeneration(cacheKey, fresh, generation);
 
-                    HandleOrchestratorTrigger(fresh.Body, psRunner, orchestrator, logger,
+                    HandleOrchestratorTrigger(fresh.BodyBytes, psRunner, orchestrator, logger,
                         "[API] Orchestrator triggered via bg refresh");
                 }
             }
@@ -253,7 +243,7 @@ public static class PowerShellDispatchEndpoint
     }
 
     private static void HandleOrchestratorTrigger(
-        string body, PowerShellRunnerService psRunner, OrchestratorService orchestrator,
+        byte[] body, PowerShellRunnerService psRunner, OrchestratorService orchestrator,
         ILogger logger, string logPrefix)
     {
         if (!ResponseTriggers.MayContain(body, ResponseTriggers.OrchestratorMarker)) return;
@@ -279,7 +269,7 @@ public static class PowerShellDispatchEndpoint
     }
 
     private static void HandleScriptTrigger(
-        string body, PowerShellRunnerService psRunner, JobManager jobManager, ILogger logger)
+        byte[] body, PowerShellRunnerService psRunner, JobManager jobManager, ILogger logger)
     {
         if (!ResponseTriggers.MayContain(body, ResponseTriggers.ScriptMarker)) return;
 
@@ -312,11 +302,11 @@ public static class PowerShellDispatchEndpoint
     private static async Task<ScriptResult> HandleCancelTriggerAsync(
         ScriptResult result, OrchestratorService orchestrator, ILogger logger, HttpContext context)
     {
-        if (!ResponseTriggers.MayContain(result.Body, ResponseTriggers.CancelMarker)) return result;
+        if (!ResponseTriggers.MayContain(result.BodyBytes, ResponseTriggers.CancelMarker)) return result;
 
         try
         {
-            if (ResponseTriggers.ParseCancel(result.Body) is not { } trigger) return result;
+            if (ResponseTriggers.ParseCancel(result.BodyBytes) is not { } trigger) return result;
 
             var (found, cancelledCount) = await orchestrator.CancelRunAsync(trigger.Command);
 

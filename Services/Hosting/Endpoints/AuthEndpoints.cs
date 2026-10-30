@@ -70,7 +70,7 @@ public static class AuthEndpoints
 
                 if (result.StatusCode is >= 200 and < 300)
                 {
-                    await context.Response.WriteAsync(result.Body);
+                    await context.Response.Body.WriteAsync(result.BodyBytes);
                     return;
                 }
 

@@ -28,7 +28,7 @@ public class CacheService : IDisposable
     private readonly int _maxEntries;
     private readonly TimeSpan _defaultTtl;
 
-    // In-memory body tier: keep hot body strings in RAM so a hit skips the disk read. Budget in bytes;
+    // In-memory body tier: keep hot bodies in RAM so a hit skips the disk read. Budget in bytes;
     // 0 = disabled (disk-only). _memBytes is the running total; _memLock serializes eviction.
     private readonly long _maxMemoryBytes;
     private long _memBytes;
@@ -112,7 +112,12 @@ public class CacheService : IDisposable
         CleanupOrphanFiles();
 
         // Eviction timer runs every 60 seconds to purge expired entries
-        _evictionTimer = new Timer(_ => EvictExpired(), null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+        // An exception escaping a timer callback terminates the process.
+        _evictionTimer = new Timer(_ =>
+        {
+            try { EvictExpired(); }
+            catch (Exception ex) { try { _logger.LogWarning(ex, "[Cache] Eviction sweep failed"); } catch { } }
+        }, null, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
     }
 
     /// <summary>
@@ -254,7 +259,7 @@ public class CacheService : IDisposable
             // Not resident — read from disk. No File.Exists pre-check: the read itself surfaces a missing
             // file via the catch below, so we save a redundant stat syscall on every disk-tier hit.
             var diskStart = CacheProfiler.Enabled ? Stopwatch.GetTimestamp() : 0;
-            var body = await File.ReadAllTextAsync(entry.FilePath);
+            var body = await File.ReadAllBytesAsync(entry.FilePath);
             if (CacheProfiler.Enabled) CacheProfiler.RecordGetDisk(Stopwatch.GetTimestamp() - diskStart);
 
             // Promote into the memory tier so subsequent hits skip the disk.
@@ -281,19 +286,19 @@ public class CacheService : IDisposable
     /// copied — nothing downstream mutates it, and copying it on every cache hit would defeat the
     /// point of the in-memory tier.
     /// </summary>
-    private static ScriptResult ToResult(CacheEntry entry, string body) => new()
+    private static ScriptResult ToResult(CacheEntry entry, byte[] body) => new()
     {
         StatusCode = entry.StatusCode,
-        Body = body,
+        BodyBytes = body,
         Headers = entry.Headers,
         ContentType = entry.ContentType
     };
 
     /// <summary>Charge a body to the in-memory tier (idempotent per entry), evicting LRU bodies if over budget.</summary>
-    private void StoreBody(CacheEntry entry, string body)
+    private void StoreBody(CacheEntry entry, byte[] body)
     {
         if (_maxMemoryBytes <= 0) return;
-        var bytes = body.Length * 2;              // ~UTF-16 in-memory size
+        var bytes = body.Length;
         var old = entry.BodyBytes;
         entry.Body = body;
         entry.BodyBytes = bytes;
@@ -350,7 +355,7 @@ public class CacheService : IDisposable
                 Encoding.UTF8.GetBytes(cacheKey)))[..32] + ".json";
             var filePath = Path.Combine(_cachePath, fileName);
 
-            await File.WriteAllTextAsync(filePath, result.Body);
+            await File.WriteAllBytesAsync(filePath, result.BodyBytes);
 
             var entry = new CacheEntry
             {
@@ -364,7 +369,7 @@ public class CacheService : IDisposable
             // Populate the in-memory body BEFORE publishing the entry, so any concurrent Get that sees the
             // new entry always sees its body (the stale-while-revalidate refresh republishes constantly —
             // publishing a body-less entry first would make those Gets fall through to a disk read).
-            StoreBody(entry, result.Body);
+            StoreBody(entry, result.BodyBytes);
             _index[cacheKey] = entry;
             if (CacheProfiler.Enabled) CacheProfiler.RecordSet(Stopwatch.GetTimestamp() - setStart);
         }

@@ -38,6 +38,8 @@ services:
       - App__Worker__BgPoolSize=${BG_POOL:-4}
       - App__ReadinessMode=Immediate
       - App__Setup__Enabled=false
+      # The per-client rate limiter is on by default; load runs would measure its 429s, not the host.
+      - App__RateLimit__Enabled=false
       - App__Orchestrator__TablePrefix=PerfBgOrch
       # OOM-resilience harness (run-oom.ps1): cap the .NET GC heap just above baseline to prove the
       # durable-queue backlog keeps memory bounded regardless of fan-out size. Empty = no cap.

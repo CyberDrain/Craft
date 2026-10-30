@@ -120,7 +120,16 @@ public class WorkPump : BackgroundService
         try
         {
             if (_claimGate is { IsCompleted: false }) await _claimGate.WaitAsync(stoppingToken);
-            await AcquireLockAsync(stoppingToken);
+            // An exception escaping ExecuteAsync stops the host, so a storage failure here retries instead.
+            while (true)
+            {
+                try { await AcquireLockAsync(stoppingToken); break; }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    try { _logger.LogError(ex, "[WorkPump] Could not take the instance lock; retrying"); } catch { }
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
+            }
         }
         catch (OperationCanceledException) { return; }
         _ = RepairAsync(stoppingToken);

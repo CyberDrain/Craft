@@ -172,6 +172,14 @@ Controls the PowerShell runspace pools that execute all scripts.
   // scheduler and JobManager still run; native tasks execute on the .NET thread pool).
   "BgPoolSize": 4,
 
+  // Extra HTTP workers built only for interactive (non-API-client) requests that find every HTTP worker
+  // busy, up to this many beyond HttpPoolSize, and disposed again once no user request has waited for
+  // HttpBurstIdleSeconds. API clients never hold more than HttpPoolSize workers at once, so this capacity
+  // is always the users'. Not built while the GC heap is above 80% of its limit. 0 = off.
+  // Env override: CRAFT_HTTP_BURST_MAX. SkuProfiles entries may set HttpBurstMax per tier.
+  "HttpBurstMax": 0,
+  "HttpBurstIdleSeconds": 600,
+
   // Run each worker's PowerShell pipeline on one reused thread instead of a new thread per invocation.
   // Default true — the biggest single per-request dispatch win (~50% of the PS-invoke cost, +68% throughput
   // on dispatch-bound load; see docs/dispatch-analysis.md), and matches the Azure Functions PS worker's
@@ -473,7 +481,7 @@ In-memory index + disk-backed (`_cache/`) response cache for HTTP `List*` GET en
   // "Enabled": true,
 
   // Bytes budget for the in-memory body tier (LRU over the disk cache) — a HIT returns the body from RAM
-  // instead of re-reading + re-decoding the file. Default 64 MiB; 0 = disk-only. Gain scales with response
+  // instead of re-reading the file. Default 64 MiB; 0 = disk-only. Gain scales with response
   // size (+44% throughput for small List* responses, +157% at ~150KB; see docs/cache-analysis.md).
   "MaxMemoryBytes": 67108864,
 

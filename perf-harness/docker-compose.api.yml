@@ -45,6 +45,8 @@ services:
       # Determinism: Kestrel up immediately; we poll /healthz. No setup wizard, quiet logs.
       - App__ReadinessMode=Immediate
       - App__Setup__Enabled=false
+      # The per-client rate limiter is on by default; load runs would measure its 429s, not the host.
+      - App__RateLimit__Enabled=false
       - CRAFT_LOG_LEVEL=Warning
       - Logging__LogLevel__Default=Warning
       # Opt-in per-segment dispatch timing (run-api.ps1 -DispatchTiming). The profiler's windowed report

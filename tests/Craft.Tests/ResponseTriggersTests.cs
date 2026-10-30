@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Craft.Hosting;
 using Craft.Hosting.Endpoints;
@@ -11,18 +12,23 @@ namespace Craft.Tests;
 /// </summary>
 public class ResponseTriggersTests
 {
+    private static bool MayContain(string? body, string marker) => ResponseTriggers.MayContain(Encoding.UTF8.GetBytes(body ?? ""), marker);
+    private static OrchestratorTrigger? ParseOrchestrator(string body) => ResponseTriggers.ParseOrchestrator(Encoding.UTF8.GetBytes(body));
+    private static ScriptTrigger? ParseScript(string body) => ResponseTriggers.ParseScript(Encoding.UTF8.GetBytes(body));
+    private static CancelTrigger? ParseCancel(string body) => ResponseTriggers.ParseCancel(Encoding.UTF8.GetBytes(body));
+
     [Theory]
     [InlineData("""{"_orchestratorTrigger":true}""", "_orchestratorTrigger", true)]
     [InlineData("""{"ok":1}""", "_orchestratorTrigger", false)]
     [InlineData("", "_orchestratorTrigger", false)]
     [InlineData(null, "_orchestratorTrigger", false)]
     public void MayContain_IsACheapPreFilter(string? body, string marker, bool expected) =>
-        Assert.Equal(expected, ResponseTriggers.MayContain(body, marker));
+        Assert.Equal(expected, MayContain(body, marker));
 
     [Fact]
     public void Orchestrator_ParsesAllFields()
     {
-        var trigger = ResponseTriggers.ParseOrchestrator("""
+        var trigger = ParseOrchestrator("""
             {
               "_orchestratorTrigger": true,
               "command": "Start-Sync",
@@ -42,7 +48,7 @@ public class ResponseTriggersTests
     [Fact]
     public void Orchestrator_PriorityDefaultsToTwo()
     {
-        var trigger = ResponseTriggers.ParseOrchestrator("""
+        var trigger = ParseOrchestrator("""
             {"_orchestratorTrigger":true,"command":"c","plannerScript":"p","taskScript":"t"}
             """);
 
@@ -53,15 +59,15 @@ public class ResponseTriggersTests
     [InlineData("""{"_orchestratorTrigger":false,"command":"c","plannerScript":"p","taskScript":"t"}""")]
     [InlineData("""{"command":"c","plannerScript":"p","taskScript":"t"}""")]
     public void Orchestrator_MarkerAbsentOrFalse_IsNotATrigger(string body) =>
-        Assert.Null(ResponseTriggers.ParseOrchestrator(body));
+        Assert.Null(ParseOrchestrator(body));
 
     [Fact]
     public void Orchestrator_MarkerMustBeBooleanTrue_NotTruthy()
     {
         // A string "true" is not a trigger. Being strict here avoids firing a fan-out off a response
         // that merely happens to carry a similarly named field.
-        Assert.Null(ResponseTriggers.ParseOrchestrator("""{"_orchestratorTrigger":"true","command":"c"}"""));
-        Assert.Null(ResponseTriggers.ParseOrchestrator("""{"_orchestratorTrigger":1,"command":"c"}"""));
+        Assert.Null(ParseOrchestrator("""{"_orchestratorTrigger":"true","command":"c"}"""));
+        Assert.Null(ParseOrchestrator("""{"_orchestratorTrigger":1,"command":"c"}"""));
     }
 
     [Fact]
@@ -70,26 +76,26 @@ public class ResponseTriggersTests
         // The caller catches this and logs; the alternative is a null-reference deep inside the
         // orchestrator with no indication of which response caused it.
         Assert.Throws<KeyNotFoundException>(() =>
-            ResponseTriggers.ParseOrchestrator("""{"_orchestratorTrigger":true,"command":"c"}"""));
+            ParseOrchestrator("""{"_orchestratorTrigger":true,"command":"c"}"""));
     }
 
     [Fact]
     public void Script_ParsesAndDefaultsPriorityToFive()
     {
-        var explicitPriority = ResponseTriggers.ParseScript(
+        var explicitPriority = ParseScript(
             """{"_scriptTrigger":true,"command":"Invoke-Thing","priority":9}""");
         Assert.Equal("Invoke-Thing", explicitPriority!.Command);
         Assert.Equal(9, explicitPriority.Priority);
 
         // Background scripts sit below orchestrations by default.
-        var defaulted = ResponseTriggers.ParseScript("""{"_scriptTrigger":true,"command":"Invoke-Thing"}""");
+        var defaulted = ParseScript("""{"_scriptTrigger":true,"command":"Invoke-Thing"}""");
         Assert.Equal(5, defaulted!.Priority);
     }
 
     [Fact]
     public void Cancel_ParsesCommand()
     {
-        var trigger = ResponseTriggers.ParseCancel("""{"_cancelTrigger":true,"command":"Start-Sync"}""");
+        var trigger = ParseCancel("""{"_cancelTrigger":true,"command":"Start-Sync"}""");
         Assert.Equal("Start-Sync", trigger!.Command);
     }
 
@@ -99,14 +105,14 @@ public class ResponseTriggersTests
         // ThrowsAny, not Throws: System.Text.Json raises JsonReaderException, a JsonException subclass.
         // The handler's `when (ex is JsonException ...)` filter matches subclasses, so this is the
         // assertion that reflects real catch behaviour.
-        Assert.ThrowsAny<JsonException>(() => ResponseTriggers.ParseOrchestrator("not json"));
+        Assert.ThrowsAny<JsonException>(() => ParseOrchestrator("not json"));
     }
 
     [Fact]
     public void NonObjectJson_IsNotATrigger()
     {
         // A handler returning a bare array is normal; it must not blow up the trigger scan.
-        Assert.Null(ResponseTriggers.ParseOrchestrator("[1,2,3]"));
+        Assert.Null(ParseOrchestrator("[1,2,3]"));
     }
 }
 
