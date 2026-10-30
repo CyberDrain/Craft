@@ -1,6 +1,7 @@
 using Craft.Configuration;
 using Craft.Endpoints;
 using Craft.Orchestration;
+using Craft.Storage;
 using Cronos;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -158,5 +159,34 @@ public sealed class SchedulerTimezoneJitterE2ETests : IDisposable
         var nightly = Assert.Single(fired, f => f.Command == "Nightly");
         Assert.InRange(nightly.At, Utc(10, 20, 0, 30) + NightlyOffset(), Utc(10, 20, 0, 30) + NightlyOffset() + Tick);
         Assert.Equal([Utc(10, 20, 3)], fired.Where(f => f.Command == "Flagged").Select(f => f.At));
+    }
+
+    [Fact]
+    public async Task TheStateTableRecordsEachFiringAndTheNextWithItsJitter()
+    {
+        var store = new MemoryTableStore();
+        await store.UpsertAsync("Timers", new StoreRow("Timer", "nightly") { ["LastFired"] = Utc(10, 17, 0, 40) });
+        await store.UpsertAsync("Timers", new StoreRow("Timer", "removed"));
+        var scheduler = new SchedulerService(NullLogger<SchedulerService>.Instance, null!, null!, null!, null!,
+            new CraftSettings { Scheduler = new SchedulerSettings { ConfigFile = _timerFile, ApplyTZOffset = true, StateTable = "Timers" } },
+            null!, null!, NativeScheduledTasks.Empty, null!, store);
+        scheduler.Start(Utc(10, 18));
+
+        await scheduler.LoadStateAsync(CancellationToken.None);
+
+        // 01:30 BST is 00:30 UTC; a restart keeps the last firing and drops timers no longer in the file
+        var nightly = await store.GetAsync("Timers", "Timer", "nightly");
+        Assert.Equal(Utc(10, 17, 0, 40), nightly!.GetDateTimeOffset("LastFired"));
+        Assert.Equal(Utc(10, 18, 0, 30) + NightlyOffset(), nightly.GetDateTimeOffset("NextFire"));
+        Assert.Null(await store.GetAsync("Timers", "Timer", "removed"));
+
+        var now = Utc(10, 18);
+        List<SchedulerTask> due;
+        while (!(due = scheduler.CollectDue(now)).Exists(t => t.Id == "nightly")) now += Tick;
+        await scheduler.WriteStateAsync(due);
+
+        nightly = await store.GetAsync("Timers", "Timer", "nightly");
+        Assert.Equal(now, nightly!.GetDateTimeOffset("LastFired"));
+        Assert.Equal(Utc(10, 19, 0, 30) + NightlyOffset(), nightly.GetDateTimeOffset("NextFire"));
     }
 }

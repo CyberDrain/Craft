@@ -462,7 +462,9 @@
       // IANA or Windows timezone ID for timezone-aware cron evaluation.
       // Overridden by env var CraftTZ if set. Empty = UTC.
       // Examples: "America/New_York", "Europe/London"
-      "Timezone": ""
+      "Timezone": "",
+      // Table recording each timer's LastFired / NextFire (jitter included). Empty = not recorded.
+      "StateTable": ""
     },
 
     "Orchestrator": {
