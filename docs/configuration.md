@@ -335,7 +335,11 @@ Drives the cron-based background task system.
   "ConfigFile": "CIPPTimers.json",
 
   // How often (seconds) the scheduler checks for due tasks.
-  "CheckIntervalSeconds": 30
+  "CheckIntervalSeconds": 30,
+
+  // Table recording each timer's LastFired / NextFire (jitter included), one row per task Id
+  // in partition "Timer". Empty = not recorded.
+  "StateTable": ""
 }
 ```
 

@@ -29,4 +29,12 @@ public class SchedulerSettings
     /// Examples: "America/New_York", "Europe/London", "Eastern Standard Time"
     /// </summary>
     public string Timezone { get; set; } = "";
+
+    /// <summary>
+    /// Table that records each timer's state so the hosted app can show it: one row per timer
+    /// (PartitionKey "Timer", RowKey = task Id) with Command, Cron, LastFired, NextFire (jitter included),
+    /// JitterMinutes, JitterSeconds and Timezone. Rewritten at startup, after each firing and on a timezone
+    /// change; rows for timers no longer in the file are removed at startup. Empty (default) = not recorded.
+    /// </summary>
+    public string StateTable { get; set; } = "";
 }

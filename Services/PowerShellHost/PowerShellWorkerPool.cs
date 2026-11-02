@@ -375,7 +375,8 @@ public class PowerShellWorkerPool : IDisposable
     /// <summary>
     /// A user request found every HTTP worker busy: build one more in the background, within HttpBurstMax, two at a
     /// time and only while the GC heap is under 80% of its limit. The waiting request takes whichever
-    /// worker frees first, so it never waits on the build itself.
+    /// worker frees first, so it never waits on the build itself. Each finished build starts the next while more
+    /// user requests wait than are being built for.
     /// </summary>
     private void GrowHttpBurst()
     {
@@ -411,6 +412,8 @@ public class PowerShellWorkerPool : IDisposable
             _httpPool.Add(worker);
             _logger.LogInformation("[Pool] HTTP burst: added W{Id} for interactive requests ({Workers}/{Max} HTTP workers)",
                 worker.Id, workers, _httpPoolSize + _httpBurstMax);
+            // Requests that arrived while two builds were running skipped their own build.
+            if (_httpPool.PriorityWaiting > Volatile.Read(ref _httpBurstBuilding)) GrowHttpBurst();
         });
     }
 

@@ -28,9 +28,12 @@ public class SchedulerService : BackgroundService
     private readonly StorageHealthMonitor _storageHealth;
     private readonly NativeScheduledTasks _nativeTasks;
     private readonly IServiceProvider _services;
+    private readonly ICraftTableStore? _store;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
+    private readonly Dictionary<string, DateTimeOffset> _lastFired = new();
     private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
+    private const string StatePartition = "Timer";
 
     /// <summary>Expose loaded tasks for the API layer.</summary>
     public IReadOnlyList<SchedulerTask> Tasks => _tasks;
@@ -45,8 +48,10 @@ public class SchedulerService : BackgroundService
         PowerShellWorkerPool pool,
         StorageHealthMonitor storageHealth,
         NativeScheduledTasks nativeTasks,
-        IServiceProvider services)
+        IServiceProvider services,
+        ICraftTableStore? store = null)
     {
+        _store = store;
         _logger = logger;
         _psRunner = psRunner;
         _limiter = limiter;
@@ -95,6 +100,12 @@ public class SchedulerService : BackgroundService
         finally
         {
             _orchestrator.MarkRecoveryDone();
+        }
+
+        try { await LoadStateAsync(stoppingToken); }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[Scheduler] Could not load timer state from {Table}", _settings.Scheduler.StateTable);
         }
 
         // Retention sweeps for the rest of the process lifetime; recovery ran the first one. Fire and
@@ -189,6 +200,8 @@ public class SchedulerService : BackgroundService
                     try { _logger.LogError(ex, "[Scheduler] Error: {Command}", task.Command); } catch { }
                 }
             }
+
+            if (due.Count > 0) _ = WriteStateAsync(due, stoppingToken);
 
             // Check at configured interval
             await Task.Delay(TimeSpan.FromSeconds(_settings.Scheduler.CheckIntervalSeconds), stoppingToken);
@@ -332,6 +345,7 @@ public class SchedulerService : BackgroundService
         {
             _lastRun[task.Id] = now - task.JitterOffset;
         }
+        _ = WriteStateAsync(_tasks);
     }
 
     /// <summary>Loads the timer file, resolves the timezone and jitter, and seeds every timer at <paramref name="startup"/>.</summary>
@@ -362,6 +376,7 @@ public class SchedulerService : BackgroundService
                 if (IsDue(cronExpression, TimeZoneFor(task), _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue), task.JitterOffset, now))
                 {
                     _lastRun[task.Id] = now;
+                    _lastFired[task.Id] = now;
                     due.Add(task);
                 }
             }
@@ -371,6 +386,62 @@ public class SchedulerService : BackgroundService
             }
         }
         return due;
+    }
+
+    /// <summary>Reads each timer's last firing back from the state table, removes rows for timers no longer in the file, and rewrites the rest.</summary>
+    internal async Task LoadStateAsync(CancellationToken ct)
+    {
+        var table = _settings.Scheduler.StateTable;
+        if (_store is null || string.IsNullOrWhiteSpace(table)) return;
+
+        await _store.EnsureTableAsync(table, ct);
+        var ids = _tasks.Select(t => t.Id).ToHashSet(StringComparer.Ordinal);
+        var stale = new List<string>();
+        await foreach (var row in _store.QueryPartitionAsync(table, StatePartition, ct))
+        {
+            if (!ids.Contains(row.RowKey)) stale.Add(row.RowKey);
+            else if (row.GetDateTimeOffset("LastFired") is { } fired) _lastFired.TryAdd(row.RowKey, fired);
+        }
+        if (stale.Count > 0) await _store.DeleteBatchAsync(table, StatePartition, stale, ct);
+        await WriteStateAsync(_tasks, ct);
+    }
+
+    /// <summary>Records <paramref name="tasks"/> in the state table. Never throws; the rows are built before the first await, on the caller's thread.</summary>
+    internal async Task WriteStateAsync(IEnumerable<SchedulerTask> tasks, CancellationToken ct = default)
+    {
+        var table = _settings.Scheduler.StateTable;
+        if (_store is null || string.IsNullOrWhiteSpace(table)) return;
+
+        var rows = tasks.Select(StateRow).ToList();
+        try { await _store.UpsertBatchAsync(table, StatePartition, rows, ct); }
+        catch (Exception ex)
+        {
+            try { _logger.LogWarning(ex, "[Scheduler] Could not record timer state in {Table}", table); } catch { }
+        }
+    }
+
+    private StoreRow StateRow(SchedulerTask task)
+    {
+        var tz = TimeZoneFor(task);
+        var row = new StoreRow(StatePartition, task.Id)
+        {
+            ["Command"] = task.Command,
+            ["Cron"] = task.Cron,
+            ["JitterMinutes"] = task.JitterMinutes,
+            ["JitterSeconds"] = (int)task.JitterOffset.TotalSeconds,
+            ["Timezone"] = tz.Id,
+        };
+        if (_lastFired.TryGetValue(task.Id, out var fired)) row["LastFired"] = fired;
+        try
+        {
+            if (_lastRun.TryGetValue(task.Id, out var lastRun)
+                && CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds).GetNextOccurrence(lastRun, tz) is { } next)
+            {
+                row["NextFire"] = next + task.JitterOffset;
+            }
+        }
+        catch (CronFormatException) { }
+        return row;
     }
 
     private TimeZoneInfo TimeZoneFor(SchedulerTask task) =>

@@ -14,6 +14,8 @@ public sealed class TieredHandoff<T> where T : class
 
     public int Count { get { lock (_lock) return _free.Count; } }
 
+    public int PriorityWaiting { get { lock (_lock) return _priority.Count; } }
+
     public void Add(T item)
     {
         TaskCompletionSource<T> waiter;
