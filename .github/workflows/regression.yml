@@ -47,7 +47,7 @@ jobs:
     name: lint (format + analyzers)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No dotnet-version here on purpose: global.json pins the SDK, and setup-dotnet honours it.
       # That keeps CI, build/Dockerfile and developer machines on one Roslyn + analyzer set.
@@ -76,7 +76,7 @@ jobs:
     name: build + unit tests (AzureTables)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -102,7 +102,7 @@ jobs:
     needs: [lint, build]
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Build the AzureTables image the E2E stack runs (compose references it as craft:ci).
       - name: Build image
