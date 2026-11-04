@@ -429,8 +429,13 @@ public class SetupService
     /// Configures the App Service with EasyAuth settings using the managed identity.
     /// Sets environment variables and authsettingsV2 via ARM REST API.
     /// </summary>
+    /// <param name="allowedTenants">
+    /// Restricted multi-tenant mode: other tenants that may sign in, merged with
+    /// <see cref="SetupSettings.AllowedTenants"/>. Empty = any tenant. Ignored for single-tenant.
+    /// </param>
     public async Task ConfigureAppServiceAuth(
-        string appId, string clientSecret, string tenantId, bool multiTenant = false, CancellationToken ct = default)
+        string appId, string clientSecret, string tenantId, bool multiTenant = false,
+        IReadOnlyList<string>? allowedTenants = null, CancellationToken ct = default)
     {
         var managementToken = await GetManagedIdentityToken("https://management.azure.com/", ct);
         if (managementToken == null)
@@ -488,13 +493,14 @@ public class SetupService
             mergedSettings["AUTH_SECRET"] = clientSecret;
         }
 
-        // Determine effective allowed tenants (always include the setup tenant)
+        // Single-tenant is restricted by its {tenantId}/v2.0 issuer. Multi-tenant uses the common
+        // issuer, optionally restricted to an allow-list that always includes the setup tenant.
         bool useCommonIssuer = multiTenant;
-
-        // Always remove WEBSITE_AUTH_AAD_ALLOWED_TENANTS — we rely on the issuer URL
-        // for tenant restriction ("Use default restrictions based on issuer" in the portal).
-        // Multi-tenant uses common/v2.0 issuer, single-tenant uses {tenantId}/v2.0.
-        mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
+        var restrictedTenants = RestrictedTenants(tenantId, multiTenant, (allowedTenants ?? []).Concat(_settings.Setup.AllowedTenants));
+        if (restrictedTenants.Length > 0)
+            mergedSettings["WEBSITE_AUTH_AAD_ALLOWED_TENANTS"] = string.Join(",", restrictedTenants);
+        else
+            mergedSettings.Remove("WEBSITE_AUTH_AAD_ALLOWED_TENANTS");
 
         // 3. PUT merged settings back
         var settingsBody = new { properties = mergedSettings };
@@ -502,7 +508,8 @@ public class SetupService
             $"{baseUri}/config/appsettings?api-version=2024-11-01",
             managementToken, settingsBody, ct);
 
-        _logger.LogInformation("[Setup] App settings updated (WEBSITE_AUTH_AAD_ALLOWED_TENANTS removed)");
+        _logger.LogInformation("[Setup] App settings updated (WEBSITE_AUTH_AAD_ALLOWED_TENANTS = {Tenants})",
+            restrictedTenants.Length > 0 ? string.Join(",", restrictedTenants) : "unset");
 
         // 4. Configure authsettingsV2
         var globalValidation = new Dictionary<string, object>
@@ -774,9 +781,25 @@ public class SetupService
     /// and configures the App Service via ARM.
     /// </summary>
     public async Task ConfigureManual(
-        string appId, string clientSecret, string tenantId, bool multiTenant = false, CancellationToken ct = default)
+        string appId, string clientSecret, string tenantId, bool multiTenant = false,
+        IReadOnlyList<string>? allowedTenants = null, CancellationToken ct = default)
     {
-        await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, ct);
+        await ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, allowedTenants, ct);
+    }
+
+    /// <summary>
+    /// The WEBSITE_AUTH_AAD_ALLOWED_TENANTS list: the setup tenant plus every other allowed tenant, or
+    /// empty (setting removed) for single-tenant and unrestricted multi-tenant.
+    /// </summary>
+    internal static string[] RestrictedTenants(string tenantId, bool multiTenant, IEnumerable<string> allowedTenants)
+    {
+        var others = allowedTenants.Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
+        if (!multiTenant || others.Length == 0) return [];
+
+        return others.Prepend(tenantId)
+            .Select(t => t.Trim().ToLowerInvariant())
+            .Distinct()
+            .ToArray();
     }
 
     // ── First User Seeding ──

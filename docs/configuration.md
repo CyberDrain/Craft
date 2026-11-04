@@ -780,7 +780,7 @@ These configure the built-in Azure AD / Entra ID OIDC authentication. When set, 
 |----------|----------|-------------|
 | `WEBSITE_AUTH_CLIENT_ID` | Yes (prod) | Azure AD app registration client/application ID |
 | `AUTH_SECRET` | Yes (prod) | Azure AD client secret for the app registration |
-| `WEBSITE_AUTH_AAD_ALLOWED_TENANTS` | No | Tenant ID to restrict logins to. Defaults to `common` (any tenant) |
+| `WEBSITE_AUTH_AAD_ALLOWED_TENANTS` | No | Comma-separated tenant IDs allowed to sign in to a multi-tenant (`common` issuer) app; App Service rejects other tenants. Unset = any tenant. Written by the setup wizard's *Restricted Multi-Tenant* mode |
 
 When **none** of these are set, Craft's auth is unconfigured — the `/login` endpoint returns an error and API requests receive no identity header. In **Development** mode, a dev principal is injected automatically (see `Auth.DevRoles`).
 
@@ -793,7 +793,6 @@ In production on Azure App Service, **do not put secrets in plain-text App Setti
 ```
 WEBSITE_AUTH_CLIENT_ID              = @Microsoft.KeyVault(VaultName=myvault;SecretName=ApplicationID)
 AUTH_SECRET                         = @Microsoft.KeyVault(VaultName=myvault;SecretName=ApplicationSecret)
-WEBSITE_AUTH_AAD_ALLOWED_TENANTS    = @Microsoft.KeyVault(VaultName=myvault;SecretName=TenantID)
 ```
 
 Key Vault references require:

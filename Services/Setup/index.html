@@ -126,10 +126,12 @@
 
         <label style="margin-bottom: 0.25rem;">Tenant Access</label>
         <div class="toggle-group" id="auto-tenant-toggle">
-            <button type="button" class="active" onclick="setTenantMode('auto', false)">Single Tenant</button>
-            <button type="button" onclick="setTenantMode('auto', true)">Multi-Tenant</button>
+            <button type="button" class="active" onclick="setTenantMode('auto', 'single')">Single Tenant</button>
+            <button type="button" onclick="setTenantMode('auto', 'multi')">Multi-Tenant</button>
+            <button type="button" onclick="setTenantMode('auto', 'restricted')">Restricted Multi-Tenant</button>
         </div>
         <div class="toggle-hint" id="auto-tenant-hint">Only users from the tenant you sign in with can access this app.</div>
+        <input type="text" id="auto-allowed-tenants" class="hidden" placeholder="Other tenant IDs that may sign in, comma-separated">
 
         <div id="device-code-display" class="hidden">
             <div class="device-code-box">
@@ -161,10 +163,12 @@
         <p>If you already have an app registration, enter the details below.</p>
         <label style="margin-bottom: 0.25rem;">Tenant Access</label>
         <div class="toggle-group" id="manual-tenant-toggle">
-            <button type="button" class="active" onclick="setTenantMode('manual', false)">Single Tenant</button>
-            <button type="button" onclick="setTenantMode('manual', true)">Multi-Tenant</button>
+            <button type="button" class="active" onclick="setTenantMode('manual', 'single')">Single Tenant</button>
+            <button type="button" onclick="setTenantMode('manual', 'multi')">Multi-Tenant</button>
+            <button type="button" onclick="setTenantMode('manual', 'restricted')">Restricted Multi-Tenant</button>
         </div>
         <div class="toggle-hint" id="manual-tenant-hint">Only users from the specified tenant can access this app.</div>
+        <input type="text" id="manual-allowed-tenants" class="hidden" placeholder="Other tenant IDs that may sign in, comma-separated">
         <details style="margin-bottom: 1rem;">
             <summary style="cursor: pointer; color: #60a5fa; font-size: 0.85rem;">How to create the app registration manually</summary>
             <ol style="margin: 0.75rem 0 0.5rem 1.25rem; font-size: 0.8rem; color: #94a3b8; line-height: 1.6;">
@@ -191,27 +195,40 @@
 
 <script>
     let setupState = {};
-    let autoMultiTenant = false;
-    let manualMultiTenant = false;
+    const tenantModes = ['single', 'multi', 'restricted'];
+    const tenantMode = { auto: 'single', manual: 'single' };
 
-    function setTenantMode(section, isMulti) {
+    function setTenantMode(section, mode) {
+        tenantMode[section] = mode;
         const toggle = document.getElementById(section + '-tenant-toggle');
-        const hint = document.getElementById(section + '-tenant-hint');
-        toggle.children[0].classList.toggle('active', !isMulti);
-        toggle.children[1].classList.toggle('active', isMulti);
-        if (section === 'auto') {
-            autoMultiTenant = isMulti;
-        } else {
-            manualMultiTenant = isMulti;
-        }
-        hint.textContent = isMulti
-            ? 'Users from any Microsoft Entra tenant can sign in to this app.'
-            : 'Only users from ' + (section === 'auto' ? 'the tenant you sign in with' : 'the specified tenant') + ' can access this app.';
+        tenantModes.forEach((m, i) => toggle.children[i].classList.toggle('active', m === mode));
+        const home = section === 'auto' ? 'the tenant you sign in with' : 'the specified tenant';
+        document.getElementById(section + '-tenant-hint').textContent = {
+            single: 'Only users from ' + home + ' can access this app.',
+            multi: 'Users from any Microsoft Entra tenant can sign in to this app.',
+            restricted: 'Only users from ' + home + ' and the tenants listed below can sign in to this app.'
+        }[mode];
+        document.getElementById(section + '-allowed-tenants').classList.toggle('hidden', mode !== 'restricted');
         if (section === 'manual') {
-            document.getElementById('manual-account-type').textContent = isMulti
-                ? 'Accounts in any organizational directory (Multitenant)'
-                : 'Accounts in this organizational directory only (Single tenant)';
+            document.getElementById('manual-account-type').textContent = mode === 'single'
+                ? 'Accounts in this organizational directory only (Single tenant)'
+                : 'Accounts in any organizational directory (Multitenant)';
         }
+    }
+
+    // The multiTenant flag and allowedTenants list for a section, or throws when the restricted list is invalid.
+    function tenantAccess(section) {
+        const mode = tenantMode[section];
+        const allowedTenants = mode === 'restricted'
+            ? document.getElementById(section + '-allowed-tenants').value.split(/[\s,;]+/).filter(Boolean)
+            : [];
+        if (mode === 'restricted') {
+            const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (allowedTenants.length === 0) throw new Error('Enter at least one other tenant ID, or choose Single Tenant.');
+            const invalid = allowedTenants.find(t => !guid.test(t));
+            if (invalid) throw new Error('"' + invalid + '" is not a tenant ID.');
+        }
+        return { multiTenant: mode !== 'single', allowedTenants };
     }
 
     // ── Wizard state ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +499,12 @@
     }
 
     async function startAutomatedSetup() {
+        try {
+            tenantAccess('auto');
+        } catch (e) {
+            showStatus('auto-status', e.message, 'error');
+            return;
+        }
         const btn = document.getElementById('btn-auto');
         btn.disabled = true;
         btn.textContent = 'Requesting code...';
@@ -566,7 +589,7 @@
         const appRes = await fetch('/api/setup/create-auth-app', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ accessToken, tenantId, redirectUri: window.location.origin, multiTenant: autoMultiTenant })
+            body: JSON.stringify({ accessToken, tenantId, redirectUri: window.location.origin, multiTenant: tenantAccess('auto').multiTenant })
         });
         if (!appRes.ok) throw new Error('App creation failed: ' + await appRes.text());
         const appData = await appRes.json();
@@ -585,7 +608,7 @@
                 appId: appData.appId,
                 clientSecret: appData.clientSecret,
                 tenantId: appData.tenantId,
-                multiTenant: autoMultiTenant
+                ...tenantAccess('auto')
             })
         });
         if (!configRes.ok) throw new Error('Configuration failed: ' + await configRes.text());
@@ -604,6 +627,13 @@
             showStatus('manual-status', 'All fields are required.', 'error');
             return;
         }
+        let access;
+        try {
+            access = tenantAccess('manual');
+        } catch (e) {
+            showStatus('manual-status', e.message, 'error');
+            return;
+        }
 
         const btn = document.getElementById('btn-manual');
         btn.disabled = true;
@@ -614,7 +644,7 @@
             const res = await fetch('/api/setup/manual', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appId, clientSecret: secret, tenantId, multiTenant: manualMultiTenant })
+                body: JSON.stringify({ appId, clientSecret: secret, tenantId, ...access })
             });
 
             if (!res.ok) throw new Error(await res.text());
