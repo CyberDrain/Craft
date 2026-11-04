@@ -10,13 +10,31 @@ env:
 
 jobs:
   build:
+    # `release: [published]` also fires for pre-releases, and this job moves :latest. Without this
+    # guard a pre-release would ship to every consumer. Negation form so a blank value cannot pass.
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # :latest may only be built from a commit that went through the PR gate on main. A release
+      # published from any other tag fails here instead of shipping.
+      - name: Verify tag is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::Release tag ${GITHUB_REF_NAME} is not an ancestor of main; refusing to build :latest"
+            exit 1
+          }
 
       - name: Set lower case image name
         run: echo "IMAGE_NAME_LC=${REPO,,}" >> $GITHUB_ENV
@@ -30,17 +48,18 @@ jobs:
           echo "app_version=$TAG" >> $GITHUB_OUTPUT
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: build/Dockerfile
@@ -66,3 +85,12 @@ jobs:
             org.opencontainers.image.description=Craft - CyberDrain Runtime for Apps, Functions, Tasks
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.app_version }}
+
+      # Signs a provenance attestation linking the pushed digest to this workflow run and commit,
+      # so consumers can verify an image came from CI rather than a direct registry push.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
