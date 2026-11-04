@@ -303,6 +303,11 @@
       // Storage connection for the allowedUsers table (empty = use AzureWebJobsStorage)
       // "UserStorageConnection": "",
 
+      // Azure Table of tenants trusted to grant Entra app roles (PartitionKey = tenant id,
+      // RowKey = role). A token's roles claim counts only for roles listed under its tid.
+      // Empty = app roles are ignored.
+      // "AppRoleTableName": "",
+
       // Roles for the auto-login dev principal (Development mode only, ignored in Production)
       // "DevRoles": ["admin", "authenticated", "anonymous"],
 

@@ -23,6 +23,15 @@ public class AuthSettings
     public string UserStorageConnection { get; set; } = "";
 
     /// <summary>
+    /// Azure Table of tenants whose Entra app-role assignments are trusted: PartitionKey = tenant id,
+    /// RowKey = a role that tenant may grant. A signed-in user's <c>roles</c> claim is honoured only for
+    /// roles listed under the token's own <c>tid</c>, so a tenant that consents a multi-tenant app cannot
+    /// grant itself roles it was never given. A matching role authorises the user without an allowedUsers
+    /// row. Empty (default) disables app-role authorisation. Shares the allowedUsers storage and cache TTL.
+    /// </summary>
+    public string AppRoleTableName { get; set; } = "";
+
+    /// <summary>
     /// Roles assigned to the dev-mode auto-login principal.
     /// Default: empty — set via appsettings (e.g. ["superadmin", "authenticated", "anonymous"]).
     /// Do NOT set defaults here — .NET config binding appends to list initializers, causing duplicates.

@@ -289,6 +289,10 @@ Controls authentication and the dev-mode auto-login principal.
   // Set this to point to a separate storage account for isolation.
   "UserStorageConnection": "",
 
+  // Azure Table of tenants trusted to grant Entra app roles (see "App roles" below).
+  // Empty (default) = the roles claim is ignored.
+  "AppRoleTableName": "",
+
   // Roles assigned to the auto-login principal in Development mode.
   // Production uses real Azure AD auth — this is dev-only.
   "DevRoles": ["superadmin", "admin", "editor", "readonly", "authenticated", "anonymous"],
@@ -857,7 +861,27 @@ The `allowedUsers` Azure Table (name configurable via `Auth.UserTableName`) maps
 Roles are cached in-memory for 5 minutes. If a user is not in the table, behavior depends on `Auth.AllowAllTenantUsers`:
 
 - **`true` (default):** User is allowed in with default roles `["authenticated", "anonymous"]`. The hosted application can perform its own role resolution (e.g. CIPP maps Entra group membership to CIPP roles via `/api/me`). Users explicitly listed in the table still get their table-defined roles.
-- **`false`:** User is denied access (401). Only users explicitly listed in the allowedUsers table can log in.
+- **`false`:** User is denied access (401). Only users explicitly listed in the allowedUsers table, or holding a trusted app role (below), can log in.
+
+#### App roles
+
+Set `Auth.AppRoleTableName` to authorise users from the Entra app roles in their token instead of listing
+them in allowedUsers. Define the roles on the sign-in app registration; each tenant that uses the app
+(the home tenant, or another tenant that consented a multi-tenant app) assigns users or groups to them on
+its enterprise app.
+
+Any tenant that consents a multi-tenant app can assign itself any of its app roles, so a role only counts
+when the table lets the token's own tenant (`tid`) grant it:
+
+| Column | Value |
+|--------|-------|
+| `PartitionKey` | Tenant id (GUID) |
+| `RowKey` | A role that tenant may grant, matching the app role's value |
+
+Trusted app roles are unioned with any allowedUsers roles and count as a match, so the user is let in even
+when `AllowAllTenantUsers` is `false`. Roles the tenant is not trusted with are dropped. The table shares
+the allowedUsers cache, so changes apply within 5 minutes or on `AuthBridge.InvalidateUsers()`. A token
+only picks up an assignment change at its next refresh or sign-in.
 
 #### Redirect URIs
 
