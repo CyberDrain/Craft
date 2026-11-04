@@ -303,6 +303,11 @@
       // Storage connection for the allowedUsers table (empty = use AzureWebJobsStorage)
       // "UserStorageConnection": "",
 
+      // Azure Table of tenants trusted to grant Entra app roles (PartitionKey = tenant id,
+      // RowKey = role). A token's roles claim counts only for roles listed under its tid.
+      // Empty = app roles are ignored.
+      // "AppRoleTableName": "",
+
       // Roles for the auto-login dev principal (Development mode only, ignored in Production)
       // "DevRoles": ["admin", "authenticated", "anonymous"],
 
@@ -325,7 +330,7 @@
       // ── Production auth is configured via environment variables or KV references: ──
       // WEBSITE_AUTH_CLIENT_ID           = Azure AD app registration client ID
       // AUTH_SECRET                      = Azure AD client secret
-      // WEBSITE_AUTH_AAD_ALLOWED_TENANTS = Tenant ID (or "common" for multi-tenant)
+      // WEBSITE_AUTH_AAD_ALLOWED_TENANTS = comma-separated tenant IDs (restricted multi-tenant; unset = any tenant)
     },
 
     // ── Storage backend (Azure Tables) ──
@@ -411,8 +416,8 @@
     //   "AllowedApplications": [],
     //   // Extra allowed token audiences beyond "api://{appId}" (empty = only api://{appId})
     //   "AllowedAudiences": [],
-    //   // Tenant IDs allowed to auth. Empty = setup tenant only (single-tenant issuer).
-    //   // Multiple entries → issuer becomes "common" + WEBSITE_AUTH_AAD_ALLOWED_TENANTS is set.
+    //   // Extra tenant IDs for restricted multi-tenant mode, merged with the wizard's list. When any
+    //   // are set, a multi-tenant app sets WEBSITE_AUTH_AAD_ALLOWED_TENANTS = setup tenant + these.
     //   "AllowedTenants": [],
     //   // Store EasyAuth client secret in Key Vault instead of app settings.
     //   // "auto" = use site name as vault name. Or set explicit vault name.

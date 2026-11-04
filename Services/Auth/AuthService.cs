@@ -23,6 +23,9 @@ public class AuthService : IDisposable
     private readonly TimeSpan _allowedUsersCacheTtl = TimeSpan.FromMinutes(5);
     private readonly SemaphoreSlim _allowedUsersLock = new(1, 1);
 
+    // tenant id -> roles that tenant may grant through the token's roles claim; swapped whole on refresh
+    private Dictionary<string, HashSet<string>> _appRoleTenants = new();
+
     public AuthService(ILogger<AuthService> logger, IConfiguration config, CraftSettings settings, ICraftTableStore store)
     {
         _logger = logger;
@@ -47,19 +50,17 @@ public class AuthService : IDisposable
     /// Sanitized for Azure Table naming rules (alphanumeric, 3-63 chars).
     /// </summary>
     private string? _resolvedTableName;
-    public string UserTableFullName
+    public string UserTableFullName => _resolvedTableName ??= SanitizeTableName(_settings.Auth.UserTableName) ?? "allowedUsers";
+
+    /// <summary>The sanitized <see cref="AuthSettings.AppRoleTableName"/>, or null when app roles are disabled.</summary>
+    private string? AppRoleTableFullName => SanitizeTableName(_settings.Auth.AppRoleTableName);
+
+    // Azure Table names are alphanumeric only, 3-63 chars
+    private static string? SanitizeTableName(string raw)
     {
-        get
-        {
-            if (_resolvedTableName != null) return _resolvedTableName;
-            var raw = _settings.Auth.UserTableName;
-            // Sanitize: Azure Table names are alphanumeric only, 3-63 chars
-            var sanitized = new string(raw.Where(char.IsLetterOrDigit).ToArray());
-            if (sanitized.Length > 63) sanitized = sanitized[..63];
-            if (sanitized.Length < 3) sanitized = "allowedUsers";
-            _resolvedTableName = sanitized;
-            return _resolvedTableName;
-        }
+        var sanitized = new string(raw.Where(char.IsLetterOrDigit).ToArray());
+        if (sanitized.Length > 63) sanitized = sanitized[..63];
+        return sanitized.Length < 3 ? null : sanitized;
     }
 
     /// <summary>
@@ -101,10 +102,41 @@ public class AuthService : IDisposable
     /// AllowAllTenantUsers is false; otherwise the default roles when nothing matched, or the union
     /// plus anonymous/authenticated when something did.
     /// </summary>
-    public async Task<string[]?> GetUserRoles(IEnumerable<string?> identifiers, CancellationToken ct = default)
+    public Task<string[]?> GetUserRoles(IEnumerable<string?> identifiers, CancellationToken ct = default) =>
+        GetUserRoles(identifiers, null, null, ct);
+
+    /// <summary>
+    /// As <see cref="GetUserRoles(IEnumerable{string?}, CancellationToken)"/>, plus the token's app roles
+    /// (<paramref name="appRoles"/>) that the app-role table lets <paramref name="tenantId"/> grant. A trusted
+    /// app role counts as a match, so it authorises the user without an allowedUsers row.
+    /// </summary>
+    public async Task<string[]?> GetUserRoles(
+        IEnumerable<string?> identifiers, string? tenantId, IReadOnlyList<string>? appRoles, CancellationToken ct = default)
     {
         var roles = new List<string>();
         var matched = false;
+
+        if (appRoles is { Count: > 0 } && !string.IsNullOrEmpty(tenantId) && AppRoleTableFullName is not null)
+        {
+            await EnsureCacheFresh(ct);
+            if (_appRoleTenants.TryGetValue(tenantId, out var grantable))
+            {
+                foreach (var appRole in appRoles)
+                {
+                    // Report the role as the table spells it, whatever casing the token used.
+                    if (grantable.TryGetValue(appRole, out var role) && !roles.Contains(role, StringComparer.Ordinal))
+                    {
+                        roles.Add(role);
+                        matched = true;
+                    }
+                }
+            }
+            if (roles.Count < appRoles.Count)
+            {
+                _logger.LogDebug("[Auth] Ignored app roles [{Roles}] from tenant {TenantId}: not granted to that tenant",
+                    string.Join(", ", appRoles.Where(r => !roles.Contains(r, StringComparer.OrdinalIgnoreCase))), tenantId);
+            }
+        }
 
         foreach (var identifier in identifiers)
         {
@@ -137,28 +169,22 @@ public class AuthService : IDisposable
 
     private async Task<AllowedUser?> GetAllowedUser(string upn, CancellationToken ct)
     {
-        // Check cache first
-        if (DateTime.UtcNow < _allowedUsersCacheExpiry && _allowedUsersCache.TryGetValue(upn, out var cached))
-        {
-            return cached;
-        }
+        await EnsureCacheFresh(ct);
+        return _allowedUsersCache.TryGetValue(upn, out var user) ? user : null;
+    }
 
-        // Refresh cache if expired
+    private async Task EnsureCacheFresh(CancellationToken ct)
+    {
+        if (DateTime.UtcNow < _allowedUsersCacheExpiry) return;
+
         await _allowedUsersLock.WaitAsync(ct);
         try
         {
             // Double-check after lock
-            if (DateTime.UtcNow < _allowedUsersCacheExpiry && _allowedUsersCache.TryGetValue(upn, out var cachedAfterLock))
-            {
-                return cachedAfterLock;
-            }
-
             if (DateTime.UtcNow >= _allowedUsersCacheExpiry)
             {
                 await RefreshAllowedUsersCache(ct);
             }
-
-            return _allowedUsersCache.TryGetValue(upn, out var user) ? user : null;
         }
         finally
         {
@@ -230,6 +256,33 @@ public class AuthService : IDisposable
             _logger.LogError(ex, "[Auth] Failed to refresh allowedUsers cache");
             // Keep stale cache on error — better than locking everyone out
             _allowedUsersCacheExpiry = DateTime.UtcNow.AddMinutes(1); // Retry sooner
+        }
+
+        await RefreshAppRoleTenants(ct);
+    }
+
+    private async Task RefreshAppRoleTenants(CancellationToken ct)
+    {
+        if (AppRoleTableFullName is not { } table) return;
+        try
+        {
+            await _store.EnsureTableAsync(table, ct);
+
+            var tenants = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            await foreach (var row in _store.QueryTableAsync(table, ct))
+            {
+                if (!tenants.TryGetValue(row.PartitionKey, out var grantable))
+                {
+                    tenants[row.PartitionKey] = grantable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                }
+                grantable.Add(row.RowKey);
+            }
+            _appRoleTenants = tenants;
+        }
+        catch (Exception ex)
+        {
+            // Keep the previous map, same reasoning as allowedUsers
+            _logger.LogError(ex, "[Auth] Failed to refresh app-role tenants");
         }
     }
 

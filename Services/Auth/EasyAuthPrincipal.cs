@@ -18,7 +18,14 @@ namespace Craft.Auth;
 /// principal <see cref="ObjectId"/> carries the provider's own stable user id (the GitHub numeric
 /// id), so the hosted app can match on either the login or the id.
 /// </param>
-public sealed record EasyAuthClaims(string? Upn, string? ObjectId, string? AppId, string? IdentityType, string? Login = null)
+/// <param name="TenantId">The <c>tid</c> claim — the Entra tenant that issued the token.</param>
+/// <param name="Roles">
+/// The <c>roles</c> claim values — app roles the issuing tenant assigned. Untrusted on their own: any tenant
+/// that consents a multi-tenant app can assign them, so they only count against a per-tenant allow-list.
+/// </param>
+public sealed record EasyAuthClaims(
+    string? Upn, string? ObjectId, string? AppId, string? IdentityType, string? Login = null,
+    string? TenantId = null, IReadOnlyList<string>? Roles = null)
 {
     /// <summary>
     /// Whether this is an app-only (client-credentials) token rather than a signed-in user.
@@ -98,7 +105,8 @@ public static class EasyAuthPrincipal
     /// </summary>
     public static EasyAuthClaims ExtractClaims(JsonElement root)
     {
-        string? upn = null, preferredUsername = null, oid = null, appId = null, idtyp = null, login = null;
+        string? upn = null, preferredUsername = null, oid = null, appId = null, idtyp = null, login = null, tid = null;
+        List<string>? roles = null;
 
         if (root.ValueKind == JsonValueKind.Object &&
             root.TryGetProperty("claims", out var claims) &&
@@ -130,6 +138,15 @@ public static class EasyAuthPrincipal
                     case "idtyp":
                         idtyp ??= val;
                         break;
+                    case "http://schemas.microsoft.com/identity/claims/tenantid":
+                    case "tid":
+                        tid ??= val;
+                        break;
+                    // EasyAuth emits one claim per role, under the short or the mapped type.
+                    case "roles":
+                    case "http://schemas.microsoft.com/ws/2008/06/identity/claims/role":
+                        if (val.Length > 0) (roles ??= []).Add(val);
+                        break;
                     // GitHub (and other non-Entra providers) carry a login rather than a UPN, and no
                     // Entra object id. App Service emits the login as 'urn:github:login' and the numeric
                     // id as 'urn:github:id'; the id is reused as the object id (a github principal never
@@ -155,7 +172,9 @@ public static class EasyAuthPrincipal
             string.IsNullOrEmpty(oid) ? null : oid,
             string.IsNullOrEmpty(appId) ? null : appId,
             string.IsNullOrEmpty(idtyp) ? null : idtyp,
-            string.IsNullOrEmpty(login) ? null : login);
+            string.IsNullOrEmpty(login) ? null : login,
+            string.IsNullOrEmpty(tid) ? null : tid,
+            roles);
     }
 
     /// <summary>

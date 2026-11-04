@@ -67,16 +67,10 @@ public class SetupSettings
     public List<string> AllowedAudiences { get; set; } = [];
 
     /// <summary>
-    /// Tenant IDs allowed to authenticate. Controls both the issuer URL and the
-    /// WEBSITE_AUTH_AAD_ALLOWED_TENANTS app setting.
-    ///
-    /// Behavior:
-    ///   - Empty (default): single-tenant — issuer is set to the setup tenant ID.
-    ///   - One entry: single-tenant — issuer is set to that tenant ID.
-    ///   - Multiple entries: issuer is set to "common" and WEBSITE_AUTH_AAD_ALLOWED_TENANTS
-    ///     is set to the comma-separated list (Azure enforces the tid claim check).
-    ///
-    /// The tenant from the setup flow is always included automatically.
+    /// Tenant IDs that may sign in to a multi-tenant app, added to those chosen in the setup wizard.
+    /// When any are set, the app runs in restricted multi-tenant mode: the issuer stays "common" and
+    /// WEBSITE_AUTH_AAD_ALLOWED_TENANTS is set to the setup tenant plus these (Azure enforces the tid
+    /// claim check). Empty = any tenant may sign in. Ignored for single-tenant, which the issuer restricts.
     /// </summary>
     public List<string> AllowedTenants { get; set; } = [];
 

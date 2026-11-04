@@ -117,8 +117,9 @@ public static class SetupEndpoints
             var clientSecret = root.GetProperty("clientSecret").GetString()!;
             var tenantId = root.GetProperty("tenantId").GetString()!;
             var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
+            if (ReadAllowedTenants(root) is not { } allowedTenants) return InvalidAllowedTenants();
 
-            await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant);
+            await setupService.ConfigureAppServiceAuth(appId, clientSecret, tenantId, multiTenant, allowedTenants);
             AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via automated setup");
 
             return Results.Json(new
@@ -138,8 +139,9 @@ public static class SetupEndpoints
             var clientSecret = root.GetProperty("clientSecret").GetString()!;
             var tenantId = root.GetProperty("tenantId").GetString()!;
             var multiTenant = root.TryGetProperty("multiTenant", out var mt) && mt.GetBoolean();
+            if (ReadAllowedTenants(root) is not { } allowedTenants) return InvalidAllowedTenants();
 
-            await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant);
+            await setupService.ConfigureManual(appId, clientSecret, tenantId, multiTenant, allowedTenants);
             AppLifecycleBridge.MarkSetupCompleted("EasyAuth configured via manual setup");
 
             return Results.Json(new
@@ -176,6 +178,27 @@ public static class SetupEndpoints
     private static IResult SetupAlreadyCompleted() => Results.Json(
         new { success = false, message = "Setup already completed. The app is pending restart." },
         statusCode: 409);
+
+    private static IResult InvalidAllowedTenants() => Results.Json(
+        new { success = false, message = "allowedTenants must list tenant IDs (GUIDs) only." },
+        statusCode: 400);
+
+    /// <summary>
+    /// The optional <c>allowedTenants</c> array of tenant IDs (restricted multi-tenant mode), or null
+    /// when any entry is not a GUID. A missing array is an empty list.
+    /// </summary>
+    internal static List<string>? ReadAllowedTenants(JsonElement root)
+    {
+        var tenants = new List<string>();
+        if (!root.TryGetProperty("allowedTenants", out var list) || list.ValueKind != JsonValueKind.Array) return tenants;
+
+        foreach (var item in list.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String || !Guid.TryParse(item.GetString(), out var id)) return null;
+            tenants.Add(id.ToString());
+        }
+        return tenants;
+    }
 
     private static async Task<JsonElement> ReadJsonBodyAsync(HttpContext context)
     {

@@ -51,7 +51,7 @@ public static class CraftAuthMiddleware
             if (hasPrincipal)
             {
                 // Returns false when the caller was rejected and a response has already been written.
-                if (!await TryNormalisePrincipalAsync(context, ids => authService.GetUserRoles(ids), logger, existingHeader.ToString()))
+                if (!await TryNormalisePrincipalAsync(context, (ids, claims) => authService.GetUserRoles(ids, claims.TenantId, claims.Roles), logger, existingHeader.ToString()))
                     return;
             }
             else if (isDevelopment)
@@ -68,10 +68,13 @@ public static class CraftAuthMiddleware
         return app;
     }
 
-    /// <param name="resolveUserRoles">Looks a signed-in user up in the allowedUsers table by its identifiers.</param>
+    /// <param name="resolveUserRoles">
+    /// Resolves a signed-in user's roles from the allowedUsers table by its identifiers, plus any app roles
+    /// its token carries that the issuing tenant is trusted to grant.
+    /// </param>
     /// <returns><see langword="false"/> if the request was rejected and the response is already written.</returns>
     internal static async Task<bool> TryNormalisePrincipalAsync(
-        HttpContext context, Func<IEnumerable<string?>, Task<string[]?>> resolveUserRoles, ILogger logger, string headerValue)
+        HttpContext context, Func<IEnumerable<string?>, EasyAuthClaims, Task<string[]?>> resolveUserRoles, ILogger logger, string headerValue)
     {
         try
         {
@@ -110,14 +113,14 @@ public static class CraftAuthMiddleware
 
             // Resolve roles by the display name AND the stable object id (a GitHub user's numeric id,
             // an Entra user's oid), so an allowedUsers row keyed on either one grants the user its roles.
-            var roles = await resolveUserRoles(new[] { userName, claims.ObjectId });
+            var roles = await resolveUserRoles(new[] { userName, claims.ObjectId }, claims);
             if (roles is null)
             {
                 // Authenticated by the platform but not authorised here. Strip the header so nothing
                 // downstream can mistake this for a valid principal.
                 context.Request.Headers.Remove("x-ms-client-principal");
                 context.Response.StatusCode = 401;
-                await context.Response.WriteAsync("Unauthorized: user not in allowedUsers table.");
+                await context.Response.WriteAsync("Unauthorized: user not in allowedUsers table and holds no trusted app role.");
                 return false;
             }
 

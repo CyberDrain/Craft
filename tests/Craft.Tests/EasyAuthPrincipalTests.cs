@@ -143,6 +143,23 @@ public class EasyAuthPrincipalTests
         Assert.Null(EasyAuthPrincipal.ExtractClaims(Principal("""{"claims":[{"val":"orphan"}]}""")).Upn);
     }
 
+    [Theory]
+    [InlineData("tid", "roles")]
+    [InlineData("http://schemas.microsoft.com/identity/claims/tenantid", "http://schemas.microsoft.com/ws/2008/06/identity/claims/role")]
+    public void TenantAndAppRoles_AreExtracted(string tidType, string roleType)
+    {
+        // EasyAuth emits one claim per app role, under the short or the mapped claim type.
+        var claims = EasyAuthPrincipal.ExtractClaims(WithClaims(
+            ("upn", "a@b.com"), (tidType, "tenant-1"), (roleType, "editor"), (roleType, "readonly"), (roleType, "")));
+
+        Assert.Equal("tenant-1", claims.TenantId);
+        Assert.Equal(["editor", "readonly"], claims.Roles!);
+    }
+
+    [Fact]
+    public void NoRolesClaim_LeavesRolesNull() =>
+        Assert.Null(EasyAuthPrincipal.ExtractClaims(WithClaims(("upn", "a@b.com"))).Roles);
+
     [Fact]
     public void GitHubLoginAndId_AreExtracted()
     {

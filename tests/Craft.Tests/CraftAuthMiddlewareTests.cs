@@ -38,10 +38,12 @@ public class CraftAuthMiddlewareTests
     private sealed class RoleLookup(string[]? roles)
     {
         public List<string?[]> Calls { get; } = [];
+        public List<EasyAuthClaims> Claims { get; } = [];
 
-        public Task<string[]?> Resolve(IEnumerable<string?> ids)
+        public Task<string[]?> Resolve(IEnumerable<string?> ids, EasyAuthClaims claims)
         {
             Calls.Add([.. ids]);
+            Claims.Add(claims);
             return Task.FromResult(roles);
         }
     }
@@ -61,6 +63,22 @@ public class CraftAuthMiddlewareTests
             .Where(c => c.GetProperty("typ").GetString() == typ)
             .Select(c => c.GetProperty("val").GetString())
             .FirstOrDefault();
+
+    [Fact]
+    public async Task SignedInUser_HandsTheTokensTenantAndAppRolesToTheLookup()
+    {
+        // The lookup can only judge an app role against the tenant that issued it.
+        var lookup = new RoleLookup(AdminRoles);
+        var context = Request(EasyAuthHeader(
+            ("upn", "a@b.com"), (OidClaim, "user-oid"),
+            ("http://schemas.microsoft.com/identity/claims/tenantid", "tenant-1"), ("roles", "editor")));
+
+        Assert.True(await Normalise(context, lookup));
+
+        var claims = Assert.Single(lookup.Claims);
+        Assert.Equal("tenant-1", claims.TenantId);
+        Assert.Equal(["editor"], claims.Roles!);
+    }
 
     [Fact]
     public async Task AppOnlyToken_BecomesAnApiClient()
