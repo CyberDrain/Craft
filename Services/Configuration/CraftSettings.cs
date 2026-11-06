@@ -113,4 +113,16 @@ public class CraftSettings
 
     /// <summary>Startup phone-home usage telemetry. Off by default. See <see cref="TelemetrySettings"/>.</summary>
     public TelemetrySettings Telemetry { get; set; } = new();
+
+    /// <summary>
+    /// Reverse proxies in front of Craft that append to <c>X-Forwarded-For</c>. Unset: 1 on App Service, else 0
+    /// (direct exposure). Env override: <c>CRAFT_TRUSTED_PROXY_HOPS</c>. See <see cref="Hosting.ForwardedForMiddleware"/>.
+    /// </summary>
+    public int? TrustedProxyHops { get; set; }
+
+    /// <summary>Resolved <see cref="TrustedProxyHops"/>, honouring the env override and App Service detection.</summary>
+    public int ResolvedTrustedProxyHops =>
+        int.TryParse(Environment.GetEnvironmentVariable("CRAFT_TRUSTED_PROXY_HOPS"), out var fromEnv) && fromEnv >= 0
+            ? fromEnv
+            : TrustedProxyHops ?? (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME")) ? 0 : 1);
 }

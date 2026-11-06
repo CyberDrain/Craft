@@ -302,6 +302,8 @@ if (app.Environment.IsDevelopment())
 // does not re-compress API JSON, so the origin keeps doing it even with static compression delegated.
 var egressAccountingEnabled = CraftSettings.RateLimit.Egress.ResolvedEnabled;
 
+app.UseCraftForwardedFor(CraftSettings.ResolvedTrustedProxyHops, logger);
+
 if (egressAccountingEnabled || apiCompressionEnabled)
 {
     app.UseWhen(IsApiPath, api =>
