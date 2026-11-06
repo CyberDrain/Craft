@@ -58,6 +58,7 @@ public sealed class WorkStore
         _store = store;
         _rate = rate ?? new PartitionRateLimiter();
         MaxAttempts = Math.Max(1, settings.Orchestrator.MaxRetries);
+        MissingChildAfter = TimeSpan.FromHours(Math.Max(1, settings.Orchestrator.RetentionHours));
         var p = settings.Orchestrator.TablePrefix;
         _work = $"{p}Work";
         _ready = $"{p}Ready";
@@ -745,6 +746,10 @@ public sealed class WorkStore
     /// <summary>Delays between index-write retries; tests shorten them.</summary>
     internal TimeSpan[] IndexRetries { get; set; } = IndexRetryDelays;
 
+    /// <summary>How old a child wait with no child run must be before the repair settles it: the run retention, past
+    /// which a finished child is swept and no task still holds an uncreated one. Tests shorten it.</summary>
+    internal TimeSpan MissingChildAfter { get; set; }
+
     /// <summary>
     /// An index write that follows a committed change to a run. Retried through a short storage blip; if it
     /// still fails the change stands, the in-process <see cref="RunChanged"/> event keeps this instance
@@ -920,14 +925,17 @@ public sealed class WorkStore
     // ── index repair ──
 
     /// <summary>What a repair pass found and did.</summary>
-    public sealed record RepairResult(int Active, int Relisted, int Retired, int Removed, int Young);
+    public sealed record RepairResult(int Active, int Relisted, int Retired, int Removed, int Young, int ChildrenSettled = 0);
 
     /// <summary>
     /// Rebuild the indexes from the active-run list, which is written before a run's other rows and removed
     /// after them. For each run on it: a run that finished is retired (Finished row, off Ready, off the list);
     /// a run still going gets its Ready entry rewritten; a run whose header never landed (its creation was
-    /// interrupted) is removed once it is older than <paramref name="abandonAfter"/>. Every step is
-    /// idempotent, so this is safe while the queue is being worked. One point read per active run.
+    /// interrupted) is removed once it is older than <paramref name="abandonAfter"/>. A run still waiting for a child
+    /// that finished (its notice was lost) has that child settled; so does one waiting, past
+    /// <see cref="MissingChildAfter"/>, for a child that no longer exists (swept by retention, or never created),
+    /// which counts as failed. Every step is idempotent, so this is safe while the queue is being worked. One point
+    /// read and one child range read per active run.
     /// </summary>
     public async Task<RepairResult> RepairIndexesAsync(TimeSpan abandonAfter, CancellationToken ct = default)
     {
@@ -935,7 +943,7 @@ public sealed class WorkStore
         var rows = new List<StoreRow>();
         await foreach (var row in _store.QueryPartitionAsync(_names, ActivePartition, ct)) rows.Add(row);
 
-        int relisted = 0, retired = 0, removed = 0, young = 0;
+        int relisted = 0, retired = 0, removed = 0, young = 0, settled = 0;
         var cutoff = DateTimeOffset.UtcNow - abandonAfter;
         foreach (var row in rows)
         {
@@ -959,12 +967,32 @@ public sealed class WorkStore
             }
             else
             {
+                var finishes = new List<Finish>();
+                await foreach (var placeholder in Range(runKey, 'C', 1000, ct))
+                {
+                    var childKey = placeholder.RowKey[2..];
+                    var childName = childKey[..Math.Max(0, childKey.LastIndexOf('|'))];
+                    if ((await GetActiveRunsAsync(childName, ct)).Any(c => c.ParentChildKey == childKey)) continue;
+                    if (await GetRunByNameAsync(childName, ct) is { IsFinished: true } child && child.ParentChildKey == childKey)
+                        finishes.Add(new Finish(0, child.Status == "Completed" ? "Completed" : "Failed", ChildKey: childKey));
+                    else if ((placeholder.Timestamp ?? DateTimeOffset.MaxValue) < DateTimeOffset.UtcNow - MissingChildAfter)
+                        finishes.Add(new Finish(0, "Failed", "Child run not found", ChildKey: childKey));
+                }
+                if (finishes.Count > 0)
+                {
+                    _logger.LogWarning("[WorkStore] Run {Run} was waiting for {Count} child run(s) that already finished or no longer exist; settling them",
+                        runKey, finishes.Count);
+                    await FinishAsync(runKey, finishes, null, ct);
+                    settled += finishes.Count;
+                    header = await GetRunAsync(runKey, ct) ?? header;
+                }
+                if (header.IsFinished) { retired++; continue; }
                 await PublishReadyAsync(header, ct);
                 Changed(runKey);
                 relisted++;
             }
         }
-        return new RepairResult(rows.Count, relisted, retired, removed, young);
+        return new RepairResult(rows.Count, relisted, retired, removed, young, settled);
     }
 
     // ── inspection ──
