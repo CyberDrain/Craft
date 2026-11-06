@@ -248,8 +248,8 @@ public class WorkPump : BackgroundService
         try
         {
             var r = await _store.RepairIndexesAsync(AbandonUnfinishedCreation, ct);
-            _logger.LogInformation("[WorkPump] Index repair: {Active} active run(s), {Relisted} relisted, {Retired} retired, {Removed} unfinished creation(s) removed, {Young} still being created",
-                r.Active, r.Relisted, r.Retired, r.Removed, r.Young);
+            _logger.LogInformation("[WorkPump] Index repair: {Active} active run(s), {Relisted} relisted, {Retired} retired, {Removed} unfinished creation(s) removed, {Young} still being created, {Settled} child wait(s) settled",
+                r.Active, r.Relisted, r.Retired, r.Removed, r.Young, r.ChildrenSettled);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

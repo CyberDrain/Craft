@@ -295,6 +295,92 @@ public class OrchestrationRecoveryTests
         Assert.Equal(1, await s.SweepFinishedAsync(TimeSpan.Zero));             // retention still finds it
     }
 
+    private static Task<RunHeader> CreateChildAsync(WorkStore s, string name, string parentKey, string childKey)
+    {
+        var started = DateTime.UtcNow;
+        return s.CreateRunAsync(new RunHeader
+        {
+            RunKey = WorkStore.RunKeyFor(name, started),
+            Name = name,
+            StartedUtc = started,
+            TaskScriptName = "Invoke-CraftTask",
+            ParentRunKey = parentKey,
+            ParentChildKey = childKey,
+        }, [new WorkStore.NewTask("c0", [])]);
+    }
+
+    private static async Task FinishOnlyTaskAsync(WorkStore s, string runKey)
+    {
+        var claim = Assert.Single(await s.ClaimAsync(runKey, 1, "w", Lease, false));
+        await s.FinishAsync(runKey, [new WorkStore.Finish(claim.Seq, "Completed", Owner: "w")]);
+    }
+
+    [Fact]
+    public async Task AParentWhoseFinishedChildsNoticeWasLost_IsSettledByTheRepair()
+    {
+        var s = NewStore(new MemoryTableStore());
+        var parent = await CreateAsync(s, "Parent", 1);
+        Assert.True(await s.AddChildAsync(parent.RunKey, "Kid|abc"));
+        var child = await CreateChildAsync(s, "Kid", parent.RunKey, "Kid|abc");
+        await FinishOnlyTaskAsync(s, child.RunKey);                 // no AfterFinish hook: the parent never hears
+        await FinishOnlyTaskAsync(s, parent.RunKey);
+        Assert.False((await s.GetRunAsync(parent.RunKey))!.IsFinished);
+
+        await s.RepairIndexesAsync(TimeSpan.FromMinutes(10));
+
+        var after = (await s.GetRunAsync(parent.RunKey))!;
+        Assert.Equal(("Completed", 2, 0), (after.Status, after.Done, after.Failed));
+        Assert.DoesNotContain("Parent", await NamesAsync(s));
+    }
+
+    [Fact]
+    public async Task AChildWaitWithNoChildRun_IsSettledAsFailedOnceOld_ButALiveChildIsLeftAlone()
+    {
+        var s = NewStore(new MemoryTableStore());
+        var parent = await CreateAsync(s, "Parent", 1);
+        Assert.True(await s.AddChildAsync(parent.RunKey, "Gone|abc"));      // swept by retention, or never created
+        Assert.True(await s.AddChildAsync(parent.RunKey, "Live|def"));
+        await CreateChildAsync(s, "Live", parent.RunKey, "Live|def");
+        await FinishOnlyTaskAsync(s, parent.RunKey);
+
+        await s.RepairIndexesAsync(TimeSpan.Zero);                          // younger than the retention: could still be created
+        Assert.Equal(2, (await s.GetChildWaitsAsync(parent.RunKey)).Count);
+        s.MissingChildAfter = TimeSpan.Zero;
+        await s.RepairIndexesAsync(TimeSpan.Zero);
+
+        var after = (await s.GetRunAsync(parent.RunKey))!;
+        Assert.False(after.IsFinished);
+        Assert.Equal((2, 1), (after.Done, after.Failed));
+        Assert.Equal(["Live|def"], await s.GetChildWaitsAsync(parent.RunKey));
+        Assert.Contains("Parent", await NamesAsync(s));
+    }
+
+    [Fact]
+    public async Task AChildsNoticeToItsParent_ThatCannotBeWritten_IsRetried()
+    {
+        var faulty = new FaultyTableStore(new MemoryTableStore());
+        await using var h = await OrchestrationHarness.CreateAsync(tables: faulty);
+        var failures = 0;
+        faulty.FailSubmit = (table, ops) => table == "OrchestratorWork"
+            && ops.Any(o => o.Kind == StoreOpKind.Delete && o.Row.RowKey.StartsWith("C|", StringComparison.Ordinal))
+            && Interlocked.Increment(ref failures) <= 2;
+        h.Svc.Body = t =>
+        {
+            if (t["TenantFilter"].ToString() == "p0")
+            {
+                var link = h.Svc.RegisterPendingChild("Parent", "Child")!.Value;
+                h.Svc.StartFromBatchAsync("Child", OrchestrationHarness.Batch(1, "c"), 4, null, null, CancellationToken.None,
+                    parentRunKey: link.ParentRunKey, childKey: link.ChildKey).GetAwaiter().GetResult();
+            }
+            return "{}";
+        };
+        Assert.True(await h.Start("Parent", OrchestrationHarness.Batch(1, "p"), "Agg"));
+
+        Assert.True(await h.DriveUntilFinished("Parent", 30_000));
+        Assert.True(failures >= 2);
+        Assert.Single(h.Svc.PostExecs);
+    }
+
     internal static async Task<List<string>> ActiveKeysAsync(FaultyTableStore t)
     {
         var keys = new List<string>();

@@ -25,8 +25,8 @@ public static class RateLimitPartitionKey
     /// The <c>X-Forwarded-For</c> step is load-bearing. Behind Azure App Service the socket peer is the
     /// platform load balancer, so <see cref="ConnectionInfo.RemoteIpAddress"/> is the same value for
     /// every anonymous caller — partitioning on it would collapse them all into one bucket and let any
-    /// single client deny service to the rest. Only the first hop is used, since the rest of the header
-    /// is caller-supplied and trivially spoofed.
+    /// single client deny service to the rest. <see cref="ForwardedForMiddleware"/> has already reduced
+    /// the header to the one address the trusted proxies vouch for.
     /// </para>
     /// </remarks>
     public static string Resolve(HttpContext context)

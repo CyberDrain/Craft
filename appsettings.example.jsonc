@@ -73,11 +73,19 @@
     //   "MaxConcurrentConnections": 200
     // },
 
+    // ── Trusted proxies ──
+    // How many reverse proxies in front of Craft append to X-Forwarded-For. Craft rewrites the header
+    // to the single address the outermost trusted proxy appended, so a caller cannot spoof it (IP
+    // allow-lists, audit logs and the rate limiter all read it). Unset: 1 on App Service, 0 elsewhere
+    // (the socket peer is used). Set it when self-hosting behind nginx/Caddy/a CDN.
+    // Env override: CRAFT_TRUSTED_PROXY_HOPS.
+    // "TrustedProxyHops": 1,
+
     // ── Request rate limiting ──
     // Per-client fixed-window limiter. ENABLED BY DEFAULT (300 requests / 10s per client),
     // partitioned by the authenticated principal name (x-ms-client-principal-name), falling back to
-    // the first X-Forwarded-For hop so anonymous callers behind the App Service load balancer aren't
-    // collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
+    // the client address (see TrustedProxyHops) so anonymous callers behind the App Service load
+    // balancer aren't collapsed into a single bucket. Requests over the limit get HTTP 429 with a Retry-After header.
     // Set "Enabled": false to turn it off (e.g. for load/perf testing); CRAFT_RATELIMIT_ENABLED=true
     // can also force it on.
     //

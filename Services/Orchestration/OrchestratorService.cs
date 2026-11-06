@@ -343,11 +343,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
         try { await _results.DeleteRunAsync(h.RunKey); }
         catch (Exception ex) { _logger.LogDebug(ex, "[Orchestrator] Could not drop results of {Run}", h.Name); }
 
+        // Through the batcher, so a failed write is retried: this run is already retired and nothing else would credit the parent.
         if (h.ParentRunKey is { } parentKey && h.ParentChildKey is { } childKey)
-        {
-            await _store.FinishAsync(parentKey,
-                [new WorkStore.Finish(0, h.Status == "Completed" ? "Completed" : "Failed", ChildKey: childKey)], null);
-        }
+            await _finisher.FinishAsync(parentKey, new WorkStore.Finish(0, h.Status == "Completed" ? "Completed" : "Failed", ChildKey: childKey));
     }
 
     // ── executing a claimed task ──
