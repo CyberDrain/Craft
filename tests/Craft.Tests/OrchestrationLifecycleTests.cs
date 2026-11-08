@@ -168,9 +168,14 @@ public class OrchestrationLifecycleTests
             Assert.Equal(!tasksFinish, drain.IsCompleted);
             Assert.Equal(started, (await store.GetTasksAsync(run.RunKey, 'R')).Count);
             Assert.Equal(12 - started, (await store.GetTasksAsync(run.RunKey, 'P')).Count);
+            Assert.NotNull(await store.GetInstanceLockAsync());
 
+            // The lock is handed over as soon as nothing claimed runs, before the host stops anything.
             release.SetResult();
             await drain.WaitAsync(TimeSpan.FromSeconds(10));
+            var until = DateTime.UtcNow.AddSeconds(5);
+            while (await store.GetInstanceLockAsync() != null && DateTime.UtcNow < until) await Task.Delay(50);
+            Assert.Null(await store.GetInstanceLockAsync());
         }
         finally
         {

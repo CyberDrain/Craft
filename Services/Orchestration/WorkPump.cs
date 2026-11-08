@@ -59,6 +59,7 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
     /// <summary>The instance lock: how long it is held for without renewal, and how often it is renewed.</summary>
     private readonly TimeSpan _lockLease;
     private readonly TimeSpan _lockRenewEvery;
+    private static readonly TimeSpan LockPoll = TimeSpan.FromSeconds(2);
     private DateTime _lockRenewedAt;
     private volatile bool _holdsLock;
 
@@ -153,9 +154,16 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
             var claimed = 0;
             try
             {
-                if (!await KeepLockAsync(stoppingToken)) await AcquireLockAsync(stoppingToken);
-                if (_draining) await DrainStepAsync(stoppingToken);
-                else claimed = await RefillAsync(stoppingToken);
+                if (_draining)
+                {
+                    if (_holdsLock) await KeepLockAsync(stoppingToken);
+                    await DrainStepAsync(stoppingToken);
+                }
+                else
+                {
+                    if (!await KeepLockAsync(stoppingToken)) await AcquireLockAsync(stoppingToken);
+                    claimed = await RefillAsync(stoppingToken);
+                }
                 await RenewAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
@@ -214,8 +222,9 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
                 _logger.LogInformation("[WorkPump] Waiting for the instance lock, held by {Holder} until {Until:O}",
                     holder?.Owner, holder?.LeaseUntil);
             }
+            // Look every 2 s: a predecessor hands the lock over the moment its drain ends, not at its lease.
             var wait = (holder?.LeaseUntil ?? DateTimeOffset.UtcNow) - DateTimeOffset.UtcNow;
-            await Task.Delay(wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait > _lockRenewEvery ? _lockRenewEvery : wait, ct);
+            await Task.Delay(wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait > LockPoll ? LockPoll : wait, ct);
         }
     }
 
@@ -448,12 +457,30 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
         catch (OperationCanceledException) { }
     }
 
-    /// <summary>One pump-loop pass while draining. On the loop's thread, which owns the claim list.</summary>
+    /// <summary>
+    /// One pump-loop pass while draining. On the loop's thread, which owns the claim list. Once no claimed task is in
+    /// flight the lock goes at once, so a successor claims while this process is still shutting down.
+    /// </summary>
     private async Task DrainStepAsync(CancellationToken ct)
     {
         await WithdrawUnstartedAsync(ct);
         Forget();
-        if (_inFlight.Count == 0) _drained.TrySetResult();
+        if (_inFlight.Count > 0) return;
+        if (_holdsLock) await ReleaseLockAsync(ct);
+        _drained.TrySetResult();
+    }
+
+    private async Task ReleaseLockAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (await _store.ReleaseInstanceLockAsync(_owner, ct))
+                _logger.LogInformation("[WorkPump] Released the instance lock");
+            else
+                _logger.LogWarning("[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease");
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease"); }
+        _holdsLock = false;
     }
 
     /// <summary>Hand back claims that never started so another process can run them now.</summary>
@@ -494,15 +521,7 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
                 _logger.LogWarning("[WorkPump] Shutdown cut short with tasks still running; the instance lock lapses at its lease");
                 return;
             }
-            try
-            {
-                if (await _store.ReleaseInstanceLockAsync(_owner, cancellationToken))
-                    _logger.LogInformation("[WorkPump] Released the instance lock");
-                else
-                    _logger.LogWarning("[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease");
-            }
-            catch (Exception ex) { _logger.LogWarning(ex, "[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease"); }
-            _holdsLock = false;
+            await ReleaseLockAsync(cancellationToken);
         }
     }
 }
