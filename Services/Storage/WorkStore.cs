@@ -1013,6 +1013,30 @@ public sealed class WorkStore
 
     // ── retention ──
 
+    /// <summary>
+    /// Delete runs still unfinished longer than <paramref name="maxAge"/> after they started: stuck work that would
+    /// otherwise be claimed again after every restart. Deleted rather than failed, so no post-execution fires a day
+    /// late. One read of the active list; a header read only for runs past the cutoff.
+    /// </summary>
+    public async Task<int> AbandonStaleAsync(TimeSpan maxAge, CancellationToken ct = default)
+    {
+        var cutoff = DateTimeOffset.UtcNow - maxAge;
+        var stale = new List<string>();
+        await foreach (var row in _store.QueryPartitionAsync(_names, ActivePartition, ct))
+            if (row.GetDateTimeOffset("StartedUtc") is { } started && started < cutoff) stale.Add(row.RowKey);
+
+        var abandoned = 0;
+        foreach (var runKey in stale)
+        {
+            if (await GetRunAsync(runKey, ct) is not { IsFinished: false } header) continue;
+            _logger.LogWarning("[WorkStore] Abandoning run {Run}: still unfinished {Hours:F0}h after it started ({Done}/{Total} done)",
+                runKey, (DateTime.UtcNow - header.StartedUtc).TotalHours, header.Done, header.Total);
+            await DeleteRunAsync(runKey, ct);
+            abandoned++;
+        }
+        return abandoned;
+    }
+
     /// <summary>Delete runs that finished before the retention cutoff: their Work and Results partitions and
     /// index rows. Reads the Finished index oldest first and stops at the cutoff.</summary>
     public async Task<int> SweepFinishedAsync(TimeSpan retention, CancellationToken ct = default)

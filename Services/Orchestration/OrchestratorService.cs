@@ -803,19 +803,30 @@ public class OrchestratorService : IJobDescriptorStateWriter
     // ── startup, retention, status lines ──
 
     /// <summary>
-    /// Startup. Storage is the state, so there is nothing to recover: create the tables and drop the previous
-    /// design's tables once. Claiming waits on this, so the first retention sweep runs in
-    /// <see cref="RunRetentionLoopAsync"/> instead.
+    /// Startup, before anything is claimed: create the tables, drop the previous design's tables once, and abandon
+    /// runs that outlived the retention window so they are not picked up again. Deleting finished runs is slower and
+    /// guards nothing, so it runs in <see cref="RunRetentionLoopAsync"/>.
     /// </summary>
     public async Task ResumeInterruptedRunsAsync(CancellationToken ct)
     {
         await _store.InitializeAsync(ct);
         await _store.DropLegacyTablesAsync(ct);
+        try { await AbandonStaleRunsAsync(ct); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { _logger.LogWarning(ex, "[Scheduler] Startup stale-run check failed"); }
+    }
+
+    private TimeSpan Retention => TimeSpan.FromHours(Math.Max(1, _settings.Orchestrator.RetentionHours));
+
+    private async Task AbandonStaleRunsAsync(CancellationToken ct)
+    {
+        var abandoned = await _store.AbandonStaleAsync(Retention, ct);
+        if (abandoned > 0) _logger.LogWarning("[OrchestratorStore] Abandoned {Count} run(s) unfinished after {Hours}h", abandoned, Retention.TotalHours);
     }
 
     public async Task<int> RunRetentionSweepAsync(CancellationToken ct)
     {
-        var removed = await _store.SweepFinishedAsync(TimeSpan.FromHours(Math.Max(1, _settings.Orchestrator.RetentionHours)), ct);
+        await AbandonStaleRunsAsync(ct);
+        var removed = await _store.SweepFinishedAsync(Retention, ct);
         if (removed > 0) _logger.LogInformation("[OrchestratorStore] Retention sweep removed {Count} finished run(s)", removed);
         return removed;
     }

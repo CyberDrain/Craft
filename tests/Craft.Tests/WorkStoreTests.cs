@@ -353,6 +353,37 @@ public class WorkStoreTests
     }
 
     [Fact]
+    public async Task ARunStillUnfinishedPastTheRetention_IsAbandoned_SoNothingClaimsIt_AndAYoungRunIsLeft()
+    {
+        var (s, _) = New();
+        var stale = await CreateAsync(s, "Stuck", 2, postExec: "Invoke-PostExec");
+        var running = await s.ClaimAsync(stale.RunKey, 1, "w", Lease, false);
+        Assert.NotEmpty(running);
+        var now = DateTime.UtcNow;
+        var young = await s.CreateRunAsync(new RunHeader
+        {
+            RunKey = WorkStore.RunKeyFor("Young", now),
+            Name = "Young",
+            StartedUtc = now,
+            TaskScriptName = "Invoke-CraftTask",
+        }, Tasks(2));
+
+        Assert.Equal(1, await s.AbandonStaleAsync(TimeSpan.FromHours(24)));
+
+        Assert.Null(await s.GetRunAsync(stale.RunKey));
+        Assert.Null(await s.GetRunByNameAsync("Stuck"));
+        var ready = new List<string>();
+        await foreach (var e in s.ReadReadyAsync()) ready.Add(e.RunKey);
+        Assert.Equal([young.RunKey], ready);
+        Assert.Equal(0, await s.AbandonStaleAsync(TimeSpan.FromHours(24)));
+
+        // A task still running elsewhere finishing later recreates nothing, so no post-execution is ever claimed.
+        Assert.Null(await s.FinishAsync(stale.RunKey, Done(running)));
+        Assert.Null(await s.GetRunAsync(stale.RunKey));
+        Assert.Empty(await s.GetTasksAsync(stale.RunKey));
+    }
+
+    [Fact]
     public async Task RetentionDeletesRunsFinishedBeforeTheCutoff()
     {
         var (s, mem) = New();
