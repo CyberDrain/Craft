@@ -205,6 +205,19 @@ public class WorkStoreTests
     }
 
     [Fact]
+    public async Task AStepOutlivingItsDriverLease_IsNotTakenBack_WhileItsOwnLeaseIsRenewed()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "LongStep", 2, sequential: true);
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", TimeSpan.FromMilliseconds(1)))!;
+        Assert.Empty(await s.RenewAsync([step], "w", Lease));
+        await Task.Delay(20);
+
+        Assert.Null(await s.ClaimSequentialAsync(run.RunKey, "w", Lease));
+        Assert.Equal(1, Assert.Single(await s.GetTasksAsync(run.RunKey, 'R')).Attempt);
+    }
+
+    [Fact]
     public async Task AStepTakenOverByAnotherDriver_IsNeitherFinishedNorFollowed_ByItsFormerOwner()
     {
         var (s, _) = New();

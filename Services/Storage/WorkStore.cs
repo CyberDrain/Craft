@@ -410,6 +410,8 @@ public sealed class WorkStore
         StoreRow? row = null;
         await foreach (var r in Range(runKey, 'R', ct: ct)) { row = r; break; }
         var reclaiming = row != null;
+        // The driver lease is not renewed during a step, but the step's own lease is: a step still held is still running.
+        if (reclaiming && row!.GetDateTimeOffset("LeaseUntil") > now && !(othersAreDead && row.GetString("Owner") != owner)) return null;
         if (row == null) await foreach (var r in Range(runKey, 'P', 1, ct)) { row = r; break; }
         if (row == null) return null;
 
