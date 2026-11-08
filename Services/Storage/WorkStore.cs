@@ -1018,7 +1018,9 @@ public sealed class WorkStore
     /// otherwise be claimed again after every restart. Deleted rather than failed, so no post-execution fires a day
     /// late. One read of the active list; a header read only for runs past the cutoff.
     /// </summary>
-    public async Task<int> AbandonStaleAsync(TimeSpan maxAge, CancellationToken ct = default)
+    /// <param name="skipClaimed">Leave a run alone while any of its tasks is held under a live lease. The periodic sweep
+    /// runs beside the pump, where a live claim is work in progress; at startup claims belong to the process that stopped.</param>
+    public async Task<int> AbandonStaleAsync(TimeSpan maxAge, bool skipClaimed, CancellationToken ct = default)
     {
         var cutoff = DateTimeOffset.UtcNow - maxAge;
         var stale = new List<string>();
@@ -1029,6 +1031,13 @@ public sealed class WorkStore
         foreach (var runKey in stale)
         {
             if (await GetRunAsync(runKey, ct) is not { IsFinished: false } header) continue;
+            if (skipClaimed)
+            {
+                var live = false;
+                await foreach (var r in Range(runKey, 'R', MaxRunningScan, ct))
+                    if (r.GetDateTimeOffset("LeaseUntil") > DateTimeOffset.UtcNow) { live = true; break; }
+                if (live) continue;
+            }
             _logger.LogWarning("[WorkStore] Abandoning run {Run}: still unfinished {Hours:F0}h after it started ({Done}/{Total} done)",
                 runKey, (DateTime.UtcNow - header.StartedUtc).TotalHours, header.Done, header.Total);
             await DeleteRunAsync(runKey, ct);

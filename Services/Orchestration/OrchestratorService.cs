@@ -811,21 +811,22 @@ public class OrchestratorService : IJobDescriptorStateWriter
     {
         await _store.InitializeAsync(ct);
         await _store.DropLegacyTablesAsync(ct);
-        try { await AbandonStaleRunsAsync(ct); }
+        try { await AbandonStaleRunsAsync(skipClaimed: false, ct); }
         catch (Exception ex) when (ex is not OperationCanceledException) { _logger.LogWarning(ex, "[Scheduler] Startup stale-run check failed"); }
     }
 
     private TimeSpan Retention => TimeSpan.FromHours(Math.Max(1, _settings.Orchestrator.RetentionHours));
 
-    private async Task AbandonStaleRunsAsync(CancellationToken ct)
+    private async Task AbandonStaleRunsAsync(bool skipClaimed, CancellationToken ct)
     {
-        var abandoned = await _store.AbandonStaleAsync(Retention, ct);
+        var abandoned = await _store.AbandonStaleAsync(Retention, skipClaimed, ct);
         if (abandoned > 0) _logger.LogWarning("[OrchestratorStore] Abandoned {Count} run(s) unfinished after {Hours}h", abandoned, Retention.TotalHours);
     }
 
+    /// <summary>The periodic sweep, beside the pump: it never blocks claiming, and leaves stale runs with live claims for later.</summary>
     public async Task<int> RunRetentionSweepAsync(CancellationToken ct)
     {
-        await AbandonStaleRunsAsync(ct);
+        await AbandonStaleRunsAsync(skipClaimed: true, ct);
         var removed = await _store.SweepFinishedAsync(Retention, ct);
         if (removed > 0) _logger.LogInformation("[OrchestratorStore] Retention sweep removed {Count} finished run(s)", removed);
         return removed;
