@@ -77,6 +77,8 @@ var nativeCatalog = NativeEndpointRegistry.Discover(
     LoggerFactory.Create(b => b.AddSimpleConsole()).CreateLogger("Craft.Endpoints"));
 
 builder.Services.AddCraftServices(roles);
+// Shutdown runs for the platform's whole grace: the background drain first, then Kestrel with what is left.
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(WorkPump.ShutdownSeconds(builder.Configuration).Grace));
 // The discovered catalog, injectable so the startup telemetry emitter can report a native route count
 // without re-scanning. Registered even when empty so the dependency always resolves.
 builder.Services.AddSingleton(nativeCatalog);

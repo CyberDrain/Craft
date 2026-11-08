@@ -14,8 +14,8 @@ namespace Craft.Orchestration;
 /// back the first time its run is read. The pump holds no other state that matters after a crash.
 ///
 /// Shutdown drains in <see cref="StoppingAsync"/>, which the host runs before any service stops, Kestrel included:
-/// claiming stops, unstarted claims go back, and running tasks get up to <c>ShutdownDrainSeconds</c> to finish
-/// while the API keeps serving.
+/// claiming stops, unstarted claims go back, and running work gets up to <c>ShutdownDrainSeconds</c> to finish
+/// while the API keeps serving and the scheduler keeps firing (what it starts lands in storage for the successor).
 /// </summary>
 public class WorkPump : BackgroundService, IHostedLifecycleService
 {
@@ -93,7 +93,7 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
         _pollInterval = TimeSpan.FromMilliseconds(Math.Max(100, configuration.GetValue("JobQueuePollIntervalMs", 1000)));
         _idlePollInterval = TimeSpan.FromMilliseconds(Math.Max(_pollInterval.TotalMilliseconds,
             configuration.GetValue("JobQueueIdlePollIntervalMs", 10_000)));
-        _drainBudget = TimeSpan.FromSeconds(Math.Max(0, configuration.GetValue("ShutdownDrainSeconds", 25)));
+        _drainBudget = TimeSpan.FromSeconds(ShutdownSeconds(configuration).Drain);
         _lockLease = TimeSpan.FromSeconds(Math.Max(5, configuration.GetValue("InstanceLockSeconds", 30)));
         _lockRenewEvery = _lockLease / 3;
         _store.RunChanged += runKey =>
@@ -126,8 +126,8 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[WorkPump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s",
-            _owner, _batchSize, _lowWater, _lease.TotalSeconds);
+        _logger.LogInformation("[WorkPump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s drain={Drain}s",
+            _owner, _batchSize, _lowWater, _lease.TotalSeconds, _drainBudget.TotalSeconds);
 
         try
         {
@@ -407,22 +407,44 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
     }
 
     /// <summary>
+    /// The shutdown budget. Grace: how long the platform waits after SIGTERM before it kills the process
+    /// (<c>ShutdownGraceSeconds</c>, else App Service's <c>WEBSITES_CONTAINER_STOP_TIME_LIMIT</c>, else 30); the host's
+    /// shutdown timeout is set to it (Program.cs). Drain: how much of it running work gets before Kestrel stops
+    /// (<c>ShutdownDrainSeconds</c>, else the grace less a margin for in-flight requests: 120 → 110, 30 → 25).
+    /// </summary>
+    public static (int Grace, int Drain) ShutdownSeconds(IConfiguration configuration)
+    {
+        var grace = Math.Max(0, configuration.GetValue<int?>("ShutdownGraceSeconds")
+            ?? configuration.GetValue<int?>("WEBSITES_CONTAINER_STOP_TIME_LIMIT") ?? 30);
+        var drain = configuration.GetValue<int?>("ShutdownDrainSeconds") ?? grace - Math.Max(5, grace / 12);
+        return (grace, Math.Clamp(drain, 0, grace));
+    }
+
+    /// <summary>
     /// The drain, before Kestrel stops: the pump loop stops claiming and hands back what has not started (see
-    /// <see cref="DrainStepAsync"/>), and this waits for the running tasks, up to the drain budget.
+    /// <see cref="DrainStepAsync"/>), and this waits until nothing claimed is in flight and the job manager is idle
+    /// (scheduled starters fired meanwhile included), up to the drain budget.
     /// </summary>
     public async Task StoppingAsync(CancellationToken cancellationToken)
     {
         _draining = true;
-        if (!_pumping) return;
         Wake();
-        _logger.LogInformation("[WorkPump] Draining: no new claims, up to {Budget}s for running tasks while the API keeps serving",
+        _logger.LogInformation("[WorkPump] Draining: no new claims, up to {Budget}s for running work while the API keeps serving",
             _drainBudget.TotalSeconds);
+        var until = DateTime.UtcNow + _drainBudget;
         try
         {
-            await _drained.Task.WaitAsync(_drainBudget, cancellationToken);
-            _logger.LogInformation("[WorkPump] Drained: no claimed task still running");
+            while (!((!_pumping || _drained.Task.IsCompleted) && _jobs.ActiveCount == 0 && _jobs.QueuedCount == 0))
+            {
+                if (DateTime.UtcNow >= until)
+                {
+                    _logger.LogWarning("[WorkPump] Drain budget spent with {Active} job(s) still running", _jobs.ActiveCount);
+                    return;
+                }
+                await Task.Delay(250, cancellationToken);
+            }
+            _logger.LogInformation("[WorkPump] Drained: nothing left running");
         }
-        catch (TimeoutException) { _logger.LogWarning("[WorkPump] Drain budget spent with claimed tasks still running"); }
         catch (OperationCanceledException) { }
     }
 

@@ -116,6 +116,26 @@ public class OrchestrationLifecycleTests
         Assert.All(pending, t => Assert.Equal(0, t.Attempt));
     }
 
+    /// <summary>The drain follows the platform's grace unless set itself, and never outlasts it.</summary>
+    [Theory]
+    [InlineData(null, "120", null, 120, 110)]
+    [InlineData(null, "30", null, 30, 25)]
+    [InlineData(null, null, null, 30, 25)]
+    [InlineData("60", "120", null, 60, 55)]
+    [InlineData(null, "120", "90", 120, 90)]
+    [InlineData(null, "30", "90", 30, 30)]
+    public void TheShutdownBudget_FollowsThePlatformGrace(string? grace, string? platform, string? drain, int expectGrace, int expectDrain)
+    {
+        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["ShutdownGraceSeconds"] = grace,
+            ["WEBSITES_CONTAINER_STOP_TIME_LIMIT"] = platform,
+            ["ShutdownDrainSeconds"] = drain,
+        }).Build();
+
+        Assert.Equal((expectGrace, expectDrain), WorkPump.ShutdownSeconds(config));
+    }
+
     /// <summary>
     /// The drain runs before the host stops anything (Kestrel included): it hands back what has not started and
     /// returns once the running tasks finish, or when its budget is spent.

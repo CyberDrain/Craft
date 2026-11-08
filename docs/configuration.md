@@ -474,6 +474,17 @@ This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applica
 5. On restart, interrupted tasks resume automatically
 6. After all tasks finish, optional `PostExecution` aggregates results and can start a second phase
 
+**Shutdown (top-level keys or environment variables):** on SIGTERM the HTTP API and frontend keep serving and the
+scheduler keeps firing while background work drains; only then does Kestrel stop.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ShutdownGraceSeconds` | `WEBSITES_CONTAINER_STOP_TIME_LIMIT`, else 30 | How long the platform waits before killing the process. The host's shutdown timeout. |
+| `ShutdownDrainSeconds` | grace less max(5, grace / 12): 120 → 110, 30 → 25 | How much of the grace running work gets before Kestrel stops. Capped at the grace. |
+
+During a restart the old and new container run side by side; each timer slot is claimed in the scheduler's
+`StateTable` (`TimerSlot` partition) so only one of them fires it.
+
 ---
 
 ### Cache
