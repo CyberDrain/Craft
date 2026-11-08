@@ -29,6 +29,8 @@ public class SchedulerService : BackgroundService
     private readonly NativeScheduledTasks _nativeTasks;
     private readonly IServiceProvider _services;
     private readonly ICraftTableStore? _store;
+    /// <summary>Set from SIGTERM until exit, while running tasks drain: nothing new is fired into a process that is going away.</summary>
+    private readonly CancellationToken _stopping;
     private List<SchedulerTask> _tasks = [];
     private readonly Dictionary<string, DateTimeOffset> _lastRun = new();
     private readonly Dictionary<string, DateTimeOffset> _lastFired = new();
@@ -49,9 +51,11 @@ public class SchedulerService : BackgroundService
         StorageHealthMonitor storageHealth,
         NativeScheduledTasks nativeTasks,
         IServiceProvider services,
-        ICraftTableStore? store = null)
+        ICraftTableStore? store = null,
+        IHostApplicationLifetime? lifetime = null)
     {
         _store = store;
+        _stopping = lifetime?.ApplicationStopping ?? CancellationToken.None;
         _logger = logger;
         _psRunner = psRunner;
         _limiter = limiter;
@@ -108,8 +112,8 @@ public class SchedulerService : BackgroundService
             _logger.LogWarning(ex, "[Scheduler] Could not load timer state from {Table}", _settings.Scheduler.StateTable);
         }
 
-        // Retention sweeps for the rest of the process lifetime; recovery ran the first one. Fire and
-        // forget is deliberate: the loop handles its own failures and ends with the stopping token.
+        // Retention sweeps for the rest of the process lifetime, the first one now. Fire and forget is
+        // deliberate: the loop handles its own failures and ends with the stopping token.
         _ = _orchestrator.RunRetentionLoopAsync(stoppingToken);
 
         // One status/re-drive sweep over all live runs, replacing the per-run timers. Same fire-and-forget
@@ -123,7 +127,7 @@ public class SchedulerService : BackgroundService
             // An exception escaping ExecuteAsync stops the host, and CollectDue allocates outside its per-timer catch
             // (an OutOfMemoryException there took the host down), so a failed check waits for the next interval.
             List<SchedulerTask> due;
-            try { due = CollectDue(now); }
+            try { due = _stopping.IsCancellationRequested ? [] : CollectDue(now); }
             catch (Exception ex)
             {
                 try { _logger.LogError(ex, "[Scheduler] Timer check failed; retrying next interval"); } catch { }

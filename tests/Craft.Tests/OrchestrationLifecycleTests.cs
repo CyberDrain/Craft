@@ -28,7 +28,7 @@ public class OrchestrationLifecycleTests
         return new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
     }
 
-    private static (WorkStore Store, WorkPump Pump, JobManager Jobs) NewIdlePump(int leaseSeconds = 1800)
+    private static (WorkStore Store, WorkPump Pump, JobManager Jobs) NewIdlePump(int leaseSeconds = 1800, int drainSeconds = 25)
     {
         var settings = new CraftSettings();
         settings.Worker.BgPoolSize = 4;
@@ -37,6 +37,7 @@ public class OrchestrationLifecycleTests
         var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["JobQueueLeaseSeconds"] = leaseSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["ShutdownDrainSeconds"] = drainSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture),
         }).Build();
         return (store, new WorkPump(NullLogger<WorkPump>.Instance, store, jobs, config, settings), jobs);
     }
@@ -113,6 +114,50 @@ public class OrchestrationLifecycleTests
         var pending = await store.GetTasksAsync(run.RunKey, 'P');
         Assert.Equal(6, pending.Count);
         Assert.All(pending, t => Assert.Equal(0, t.Attempt));
+    }
+
+    /// <summary>
+    /// The drain runs before the host stops anything (Kestrel included): it hands back what has not started and
+    /// returns once the running tasks finish, or when its budget is spent.
+    /// </summary>
+    [Theory]
+    [InlineData(25, true)]
+    [InlineData(1, false)]
+    public async Task OnShutdown_TheDrain_HandsBackUnstartedClaims_AndWaitsForRunningTasks_UpToItsBudget(int drainSeconds, bool tasksFinish)
+    {
+        var (store, pump, jobs) = NewIdlePump(drainSeconds: drainSeconds);
+        var release = new TaskCompletionSource();
+        var started = 0;
+        jobs.SetWorkResolver((_, _) => Task.FromResult<Func<CancellationToken, Task>?>(async _ =>
+        {
+            Interlocked.Increment(ref started);
+            await release.Task;
+        }));
+        var run = await CreateAsync(store, "Draining", 12);
+        _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
+        await pump.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(20);
+            while (Volatile.Read(ref started) == 0 && DateTime.UtcNow < deadline) await Task.Delay(50);
+            await Task.Delay(500);
+            Assert.True(started > 0);
+
+            var drain = pump.StoppingAsync(CancellationToken.None);
+            await Task.Delay(drainSeconds == 1 ? 2000 : 1500);
+            Assert.Equal(!tasksFinish, drain.IsCompleted);
+            Assert.Equal(started, (await store.GetTasksAsync(run.RunKey, 'R')).Count);
+            Assert.Equal(12 - started, (await store.GetTasksAsync(run.RunKey, 'P')).Count);
+
+            release.SetResult();
+            await drain.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await pump.StopAsync(CancellationToken.None);
+            await jobs.StopAsync(CancellationToken.None);
+        }
     }
 
     /// <summary>

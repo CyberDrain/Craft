@@ -803,15 +803,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
     // ── startup, retention, status lines ──
 
     /// <summary>
-    /// Startup. Storage is the state, so there is nothing to recover: create the tables, drop the previous
-    /// design's tables once, and sweep expired runs.
+    /// Startup. Storage is the state, so there is nothing to recover: create the tables and drop the previous
+    /// design's tables once. Claiming waits on this, so the first retention sweep runs in
+    /// <see cref="RunRetentionLoopAsync"/> instead.
     /// </summary>
     public async Task ResumeInterruptedRunsAsync(CancellationToken ct)
     {
         await _store.InitializeAsync(ct);
         await _store.DropLegacyTablesAsync(ct);
-        try { await RunRetentionSweepAsync(ct); }
-        catch (Exception ex) { _logger.LogWarning(ex, "[Scheduler] Startup retention sweep failed"); }
     }
 
     public async Task<int> RunRetentionSweepAsync(CancellationToken ct)
@@ -823,6 +822,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
 
     public async Task RunRetentionLoopAsync(CancellationToken ct)
     {
+        try { await RunRetentionSweepAsync(ct); }
+        catch (Exception ex) when (ex is not OperationCanceledException) { _logger.LogWarning(ex, "[Scheduler] Startup retention sweep failed"); }
+        catch (OperationCanceledException) { return; }
+
         var hours = _settings.Orchestrator.CleanupIntervalHours;
         if (hours <= 0) return;
         using var timer = new PeriodicTimer(TimeSpan.FromHours(hours));
