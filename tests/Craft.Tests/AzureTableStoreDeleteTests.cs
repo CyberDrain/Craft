@@ -14,6 +14,7 @@ namespace Craft.Tests;
 public class AzureTableStoreDeleteTests
 {
     private static readonly string[] ABC = ["a", "b", "c"];
+    private static readonly string[] KeyColumns = ["PartitionKey", "RowKey", "Timestamp"];
 
     private static async Task<(AzureTableStore Store, TableClient Client)?> ConnectAsync()
     {
@@ -84,6 +85,24 @@ public class AzureTableStoreDeleteTests
             await c.Store.DeleteBatchAsync(c.Client.Name, "p", keys);
 
             Assert.Empty(await KeysAsync(c.Client));
+        }
+        finally { await c.Client.DeleteAsync(); }
+    }
+
+    /// <summary>The orphan sweep ages partitions by Timestamp from a keys-only scan; without it nothing would ever go.</summary>
+    [Fact]
+    public async Task TheKeysOnlyScan_ReturnsEachRowsTimestamp()
+    {
+        if (await ConnectAsync() is not { } c) return;
+        try
+        {
+            await SeedAsync(c.Client, ["a", "b"]);
+
+            var rows = new List<StoreRow>();
+            await foreach (var r in c.Store.QueryTableAsync(c.Client.Name, null, KeyColumns)) rows.Add(r);
+
+            Assert.Equal(2, rows.Count);
+            Assert.All(rows, r => Assert.InRange(r.Timestamp!.Value, DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddMinutes(5)));
         }
         finally { await c.Client.DeleteAsync(); }
     }

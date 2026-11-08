@@ -823,12 +823,25 @@ public class OrchestratorService : IJobDescriptorStateWriter
         if (abandoned > 0) _logger.LogWarning("[OrchestratorStore] Abandoned {Count} run(s) unfinished after {Hours}h", abandoned, Retention.TotalHours);
     }
 
+    /// <summary>When the orphan sweep last ran in this process; it scans whole tables, so it runs once a day.</summary>
+    private DateTime _lastOrphanSweep = DateTime.MinValue;
+    private static readonly TimeSpan OrphanSweepEvery = TimeSpan.FromHours(24);
+    private static readonly TimeSpan OrphanMinAge = TimeSpan.FromHours(1);
+
     /// <summary>The periodic sweep, beside the pump: it never blocks claiming, and leaves stale runs with live claims for later.</summary>
     public async Task<int> RunRetentionSweepAsync(CancellationToken ct)
     {
         await AbandonStaleRunsAsync(skipClaimed: true, ct);
         var removed = await _store.SweepFinishedAsync(Retention, ct);
         if (removed > 0) _logger.LogInformation("[OrchestratorStore] Retention sweep removed {Count} finished run(s)", removed);
+
+        if (DateTime.UtcNow - _lastOrphanSweep >= OrphanSweepEvery)
+        {
+            _lastOrphanSweep = DateTime.UtcNow;
+            var orphans = await _store.SweepOrphansAsync(OrphanMinAge, ct);
+            _logger.LogInformation("[OrchestratorStore] Orphan sweep removed {Work} Work partition(s), {Results} Results partition(s), {Names} name row(s)",
+                orphans.Work, orphans.Results, orphans.Names);
+        }
         return removed;
     }
 

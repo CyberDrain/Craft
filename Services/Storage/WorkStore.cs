@@ -1046,6 +1046,53 @@ public sealed class WorkStore
         return abandoned;
     }
 
+    public sealed record OrphanResult(int Work, int Results, int Names);
+
+    private static readonly string[] KeyColumns = ["PartitionKey", "RowKey", "Timestamp"];
+
+    /// <summary>
+    /// Delete what no index reaches, so storage stays bounded whatever was interrupted: Work partitions with no run
+    /// header, and Results partitions and name rows whose run has none. Runs on the active list (index repair owns
+    /// those) and anything written within <paramref name="minAge"/> are left alone, so a run being created or a result
+    /// landing is never taken. A keys-only scan of the Work and Results tables, so it is run rarely.
+    /// </summary>
+    public async Task<OrphanResult> SweepOrphansAsync(TimeSpan minAge, CancellationToken ct = default)
+    {
+        var cutoff = DateTimeOffset.UtcNow - minAge;
+        var active = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var row in _store.QueryPartitionAsync(_names, ActivePartition, ct)) active.Add(row.RowKey);
+
+        var work = await PartitionStampsAsync(_work, ct);
+        var live = work.Where(p => p.Value.Header).Select(p => p.Key).ToHashSet(StringComparer.Ordinal);
+        var results = await PartitionStampsAsync(_results, ct);
+
+        var workOrphans = work.Where(p => !p.Value.Header && !active.Contains(p.Key) && p.Value.Newest < cutoff).Select(p => p.Key).ToList();
+        var resultOrphans = results.Where(p => !live.Contains(p.Key) && !active.Contains(p.Key) && p.Value.Newest < cutoff).Select(p => p.Key).ToList();
+        foreach (var pk in workOrphans) await _store.DeletePartitionAsync(_work, pk, ct);
+        foreach (var pk in resultOrphans) await _store.DeletePartitionAsync(_results, pk, ct);
+
+        var names = new List<string>();
+        await foreach (var row in _store.QueryPartitionAsync(_names, "N", ct))
+            if (row.GetString("RunKey") is not { } runKey || (!live.Contains(runKey) && !active.Contains(runKey) && row.Timestamp < cutoff))
+                names.Add(row.RowKey);
+        await _store.DeleteBatchAsync(_names, "N", names, ct);
+
+        return new OrphanResult(workOrphans.Count, resultOrphans.Count, names.Count);
+    }
+
+    /// <summary>Per partition of <paramref name="table"/>: whether it holds a run header, and its newest write.</summary>
+    private async Task<Dictionary<string, (bool Header, DateTimeOffset Newest)>> PartitionStampsAsync(string table, CancellationToken ct)
+    {
+        var parts = new Dictionary<string, (bool Header, DateTimeOffset Newest)>(StringComparer.Ordinal);
+        await foreach (var r in _store.QueryTableAsync(table, null, KeyColumns, ct))
+        {
+            var p = parts.GetValueOrDefault(r.PartitionKey, (Header: false, Newest: DateTimeOffset.MinValue));
+            var stamp = r.Timestamp ?? DateTimeOffset.MaxValue;
+            parts[r.PartitionKey] = (p.Header || r.RowKey == HeaderKey, stamp > p.Newest ? stamp : p.Newest);
+        }
+        return parts;
+    }
+
     /// <summary>Delete runs that finished before the retention cutoff: their Work and Results partitions and
     /// index rows. Reads the Finished index oldest first and stops at the cutoff.</summary>
     public async Task<int> SweepFinishedAsync(TimeSpan retention, CancellationToken ct = default)

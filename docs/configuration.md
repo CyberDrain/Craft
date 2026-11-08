@@ -435,7 +435,9 @@ nothing to recover: claims held by a stopped process lapse and are taken again.
   // Retention sweep. A run that finished longer ago than RetentionHours is removed with its Work and
   // Results partitions, and a run still unfinished RetentionHours after it started is abandoned (deleted,
   // no post-execution). Abandoning also runs at startup before anything is claimed. Runs once at startup
-  // and then every CleanupIntervalHours; 0 keeps only the startup pass.
+  // and then every CleanupIntervalHours; 0 keeps only the startup pass. Once a day it also scans for rows no
+  // index reaches (Work partitions without a run header, Results partitions and name rows of runs that have
+  // none, older than an hour) and deletes them, so storage stays bounded after any interrupted delete.
   "RetentionHours": 24,
   "CleanupIntervalHours": 4
 }

@@ -398,6 +398,35 @@ public class WorkStoreTests
         Assert.Null(await s.GetRunAsync(stale.RunKey));
     }
 
+    /// <summary>
+    /// What no index reaches goes: a Work partition with no header, Results and a name row for a run that has none.
+    /// A live run's rows, a run on the active list (still being created) and anything newer than the minimum age stay.
+    /// </summary>
+    [Fact]
+    public async Task TheOrphanSweep_DropsWhatNoIndexReaches_AndKeepsLiveYoungAndListedRuns()
+    {
+        var (s, mem) = New();
+        var p = new CraftSettings().Orchestrator.TablePrefix;
+        var live = await CreateAsync(s, "Live", 2);
+        await mem.UpsertAsync($"{p}TaskResults", new StoreRow(live.RunKey, "0"));
+        await mem.UpsertAsync($"{p}Work", new StoreRow("Gone~1", "D|0000000"));
+        await mem.UpsertAsync($"{p}TaskResults", new StoreRow("Gone~2", "0"));
+        await mem.UpsertAsync($"{p}Names", new StoreRow("N", "Gone") { ["RunKey"] = "Gone~2" });
+        await mem.UpsertAsync($"{p}Names", new StoreRow("A", "Creating~3"));
+        await mem.UpsertAsync($"{p}Work", new StoreRow("Creating~3", "P|0000000"));
+
+        Assert.Equal(new WorkStore.OrphanResult(0, 0, 0), await s.SweepOrphansAsync(TimeSpan.FromHours(1)));
+        Assert.Equal(new WorkStore.OrphanResult(1, 1, 1), await s.SweepOrphansAsync(TimeSpan.Zero));
+
+        Assert.DoesNotContain(mem.All($"{p}Work"), r => r.PartitionKey == "Gone~1");
+        Assert.DoesNotContain(mem.All($"{p}TaskResults"), r => r.PartitionKey == "Gone~2");
+        Assert.Contains(mem.All($"{p}TaskResults"), r => r.PartitionKey == live.RunKey);
+        Assert.Contains(mem.All($"{p}Work"), r => r.PartitionKey == "Creating~3");
+        Assert.NotNull(await s.GetRunAsync(live.RunKey));
+        Assert.NotNull(await s.GetRunByNameAsync("Live"));
+        Assert.Equal(new WorkStore.OrphanResult(0, 0, 0), await s.SweepOrphansAsync(TimeSpan.Zero));
+    }
+
     [Fact]
     public async Task RetentionDeletesRunsFinishedBeforeTheCutoff()
     {
