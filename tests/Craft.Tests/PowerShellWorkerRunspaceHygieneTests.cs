@@ -50,4 +50,23 @@ public class PowerShellWorkerRunspaceHygieneTests
         a.Dispose(); b.Dispose();
         Directory.Delete(dir, recursive: true);
     }
+
+    [Fact]
+    public async Task Initialize_GlobalJsonPreloads_SurviveTheGlobalSweep_WhileInvocationGlobalsDoNot()
+    {
+        var dir = Directory.CreateTempSubdirectory("craft-preload-").FullName;
+        File.WriteAllText(Path.Combine(dir, "flags.json"), """[{ "Id": "SuperAdminNG" }]""");
+        var settings = new CraftSettings();
+        settings.Worker.JsonPreloads = [new GlobalJsonPreload { File = "flags.json", Variable = "SweepFlags", Scope = "global" }];
+        var worker = new PowerShellWorker(95, InitialSessionState.CreateDefault2(), NullLogger.Instance);
+        worker.Initialize(new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings), dir, settings);
+
+        await worker.InvokeScriptAsync(ScriptBlock.Create("$global:FromInvocation = 1; $global:SweepFlags.Id"));
+        var later = await worker.InvokeScriptAsync(ScriptBlock.Create("$global:SweepFlags.Id; $null -eq $global:FromInvocation"));
+
+        Assert.Equal("SuperAdminNG", later[0].BaseObject);
+        Assert.True((bool)later[1].BaseObject);
+        worker.Dispose();
+        Directory.Delete(dir, recursive: true);
+    }
 }
