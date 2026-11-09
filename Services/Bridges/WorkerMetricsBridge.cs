@@ -830,7 +830,8 @@ public static class WorkerMetricsBridge
         while (durationMs > current && Interlocked.CompareExchange(ref stats.MaxDurationMs, durationMs, current) != current);
     }
 
-    private static long s_lastTrimTicks;
+    // Starts at process start, so the first trim waits a full cooldown instead of pausing the workers while they warm up.
+    private static long s_lastTrimTicks = Stopwatch.GetTimestamp();
 
     /// <summary>
     /// Force a full GC collection with LOH compaction and working-set trim.
