@@ -132,14 +132,25 @@ public static class WorkerMetricsBridge
         // Track min/max/recent durations
         UpdateDurationStats(stats, elapsedMs);
 
-        // Every 100 global invocations, attempt a memory trim (2-min cooldown)
+        // Every 100 global invocations, attempt a memory trim (2-min cooldown). On the thread pool: this runs while a
+        // request or task is being reclaimed, and inline it held the response and the worker for the full trim.
         var count = Interlocked.Increment(ref s_globalInvocations);
         if (count % 100 == 0)
         {
-            var reclaimed = TrimMemory();
-            if (reclaimed >= 0)
-                s_logger?.LogInformation("[System] Memory trim at invocation {Count}: reclaimed ~{MB}MB {Memory}",
-                    count, reclaimed, BackgroundTaskLimiter.GetMemorySnapshot());
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    var reclaimed = TrimMemory();
+                    if (reclaimed >= 0)
+                        s_logger?.LogInformation("[System] Memory trim at invocation {Count}: reclaimed ~{MB}MB {Memory}",
+                            count, reclaimed, BackgroundTaskLimiter.GetMemorySnapshot());
+                }
+                catch (Exception ex)
+                {
+                    s_logger?.LogWarning(ex, "[System] Memory trim at invocation {Count} failed", count);
+                }
+            });
         }
     }
 
