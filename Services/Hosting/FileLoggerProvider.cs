@@ -12,10 +12,11 @@ namespace Craft.Hosting;
 /// Older rotated files have higher numbers. Files beyond MaxFileCount are deleted.
 ///
 /// Producer-side <see cref="WriteLine"/> is non-blocking: log entries are pushed onto
-/// an unbounded channel and a single background consumer task performs the actual
+/// a bounded channel and a single background consumer task performs the actual
 /// file writes. The consumer flushes once per drain burst, so a 1000-line burst
-/// yields a single flush — under sustained load the queue grows briefly while the
-/// consumer drains it as fast as the disk allows. Nothing is ever dropped.
+/// yields a single flush. A flood that outruns the disk past <see cref="QueueCapacity"/>
+/// lines drops the newest lines rather than grow memory or block the caller; the count
+/// dropped is written to the log once the consumer catches up.
 /// </summary>
 public sealed class FileLoggerProvider : ILoggerProvider
 {
@@ -30,8 +31,11 @@ public sealed class FileLoggerProvider : ILoggerProvider
     private StreamWriter? _writer;
     private long _currentFileSize;
 
+    internal const int QueueCapacity = 50_000;
+
     private readonly Channel<LogItem> _channel;
     private readonly Task _consumerTask;
+    private long _dropped;
 
     private readonly record struct LogItem(string Line, string? ExLine, TaskCompletionSource? RotateSignal);
 
@@ -48,10 +52,15 @@ public sealed class FileLoggerProvider : ILoggerProvider
         Directory.CreateDirectory(_directory);
         OpenCurrentFile();
 
-        _channel = Channel.CreateUnbounded<LogItem>(new UnboundedChannelOptions
+        _channel = Channel.CreateBounded<LogItem>(new BoundedChannelOptions(QueueCapacity)
         {
             SingleReader = true,
             SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropWrite,
+        }, item =>
+        {
+            if (item.RotateSignal is { } rotate) rotate.TrySetResult();
+            else Interlocked.Increment(ref _dropped);
         });
         _consumerTask = Task.Run(ConsumeLoopAsync);
     }
@@ -125,6 +134,8 @@ public sealed class FileLoggerProvider : ILoggerProvider
                     }
                     WriteToFile(item.Line, item.ExLine);
                 }
+                if (Interlocked.Exchange(ref _dropped, 0) is var dropped and > 0)
+                    WriteToFile($"{DateTime.UtcNow.ToString(_timestampFormat, CultureInfo.InvariantCulture)} [WRN] Dropped {dropped} log lines: the log queue was full", null);
                 try { _writer?.Flush(); } catch { }
             }
         }
