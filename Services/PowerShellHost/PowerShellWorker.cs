@@ -228,6 +228,8 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
             _logger.LogWarning(ex, "Worker{Id}: failed to capture ExecutionContext baseline; per-invocation reset will be skipped.", Id);
         }
 
+        _pwsh.Runspace.SessionStateProxy.PSVariable.Set(StopTokenVariable, CancellationToken.None);
+
         // Last, so the JSON preloads and anything else set up above survive the per-invocation global sweep.
         var vars = GetGlobalVariables();
         _baselineGlobals = new HashSet<string>(vars.Count + 3, StringComparer.OrdinalIgnoreCase) { "PSScriptRoot", "PSCommandPath", "MyInvocation" };
@@ -408,6 +410,9 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     /// </summary>
     private async Task<PSDataCollection<PSObject>> RunPipelineAsync(string label, CancellationToken ct)
     {
+        // Cancelled before the stop request, so a .NET call waiting on it returns and the stop can land.
+        using var stopToken = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _pwsh.Runspace.SessionStateProxy.PSVariable.Set(StopTokenVariable, stopToken.Token);
         // A fresh output collection per invocation: after an invocation that threw, the PowerShell object's
         // own output buffer comes back null from the next EndInvoke, silently dropping that call's output.
         var outputs = new PSDataCollection<PSObject>();
@@ -423,6 +428,8 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
 
                 if (!run.IsCompleted)
                 {
+                    try { stopToken.Cancel(); }
+                    catch (Exception ex) { _logger.LogDebug(ex, "Worker{Id}: a stop token callback threw", Id); }
                     stop = Task.Factory.StartNew(StopPipeline, CancellationToken.None,
                         TaskCreationOptions.LongRunning, TaskScheduler.Default);
                     if (await Task.WhenAny(run, Task.Delay(StopGrace, CancellationToken.None)) != run)
@@ -500,6 +507,12 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     public PSDataStreams Streams => _pwsh.Streams;
 
     /// <summary>
+    /// $global:CraftPipelineStopToken: cancelled when the invocation is stopped. PowerShell 7.4 has no
+    /// $PSCmdlet.PipelineStopToken, and a stop request never reaches a pipeline blocked in a .NET call.
+    /// </summary>
+    internal const string StopTokenVariable = "CraftPipelineStopToken";
+
+    /// <summary>
     /// Make the caller's ambient <see cref="OperationContext"/> readable from PowerShell as
     /// $global:CraftOperationContext.
     ///
@@ -528,6 +541,8 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
     {
         _pwsh.Commands.Clear();
         _pwsh.Streams.ClearStreams();
+        try { _pwsh.Runspace.SessionStateProxy.PSVariable.Set(StopTokenVariable, CancellationToken.None); }
+        catch { }
         ResetPipelineExecutionContext();
         CleanupGlobalVariables();
         ClearErrorVariable();
