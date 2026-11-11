@@ -78,4 +78,24 @@ public class HttpDiagnosticListenerTests
         Assert.DoesNotContain("secret-value", line);
         Assert.DoesNotContain(logger.Lines, l => l.Contains("/fast"));
     }
+
+    [Fact]
+    public async Task ARequestWhoseStopNeverArrives_IsAgedOut()
+    {
+        using var diagnostics = new HttpDiagnosticListener(new ListLogger()) { MaxInFlightAge = TimeSpan.FromMilliseconds(100) };
+        IObserver<KeyValuePair<string, object?>> observer = diagnostics;
+        void Start()
+        {
+            using var activity = new System.Diagnostics.Activity("test").Start();
+            observer.OnNext(new("System.Net.Http.HttpRequestOut.Start", new { Request = new HttpRequestMessage(HttpMethod.Get, "http://127.0.0.1/") }));
+        }
+
+        for (var i = 0; i < 10_000; i++) Start();
+        await Task.Delay(300);
+        Start();
+
+        var counts = new Dictionary<string, long>();
+        diagnostics.CountRetained(counts);
+        Assert.True(counts["HttpDiag.inflight"] <= 1, $"{counts["HttpDiag.inflight"]} unmatched starts are still held");
+    }
 }

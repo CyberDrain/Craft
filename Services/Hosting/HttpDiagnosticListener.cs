@@ -30,6 +30,10 @@ public sealed class HttpDiagnosticListener : EventListener,
     // Track socket connect timing
     private readonly ConcurrentDictionary<string, long> _connectInFlight = new();
 
+    /// <summary>A start whose stop never arrives under the same key is dropped after this; tests shorten it.</summary>
+    internal TimeSpan MaxInFlightAge { get; set; } = TimeSpan.FromMinutes(10);
+    private long _nextSweep;
+
     private IDisposable? _allListenersSubscription;
     private IDisposable? _httpListenerSubscription;
 
@@ -78,7 +82,7 @@ public sealed class HttpDiagnosticListener : EventListener,
         // EventId 1 = ResolutionStart, EventId 2 = ResolutionStop
         if (e.EventId == 1)
         {
-            _dnsInFlight[key] = System.Diagnostics.Stopwatch.GetTimestamp();
+            _dnsInFlight[key] = SweepStale();
             var host = e.Payload?.Count > 0 ? e.Payload[0]?.ToString() : "?";
             _logger.LogDebug("[DNS-START] {Host}", host);
         }
@@ -102,7 +106,7 @@ public sealed class HttpDiagnosticListener : EventListener,
         // EventId 1 = HandshakeStart, EventId 2 = HandshakeStop
         if (e.EventId == 1)
         {
-            _tlsInFlight[key] = System.Diagnostics.Stopwatch.GetTimestamp();
+            _tlsInFlight[key] = SweepStale();
         }
         else if (e.EventId == 2)
         {
@@ -124,7 +128,7 @@ public sealed class HttpDiagnosticListener : EventListener,
         // EventId 1 = ConnectStart, EventId 2 = ConnectStop
         if (e.EventId == 1)
         {
-            _connectInFlight[key] = System.Diagnostics.Stopwatch.GetTimestamp();
+            _connectInFlight[key] = SweepStale();
         }
         else if (e.EventId == 2)
         {
@@ -147,6 +151,21 @@ public sealed class HttpDiagnosticListener : EventListener,
         into["HttpDiag.dnsInFlight"] = _dnsInFlight.Count;
         into["HttpDiag.tlsInFlight"] = _tlsInFlight.Count;
         into["HttpDiag.connectInFlight"] = _connectInFlight.Count;
+    }
+
+    /// <summary>Drop starts older than <see cref="MaxInFlightAge"/>, at most once per that age; returns now.</summary>
+    private long SweepStale()
+    {
+        var now = Stopwatch.GetTimestamp();
+        var next = Interlocked.Read(ref _nextSweep);
+        var age = (long)(MaxInFlightAge.TotalSeconds * Stopwatch.Frequency);
+        if (now < next || Interlocked.CompareExchange(ref _nextSweep, now + age, next) != next) return now;
+        var cutoff = now - age;
+        foreach (var e in _dnsInFlight) if (e.Value < cutoff) _dnsInFlight.TryRemove(e);
+        foreach (var e in _tlsInFlight) if (e.Value < cutoff) _tlsInFlight.TryRemove(e);
+        foreach (var e in _connectInFlight) if (e.Value < cutoff) _connectInFlight.TryRemove(e);
+        foreach (var e in _inflight) if (e.Value.StartTicks < cutoff) _inflight.TryRemove(e);
+        return now;
     }
 
     private static long GetElapsedMs(long startTicks)
@@ -193,7 +212,7 @@ public sealed class HttpDiagnosticListener : EventListener,
         var key = Activity.Current?.Id;
         if (key == null) return;
 
-        _inflight[key] = (request.RequestUri, Stopwatch.GetTimestamp());
+        _inflight[key] = (request.RequestUri, SweepStale());
     }
 
     private void OnHttpStop(object? payload)
