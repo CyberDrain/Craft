@@ -88,6 +88,7 @@ public class JobManagerRetentionTests
 
         await WaitUntilAsync(() => Enumerable.Range(0, N).All(i => !jobs.IsQueuedOrRunning($"run-t{i}")),
             "a re-enqueued job took its predecessor's cancellation and is reported queued forever");
+        await WaitUntilAsync(() => jobs.QueuedCount == 0 && jobs.ActiveCount == 0, "the cancelled entries were never dequeued");
         Assert.Equal(N, Volatile.Read(ref ran));
         Assert.Equal(0, Counts(jobs)["JobManager.cancelledJobs"]);
         Assert.Equal(0, Counts(jobs)["JobManager.pendingWork"]);
