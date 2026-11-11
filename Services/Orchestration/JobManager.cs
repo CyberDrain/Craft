@@ -547,11 +547,11 @@ public class JobManager : BackgroundService
 
     // ─── Cleanup ───
 
-    private void CleanupOldJobs()
+    internal void CleanupOldJobs()
     {
         var cutoff = DateTime.UtcNow - MaxJobAge;
         var toRemove = _jobs.Values
-            .Where(j => j.Status is "Completed" or "Failed" or "Cancelled"
+            .Where(j => j.Status is not ("Queued" or "Running")
                      && j.CompletedUtc.HasValue && j.CompletedUtc < cutoff)
             .Select(j => j.Id)
             .ToList();
@@ -563,7 +563,7 @@ public class JobManager : BackgroundService
         if (_jobs.Count > MaxTrackedJobs)
         {
             var excess = _jobs.Values
-                .Where(j => j.Status is "Completed" or "Failed" or "Cancelled")
+                .Where(j => j.Status is not ("Queued" or "Running"))
                 .OrderBy(j => j.CompletedUtc)
                 .Take(_jobs.Count - MaxTrackedJobs)
                 .Select(j => j.Id)
