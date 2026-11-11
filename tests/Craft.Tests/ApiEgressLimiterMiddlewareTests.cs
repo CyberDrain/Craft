@@ -166,4 +166,25 @@ public class ApiEgressLimiterMiddlewareTests : IDisposable
         Assert.Contains("resetUtc", body);
         Assert.Equal("application/json", ctx.Response.ContentType);
     }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("deflate", true)]
+    [InlineData("gzip, deflate", false)]
+    [InlineData("gzip, deflate, br", false)]
+    [InlineData("BR;q=1.0", false)]
+    public async Task ApiCaller_Shed_HintsCompression_OnlyWhenTheRequestDidNotAskForIt(string? acceptEncoding, bool hinted)
+    {
+        var ledger = Ledger(cap: 1000);
+        ledger.Record(1000, "seed");
+        var mw = Middleware(_ => Task.CompletedTask, ledger);
+
+        var ctx = ApiContext();
+        if (acceptEncoding is not null) ctx.Request.Headers.AcceptEncoding = acceptEncoding;
+        await mw.InvokeAsync(ctx);
+
+        using var body = System.Text.Json.JsonDocument.Parse(BodyText(ctx));
+        Assert.Equal("egress_quota_exceeded", body.RootElement.GetProperty("error").GetString());
+        Assert.Equal(hinted, body.RootElement.TryGetProperty("compressionHint", out _));
+    }
 }
