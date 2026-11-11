@@ -905,8 +905,10 @@ public class OrchestratorService : IJobDescriptorStateWriter
         var running = _jobManager.GetJobs(status: "Running").Where(j => j.RunName != null)
             .GroupBy(j => j.RunName!).ToDictionary(g => g.Key, g => g.Count());
         var now = DateTime.UtcNow;
+        var listed = new HashSet<string>(StringComparer.Ordinal);
         await foreach (var e in _store.ReadReadyAsync(200, ct))
         {
+            listed.Add(e.RunKey);
             var r = Math.Min(Math.Max(0, e.Total - e.Done), running.GetValueOrDefault(e.Name));
             running[e.Name] = running.GetValueOrDefault(e.Name) - r;
             var p = Math.Max(0, e.Total - e.Done - r);
@@ -918,6 +920,9 @@ public class OrchestratorService : IJobDescriptorStateWriter
                 e.Name, (now - e.StartedUtc).TotalMinutes, e.Done - e.Failed - e.Cancelled, e.Total, r, p, e.Failed,
                 _jobManager.ActiveCount, _jobManager.QueuedCount, BackgroundTaskLimiter.GetMemorySnapshot());
         }
+        // Runs gone from the Ready list ended some way other than a completing finish (abandoned, deleted, repaired).
+        foreach (var key in _lastStatusLog.Keys)
+            if (!listed.Contains(key)) _lastStatusLog.TryRemove(key, out _);
     }
 
     // ── parsing batches into tasks ──
