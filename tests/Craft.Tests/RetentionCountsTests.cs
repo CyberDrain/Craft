@@ -29,10 +29,10 @@ public class RetentionCountsTests
         release.SetResult();
 
         Assert.Equal(3, counts["JobManager.jobs"]);
-        Assert.Equal(3, counts["JobManager.jobs.Queued"] + counts.GetValueOrDefault("JobManager.jobs.Running"));
+        Assert.Equal(3, counts.GetValueOrDefault("JobManager.jobs.Queued") + counts.GetValueOrDefault("JobManager.jobs.Running"));
         foreach (var name in new[]
         {
-            "JobManager.pendingWork", "JobManager.cancelledJobIds", "JobManager.lastStep",
+            "JobManager.pendingWork", "JobManager.cancelledJobs", "JobManager.lastStep",
             "Orchestrator.activePlanners", "Orchestrator.lastStatusLog", "FinishBatcher.pending",
             "WorkStore.cancelling", "WorkStore.rateBuckets", "WorkPump.skip", "WorkPump.inFlight", "WorkPump.changed",
             "HttpDiag.inflight", "HttpDiag.dnsInFlight", "HttpDiag.tlsInFlight", "HttpDiag.connectInFlight",

@@ -71,4 +71,25 @@ public class JobManagerRetentionTests
         Assert.Equal(N, Volatile.Read(ref ran));
         Assert.Equal(0, Counts(jobs).GetValueOrDefault("JobManager.reprioritized"));
     }
+
+    [Fact]
+    public async Task ACancelledJob_DoesNotCancelItsReEnqueuedSuccessor()
+    {
+        var jobs = NewManager();
+        var ran = 0;
+        jobs.SetWorkResolver((_, _) => Task.FromResult<Func<CancellationToken, Task>?>(_ => { Interlocked.Increment(ref ran); return Task.CompletedTask; }));
+        for (var i = 0; i < N; i++)
+        {
+            var id = jobs.Enqueue(new JobDescriptor("run", $"t{i}", 5), $"run-t{i}");
+            Assert.True(jobs.CancelJob(id));
+            jobs.Enqueue(new JobDescriptor("run", $"t{i}", 1), $"run-t{i}");
+        }
+        _ = Start(jobs);
+
+        await WaitUntilAsync(() => Enumerable.Range(0, N).All(i => !jobs.IsQueuedOrRunning($"run-t{i}")),
+            "a re-enqueued job took its predecessor's cancellation and is reported queued forever");
+        Assert.Equal(N, Volatile.Read(ref ran));
+        Assert.Equal(0, Counts(jobs)["JobManager.cancelledJobs"]);
+        Assert.Equal(0, Counts(jobs)["JobManager.pendingWork"]);
+    }
 }

@@ -62,8 +62,9 @@ public class JobManager : BackgroundService
     /// in the queue tells it straight away; one that lands after the dispatcher has dequeued the job cannot see
     /// its descriptor, so the dispatcher (or the job's start) tells it instead. Without that, the claim behind
     /// the job was never finished, lapsed half an hour later, and ran after all.
+    /// Keyed by record, not id: a descriptor id is stable, so a re-enqueued job would take its predecessor's cancel.
     /// </summary>
-    private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
+    private readonly ConcurrentDictionary<JobRecord, bool> _cancelledJobs = new(ReferenceEqualityComparer.Instance);
     private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
     private long _totalProcessed;
 
@@ -293,7 +294,7 @@ public class JobManager : BackgroundService
                 // The work ref must go too: CancelJob only marks the id, so leaving the entry here
                 // stranded the captured closure (and everything it captured) in _pendingWork forever —
                 // nothing else ever removes it, not even CleanupOldJobs.
-                if (_cancelledJobIds.TryRemove(job.Record.Id, out var notified))
+                if (_cancelledJobs.TryRemove(job.Record, out var notified))
                 {
                     _pendingWork.TryRemove(job.Record.Id, out _);
                     if (!notified && job.Descriptor is { } cancelled)
@@ -386,7 +387,7 @@ public class JobManager : BackgroundService
             bool skip, notified;
             lock (job.Record)
             {
-                skip = _cancelledJobIds.TryRemove(job.Record.Id, out notified);
+                skip = _cancelledJobs.TryRemove(job.Record, out notified);
                 if (!skip)
                 {
                     job.Record.Status = "Running";
@@ -537,7 +538,7 @@ public class JobManager : BackgroundService
         foreach (var (_, j) in _jobs) byStatus[j.Status] = byStatus.GetValueOrDefault(j.Status) + 1;
         foreach (var (status, n) in byStatus) into[$"JobManager.jobs.{status}"] = n;
         into["JobManager.pendingWork"] = _pendingWork.Count;
-        into["JobManager.cancelledJobIds"] = _cancelledJobIds.Count;
+        into["JobManager.cancelledJobs"] = _cancelledJobs.Count;
         into["JobManager.lastStep"] = _lastStep.Count;
     }
 
@@ -607,7 +608,7 @@ public class JobManager : BackgroundService
             lock (_queueLock)
             {
                 descriptor = FindLiveEntry(record)?.Descriptor;
-                _cancelledJobIds[jobId] = descriptor != null;
+                _cancelledJobs[record] = descriptor != null;
             }
         }
         if (descriptor is { } d)
@@ -667,7 +668,7 @@ public class JobManager : BackgroundService
             record.Status = "Cancelled";
             record.CompletedUtc = DateTime.UtcNow;
             record.LastError = "Withdrawn at shutdown";
-            _cancelledJobIds[jobId] = true;
+            _cancelledJobs[record] = true;
         }
         return true;
     }
@@ -684,7 +685,7 @@ public class JobManager : BackgroundService
         lock (_queueLock)
         {
             // Marked under the lock for the same reason as CancelJob: found here means told here.
-            foreach (var record in toCancel) _cancelledJobIds[record.Id] = false;
+            foreach (var record in toCancel) _cancelledJobs[record] = false;
             var wanted = toCancel.ToDictionary(r => r.Id, r => r);
             foreach (var (entry, _) in _pendingQueue.UnorderedItems)
             {
@@ -693,7 +694,7 @@ public class JobManager : BackgroundService
                 if (!ReferenceEquals(entry.Record, rec)) continue;
                 if (entry.Superseded) continue;
                 descriptors.Add(d);
-                _cancelledJobIds[rec.Id] = true;
+                _cancelledJobs[rec] = true;
             }
         }
 
