@@ -65,9 +65,6 @@ public class JobManager : BackgroundService
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _cancelledJobIds = new();
     private readonly ConcurrentDictionary<string, Func<CancellationToken, Task>> _pendingWork = new();
-
-    /// <summary>Live queue epoch per reprioritized job. Only populated by <see cref="ChangePriority"/>.</summary>
-    private readonly ConcurrentDictionary<string, int> _reprioritized = new();
     private long _totalProcessed;
 
     // ── Descriptor rehydration + durability ──
@@ -173,7 +170,7 @@ public class JobManager : BackgroundService
     public void SetDescriptorStateWriter(IJobDescriptorStateWriter writer) => _stateWriter = writer;
 
     /// <summary>
-    /// Find the live queue entry for a job id. Superseded entries (an older epoch left behind by
+    /// Find the live queue entry for a job id. Superseded entries (left behind by
     /// <see cref="ChangePriority"/>) are skipped. Caller must hold <see cref="_queueLock"/>.
     /// </summary>
     private QueuedJob? FindLiveEntry(JobRecord record)
@@ -181,7 +178,7 @@ public class JobManager : BackgroundService
         foreach (var (entry, _) in _pendingQueue.UnorderedItems)
         {
             if (!ReferenceEquals(entry.Record, record)) continue;
-            if (_reprioritized.TryGetValue(record.Id, out var live) && entry.Epoch != live) continue;
+            if (entry.Superseded) continue;
             return entry;
         }
         return null;
@@ -285,7 +282,7 @@ public class JobManager : BackgroundService
                 }
 
                 // Superseded by a ChangePriority re-enqueue — the live entry is elsewhere in the queue.
-                if (_reprioritized.TryGetValue(job.Record.Id, out var liveEpoch) && job.Epoch != liveEpoch)
+                if (job.Superseded)
                 {
                     _limiter.ReleaseSlot();
                     slotHeld = false;
@@ -541,7 +538,6 @@ public class JobManager : BackgroundService
         foreach (var (status, n) in byStatus) into[$"JobManager.jobs.{status}"] = n;
         into["JobManager.pendingWork"] = _pendingWork.Count;
         into["JobManager.cancelledJobIds"] = _cancelledJobIds.Count;
-        into["JobManager.reprioritized"] = _reprioritized.Count;
         into["JobManager.lastStep"] = _lastStep.Count;
     }
 
@@ -695,7 +691,7 @@ public class JobManager : BackgroundService
                 if (entry.Descriptor is not { } d) continue;
                 if (!wanted.TryGetValue(entry.Record.Id, out var rec)) continue;
                 if (!ReferenceEquals(entry.Record, rec)) continue;
-                if (_reprioritized.TryGetValue(rec.Id, out var live) && entry.Epoch != live) continue;
+                if (entry.Superseded) continue;
                 descriptors.Add(d);
                 _cancelledJobIds[rec.Id] = true;
             }
@@ -727,13 +723,12 @@ public class JobManager : BackgroundService
     /// <summary>
     /// Change a queued job's priority. Updates the record immediately.
     /// The PriorityQueue doesn't support re-ordering, so the job is re-enqueued at the new priority and
-    /// the superseded entry is retired by epoch when it reaches the front.
+    /// the superseded entry is marked and dropped when it reaches the front.
     ///
-    /// Epochs, not the cancelled-id set, because that set is keyed by job id and cannot tell the two
+    /// A mark on the entry, not the cancelled-id set, because that set is keyed by job id and cannot tell the two
     /// entries apart: the previous implementation added the id, re-enqueued, then removed the id again
     /// so the NEW entry would not be skipped — which left the OLD entry live as well, and the job ran
-    /// twice. <see cref="_reprioritized"/> is only populated when a job is actually reprioritized, so
-    /// the normal path costs one missing lookup and no memory.
+    /// twice. The mark leaves with the entry, so nothing outlives the job.
     /// </summary>
     public bool ChangePriority(string jobId, int newPriority)
     {
@@ -756,9 +751,9 @@ public class JobManager : BackgroundService
 
             // Re-enqueue carries the same payload as the entry it supersedes — descriptor jobs stay
             // descriptor jobs rather than being downgraded to a closure.
-            var epoch = _reprioritized.AddOrUpdate(jobId, 1, (_, e) => e + 1);
+            superseded.Superseded = true;
             record.Priority = newPriority;
-            _pendingQueue.Enqueue(superseded with { Epoch = epoch }, newPriority);
+            _pendingQueue.Enqueue(superseded with { Superseded = false }, newPriority);
         }
         _itemAvailable.Release();
 
@@ -847,8 +842,8 @@ public class JobManager : BackgroundService
     /// </summary>
     private sealed record QueuedJob(JobRecord Record, Func<CancellationToken, Task>? Work, JobDescriptor? Descriptor)
     {
-        /// <summary>Bumped by <see cref="ChangePriority"/>; entries below the live epoch are superseded.</summary>
-        public int Epoch { get; init; }
+        /// <summary>Set under the queue lock by <see cref="ChangePriority"/> when it re-enqueues the job.</summary>
+        public bool Superseded { get; set; }
 
         /// <summary>Priority nested enqueues should inherit (closure jobs only — see Enqueue).</summary>
         public int? InheritPriority { get; init; }

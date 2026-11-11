@@ -55,4 +55,20 @@ public class JobManagerRetentionTests
 
         Assert.Equal(0, Counts(jobs)["JobManager.jobs"]);
     }
+
+    [Fact]
+    public async Task ReprioritizedJobs_LeaveNothingBehindOnceTheyRan()
+    {
+        var jobs = NewManager();
+        var ran = 0;
+        var ids = Enumerable.Range(0, N).Select(i => jobs.Enqueue($"j{i}", 5, _ => { Interlocked.Increment(ref ran); return Task.CompletedTask; })).ToList();
+        foreach (var id in ids) Assert.True(jobs.ChangePriority(id, 1));
+        _ = Start(jobs);
+
+        await WaitUntilAsync(() => ids.All(id => !jobs.IsQueuedOrRunning(id)), "the reprioritized jobs never finished");
+        await Task.Delay(200);
+
+        Assert.Equal(N, Volatile.Read(ref ran));
+        Assert.Equal(0, Counts(jobs).GetValueOrDefault("JobManager.reprioritized"));
+    }
 }
