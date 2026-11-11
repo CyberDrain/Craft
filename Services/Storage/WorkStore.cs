@@ -960,6 +960,7 @@ public sealed class WorkStore
             if (header == null)
             {
                 if ((row.GetDateTimeOffset("StartedUtc") ?? DateTimeOffset.MinValue) > cutoff) { young++; continue; }
+                _rate.Forget(runKey);
                 _logger.LogWarning("[WorkStore] Removing run {Run}: its creation never finished", runKey);
                 await _store.DeletePartitionAsync(_work, runKey, ct);
                 await _store.DeletePartitionAsync(_results, runKey, ct);
@@ -968,6 +969,7 @@ public sealed class WorkStore
             }
             else if (header.IsFinished)
             {
+                _rate.Forget(runKey);
                 await RecordFinishedAsync(header, ct);
                 await _store.DeleteAsync(_ready, ReadyPartition(header.Priority), ReadyKey(header), ct);
                 await _store.DeleteAsync(_names, ActivePartition, runKey, ct);
@@ -1120,6 +1122,7 @@ public sealed class WorkStore
     /// <summary>Delete a run's partitions and its name entry if it still points at this run.</summary>
     public async Task DeleteRunAsync(string runKey, CancellationToken ct = default)
     {
+        _rate.Forget(runKey);
         var header = await GetRunAsync(runKey, ct);
         await _store.DeletePartitionAsync(_work, runKey, ct);
         await _store.DeletePartitionAsync(_results, runKey, ct);

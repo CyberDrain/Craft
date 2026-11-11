@@ -35,4 +35,13 @@ public class OrchestratorRetentionTests
 
         Assert.Equal(0, Counts(h)["Orchestrator.lastStatusLog"]);
     }
+
+    [Fact]
+    public async Task ADeletedRun_LeavesNoRateLimiterBucket()
+    {
+        var (h, _) = await AbandonedRunsAsync();
+        await using var _h = h;
+
+        Assert.Equal(0, Counts(h)["WorkStore.rateBuckets"]);
+    }
 }
