@@ -1,0 +1,13 @@
+# Overlay for run-stoptoken-ab.ps1: a server that accepts connections and never answers, plus short background
+# timeouts so a task blocked on it is cancelled (and, without a stop token, abandoned) within the run.
+services:
+  blackhole:
+    image: python:3-alpine
+    container_name: craft-perf-blackhole
+    command: ["python", "-c", "import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('', 8080))\ns.listen(512)\nheld = []\nwhile True:\n    held.append(s.accept())\n"]
+    networks: [perfbgnet]
+  sut:
+    environment:
+      - App__Worker__BgTimeoutSeconds=${BG_TIMEOUT:-20}
+      - App__Worker__StopGraceSeconds=${STOP_GRACE:-10}
+      - Logging__LogLevel__Craft.PowerShellHost.PowerShellWorker=Information

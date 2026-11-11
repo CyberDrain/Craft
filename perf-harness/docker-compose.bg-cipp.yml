@@ -1,0 +1,33 @@
+# Overlay for docker-compose.bg.yml: load CIPP's built modules into the workers next to PerfApi, so every worker
+# build (and recycle) pays the real module import. run-retention.ps1 -CippRoot C:\GitHub\CIPP uses it.
+# CIPP_ROOT is a CIPP checkout whose build/.devmodules holds the ModuleBuilder output (the dev module watcher
+# keeps it current).
+services:
+  sut:
+    volumes: !override
+      - ./api-harness/API/Modules/PerfApi:/app/API/Modules/PerfApi:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPCore:/app/API/Modules/CIPPCore:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPHTTP:/app/API/Modules/CIPPHTTP:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPActivityTriggers:/app/API/Modules/CIPPActivityTriggers:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPDB:/app/API/Modules/CIPPDB:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPBaselines:/app/API/Modules/CIPPBaselines:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPTests:/app/API/Modules/CIPPTests:ro
+      - ${CIPP_ROOT}/build/.devmodules/CIPPAlerts:/app/API/Modules/CIPPAlerts:ro
+      - ${CIPP_ROOT}/backend/Modules/AzBobbyTables:/app/API/Modules/AzBobbyTables:ro
+      - ${CIPP_ROOT}/backend/Shared:/app/API/Shared:ro
+      - ${CIPP_ROOT}/backend/Config:/app/API/Config:ro
+    environment:
+      - App__Scripts__HttpModules__0=PerfApi
+      - App__Scripts__HttpModules__1=CIPPCore
+      - App__Scripts__HttpModules__2=CIPPHTTP
+      - App__Scripts__HttpModules__3=AzBobbyTables
+      - App__Scripts__BgModules__0=PerfApi
+      - App__Scripts__BgModules__1=CIPPCore
+      - App__Scripts__BgModules__2=CIPPActivityTriggers
+      - App__Scripts__BgModules__3=CIPPDB
+      - App__Scripts__BgModules__4=CIPPBaselines
+      - App__Scripts__BgModules__5=CIPPTests
+      - App__Scripts__BgModules__6=CIPPAlerts
+      - App__Scripts__BgModules__7=AzBobbyTables
+      - App__Worker__RootPathVars__0=CIPPRootPath
+      - Logging__LogLevel__Craft.PowerShellHost.PowerShellWorkerPool=Information
