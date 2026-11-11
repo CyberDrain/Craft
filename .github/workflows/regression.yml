@@ -51,7 +51,7 @@ jobs:
 
       # No dotnet-version here on purpose: global.json pins the SDK, and setup-dotnet honours it.
       # That keeps CI, build/Dockerfile and developer machines on one Roslyn + analyzer set.
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
@@ -78,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v5
+      - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
 
