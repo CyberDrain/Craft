@@ -26,6 +26,11 @@ public static class QueueStatusBridge
     /// <summary>Display metadata the app registered for a queue id or reference.</summary>
     private static readonly ConcurrentDictionary<string, RunLabel> s_labels = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>As long as a run's status stays queryable (orchestrator and job retention).</summary>
+    private static readonly TimeSpan LabelTtl = TimeSpan.FromHours(24);
+    private const int MaxLabels = 10_000;
+    private static long s_nextLabelSweep;
+
     internal static int LabelCount => s_labels.Count;
 
     public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null,
@@ -42,11 +47,26 @@ public static class QueueStatusBridge
     /// </summary>
     public static void RegisterQueueMetadata(string queueId, string label, string link, string reference)
     {
-        var meta = new RunLabel(label ?? "", link ?? "");
+        var now = DateTime.UtcNow;
+        var meta = new RunLabel(label ?? "", link ?? "", now);
         if (!string.IsNullOrEmpty(queueId))
             s_labels[queueId] = meta;
         if (!string.IsNullOrEmpty(reference))
             s_labels[reference] = meta;
+        if (now.Ticks >= Interlocked.Read(ref s_nextLabelSweep) || s_labels.Count > MaxLabels) TrimLabels(now);
+    }
+
+    /// <summary>Drop labels past <see cref="LabelTtl"/>, then the oldest while over <see cref="MaxLabels"/>.</summary>
+    internal static void TrimLabels(DateTime now)
+    {
+        Interlocked.Exchange(ref s_nextLabelSweep, (now + TimeSpan.FromHours(1)).Ticks);
+        var cutoff = now - LabelTtl;
+        foreach (var e in s_labels) if (e.Value.RegisteredUtc < cutoff) s_labels.TryRemove(e);
+        var excess = s_labels.Count - MaxLabels;
+        if (excess <= 0) return;
+        // A tenth below the cap, so the next registrations do not sort again.
+        foreach (var e in s_labels.OrderBy(e => e.Value.RegisteredUtc).Take(excess + MaxLabels / 10).ToList())
+            s_labels.TryRemove(e);
     }
 
     /// <summary>
@@ -334,7 +354,7 @@ public static class QueueStatusBridge
         public DateTime At { get; set; }
     }
 
-    internal sealed record RunLabel(string Label, string Link);
+    internal sealed record RunLabel(string Label, string Link, DateTime RegisteredUtc);
 
     private static readonly JsonSerializerOptions s_json = new()
     {
