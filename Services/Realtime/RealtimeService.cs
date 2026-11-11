@@ -47,6 +47,13 @@ public sealed class RealtimeService : IDisposable
 
     private static readonly TimeSpan RunPumpInterval = TimeSpan.FromSeconds(3);
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["Realtime.matrix"] = _matrix.Count;
+        into["Realtime.conns"] = _conns.Count;
+        into["Realtime.watches"] = _watches.Count;
+    }
+
     private long _seq;
     private int _connectionCount;
 

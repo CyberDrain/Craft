@@ -24,6 +24,8 @@ public sealed class FinishBatcher(WorkStore store, ILogger logger, TimeSpan? win
     /// <summary>The first background retry delay, doubling to a minute; tests shorten it.</summary>
     internal TimeSpan FirstRetry { get; set; } = TimeSpan.FromSeconds(1);
 
+    internal int PendingRuns { get { lock (_lock) return _pending.Count; } }
+
     /// <summary>Finishes waiting on a background retry, for status and tests.</summary>
     public int Retrying => Volatile.Read(ref _retrying);
     private int _retrying;

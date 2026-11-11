@@ -59,6 +59,8 @@ public sealed class FileLoggerProvider : ILoggerProvider
     /// <summary>Path to the currently active log file.</summary>
     public string CurrentFilePath => Path.Combine(_directory, $"{_filePrefix}.log");
 
+    internal int QueueDepth => _channel.Reader.Count;
+
     /// <summary>Log directory path.</summary>
     public string LogDirectory => _directory;
 

@@ -1,8 +1,11 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime;
+using Craft.Caching;
+using Craft.Hosting;
 using Craft.Orchestration;
 using Craft.PowerShellHost;
+using Craft.Realtime;
 
 // NAMESPACE PINNED — do not change.
 // Downstream PowerShell reaches these types by fully-qualified name, e.g.
@@ -31,6 +34,11 @@ public static class WorkerMetricsBridge
     private static JobQueueStatusReader? s_queueReader;
     private static OrchestratorService? s_orchestrator;
     private static ILogger? s_logger;
+    private static WorkPump? s_pump;
+    private static CacheService? s_cache;
+    private static RealtimeService? s_realtime;
+    private static EgressLedger? s_egress;
+    private static HttpDiagnosticListener? s_httpDiagnostics;
 
     // Per-worker tracking: workerId → stats
     private static readonly ConcurrentDictionary<int, WorkerStats> s_workerStats = new();
@@ -49,14 +57,43 @@ public static class WorkerMetricsBridge
     private static long s_retiredBgFaults;
 
     public static void Initialize(PowerShellWorkerPool pool, BackgroundTaskLimiter limiter, JobManager jobManager,
-        ILogger? logger = null, JobQueueStatusReader? queueReader = null, OrchestratorService? orchestrator = null)
+        ILogger? logger = null, JobQueueStatusReader? queueReader = null, OrchestratorService? orchestrator = null,
+        WorkPump? pump = null, CacheService? cache = null, RealtimeService? realtime = null, EgressLedger? egress = null,
+        HttpDiagnosticListener? httpDiagnostics = null)
     {
+        s_pump = pump;
+        s_cache = cache;
+        s_realtime = realtime;
+        s_egress = egress;
+        s_httpDiagnostics = httpDiagnostics;
         s_pool = pool;
         s_limiter = limiter;
         s_jobManager = jobManager;
         s_queueReader = queueReader;
         s_orchestrator = orchestrator;
         s_logger = logger;
+    }
+
+    /// <summary>
+    /// Entry counts of every process-lifetime holder, flat name -> count, for spotting one that grows.
+    /// PS usage: [Craft.Services.WorkerMetricsBridge]::GetRetentionCounts()
+    /// </summary>
+    public static Dictionary<string, long> GetRetentionCounts()
+    {
+        var c = new Dictionary<string, long>(StringComparer.Ordinal);
+        s_jobManager?.CountRetained(c);
+        s_orchestrator?.CountRetained(c);
+        s_pump?.CountRetained(c);
+        s_realtime?.CountRetained(c);
+        s_egress?.CountRetained(c);
+        s_httpDiagnostics?.CountRetained(c);
+        if (s_cache != null) c["Cache.entries"] = s_cache.Count;
+        if (s_pool != null) c["Pool.workersBuilt"] = s_pool.WorkersBuilt;
+        PowerShellRunnerService.CountSharedCaches(c);
+        c["QueueStatus.labels"] = QueueStatusBridge.LabelCount;
+        c["Log.queueDepth"] = LogBridge.QueueDepth;
+        c["Process.dynamicAssemblies"] = AppDomain.CurrentDomain.GetAssemblies().Count(a => a.IsDynamic);
+        return c;
     }
 
     // ── Called by PowerShellWorkerPool/RunnerService at checkout/reclaim ──

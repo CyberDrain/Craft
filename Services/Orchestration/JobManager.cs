@@ -533,6 +533,18 @@ public class JobManager : BackgroundService
         return query.ToList();
     }
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["JobManager.jobs"] = _jobs.Count;
+        var byStatus = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (_, j) in _jobs) byStatus[j.Status] = byStatus.GetValueOrDefault(j.Status) + 1;
+        foreach (var (status, n) in byStatus) into[$"JobManager.jobs.{status}"] = n;
+        into["JobManager.pendingWork"] = _pendingWork.Count;
+        into["JobManager.cancelledJobIds"] = _cancelledJobIds.Count;
+        into["JobManager.reprioritized"] = _reprioritized.Count;
+        into["JobManager.lastStep"] = _lastStep.Count;
+    }
+
     // ─── Cleanup ───
 
     private void CleanupOldJobs()

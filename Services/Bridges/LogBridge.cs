@@ -35,6 +35,8 @@ public static class LogBridge
 
     public static void Initialize(FileLoggerProvider provider) => s_provider = provider;
 
+    internal static int QueueDepth => s_provider?.QueueDepth ?? 0;
+
     /// <summary>Get the path to the currently active log file.</summary>
     public static string GetCurrentLogPath() => s_provider?.CurrentFilePath ?? "";
 

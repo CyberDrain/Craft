@@ -26,6 +26,8 @@ public static class QueueStatusBridge
     /// <summary>Display metadata the app registered for a queue id or reference.</summary>
     private static readonly ConcurrentDictionary<string, RunLabel> s_labels = new(StringComparer.OrdinalIgnoreCase);
 
+    internal static int LabelCount => s_labels.Count;
+
     public static void Initialize(JobManager jobManager, OrchestratorService? orchestratorService = null,
         JobQueueStatusReader? queueReader = null)
     {

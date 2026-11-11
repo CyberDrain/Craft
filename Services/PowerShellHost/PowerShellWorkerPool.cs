@@ -556,6 +556,8 @@ public class PowerShellWorkerPool : IDisposable
         });
     }
 
+    internal int WorkersBuilt => Volatile.Read(ref _nextId);
+
     private PowerShellWorker NewWorker(InitialSessionState iss) =>
         new(Interlocked.Increment(ref _nextId), iss, _logger)
         {

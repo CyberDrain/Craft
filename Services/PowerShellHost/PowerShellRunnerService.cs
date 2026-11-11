@@ -60,6 +60,11 @@ public class PowerShellRunnerService : IDisposable
     public static Hashtable GetSharedCache(string name) =>
         SharedCaches.GetOrAdd(name, _ => Hashtable.Synchronized(new Hashtable()));
 
+    internal static void CountSharedCaches(Dictionary<string, long> into)
+    {
+        foreach (var (name, cache) in SharedCaches) into[$"SharedCache.{name}"] = cache.Count;
+    }
+
     /// <summary>
     /// Set a process-level environment variable from any worker runspace.
     /// The value is visible to ALL workers via $env:NAME because it calls

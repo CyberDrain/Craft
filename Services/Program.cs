@@ -485,7 +485,8 @@ QueueStatusBridge.Initialize(jobManager, app.Services.GetRequiredService<Orchest
     app.Services.GetRequiredService<JobQueueStatusReader>());
 WorkerMetricsBridge.Initialize(pool, app.Services.GetRequiredService<BackgroundTaskLimiter>(), jobManager,
     app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Craft.Services.WorkerMetricsBridge"),
-    app.Services.GetRequiredService<JobQueueStatusReader>(), orchestrator);
+    app.Services.GetRequiredService<JobQueueStatusReader>(), orchestrator, app.Services.GetService<WorkPump>(), cache, realtime,
+    app.Services.GetService<EgressLedger>(), httpListener);
 SchedulerBridge.Initialize(app.Services.GetRequiredService<SchedulerService>());
 CacheBridge.Initialize(cache);
 StatsHistoryBridge.Initialize(app.Services.GetRequiredService<StatsHistoryService>());

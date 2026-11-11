@@ -141,6 +141,14 @@ public sealed class HttpDiagnosticListener : EventListener,
         }
     }
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["HttpDiag.inflight"] = _inflight.Count;
+        into["HttpDiag.dnsInFlight"] = _dnsInFlight.Count;
+        into["HttpDiag.tlsInFlight"] = _tlsInFlight.Count;
+        into["HttpDiag.connectInFlight"] = _connectInFlight.Count;
+    }
+
     private static long GetElapsedMs(long startTicks)
     {
         return (Stopwatch.GetTimestamp() - startTicks) * 1000 / Stopwatch.Frequency;

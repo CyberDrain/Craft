@@ -326,6 +326,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
         await _store.FinishAsync(parentRunKey, [new WorkStore.Finish(0, "Completed", ChildKey: childKey)], null);
     }
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["Orchestrator.activePlanners"] = _activePlanners.Count;
+        into["Orchestrator.lastStatusLog"] = _lastStatusLog.Count;
+        into["FinishBatcher.pending"] = _finisher.PendingRuns;
+        _store.CountRetained(into);
+    }
+
     // ── what happens when tasks finish ──
 
     private async Task AfterFinishAsync(WorkStore.FinishOutcome outcome)

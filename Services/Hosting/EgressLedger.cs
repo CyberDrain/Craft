@@ -135,6 +135,19 @@ public sealed class EgressLedger : BackgroundService
         }
     }
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        lock (_lock)
+        {
+            long endpoints = _interactive.Endpoints.Count, ips = 0;
+            foreach (var c in _clients.Values) { endpoints += c.Endpoints.Count; ips += c.Ips.Count; }
+            into["Egress.clients"] = _clients.Count;
+            into["Egress.endpoints"] = endpoints;
+            into["Egress.ips"] = ips;
+            into["Egress.buckets"] = _buckets.Count;
+        }
+    }
+
     /// <summary>Add the outbound bytes of one API-client response to today's running totals, attributed to
     /// the client and, in its daily and the instance bucket breakdowns, to <paramref name="endpoint"/>.</summary>
     public void Record(long bytes, string appId, string? endpoint = null, bool cacheHit = false, int statusCode = 200, string? ip = null, string? encoding = null)

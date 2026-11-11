@@ -822,6 +822,12 @@ public sealed class WorkStore
     /// <summary>Whether a full cancel of the run is in progress in this process (the scheduler leaves it alone).</summary>
     public bool IsCancelling(string runKey) => _cancelling.ContainsKey(runKey);
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["WorkStore.cancelling"] = _cancelling.Count;
+        into["WorkStore.rateBuckets"] = _rate.Count;
+    }
+
     /// <param name="maxPages">Pages of up to 49 to cancel before returning; the scheduler does one per visit to finish
     /// a cancel that was interrupted. A full cancel (no bound) marks the run as being cancelled while it works.</param>
     public async Task<(int Cancelled, FinishOutcome? Outcome)> CancelPendingAsync(string runKey,
@@ -1283,6 +1289,8 @@ public sealed class PartitionRateLimiter(int perSecond = 1_900)
     private readonly ConcurrentDictionary<string, Bucket> _buckets = new(StringComparer.Ordinal);
 
     public void Forget(string partition) => _buckets.TryRemove(partition, out _);
+
+    public int Count => _buckets.Count;
 
     public async Task TakeAsync(string partition, int cost, CancellationToken ct = default)
     {
