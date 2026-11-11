@@ -205,6 +205,19 @@ public class WorkStoreTests
     }
 
     [Fact]
+    public async Task AStepOutlivingItsDriverLease_IsNotTakenBack_WhileItsOwnLeaseIsRenewed()
+    {
+        var (s, _) = New();
+        var run = await CreateModeAsync(s, "LongStep", 2, sequential: true);
+        var step = (await s.ClaimSequentialAsync(run.RunKey, "w", TimeSpan.FromMilliseconds(1)))!;
+        Assert.Empty(await s.RenewAsync([step], "w", Lease));
+        await Task.Delay(20);
+
+        Assert.Null(await s.ClaimSequentialAsync(run.RunKey, "w", Lease));
+        Assert.Equal(1, Assert.Single(await s.GetTasksAsync(run.RunKey, 'R')).Attempt);
+    }
+
+    [Fact]
     public async Task AStepTakenOverByAnotherDriver_IsNeitherFinishedNorFollowed_ByItsFormerOwner()
     {
         var (s, _) = New();
@@ -337,6 +350,81 @@ public class WorkStoreTests
 
         var again = Assert.Single(await s.ClaimAsync(run.RunKey, 1, "w", Lease, false));
         Assert.Equal(1, again.Attempt);
+    }
+
+    [Fact]
+    public async Task ARunStillUnfinishedPastTheRetention_IsAbandoned_SoNothingClaimsIt_AndAYoungRunIsLeft()
+    {
+        var (s, _) = New();
+        var stale = await CreateAsync(s, "Stuck", 2, postExec: "Invoke-PostExec");
+        var running = await s.ClaimAsync(stale.RunKey, 1, "w", Lease, false);
+        Assert.NotEmpty(running);
+        var now = DateTime.UtcNow;
+        var young = await s.CreateRunAsync(new RunHeader
+        {
+            RunKey = WorkStore.RunKeyFor("Young", now),
+            Name = "Young",
+            StartedUtc = now,
+            TaskScriptName = "Invoke-CraftTask",
+        }, Tasks(2));
+
+        // The periodic sweep leaves a run with a live claim alone; startup, whose claims are a stopped process's, does not.
+        Assert.Equal(0, await s.AbandonStaleAsync(TimeSpan.FromHours(24), skipClaimed: true));
+        Assert.NotNull(await s.GetRunAsync(stale.RunKey));
+        Assert.Equal(1, await s.AbandonStaleAsync(TimeSpan.FromHours(24), skipClaimed: false));
+
+        Assert.Null(await s.GetRunAsync(stale.RunKey));
+        Assert.Null(await s.GetRunByNameAsync("Stuck"));
+        var ready = new List<string>();
+        await foreach (var e in s.ReadReadyAsync()) ready.Add(e.RunKey);
+        Assert.Equal([young.RunKey], ready);
+        Assert.Equal(0, await s.AbandonStaleAsync(TimeSpan.FromHours(24), skipClaimed: false));
+
+        // A task still running elsewhere finishing later recreates nothing, so no post-execution is ever claimed.
+        Assert.Null(await s.FinishAsync(stale.RunKey, Done(running)));
+        Assert.Null(await s.GetRunAsync(stale.RunKey));
+        Assert.Empty(await s.GetTasksAsync(stale.RunKey));
+    }
+
+    [Fact]
+    public async Task ThePeriodicSweep_AbandonsAStaleRun_OnceItsClaimsHaveLapsed()
+    {
+        var (s, _) = New();
+        var stale = await CreateAsync(s, "Lapsed", 2);
+        Assert.NotEmpty(await s.ClaimAsync(stale.RunKey, 1, "w", TimeSpan.FromMilliseconds(1), false));
+        await Task.Delay(20);
+
+        Assert.Equal(1, await s.AbandonStaleAsync(TimeSpan.FromHours(24), skipClaimed: true));
+        Assert.Null(await s.GetRunAsync(stale.RunKey));
+    }
+
+    /// <summary>
+    /// What no index reaches goes: a Work partition with no header, Results and a name row for a run that has none.
+    /// A live run's rows, a run on the active list (still being created) and anything newer than the minimum age stay.
+    /// </summary>
+    [Fact]
+    public async Task TheOrphanSweep_DropsWhatNoIndexReaches_AndKeepsLiveYoungAndListedRuns()
+    {
+        var (s, mem) = New();
+        var p = new CraftSettings().Orchestrator.TablePrefix;
+        var live = await CreateAsync(s, "Live", 2);
+        await mem.UpsertAsync($"{p}TaskResults", new StoreRow(live.RunKey, "0"));
+        await mem.UpsertAsync($"{p}Work", new StoreRow("Gone~1", "D|0000000"));
+        await mem.UpsertAsync($"{p}TaskResults", new StoreRow("Gone~2", "0"));
+        await mem.UpsertAsync($"{p}Names", new StoreRow("N", "Gone") { ["RunKey"] = "Gone~2" });
+        await mem.UpsertAsync($"{p}Names", new StoreRow("A", "Creating~3"));
+        await mem.UpsertAsync($"{p}Work", new StoreRow("Creating~3", "P|0000000"));
+
+        Assert.Equal(new WorkStore.OrphanResult(0, 0, 0), await s.SweepOrphansAsync(TimeSpan.FromHours(1)));
+        Assert.Equal(new WorkStore.OrphanResult(1, 1, 1), await s.SweepOrphansAsync(TimeSpan.Zero));
+
+        Assert.DoesNotContain(mem.All($"{p}Work"), r => r.PartitionKey == "Gone~1");
+        Assert.DoesNotContain(mem.All($"{p}TaskResults"), r => r.PartitionKey == "Gone~2");
+        Assert.Contains(mem.All($"{p}TaskResults"), r => r.PartitionKey == live.RunKey);
+        Assert.Contains(mem.All($"{p}Work"), r => r.PartitionKey == "Creating~3");
+        Assert.NotNull(await s.GetRunAsync(live.RunKey));
+        Assert.NotNull(await s.GetRunByNameAsync("Live"));
+        Assert.Equal(new WorkStore.OrphanResult(0, 0, 0), await s.SweepOrphansAsync(TimeSpan.Zero));
     }
 
     [Fact]

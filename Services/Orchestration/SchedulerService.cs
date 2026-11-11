@@ -34,6 +34,9 @@ public class SchedulerService : BackgroundService
     private readonly Dictionary<string, DateTimeOffset> _lastFired = new();
     private TimeZoneInfo _configuredTz = TimeZoneInfo.Utc;
     private const string StatePartition = "Timer";
+    /// <summary>One row per timer holding the last slot fired, claimed by ETag. Kept apart from the Timer rows, which
+    /// every process rewrites wholesale.</summary>
+    private const string SlotPartition = "TimerSlot";
 
     /// <summary>Expose loaded tasks for the API layer.</summary>
     public IReadOnlyList<SchedulerTask> Tasks => _tasks;
@@ -108,8 +111,8 @@ public class SchedulerService : BackgroundService
             _logger.LogWarning(ex, "[Scheduler] Could not load timer state from {Table}", _settings.Scheduler.StateTable);
         }
 
-        // Retention sweeps for the rest of the process lifetime; recovery ran the first one. Fire and
-        // forget is deliberate: the loop handles its own failures and ends with the stopping token.
+        // Retention sweeps for the rest of the process lifetime, the first one now. Fire and forget is
+        // deliberate: the loop handles its own failures and ends with the stopping token.
         _ = _orchestrator.RunRetentionLoopAsync(stoppingToken);
 
         // One status/re-drive sweep over all live runs, replacing the per-run timers. Same fire-and-forget
@@ -130,10 +133,17 @@ public class SchedulerService : BackgroundService
                 due = [];
             }
 
+            var fired = new List<SchedulerTask>(due.Count);
             foreach (var task in due)
             {
                 try
                 {
+                    if (!await ClaimSlotAsync(task, stoppingToken))
+                    {
+                        _logger.LogInformation("[Scheduler] Skipped: {Command} — another process fired this slot", task.Command);
+                        continue;
+                    }
+                    fired.Add(task);
                     _logger.LogInformation("[Scheduler] Firing: {Command}", task.Command);
 
                     if (_nativeTasks.TryGet(task.Command, out var native))
@@ -201,7 +211,7 @@ public class SchedulerService : BackgroundService
                 }
             }
 
-            if (due.Count > 0) _ = WriteStateAsync(due, stoppingToken);
+            if (fired.Count > 0) _ = WriteStateAsync(fired, stoppingToken);
 
             // Check at configured interval
             await Task.Delay(TimeSpan.FromSeconds(_settings.Scheduler.CheckIntervalSeconds), stoppingToken);
@@ -364,6 +374,29 @@ public class SchedulerService : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Claim <paramref name="task"/>'s due slot, so only one process fires it: a restart runs the old and the new
+    /// container side by side, and scaled-out nodes all run a scheduler. False when another process got it first.
+    /// Fires anyway when storage cannot answer, as it did before slots were claimed.
+    /// </summary>
+    internal async Task<bool> ClaimSlotAsync(SchedulerTask task, CancellationToken ct)
+    {
+        var table = _settings.Scheduler.StateTable;
+        if (_store is null || string.IsNullOrWhiteSpace(table)) return true;
+        try
+        {
+            var row = await _store.GetAsync(table, SlotPartition, task.Id, ct);
+            if (row?.GetDateTimeOffset("Slot") is { } taken && taken >= task.DueSlot) return false;
+            var claim = new StoreRow(SlotPartition, task.Id) { ETag = row?.ETag, ["Slot"] = task.DueSlot };
+            return await _store.TrySubmitAsync(table, SlotPartition, [row == null ? StoreOp.Insert(claim) : StoreOp.Replace(claim)], ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "[Scheduler] Could not claim the slot for {Command}; firing it anyway", task.Command);
+            return true;
+        }
+    }
+
     /// <summary>The timers due at <paramref name="now"/>, in priority order, each marked as run.</summary>
     internal List<SchedulerTask> CollectDue(DateTimeOffset now)
     {
@@ -373,8 +406,14 @@ public class SchedulerService : BackgroundService
             try
             {
                 var cronExpression = CronExpression.Parse(task.Cron, CronFormat.IncludeSeconds);
-                if (IsDue(cronExpression, TimeZoneFor(task), _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue), task.JitterOffset, now))
+                var tz = TimeZoneFor(task);
+                var lastRun = _lastRun.GetValueOrDefault(task.Id, DateTimeOffset.MinValue);
+                if (IsDue(cronExpression, tz, lastRun, task.JitterOffset, now))
                 {
+                    // The latest slot due, so a process that last fired long ago agrees with one that just started.
+                    var slot = cronExpression.GetNextOccurrence(lastRun, tz)!.Value;
+                    while (cronExpression.GetNextOccurrence(slot, tz) is { } later && later + task.JitterOffset <= now) slot = later;
+                    task.DueSlot = slot;
                     _lastRun[task.Id] = now;
                     _lastFired[task.Id] = now;
                     due.Add(task);

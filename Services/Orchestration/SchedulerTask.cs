@@ -38,6 +38,10 @@ public class SchedulerTask
     [JsonIgnore]
     public TimeSpan JitterOffset { get; set; }
 
+    /// <summary>The cron slot (before jitter) last found due: the key every process claims it under.</summary>
+    [JsonIgnore]
+    public DateTimeOffset DueSlot { get; set; }
+
     /// <summary>
     /// Explicit override for orchestrator detection. When set in CIPPTimers.json,
     /// this timer uses the StartOrResumeRun planner+task pattern.

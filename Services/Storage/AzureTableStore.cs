@@ -371,20 +371,28 @@ public sealed class AzureTableStore : ICraftTableStore
         for (int i = 0; i < rowKeys.Count; i += MaxBatch)
         {
             var chunk = rowKeys.Skip(i).Take(MaxBatch).ToList();
-            var batch = chunk
-                .Select(rk => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(partitionKey, rk)))
-                .ToList();
-            try
+            while (chunk.Count > 0)
             {
-                await client.SubmitTransactionAsync(batch, ct);
-            }
-            catch (RequestFailedException ex) when (ex.Status == 404)
-            {
-                // A transaction is all-or-nothing, so one already-deleted row (or a missing table) 404s
-                // the whole chunk. Fall back to per-row deletes, which tolerate a missing row (and a
-                // missing table) individually — the removal is idempotent either way.
-                foreach (var rk in chunk)
-                    await DeleteAsync(table, partitionKey, rk, ct);
+                try
+                {
+                    await client.SubmitTransactionAsync(chunk
+                        .Select(rk => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(partitionKey, rk))), ct);
+                    break;
+                }
+                catch (TableTransactionFailedException ex) when (ex.Status == 404 && !IsTableNotFound(ex)
+                    && ex.FailedTransactionActionIndex is int gone && gone < chunk.Count)
+                {
+                    // A transaction is all-or-nothing, so one already-deleted row 404s the whole chunk and the
+                    // service names it: drop that row and send the rest again.
+                    chunk.RemoveAt(gone);
+                }
+                catch (RequestFailedException ex) when (ex.Status == 404)
+                {
+                    // No index to go on (Azurite) or the table is gone: per-row deletes tolerate either.
+                    foreach (var rk in chunk)
+                        await DeleteAsync(table, partitionKey, rk, ct);
+                    break;
+                }
             }
         }
     }
@@ -542,27 +550,16 @@ public sealed class AzureTableStore : ICraftTableStore
     public async Task DeletePartitionAsync(string table, string partitionKey, CancellationToken ct = default)
     {
         var client = Client(table);
-        var keys = new List<(string pk, string rk)>();
+        var keys = new List<string>();
         var filter = $"PartitionKey eq '{Escape(partitionKey)}'";
         await foreach (var entity in EnumerateAsync(table, () => client.QueryAsync<TableEntity>(filter: filter, select: select, cancellationToken: ct), ct))
         {
-            keys.Add((entity.PartitionKey, entity.RowKey));
+            keys.Add(entity.RowKey);
         }
 
-        for (int i = 0; i < keys.Count; i += MaxBatch)
-        {
-            var batch = keys.Skip(i).Take(MaxBatch)
-                .Select(k => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(k.pk, k.rk)))
-                .ToList();
-            try
-            {
-                await client.SubmitTransactionAsync(batch, ct);
-            }
-            catch (RequestFailedException ex) when (ex.Status == 404)
-            {
-                // Already deleted — safe to ignore.
-            }
-        }
+        // A row deleted since the read 404s its whole batch; DeleteBatchAsync then deletes that batch row by row
+        // rather than leaving the rest behind.
+        await DeleteBatchAsync(table, partitionKey, keys, ct);
     }
 
     // ── Large-entity splitting ─────────────────────────────────────────────────

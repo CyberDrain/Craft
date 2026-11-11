@@ -34,10 +34,10 @@ public class OrchestratorSettings
     public int MaxRetries { get; set; } = 3;
 
     /// <summary>
-    /// How long a finished run's rows outlive it (hours, default 48). Craft needs them only while the run
-    /// is live; they stay this long for operators reading recent history.
+    /// How long a finished run's rows outlive it, and how long a run may stay unfinished before it is abandoned
+    /// (deleted, at startup before anything is claimed and at every sweep). Hours, default 24.
     /// </summary>
-    public int RetentionHours { get; set; } = 48;
+    public int RetentionHours { get; set; } = 24;
 
     /// <summary>
     /// How often the retention sweep runs after the one at startup (hours, default 4). 0 disables the

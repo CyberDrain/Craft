@@ -12,8 +12,12 @@ namespace Craft.Orchestration;
 /// every few seconds and released on shutdown), so a recycle never has two processes claiming at once. While it
 /// holds the lock, any claim in storage owned by another process belongs to one that has stopped, and is taken
 /// back the first time its run is read. The pump holds no other state that matters after a crash.
+///
+/// Shutdown drains in <see cref="StoppingAsync"/>, which the host runs before any service stops, Kestrel included:
+/// claiming stops, unstarted claims go back, and running work gets up to <c>ShutdownDrainSeconds</c> to finish
+/// while the API keeps serving and the scheduler keeps firing (what it starts lands in storage for the successor).
 /// </summary>
-public class WorkPump : BackgroundService
+public class WorkPump : BackgroundService, IHostedLifecycleService
 {
     private readonly ILogger<WorkPump> _logger;
     private readonly WorkStore _store;
@@ -55,6 +59,7 @@ public class WorkPump : BackgroundService
     /// <summary>The instance lock: how long it is held for without renewal, and how often it is renewed.</summary>
     private readonly TimeSpan _lockLease;
     private readonly TimeSpan _lockRenewEvery;
+    private static readonly TimeSpan LockPoll = TimeSpan.FromSeconds(2);
     private DateTime _lockRenewedAt;
     private volatile bool _holdsLock;
 
@@ -63,6 +68,13 @@ public class WorkPump : BackgroundService
 
     /// <summary>How long a run may sit with its creation unfinished before the startup repair removes it.</summary>
     private static readonly TimeSpan AbandonUnfinishedCreation = TimeSpan.FromMinutes(10);
+
+    /// <summary>Shutdown: how long running tasks may hold it up, and the state the pump loop drains with. The host's
+    /// shutdown timeout (30 s) covers this and Kestrel's own stop after it.</summary>
+    private readonly TimeSpan _drainBudget;
+    private volatile bool _draining;
+    private volatile bool _pumping;
+    private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Claims handed to the JobManager, by job id, with when their lease runs out.</summary>
     private readonly Dictionary<string, (WorkStore.ClaimedTask Claim, DateTime LeaseUntil)> _inFlight = new(StringComparer.Ordinal);
@@ -82,6 +94,7 @@ public class WorkPump : BackgroundService
         _pollInterval = TimeSpan.FromMilliseconds(Math.Max(100, configuration.GetValue("JobQueuePollIntervalMs", 1000)));
         _idlePollInterval = TimeSpan.FromMilliseconds(Math.Max(_pollInterval.TotalMilliseconds,
             configuration.GetValue("JobQueueIdlePollIntervalMs", 10_000)));
+        _drainBudget = TimeSpan.FromSeconds(ShutdownSeconds(configuration).Drain);
         _lockLease = TimeSpan.FromSeconds(Math.Max(5, configuration.GetValue("InstanceLockSeconds", 30)));
         _lockRenewEvery = _lockLease / 3;
         _store.RunChanged += runKey =>
@@ -114,8 +127,8 @@ public class WorkPump : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("[WorkPump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s",
-            _owner, _batchSize, _lowWater, _lease.TotalSeconds);
+        _logger.LogInformation("[WorkPump] Started: owner={Owner} batch={Batch} lowWater={Low} lease={Lease}s drain={Drain}s",
+            _owner, _batchSize, _lowWater, _lease.TotalSeconds, _drainBudget.TotalSeconds);
 
         try
         {
@@ -134,14 +147,23 @@ public class WorkPump : BackgroundService
         catch (OperationCanceledException) { return; }
         _ = RepairAsync(stoppingToken);
 
+        _pumping = true;
         var idleTicks = 0;
         while (!stoppingToken.IsCancellationRequested)
         {
             var claimed = 0;
             try
             {
-                if (!await KeepLockAsync(stoppingToken)) await AcquireLockAsync(stoppingToken);
-                claimed = await RefillAsync(stoppingToken);
+                if (_draining)
+                {
+                    if (_holdsLock) await KeepLockAsync(stoppingToken);
+                    await DrainStepAsync(stoppingToken);
+                }
+                else
+                {
+                    if (!await KeepLockAsync(stoppingToken)) await AcquireLockAsync(stoppingToken);
+                    claimed = await RefillAsync(stoppingToken);
+                }
                 await RenewAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
@@ -200,8 +222,9 @@ public class WorkPump : BackgroundService
                 _logger.LogInformation("[WorkPump] Waiting for the instance lock, held by {Holder} until {Until:O}",
                     holder?.Owner, holder?.LeaseUntil);
             }
+            // Look every 2 s: a predecessor hands the lock over the moment its drain ends, not at its lease.
             var wait = (holder?.LeaseUntil ?? DateTimeOffset.UtcNow) - DateTimeOffset.UtcNow;
-            await Task.Delay(wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait > _lockRenewEvery ? _lockRenewEvery : wait, ct);
+            await Task.Delay(wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait > LockPoll ? LockPoll : wait, ct);
         }
     }
 
@@ -392,17 +415,95 @@ public class WorkPump : BackgroundService
         foreach (var (id, v) in due) _inFlight[id] = (v.Claim, now + _lease);
     }
 
-    /// <summary>On shutdown, hand back claims that never started so another process can run them now.</summary>
+    /// <summary>
+    /// The shutdown budget. Grace: how long the platform waits after SIGTERM before it kills the process
+    /// (<c>ShutdownGraceSeconds</c>, else App Service's <c>WEBSITES_CONTAINER_STOP_TIME_LIMIT</c>, else 30); the host's
+    /// shutdown timeout is set to it (Program.cs). Drain: how much of it running work gets before Kestrel stops
+    /// (<c>ShutdownDrainSeconds</c>, else the grace less a margin for in-flight requests: 120 → 110, 30 → 25).
+    /// </summary>
+    public static (int Grace, int Drain) ShutdownSeconds(IConfiguration configuration)
+    {
+        var grace = Math.Max(0, configuration.GetValue<int?>("ShutdownGraceSeconds")
+            ?? configuration.GetValue<int?>("WEBSITES_CONTAINER_STOP_TIME_LIMIT") ?? 30);
+        var drain = configuration.GetValue<int?>("ShutdownDrainSeconds") ?? grace - Math.Max(5, grace / 12);
+        return (grace, Math.Clamp(drain, 0, grace));
+    }
+
+    /// <summary>
+    /// The drain, before Kestrel stops: the pump loop stops claiming and hands back what has not started (see
+    /// <see cref="DrainStepAsync"/>), and this waits until nothing claimed is in flight and the job manager is idle
+    /// (scheduled starters fired meanwhile included), up to the drain budget.
+    /// </summary>
+    public async Task StoppingAsync(CancellationToken cancellationToken)
+    {
+        _draining = true;
+        Wake();
+        _logger.LogInformation("[WorkPump] Draining: no new claims, up to {Budget}s for running work while the API keeps serving",
+            _drainBudget.TotalSeconds);
+        var until = DateTime.UtcNow + _drainBudget;
+        try
+        {
+            while (!((!_pumping || _drained.Task.IsCompleted) && _jobs.ActiveCount == 0 && _jobs.QueuedCount == 0))
+            {
+                if (DateTime.UtcNow >= until)
+                {
+                    _logger.LogWarning("[WorkPump] Drain budget spent with {Active} job(s) still running", _jobs.ActiveCount);
+                    return;
+                }
+                await Task.Delay(250, cancellationToken);
+            }
+            _logger.LogInformation("[WorkPump] Drained: nothing left running");
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    /// <summary>
+    /// One pump-loop pass while draining. On the loop's thread, which owns the claim list. Once no claimed task is in
+    /// flight the lock goes at once, so a successor claims while this process is still shutting down.
+    /// </summary>
+    private async Task DrainStepAsync(CancellationToken ct)
+    {
+        await WithdrawUnstartedAsync(ct);
+        Forget();
+        if (_inFlight.Count > 0) return;
+        if (_holdsLock) await ReleaseLockAsync(ct);
+        _drained.TrySetResult();
+    }
+
+    private async Task ReleaseLockAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (await _store.ReleaseInstanceLockAsync(_owner, ct))
+                _logger.LogInformation("[WorkPump] Released the instance lock");
+            else
+                _logger.LogWarning("[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease");
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease"); }
+        _holdsLock = false;
+    }
+
+    /// <summary>Hand back claims that never started so another process can run them now.</summary>
+    private async Task WithdrawUnstartedAsync(CancellationToken ct)
+    {
+        foreach (var (id, v) in _inFlight.ToList())
+        {
+            if (!_jobs.WithdrawJob(id)) continue;
+            try { await _store.ReleaseAsync(v.Claim.RunKey, v.Claim.Seq, _owner, refundAttempt: true, ct); }
+            catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release {Job} on shutdown", id); }
+        }
+    }
+
+    public Task StartingAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task StartedAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task StoppedAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>After the drain (or without one, when the host is stopped directly): the same hand-back, then the lock.</summary>
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         await base.StopAsync(cancellationToken);
         _logger.LogInformation("[WorkPump] Stopping with {Count} claim(s) in flight; lock held={Held}", _inFlight.Count, _holdsLock);
-        foreach (var (id, v) in _inFlight.ToList())
-        {
-            if (!_jobs.WithdrawJob(id)) continue;
-            try { await _store.ReleaseAsync(v.Claim.RunKey, v.Claim.Seq, _owner, refundAttempt: true, cancellationToken); }
-            catch (Exception ex) { _logger.LogDebug(ex, "[WorkPump] Could not release {Job} on shutdown", id); }
-        }
+        await WithdrawUnstartedAsync(cancellationToken);
         if (_holdsLock)
         {
             // Hold the lock while this process still runs claimed tasks: a successor holding it would take those
@@ -420,15 +521,7 @@ public class WorkPump : BackgroundService
                 _logger.LogWarning("[WorkPump] Shutdown cut short with tasks still running; the instance lock lapses at its lease");
                 return;
             }
-            try
-            {
-                if (await _store.ReleaseInstanceLockAsync(_owner, cancellationToken))
-                    _logger.LogInformation("[WorkPump] Released the instance lock");
-                else
-                    _logger.LogWarning("[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease");
-            }
-            catch (Exception ex) { _logger.LogWarning(ex, "[WorkPump] Could not release the instance lock on shutdown; it lapses at its lease"); }
-            _holdsLock = false;
+            await ReleaseLockAsync(cancellationToken);
         }
     }
 }

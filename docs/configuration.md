@@ -433,10 +433,12 @@ nothing to recover: claims held by a stopped process lapse and are taken again.
   "MaxRetries": 3,
 
   // Retention sweep. A run that finished longer ago than RetentionHours is removed with its Work and
-  // Results partitions. Runs once at startup and then every CleanupIntervalHours; 0 keeps only the
-  // startup pass. Craft needs the rows only while a run is live — the retention is for operators
-  // reading recent history.
-  "RetentionHours": 48,
+  // Results partitions, and a run still unfinished RetentionHours after it started is abandoned (deleted,
+  // no post-execution). Abandoning also runs at startup before anything is claimed. Runs once at startup
+  // and then every CleanupIntervalHours; 0 keeps only the startup pass. Once a day it also scans for rows no
+  // index reaches (Work partitions without a run header, Results partitions and name rows of runs that have
+  // none, older than an hour) and deletes them, so storage stays bounded after any interrupted delete.
+  "RetentionHours": 24,
   "CleanupIntervalHours": 4
 }
 ```
@@ -473,6 +475,17 @@ This bridges into the C# `OrchestratorService` via `OrchestratorBridge`. Applica
 4. State is persisted to Azure Table Storage after every change
 5. On restart, interrupted tasks resume automatically
 6. After all tasks finish, optional `PostExecution` aggregates results and can start a second phase
+
+**Shutdown (top-level keys or environment variables):** on SIGTERM the HTTP API and frontend keep serving and the
+scheduler keeps firing while background work drains; only then does Kestrel stop.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ShutdownGraceSeconds` | `WEBSITES_CONTAINER_STOP_TIME_LIMIT`, else 30 | How long the platform waits before killing the process. The host's shutdown timeout. |
+| `ShutdownDrainSeconds` | grace less max(5, grace / 12): 120 → 110, 30 → 25 | How much of the grace running work gets before Kestrel stops. Capped at the grace. |
+
+During a restart the old and new container run side by side; each timer slot is claimed in the scheduler's
+`StateTable` (`TimerSlot` partition) so only one of them fires it.
 
 ---
 

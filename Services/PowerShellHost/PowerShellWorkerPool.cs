@@ -209,15 +209,6 @@ public class PowerShellWorkerPool : IDisposable
                 StartupInfoBridge.SetHttpPoolFull(sw.ElapsedMilliseconds);
                 _logger.LogInformation("[System] HTTP pool full: {Count} workers in {Ms}ms", _httpPoolSize, sw.ElapsedMilliseconds);
             }
-
-            if (_httpBurstMax > 0)
-            {
-                var tick = TimeSpan.FromMilliseconds(Math.Clamp(_httpBurstIdleMs, 1000, 60_000));
-                _httpBurstTrim = new Timer(_ => TrimHttpBurst(), null, tick, tick);
-                _httpBurstReady = true;
-                _logger.LogInformation("[System] HTTP burst: up to {Max} more workers for interactive requests, trimmed after {Idle}s idle",
-                    _httpBurstMax, _httpBurstIdleMs / 1000);
-            }
         }
         else
         {
@@ -260,6 +251,16 @@ public class PowerShellWorkerPool : IDisposable
         StartupInfoBridge.SetFullyReady(sw.ElapsedMilliseconds);
         _logger.LogInformation("[System] Pool fully ready: {Http} HTTP + {Bg} BG workers in {Ms}ms",
             _httpWorkerIds.Count, _bgWorkerIds.Count, sw.ElapsedMilliseconds);
+
+        // Burst only once every pool is built, so startup is not slowed by extra HTTP workers competing for CPU.
+        if (enableHttp && _httpBurstMax > 0)
+        {
+            var tick = TimeSpan.FromMilliseconds(Math.Clamp(_httpBurstIdleMs, 1000, 60_000));
+            _httpBurstTrim = new Timer(_ => TrimHttpBurst(), null, tick, tick);
+            _httpBurstReady = true;
+            _logger.LogInformation("[System] HTTP burst: up to {Max} more workers for interactive requests, trimmed after {Idle}s idle",
+                _httpBurstMax, _httpBurstIdleMs / 1000);
+        }
     }
 
     private PowerShellWorker BuildWorker(bool isHttp) => OpenWorker(isHttp, BuildISS(isHttp));

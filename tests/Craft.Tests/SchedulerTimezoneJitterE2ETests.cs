@@ -161,6 +161,35 @@ public sealed class SchedulerTimezoneJitterE2ETests : IDisposable
         Assert.Equal([Utc(10, 20, 3)], fired.Where(f => f.Command == "Flagged").Select(f => f.At));
     }
 
+    /// <summary>A restart runs the old and the new container side by side; both find the same slots due.</summary>
+    [Fact]
+    public async Task TwoSchedulersSharingStorage_EachSlotFiresOnce_ThroughARestartOverlap()
+    {
+        var store = new MemoryTableStore();
+        SchedulerService New() => new(NullLogger<SchedulerService>.Instance, null!, null!, null!, null!,
+            new CraftSettings { Scheduler = new SchedulerSettings { ConfigFile = _timerFile, ApplyTZOffset = true, StateTable = "Timers" } },
+            null!, null!, NativeScheduledTasks.Empty, null!, store);
+        var old = New();
+        old.Start(Utc(10, 17));
+        var successor = New();
+        successor.Start(Utc(10, 18));
+
+        var due = 0;
+        var fired = new List<(string Id, DateTimeOffset Slot)>();
+        for (var now = Utc(10, 17); now < Utc(10, 19); now += Tick)
+            foreach (var s in now < Utc(10, 18) ? new[] { old } : new[] { old, successor })
+                foreach (var t in s.CollectDue(now))
+                {
+                    due++;
+                    if (await s.ClaimSlotAsync(t, CancellationToken.None)) fired.Add((t.Id, t.DueSlot));
+                }
+
+        Assert.True(due > fired.Count);
+        Assert.Equal(fired.Count, fired.Distinct().Count());
+        Assert.Equal(2, fired.Count(f => f.Id == "nightly"));
+        Assert.Equal(24, fired.Count(f => f.Id == "two-hourly"));
+    }
+
     [Fact]
     public async Task TheStateTableRecordsEachFiringAndTheNextWithItsJitter()
     {

@@ -100,6 +100,13 @@ public sealed class ApiEgressLimiterMiddleware
             "{\"error\":\"egress_quota_exceeded\"," +
             "\"message\":\"Daily API egress limit reached for this instance. Requests resume after the UTC daily reset.\"," +
             $"\"retryAfterSeconds\":{retryAfter}," +
+            (AsksForCompression(context.Request) ? "" :
+                "\"compressionHint\":\"This request did not send Accept-Encoding: br or gzip, so its responses are sent uncompressed and use the limit several times faster. Send Accept-Encoding: br, gzip (curl: --compressed). Windows PowerShell 5.1 never sends it; PowerShell 7 does.\",") +
             $"\"resetUtc\":\"{resetUtc}\"}}");
     }
+
+    private static bool AsksForCompression(HttpRequest request) =>
+        request.Headers.AcceptEncoding.ToString().Split(',')
+            .Select(e => e.Split(';')[0].Trim())
+            .Any(e => e.Equals("br", StringComparison.OrdinalIgnoreCase) || e.Equals("gzip", StringComparison.OrdinalIgnoreCase));
 }

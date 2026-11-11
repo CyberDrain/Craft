@@ -20,7 +20,9 @@ public class PowerShellWorker : IDisposable
     private static readonly object[] s_getJobsArgs = { null!, false, false, null! };
     // New-Module has no -Version; without this a shared module reads 0.0 where a manifest import reads ModuleVersion.
     private static readonly MethodInfo? s_setModuleVersion = typeof(PSModuleInfo).GetMethod("SetVersion", NonPublicInstance);
-    private static HashSet<string>? s_builtinGlobalVars;
+    // Globals that exist once Initialize finishes (built-ins, JSON preloads, post-init state); the sweep after each
+    // invocation removes every other global. Per worker so it always reflects this runspace's own setup.
+    private HashSet<string>? _baselineGlobals;
 
     // Global JSON preloads are parsed by the first worker and the same object is handed to the rest: the values
     // are read-only lookup tables, and a parse per worker cost a full copy each.
@@ -63,19 +65,8 @@ public class PowerShellWorker : IDisposable
         if (settings.Worker.ReuseRunspaceThread)
             _pwsh.Runspace.ThreadOptions = PSThreadOptions.ReuseThread;
 
-        // Before the built-in globals are captured, so the runspace looks as it would had the ISS imported them.
         foreach (var module in sharedModules ?? [])
             ImportSharedModule(module);
-
-        // Capture built-in globals for cleanup (once, thread-safe)
-        if (s_builtinGlobalVars == null)
-        {
-            var vars = GetGlobalVariables();
-            var set = new HashSet<string>(vars.Count + 3, StringComparer.OrdinalIgnoreCase)
-                { "PSScriptRoot", "PSCommandPath", "MyInvocation" };
-            foreach (var v in vars) set.Add(v.Name);
-            Interlocked.CompareExchange(ref s_builtinGlobalVars, set, null);
-        }
 
         // Warm up (Azure Functions pattern: create+remove dummy function)
         RunScript("New-Item -Path Function:\\ -Name '_warmup_' -Value {} -Force | Out-Null; Remove-Item Function:\\_warmup_ -Force");
@@ -244,6 +235,11 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
         {
             _logger.LogWarning(ex, "Worker{Id}: failed to capture ExecutionContext baseline; per-invocation reset will be skipped.", Id);
         }
+
+        // Last, so the JSON preloads and anything else set up above survive the per-invocation global sweep.
+        var vars = GetGlobalVariables();
+        _baselineGlobals = new HashSet<string>(vars.Count + 3, StringComparer.OrdinalIgnoreCase) { "PSScriptRoot", "PSCommandPath", "MyInvocation" };
+        foreach (var v in vars) _baselineGlobals.Add(v.Name);
 
         _initialized = true;
         _logger.LogInformation("Worker{Id}: {Count} functions deployed", Id, deployed);
@@ -582,14 +578,14 @@ if (Test-Path $_fp) {{ $global:{preload.Variable} = Get-Content $_fp -Raw | Conv
 
     private void CleanupGlobalVariables()
     {
-        if (s_builtinGlobalVars == null) return;
+        if (_baselineGlobals == null) return;
         try
         {
             var currentVars = GetGlobalVariables();
             List<string>? toRemove = null;
             foreach (var v in currentVars)
             {
-                if (s_builtinGlobalVars.Contains(v.Name)) continue;
+                if (_baselineGlobals.Contains(v.Name)) continue;
                 if (v.Options.HasFlag(ScopedItemOptions.Constant)) continue;
                 if (v.Module != null) continue;
                 if (v.GetType() != typeof(PSVariable)) continue;
