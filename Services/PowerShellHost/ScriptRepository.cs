@@ -352,8 +352,8 @@ public class ScriptRepository
     }
 
     /// <summary>
-    /// Check if a command name exists as a function in any loaded PowerShell module
-    /// (CIPPCore, CIPPStandards, etc.) even if not indexed in _functions.
+    /// Check if a command name exists as a function in any PowerShell module, preloaded (Worker:BgModules) or
+    /// loaded on demand, even if not indexed in _functions.
     /// Uses a lazy-loaded set of function names extracted from .psm1 files.
     /// </summary>
     public bool IsModuleFunction(string name)

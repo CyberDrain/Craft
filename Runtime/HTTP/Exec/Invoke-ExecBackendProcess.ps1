@@ -4,8 +4,7 @@ function Invoke-ExecBackendProcess {
         List or trigger scheduled background tasks.
     .DESCRIPTION
         Framework endpoint for the Craft scheduler. Lists tasks from the scheduler
-        config or triggers one for immediate execution via _orchestratorTrigger/_scriptTrigger
-        response flags that the C# middleware intercepts.
+        config or fires one now through the scheduler, exactly as its schedule would.
 
         GET /api/ExecBackendProcess              — List all scheduled tasks
         GET /api/ExecBackendProcess?Action=Start&Command=TaskName — Trigger a task
@@ -41,25 +40,14 @@ function Invoke-ExecBackendProcess {
                     if (-not $Task) {
                         $Body = @{ error = "Task '$Command' not found in scheduler config" }
                         $StatusCode = 404
+                    } elseif (-not [Craft.Services.SchedulerBridge]::RunNow($Task.Command)) {
+                        $Body = @{ error = "Task '$($Task.Command)' is not loaded by the scheduler" }
+                        $StatusCode = 404
                     } else {
-                        $IsOrch = if ($null -ne $Task.IsOrchestratorOverride) { $Task.IsOrchestratorOverride } else { $Task.Command -match 'Orchestrator' }
-                        if ($IsOrch) {
-                            $BaseName = if ($Task.Command -match '^Start-(.+)$') { $Matches[1] } else { $Task.Command }
-                            $Body = @{
-                                _orchestratorTrigger = $true
-                                command              = $Task.Command
-                                plannerScript        = $Task.Command
-                                taskScript           = "Invoke-${BaseName}Task"
-                                priority             = $Task.Priority
-                                message              = "Orchestrator '$($Task.Command)' queued at priority $($Task.Priority)"
-                            }
-                        } else {
-                            $Body = @{
-                                _scriptTrigger = $true
-                                command        = $Task.Command
-                                priority       = $Task.Priority
-                                message        = "Script '$($Task.Command)' queued at priority $($Task.Priority)"
-                            }
+                        $Body = @{
+                            command  = $Task.Command
+                            priority = $Task.Priority
+                            message  = "'$($Task.Command)' queued at priority $($Task.Priority)"
                         }
                         $StatusCode = 200
                         Write-LogMessage -API $APIName -message "Backend process '$($Task.Command)' triggered (P$($Task.Priority))" -sev Info
@@ -69,7 +57,7 @@ function Invoke-ExecBackendProcess {
             default {
                 # List all scheduled tasks (orchestrators + simple scripts) with priority info
                 $Body = @($AllTasks | ForEach-Object {
-                        $IsOrch = if ($null -ne $_.IsOrchestratorOverride) { $_.IsOrchestratorOverride } else { $_.Command -match 'Orchestrator' }
+                        $IsOrch = $_.IsOrchestratorOverride -eq $true
                         @{
                             id          = $_.Id
                             command     = $_.Command

@@ -15,7 +15,7 @@ Kestrel ─▶ /API/{endpoint} handler ─▶ ExecuteHttpScript
    │     ├─ pipeline  the PS engine run itself
    │     └─ cleanup   Commands.Clear + ClearStreams + CleanupGlobalVariables + CleanupJobs (every request)
    ├─ extract   ExtractResponse        → pull {StatusCode,Body}, ConvertPsObjectToJson
-   └─ handler   write headers + body; scan body ×2 for _orchestratorTrigger / _scriptTrigger
+   └─ handler   write headers + body
 ```
 
 ## Measurement 1 — uncontended floor (pool 1, 1 VU, fully serial)
@@ -82,9 +82,6 @@ Given (1), a meaningful reduction in per-request cost means attacking the ~0.5 m
 - **Cheapest safe win (~6%): make `cleanup` proportional to work.** Skip `CleanupGlobalVariables` /
   `CleanupJobs` when the invocation created no globals/jobs (track via a cheap pre/post count), instead of
   always walking the provider. Small here (36 µs), larger for global-heavy app modules.
-- **Response-body trigger scan.** The handler does two `string.Contains` over the whole response body per
-  request for `_orchestratorTrigger`/`_scriptTrigger`. Negligible for small bodies; for large responses
-  (`PerfJson`) it's two full scans — gate behind a cheap length/first-char check or a response flag.
 - **The pipeline floor itself** (`BeginInvoke`/`EndInvoke`, output-collection copy) is largely intrinsic to
   the PowerShell SDK. Reducing it would need an architectural change (e.g. a persistent pre-built pipeline,
   or bypassing PS for pure-C# endpoints) and should be measured against this baseline before committing.
