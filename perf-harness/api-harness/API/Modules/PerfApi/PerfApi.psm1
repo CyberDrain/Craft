@@ -944,4 +944,170 @@ function Invoke-PerfModuleInfo {
     return @{ StatusCode = 200; Body = $Body }
 }
 
+# ── Retention harness (run-retention.ps1) ────────────────────────────────────────────────────────────
+# Proves that finished work leaves nothing behind: enqueue many production-shaped runs (payload in, result
+# out, some failures, a post-exec step, optional child runs), let them all finish, force a compacting GC, and
+# compare the heap and the entry count of every collection reachable from Craft's statics with the baseline.
+
+# runs=R tasks=K resultkb paramkb failpct (0-100) post=1 child=C (tasks in a child run started by every
+# task with idx 0) prefix=P
+function Invoke-PerfRetentionEnqueue {
+    param($Request, $TriggerMetadata)
+    $Q = $Request.Query
+    $Runs = [int]($Q.runs ?? 10); $Tasks = [int]($Q.tasks ?? 10)
+    $Param = 'p' * (1KB * [int]($Q.paramkb ?? 0))
+    $Prefix = $Q.prefix ?? 'PerfRetain'
+    $Created = foreach ($r in 1..$Runs) {
+        $In = @{
+            OrchestratorName = "$Prefix-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+            Batch            = @(foreach ($i in 0..($Tasks - 1)) {
+                    @{ FunctionName = 'PerfRetain'; idx = $i; resultkb = [int]($Q.resultkb ?? 0); failpct = [int]($Q.failpct ?? 0); child = [int]($Q.child ?? 0); param = $Param }
+                })
+        }
+        if ($Q.post -eq '1') { $In.PostExecution = @{ FunctionName = 'PerfRetainPost'; Parameters = @{ prefix = $Prefix } } }
+        Start-CraftOrchestrator -InputObject $In
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; runs = @($Created).Count; tasks = $Runs * $Tasks } }
+}
+
+function Push-PerfRetain {
+    param($Item)
+    if ([int]$Item.failpct -gt 0 -and ([int]$Item.idx % 100) -lt [int]$Item.failpct) { throw "synthetic failure $($Item.idx)" }
+    if ([int]$Item.child -gt 0 -and [int]$Item.idx -eq 0) {
+        Start-CraftOrchestrator -InputObject @{
+            OrchestratorName = "PerfRetainChild-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+            Batch            = @(foreach ($j in 1..[int]$Item.child) { @{ FunctionName = 'PerfBgLeaf'; idx = $j } })
+        } | Out-Null
+    }
+    return @{ idx = $Item.idx; out = 'r' * (1KB * [int]$Item.resultkb) }
+}
+
+function Push-PerfRetainPost {
+    param($Item)
+    return @{ results = @($Item.Results).Count }
+}
+
+# Forces a full compacting GC, then reports the heap and the Count of every collection reachable from a
+# static field in a Craft assembly (following Craft-typed objects and delegate targets up to depth 5).
+# Collections are counted, never enumerated. Paths are Type.field.field...; the first path to reach an
+# object names it.
+function Invoke-PerfSettle {
+    param($Request, $TriggerMetadata)
+    foreach ($i in 1..2) {
+        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = 'CompactOnce'
+        [GC]::Collect(2, [GCCollectionMode]::Forced, $true, $true)
+        [GC]::WaitForPendingFinalizers()
+    }
+    $Static = [Reflection.BindingFlags]'Static,Public,NonPublic,DeclaredOnly'
+    $Instance = [Reflection.BindingFlags]'Instance,Public,NonPublic'
+    $Seen = [System.Collections.Generic.HashSet[object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+    $Holders = [ordered]@{}
+    $Queue = [System.Collections.Generic.Queue[object]]::new()
+    $CountOf = [System.Collections.ICollection].GetProperty('Count')
+    foreach ($Asm in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        if ($Asm.IsDynamic -or $Asm.GetName().Name -notmatch '^(Craft|CIPPSharp)') { continue }
+        $Types = try { $Asm.GetTypes() } catch [Reflection.ReflectionTypeLoadException] { $_.Exception.Types.Where({ $_ }) }
+        foreach ($T in $Types) {
+            if ($T.ContainsGenericParameters) { continue }
+            foreach ($F in $T.GetFields($Static)) {
+                if ($F.IsLiteral) { continue }
+                $V = try { $F.GetValue($null) } catch { $null }
+                if ($null -ne $V) { $Queue.Enqueue(@("$($T.FullName).$($F.Name)", $V, 0)) }
+            }
+        }
+    }
+    while ($Queue.Count) {
+        $Path, $V, $Depth = $Queue.Dequeue()
+        $VT = $V.GetType()
+        if ($VT.IsValueType -or $V -is [string] -or $V -is [System.Reflection.MemberInfo] -or $V -is [type]) { continue }
+        if (-not $Seen.Add($V)) { continue }
+        if ($V -is [System.Delegate]) {
+            if ($null -ne $V.Target) { $Queue.Enqueue(@("$Path.<target>", $V.Target, $Depth + 1)) }
+            continue
+        }
+        if ($V -is [array]) { $Holders[$Path] = $V.Length; continue }
+        $Count = if ($V -is [System.Collections.ICollection]) { $CountOf.GetValue($V) }
+        else { $P = $VT.GetProperties([Reflection.BindingFlags]'Instance,Public').Where({ $_.Name -eq 'Count' -and $_.PropertyType -eq [int] -and $_.GetIndexParameters().Count -eq 0 }, 'First')[0]; if ($P) { try { $P.GetValue($V) } catch { $null } } }
+        if ($null -ne $Count) { $Holders[$Path] = $Count; continue }
+        if ($Depth -ge 5 -or $VT.FullName -notmatch '^(Craft|CIPP)\.') { continue }
+        foreach ($F in $VT.GetFields($Instance)) {
+            if ($F.FieldType.IsPrimitive -or $F.FieldType -eq [string]) { continue }
+            $FV = try { $F.GetValue($V) } catch { $null }
+            if ($null -ne $FV) { $Queue.Enqueue(@("$Path.$($F.Name)", $FV, $Depth + 1)) }
+        }
+    }
+    $Info = [GC]::GetGCMemoryInfo()
+    return @{ StatusCode = 200; Body = @{
+            heapMB      = [math]::Round([GC]::GetTotalMemory($false) / 1MB, 1)
+            committedMB = [math]::Round($Info.TotalCommittedBytes / 1MB, 1)
+            gen2        = [GC]::CollectionCount(2)
+            holders     = $Holders
+        }
+    }
+}
+
+# ── Stop-token A/B (run-stoptoken-ab.ps1) ────────────────────────────────────────────────────────────
+# A background task that holds holdmb of live memory and then blocks in CIPP's HTTP client on a server that
+# accepts the connection and never answers (TimeoutSec 0 = no client timeout). Without a stop token the call
+# cannot be interrupted, Craft abandons the worker at its BG timeout + StopGrace and the memory stays pinned;
+# with one, the call is cancelled, the pipeline stops and the memory is freed. Needs CIPPCore loaded
+# (docker-compose.bg-cipp.yml). n=N holdmb=M uri=U
+function Invoke-PerfHangHttpEnqueue {
+    param($Request, $TriggerMetadata)
+    $N = [int]($Request.Query.n ?? 1)
+    $Batch = @(foreach ($i in 1..$N) { @{ FunctionName = 'PerfHangHttp'; idx = $i; holdmb = [int]($Request.Query.holdmb ?? 100); uri = $Request.Query.uri ?? 'http://blackhole:8080/' } })
+    $Run = Start-CraftOrchestrator -InputObject @{ OrchestratorName = "PerfHangHttp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"; Batch = $Batch }
+    return @{ StatusCode = 200; Body = @{ ok = $true; enqueued = $N; run = $Run } }
+}
+
+function Push-PerfHangHttp {
+    param($Item)
+    $Hold = [System.Collections.Generic.List[byte[]]]::new()
+    foreach ($i in 1..[int]$Item.holdmb) { $B = [byte[]]::new(1MB); $B[0] = 1; $Hold.Add($B) }
+    $null = Invoke-CIPPRestMethod -Uri $Item.uri -Method GET -TimeoutSec 0
+    return @{ ok = $true; held = $Hold.Count }
+}
+
+# ── Leak replication (run-retention.ps1 -Workload Leak) ──────────────────────────────────────────────
+# Each task drives n iterations of the process-lifetime paths that leaked, through the real code, with keys no
+# later call reuses: CIPPSharp's token cache (expired entries never looked up again) and its per-key locks, the
+# rate limiter's tenant-by-token map (distinct ~3 KB bearer tokens), its per-host request counts (a refused
+# request to a new loopback address), report image names that do not ship, and Craft's run labels.
+# runs=R tasks=K n=N payloadkb=P
+function Invoke-PerfLeakEnqueue {
+    param($Request, $TriggerMetadata)
+    $Q = $Request.Query
+    $Runs = [int]($Q.runs ?? 10); $Tasks = [int]($Q.tasks ?? 10)
+    foreach ($r in 1..$Runs) {
+        $Seed = [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $null = Start-CraftOrchestrator -InputObject @{
+            OrchestratorName = "PerfLeak-$Seed"
+            Batch            = @(foreach ($i in 0..($Tasks - 1)) { @{ FunctionName = 'PerfLeak'; seed = "$Seed-$i"; n = [int]($Q.n ?? 20); payloadkb = [int]($Q.payloadkb ?? 1) } })
+        }
+    }
+    return @{ StatusCode = 200; Body = @{ ok = $true; tasks = $Runs * $Tasks } }
+}
+
+function Push-PerfLeak {
+    param($Item)
+    $Payload = '{"token_type":"Bearer","access_token":"' + ('a' * (1KB * [int]$Item.payloadkb)) + '"}'
+    $Expired = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 60
+    $Pad = 'x' * 3000
+    foreach ($i in 1..[int]$Item.n) {
+        $Key = "$($Item.seed)-$i"
+        [CIPP.CIPPTokenCache]::Store("leak|$Key|https://graph.microsoft.com/.default", $Payload, $Expired)
+        if ([CIPP.CIPPTokenCache]::AcquireLock("leaklock|$Key", 1000)) { [CIPP.CIPPTokenCache]::ReleaseLock("leaklock|$Key") }
+        $Claims = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{ tid = [guid]::NewGuid().ToString(); pad = $Pad } | ConvertTo-Json -Compress))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        $Headers = [System.Collections.Generic.Dictionary[string, string]]::new()
+        $Headers['Authorization'] = "Bearer eyJhbGciOiJub25lIn0.$Claims.sig"
+        $Claim = [CIPP.CIPPRateLimiter]::Acquire('https://graph.microsoft.com/v1.0/users', 'GET', $null, $Headers)
+        [CIPP.CIPPRateLimiter]::Observe($Claim, 200, $null, [string]'')
+        $null = [CIPP.Reporting.ReportComponents]::ReportImage("missing-$Key.jpg")
+        [Craft.Services.QueueStatusBridge]::RegisterQueueMetadata([guid]::NewGuid().ToString(), "Leak $Key", '', [guid]::NewGuid().ToString())
+    }
+    $Host4 = [Math]::Abs($Item.seed.GetHashCode())
+    try { $null = Invoke-CIPPRestMethod -Uri "http://127.$($Host4 % 250 + 1).$(($Host4 -shr 8) % 250 + 1).$(($Host4 -shr 16) % 250 + 1):9/" -TimeoutSec 2 } catch {}
+    return @{ ok = $true }
+}
+
 Set-Alias -Name Get-PerfPingAlias -Value Invoke-PerfPing

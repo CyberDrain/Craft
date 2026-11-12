@@ -1,7 +1,6 @@
 using System.Collections;
 using System.Management.Automation;
 using Craft.Services;
-using Microsoft.Azure.Functions.PowerShellWorker;
 
 namespace Craft.Tests;
 

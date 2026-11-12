@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using Craft.Auth;
 using Craft.Configuration;
 
@@ -14,6 +15,7 @@ namespace Craft.Hosting;
 ///   <item><description>Already SWA-format (<c>userRoles</c> present) — passed through untouched.</description></item>
 ///   <item><description>No principal header at all — a dev principal is injected, in Development only.</description></item>
 /// </list>
+/// Outside Development, principal headers on a loopback connection are dropped first: they did not come through EasyAuth.
 /// </para>
 /// <para>
 /// Authentication itself belongs to the upstream EasyAuth platform. This middleware only translates
@@ -37,6 +39,9 @@ public static class CraftAuthMiddleware
         {
             var authStart = CacheProfiler.Enabled ? Stopwatch.GetTimestamp() : 0;
             var path = context.Request.Path.Value ?? "";
+
+            if (DropLoopbackPrincipal(context, isDevelopment))
+                logger.LogWarning("[Auth] Dropped principal headers from a loopback connection to {Path}", path);
 
             if (EasyAuthPrincipal.ShouldSkipInjection(path))
             {
@@ -66,6 +71,24 @@ public static class CraftAuthMiddleware
         });
 
         return app;
+    }
+
+    /// <summary>
+    /// EasyAuth strips inbound principal headers at the front end, but a caller inside the container reaches Craft over
+    /// loopback without passing through it. Outside Development such a connection never carries a principal, so its
+    /// <c>x-ms-client-principal*</c> headers are removed. Reads the socket peer, never <c>X-Forwarded-For</c>.
+    /// </summary>
+    /// <returns><see langword="true"/> when headers were removed.</returns>
+    internal static bool DropLoopbackPrincipal(HttpContext context, bool isDevelopment)
+    {
+        if (isDevelopment || context.Connection.RemoteIpAddress is not { } peer ||
+            !IPAddress.IsLoopback(peer.IsIPv4MappedToIPv6 ? peer.MapToIPv4() : peer))
+            return false;
+
+        var names = context.Request.Headers.Keys
+            .Where(k => k.StartsWith("x-ms-client-principal", StringComparison.OrdinalIgnoreCase)).ToList();
+        foreach (var name in names) context.Request.Headers.Remove(name);
+        return names.Count > 0;
     }
 
     /// <param name="resolveUserRoles">

@@ -1,8 +1,6 @@
 using System.Collections;
 using System.Diagnostics;
-using System.Text.Json;
 using Craft.Caching;
-using Craft.Orchestration;
 using Craft.Services;
 
 namespace Craft.Hosting.Endpoints;
@@ -11,8 +9,7 @@ namespace Craft.Hosting.Endpoints;
 /// Dispatches <c>/API/{endpoint}</c> to the PowerShell function discovered for that route.
 /// <para>
 /// This is the hot path of the whole runtime: it owns the response cache (including
-/// stale-while-revalidate), the concurrency counter used by diagnostics, and the post-response trigger
-/// handling that lets a short HTTP handler kick off long-running background work.
+/// stale-while-revalidate) and the concurrency counter used by diagnostics.
 /// </para>
 /// </summary>
 public static class PowerShellDispatchEndpoint
@@ -40,8 +37,6 @@ public static class PowerShellDispatchEndpoint
 
         var psRunner = app.Services.GetRequiredService<PowerShellRunnerService>();
         var cache = app.Services.GetRequiredService<CacheService>();
-        var orchestrator = app.Services.GetRequiredService<OrchestratorService>();
-        var jobManager = app.Services.GetRequiredService<JobManager>();
 
         app.MapMethods("/API/{endpoint}", DispatchMethods, async (HttpContext context, string endpoint) =>
         {
@@ -88,7 +83,7 @@ public static class PowerShellDispatchEndpoint
 
                     if (cached.Response is { } hit)
                     {
-                        await ServeCachedAsync(context, cache, psRunner, orchestrator, logger,
+                        await ServeCachedAsync(context, cache, psRunner, logger,
                             endpoint, cached.Key!, hit, requestSw);
                         return;
                     }
@@ -126,13 +121,6 @@ public static class PowerShellDispatchEndpoint
                 if (cacheBypassReason is not null)
                     context.Response.Headers["X-Cache-Bypass"] = cacheBypassReason;
                 context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
-
-                if (result.StatusCode is >= 200 and < 300)
-                {
-                    HandleOrchestratorTrigger(result.BodyBytes, psRunner, orchestrator, logger, "[API] Orchestrator triggered");
-                    HandleScriptTrigger(result.BodyBytes, psRunner, jobManager, logger);
-                    result = await HandleCancelTriggerAsync(result, orchestrator, logger, context);
-                }
 
                 if (HandlerHeaders.AllowsBody(result.StatusCode))
                     await context.Response.Body.WriteAsync(result.BodyBytes);
@@ -173,8 +161,7 @@ public static class PowerShellDispatchEndpoint
     }
 
     private static async Task ServeCachedAsync(
-        HttpContext context, CacheService cache, PowerShellRunnerService psRunner,
-        OrchestratorService orchestrator, ILogger logger,
+        HttpContext context, CacheService cache, PowerShellRunnerService psRunner, ILogger logger,
         string endpoint, string cacheKey, CachedResponse cached, Stopwatch requestSw)
     {
         cache.Touch(cacheKey);
@@ -200,7 +187,7 @@ public static class PowerShellDispatchEndpoint
 
         if (requestSnapshot is null) return;
 
-        StartBackgroundRefresh(cache, psRunner, orchestrator, logger, endpoint, cacheKey, requestSnapshot);
+        StartBackgroundRefresh(cache, psRunner, logger, endpoint, cacheKey, requestSnapshot);
     }
 
     /// <summary>
@@ -208,7 +195,7 @@ public static class PowerShellDispatchEndpoint
     /// path. Deliberately fire-and-forget — nothing is waiting on it.
     /// </summary>
     private static void StartBackgroundRefresh(
-        CacheService cache, PowerShellRunnerService psRunner, OrchestratorService orchestrator,
+        CacheService cache, PowerShellRunnerService psRunner,
         ILogger logger, string endpoint, string cacheKey, Hashtable requestSnapshot)
     {
         var generation = cache.Generation;
@@ -220,15 +207,10 @@ public static class PowerShellDispatchEndpoint
                 await cache.WaitForBgRefreshSlot(endpoint);
                 var fresh = await psRunner.ExecuteHttpScript(endpoint, requestSnapshot);
 
+                // Generation check: an invalidation may have landed while this was running, and
+                // writing back then would resurrect data the invalidation was meant to drop.
                 if (fresh.StatusCode is >= 200 and < 400)
-                {
-                    // Generation check: an invalidation may have landed while this was running, and
-                    // writing back then would resurrect data the invalidation was meant to drop.
                     cache.SetIfSameGeneration(cacheKey, fresh, generation);
-
-                    HandleOrchestratorTrigger(fresh.BodyBytes, psRunner, orchestrator, logger,
-                        "[API] Orchestrator triggered via bg refresh");
-                }
             }
             catch (Exception ex)
             {
@@ -240,112 +222,5 @@ public static class PowerShellDispatchEndpoint
                 cache.FinishRefresh(cacheKey);
             }
         });
-    }
-
-    private static void HandleOrchestratorTrigger(
-        byte[] body, PowerShellRunnerService psRunner, OrchestratorService orchestrator,
-        ILogger logger, string logPrefix)
-    {
-        if (!ResponseTriggers.MayContain(body, ResponseTriggers.OrchestratorMarker)) return;
-
-        try
-        {
-            if (ResponseTriggers.ParseOrchestrator(body) is not { } trigger) return;
-
-            var plannerPath = psRunner.FindScript(trigger.PlannerScript);
-            var taskPath = psRunner.FindScript(trigger.TaskScript);
-            if (plannerPath is null || taskPath is null) return;
-
-            _ = orchestrator.StartOrResumeRun(
-                trigger.Command, plannerPath, taskPath, trigger.Priority, CancellationToken.None);
-
-            logger.LogInformation("{Prefix}: {Command} P{Priority}",
-                logPrefix, trigger.Command, trigger.Priority);
-        }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
-        {
-            logger.LogWarning(ex, "Failed to parse orchestrator trigger from response");
-        }
-    }
-
-    private static void HandleScriptTrigger(
-        byte[] body, PowerShellRunnerService psRunner, JobManager jobManager, ILogger logger)
-    {
-        if (!ResponseTriggers.MayContain(body, ResponseTriggers.ScriptMarker)) return;
-
-        try
-        {
-            if (ResponseTriggers.ParseScript(body) is not { } trigger) return;
-
-            if (psRunner.FindScript(trigger.Command) is null)
-            {
-                logger.LogWarning("[API] Script not found for trigger: {Command}", trigger.Command);
-                return;
-            }
-
-            jobManager.Enqueue(trigger.Command, trigger.Priority, async _ =>
-                await psRunner.ExecuteScript(trigger.Command));
-
-            logger.LogInformation("[API] Script triggered: {Command} P{Priority}",
-                trigger.Command, trigger.Priority);
-        }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
-        {
-            logger.LogWarning(ex, "Failed to parse script trigger from response");
-        }
-    }
-
-    /// <summary>
-    /// Cancellation is the one trigger that rewrites the response, because the caller needs to know
-    /// whether the run was actually found.
-    /// </summary>
-    private static async Task<ScriptResult> HandleCancelTriggerAsync(
-        ScriptResult result, OrchestratorService orchestrator, ILogger logger, HttpContext context)
-    {
-        if (!ResponseTriggers.MayContain(result.BodyBytes, ResponseTriggers.CancelMarker)) return result;
-
-        try
-        {
-            if (ResponseTriggers.ParseCancel(result.BodyBytes) is not { } trigger) return result;
-
-            var (found, cancelledCount) = await orchestrator.CancelRunAsync(trigger.Command);
-
-            // Callers pass the bare name; the registered run is the cmdlet that starts it.
-            if (!found)
-                (found, cancelledCount) = await orchestrator.CancelRunAsync($"Start-{trigger.Command}");
-
-            if (found)
-            {
-                logger.LogInformation("[API] Run cancelled: {Command} ({Cancelled} pending tasks)",
-                    trigger.Command, cancelledCount);
-
-                result = new ScriptResult
-                {
-                    StatusCode = 200,
-                    Body = JsonSerializer.Serialize(new
-                    {
-                        name = trigger.Command,
-                        cancelled = cancelledCount,
-                        message = $"Cancelled {cancelledCount} pending tasks",
-                    }),
-                };
-            }
-            else
-            {
-                result = new ScriptResult
-                {
-                    StatusCode = 404,
-                    Body = JsonSerializer.Serialize(new { error = $"No run found for '{trigger.Command}'" }),
-                };
-            }
-
-            context.Response.StatusCode = result.StatusCode;
-        }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
-        {
-            logger.LogWarning(ex, "Failed to parse cancel trigger from response");
-        }
-
-        return result;
     }
 }

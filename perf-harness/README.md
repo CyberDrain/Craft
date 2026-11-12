@@ -251,3 +251,35 @@ pwsh scripts\run-compression.ps1 -Requests 60 -KeepUp
 ```
 
 Exits non-zero if any Phase-1 assertion fails. Results go to `results/compression-<timestamp>.{json,md}`.
+
+## Retained memory (run-retention.ps1, run-stoptoken-ab.ps1)
+
+These measure what is still held after work finishes, not the peak while it runs. Both need a GC-settled
+reading: `/API/PerfSettle` forces two compacting collections and returns the heap plus the Count of every
+collection reachable from a static in a Craft or CIPPSharp assembly. `-GcDump` adds an exact retained-type diff
+from a full `dotnet-dump` taken by a sidecar (dotnet-gcdump is lossy against .NET 8 and drops types).
+`-CippRoot <CIPP checkout>` loads that checkout's built modules (`build/.devmodules`) and CIPPSharp into the
+workers through `docker-compose.bg-cipp.yml`, the way production loads them.
+
+```powershell
+# Finished jobs leave nothing behind: warm-up, settle, N production-shaped jobs in waves, settle, diff
+pwsh scripts\run-retention.ps1 -SutImage craft:local -CippRoot C:\GitHub\CIPP -Jobs 30000 -RecycleAfter 250 -GcDump
+
+# Leak replication: each task drives -LeakN passes through the process-lifetime holders (token cache and its
+# locks, rate-limiter token map, per-host telemetry, report image misses, run labels); old vs new build
+pwsh scripts\run-retention.ps1 -SutImage craft:local -CippRoot C:\GitHub\CIPP -Workload Leak -LeakN 20 -Jobs 5000 -GcDump
+
+# A timed-out task blocked in an HTTP call: abandoned with its memory pinned, or stopped and freed
+pwsh scripts\run-stoptoken-ab.ps1 -SutImage craft:local -CippRoot C:\GitHub\CIPP
+```
+
+Measured on 2026-11-12 (craft:dev 4def620 + CIPP f4195160a vs Craft 0b11684 + CIPP 888e8ac04):
+
+| Run | Old | New |
+| --- | --- | --- |
+| Leak, 100k passes | +153.8 MB (100k token-cache entries, 100k key locks, 100k image misses, 200k labels) | +11.6 MB (all capped) |
+| Stop token, 4 x 200 MB tasks | 4 workers abandoned, +815 MB pinned | 0 abandoned, +4 MB |
+
+Both halves are needed for the stop token: new Craft with the old CIPPSharp, or the reverse, still pins.
+Per worker recycle, PowerShell keeps each runspace's TypeTable alive through the shared modules' call-site rule
+caches; that is capped by the rule cache (+5.7 MB at 261 recycles, +8.8 MB at 1,032).

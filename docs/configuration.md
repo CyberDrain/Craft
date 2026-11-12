@@ -246,6 +246,10 @@ Controls the PowerShell runspace pools that execute all scripts.
   // Use for test modules or legacy entrypoints you don't want loaded.
   "SkipModules": ["CippEntrypoints"],
 
+  // Modules each pool preloads; empty preloads every module. Other modules still load on demand.
+  "HttpModules": ["CIPPCore", "CIPPHTTP"],
+  "BgModules": ["CIPPCore", "CIPPDB"],
+
   // JSON files to preload into PowerShell variables at startup.
   "JsonPreloads": [
     {

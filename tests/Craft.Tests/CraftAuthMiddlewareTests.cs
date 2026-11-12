@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using Craft.Auth;
@@ -166,5 +167,49 @@ public class CraftAuthMiddlewareTests
         Assert.True(await Normalise(context, new RoleLookup(AdminRoles)));
 
         Assert.Equal("not-base64!!", context.Request.Headers["x-ms-client-principal"].ToString());
+    }
+
+    private static DefaultHttpContext FromPeer(string peer)
+    {
+        var context = Request(EasyAuthHeader(("upn", "a@b.com")));
+        context.Request.Headers["x-ms-client-principal-name"] = "a@b.com";
+        context.Request.Headers["x-ms-client-principal-id"] = "user-oid";
+        context.Connection.RemoteIpAddress = IPAddress.Parse(peer);
+        return context;
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("127.1.2.3")]
+    [InlineData("::1")]
+    [InlineData("::ffff:127.0.0.1")]
+    public void LoopbackPrincipal_IsDroppedOutsideDevelopment(string peer)
+    {
+        // A request from inside the container never went through EasyAuth, so its principal is the caller's own.
+        var context = FromPeer(peer);
+
+        Assert.True(CraftAuthMiddleware.DropLoopbackPrincipal(context, isDevelopment: false));
+        Assert.DoesNotContain(context.Request.Headers.Keys, k => k.StartsWith("x-ms-client-principal", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("169.254.133.2", false)]  // the App Service auth container, on the site bridge
+    [InlineData("172.18.0.5", false)]     // a sibling container, e.g. the local EasyAuth simulator
+    [InlineData("127.0.0.1", true)]       // local dev keeps forging principals to test roles
+    public void PrincipalIsKept_FromTheFrontEndAndInDevelopment(string peer, bool isDevelopment)
+    {
+        var context = FromPeer(peer);
+
+        Assert.False(CraftAuthMiddleware.DropLoopbackPrincipal(context, isDevelopment));
+        Assert.Equal(4, context.Request.Headers.Keys.Count(k => k.StartsWith("x-ms-client-principal", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public void LoopbackWithoutAPrincipal_ReportsNothingDropped()
+    {
+        var context = new DefaultHttpContext();
+        context.Connection.RemoteIpAddress = IPAddress.Loopback;
+
+        Assert.False(CraftAuthMiddleware.DropLoopbackPrincipal(context, isDevelopment: false));
     }
 }

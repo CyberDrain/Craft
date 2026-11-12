@@ -15,6 +15,7 @@ namespace Craft.Tests;
 /// queue their own, and child runs that only reach storage after the task that queued them has returned
 /// (PowerShell's QueueOrchestration is drained asynchronously).
 /// </summary>
+[Collection(nameof(QueueStatusBridgeLabelTests))]
 public class RealtimeRunStatusE2ETests
 {
     private const string User = "alice@contoso.com";

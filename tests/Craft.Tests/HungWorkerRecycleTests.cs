@@ -141,6 +141,47 @@ public sealed class HungWorkerRecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task ADotNetCallGivenCraftPipelineStopToken_IsCancelledWithoutAbandoningTheWorker()
+    {
+        // PowerShell 7.4 has no $PSCmdlet.PipelineStopToken, so Craft hands each invocation a token it cancels on stop.
+        using var worker = NewWorker(TimeSpan.FromSeconds(5));
+        using var cts = new CancellationTokenSource(200);
+        var sw = Stopwatch.StartNew();
+
+        // Falls back to no token when the host supplies none, as a consumer running on older hosts must.
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.InvokeScriptAsync(ScriptBlock.Create(
+            "$t = if ($global:CraftPipelineStopToken) { $global:CraftPipelineStopToken } else { [Threading.CancellationToken]::None }; " +
+            "[Threading.Tasks.Task]::Delay([Threading.Timeout]::Infinite, $t).GetAwaiter().GetResult()"), ct: cts.Token));
+
+        Assert.IsNotType<WorkerHungException>(ex);
+        Assert.False(worker.IsHung);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed.TotalSeconds:0.0}s");
+        Assert.Equal("after", Assert.Single(await worker.InvokeScriptAsync(ScriptBlock.Create("'after'"))).ToString());
+    }
+
+    [Fact]
+    public async Task CraftPipelineStopToken_IsFreshEachInvocation_AndSurvivesTheGlobalSweep()
+    {
+        var dir = Directory.CreateTempSubdirectory("craft-stoptoken-").FullName;
+        var settings = new CraftSettings();
+        using var worker = new PowerShellWorker(8, InitialSessionState.CreateDefault2(), NullLogger.Instance) { StopGrace = TimeSpan.FromSeconds(5) };
+        worker.Initialize(new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings), dir, settings);
+        const string Read = "$t = $global:CraftPipelineStopToken; $t -is [Threading.CancellationToken]; $t.CanBeCanceled; $t.IsCancellationRequested";
+
+        using (var cts = new CancellationTokenSource(200))
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.InvokeScriptAsync(ScriptBlock.Create(
+                "[Threading.Tasks.Task]::Delay(-1, $global:CraftPipelineStopToken).GetAwaiter().GetResult()"), ct: cts.Token));
+        var between = worker.Runspace.SessionStateProxy.PSVariable.GetValue("CraftPipelineStopToken");
+        var next = await worker.InvokeScriptAsync(ScriptBlock.Create(Read));
+        var after = worker.Runspace.SessionStateProxy.PSVariable.GetValue("CraftPipelineStopToken");
+        Directory.Delete(dir, recursive: true);
+
+        Assert.Equal(CancellationToken.None, between);
+        Assert.Equal(["True", "True", "False"], next.Select(o => o.ToString()));
+        Assert.Equal(CancellationToken.None, after);
+    }
+
+    [Fact]
     public async Task DisposingAHungWorkerDoesNotBlock_AndClosesItOnceTheCallReturns()
     {
         var gate = NewGate();

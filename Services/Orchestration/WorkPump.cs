@@ -192,6 +192,13 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
 
     internal void ForgetBackoff() => _skip.Clear();
 
+    internal void CountRetained(Dictionary<string, long> into)
+    {
+        into["WorkPump.skip"] = _skip.Count;
+        into["WorkPump.inFlight"] = _inFlight.Count;
+        into["WorkPump.changed"] = _changed.Count;
+    }
+
     /// <summary>The job a claimed task runs as: its id, and the name job lists and worker stats show.</summary>
     internal static string JobId(WorkStore.ClaimedTask c) => $"{c.RunKey}|{c.Seq}";
 

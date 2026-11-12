@@ -36,6 +36,8 @@ services:
       - App__Worker__IgnoreSkuProfiles=true
       - App__Worker__HttpPoolSize=${HTTP_POOL:-2}
       - App__Worker__BgPoolSize=${BG_POOL:-4}
+      # Worker recycle after N invocations (CIPP prod: 250). run-retention.ps1 -RecycleAfter sets it; 0 = never.
+      - App__Worker__RecycleAfterInvocations=${RECYCLE_AFTER:-0}
       - App__ReadinessMode=Immediate
       - App__Setup__Enabled=false
       # The per-client rate limiter is on by default; load runs would measure its 429s, not the host.

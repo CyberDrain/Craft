@@ -146,64 +146,7 @@ public class SchedulerService : BackgroundService
                     fired.Add(task);
                     _logger.LogInformation("[Scheduler] Firing: {Command}", task.Command);
 
-                    if (_nativeTasks.TryGet(task.Command, out var native))
-                    {
-                        if (task.IsOrchestrator)
-                        {
-                            // Also reported once at load; repeated here because LoadConfig's
-                            // report is easy to scroll past and this timer will otherwise look
-                            // like it silently never runs.
-                            _logger.LogWarning(
-                                "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — skipped",
-                                task.Command);
-                        }
-                        else
-                        {
-                            EnqueueNativeTask(task, native, now);
-                        }
-                    }
-                    else if (task.IsOrchestrator)
-                    {
-                        // Fan-out/fan-in: planner = Command, task script derived from Command
-                        // Convention: strip "Start-" prefix → "Invoke-{rest}Task"
-                        var plannerFunc = FindScript(task.Command);
-                        var baseName = task.Command.StartsWith("Start-", StringComparison.OrdinalIgnoreCase)
-                            ? task.Command[6..]
-                            : task.Command;
-                        var taskScriptName = $"Invoke-{baseName}Task";
-                        var taskFunc = FindScript(taskScriptName);
-
-                        if (plannerFunc != null && taskFunc != null)
-                        {
-                            _ = _orchestrator.StartOrResumeRun(task.Command, plannerFunc, taskFunc, task.Priority, stoppingToken);
-                            _logger.LogInformation("[Scheduler] Orchestrator started: {Command} P{Priority}", task.Command, task.Priority);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("[Scheduler] Orchestrator scripts not deployed: {Command} planner={Planner} task={Task}",
-                                task.Command, task.Command, taskScriptName);
-                        }
-                    }
-                    else
-                    {
-                        // Simple scheduled script — dispatch through JobManager for priority ordering
-                        var scriptFunc = FindScript(task.Command);
-                        if (scriptFunc != null)
-                        {
-                            var capturedFunc = scriptFunc;
-                            var capturedParams = task.Parameters;
-                            _jobManager.Enqueue(
-                                name: task.Command,
-                                priority: task.Priority,
-                                work: (ct) => _psRunner.ExecuteScript(capturedFunc, capturedParams)
-                            );
-                            _logger.LogInformation("[Scheduler] Enqueued: {Command} P{Priority}", task.Command, task.Priority);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("[Scheduler] Script not deployed: {Command}", task.Command);
-                        }
-                    }
+                    Dispatch(task, now, stoppingToken);
                 }
                 catch (Exception ex)
                 {
@@ -215,6 +158,78 @@ public class SchedulerService : BackgroundService
 
             // Check at configured interval
             await Task.Delay(TimeSpan.FromSeconds(_settings.Scheduler.CheckIntervalSeconds), stoppingToken);
+        }
+    }
+
+    /// <summary>Fires <paramref name="command"/>'s timer now, outside its schedule. False when no timer has that command.</summary>
+    internal bool RunNow(string command)
+    {
+        var task = _tasks.FirstOrDefault(t => string.Equals(t.Command, command, StringComparison.OrdinalIgnoreCase));
+        if (task is null) return false;
+        _logger.LogInformation("[Scheduler] Run now: {Command}", task.Command);
+        Dispatch(task, DateTimeOffset.UtcNow, CancellationToken.None);
+        return true;
+    }
+
+    private void Dispatch(SchedulerTask task, DateTimeOffset now, CancellationToken ct)
+    {
+        if (_nativeTasks.TryGet(task.Command, out var native))
+        {
+            if (task.IsOrchestrator)
+            {
+                // Also reported once at load; repeated here because LoadConfig's
+                // report is easy to scroll past and this timer will otherwise look
+                // like it silently never runs.
+                _logger.LogWarning(
+                    "[Scheduler] {Command}: IsOrchestrator is not supported for native tasks — skipped",
+                    task.Command);
+            }
+            else
+            {
+                EnqueueNativeTask(task, native, now);
+            }
+        }
+        else if (task.IsOrchestrator)
+        {
+            // Fan-out/fan-in: planner = Command, task script derived from Command
+            // Convention: strip "Start-" prefix → "Invoke-{rest}Task"
+            var plannerFunc = FindScript(task.Command);
+            var baseName = task.Command.StartsWith("Start-", StringComparison.OrdinalIgnoreCase)
+                ? task.Command[6..]
+                : task.Command;
+            var taskScriptName = $"Invoke-{baseName}Task";
+            var taskFunc = FindScript(taskScriptName);
+
+            if (plannerFunc != null && taskFunc != null)
+            {
+                _ = _orchestrator.StartOrResumeRun(task.Command, plannerFunc, taskFunc, task.Priority, ct);
+                _logger.LogInformation("[Scheduler] Orchestrator started: {Command} P{Priority}", task.Command, task.Priority);
+            }
+            else
+            {
+                _logger.LogWarning("[Scheduler] Orchestrator scripts not deployed: {Command} planner={Planner} task={Task}",
+                    task.Command, task.Command, taskScriptName);
+            }
+        }
+        else
+        {
+            // Simple scheduled script — dispatch through JobManager for priority ordering
+            var scriptFunc = FindScript(task.Command);
+            if (scriptFunc != null)
+            {
+                var capturedFunc = scriptFunc;
+                var capturedParams = task.Parameters;
+                _jobManager.Enqueue(
+                    name: task.Command,
+                    priority: task.Priority,
+                    work: _ => _psRunner.ExecuteScript(capturedFunc, capturedParams)
+                );
+                _logger.LogInformation("[Scheduler] Enqueued: {Command} P{Priority}", task.Command, task.Priority);
+            }
+            else
+            {
+                _logger.LogWarning("[Scheduler] Script not deployed: {Command}", task.Command);
+            }
         }
     }
 

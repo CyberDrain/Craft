@@ -29,4 +29,11 @@ public static class SchedulerBridge
 
     /// <summary>Returns the current timezone ID, or empty string if UTC.</summary>
     public static string GetTimezone() => s_service?.GetTimezone() ?? "";
+
+    /// <summary>
+    /// Fires a configured timer now, exactly as its schedule would. Only commands in the timer file can run.
+    /// PS usage: [Craft.Services.SchedulerBridge]::RunNow("Start-TableCleanup") — false when no timer has it.
+    /// </summary>
+    public static bool RunNow(string command) =>
+        (s_service ?? throw new InvalidOperationException("SchedulerService not initialized")).RunNow(command);
 }

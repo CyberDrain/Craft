@@ -60,6 +60,11 @@ public class PowerShellRunnerService : IDisposable
     public static Hashtable GetSharedCache(string name) =>
         SharedCaches.GetOrAdd(name, _ => Hashtable.Synchronized(new Hashtable()));
 
+    internal static void CountSharedCaches(Dictionary<string, long> into)
+    {
+        foreach (var (name, cache) in SharedCaches) into[$"SharedCache.{name}"] = cache.Count;
+    }
+
     /// <summary>
     /// Set a process-level environment variable from any worker runspace.
     /// The value is visible to ALL workers via $env:NAME because it calls
@@ -755,10 +760,10 @@ public class PowerShellRunnerService : IDisposable
     /// </summary>
     public string? FindScript(string command)
     {
+        // Everything resolved here runs on a background worker, so an HTTP entrypoint never qualifies.
         var entry = _repo.GetByName(command);
-        if (entry != null) return entry.FunctionName;
+        if (entry is { Category: not FunctionCategory.Http }) return entry.FunctionName;
 
-        // Check if the command exists as a function in the loaded modules
         if (_repo.IsModuleFunction(command)) return command;
 
         return null;

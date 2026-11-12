@@ -1,5 +1,8 @@
 using Craft.Configuration;
+using Craft.Orchestration;
 using Craft.PowerShellHost;
+using Craft.Services;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Craft.Tests;
@@ -65,5 +68,79 @@ public class ModuleFunctionScanTests
             var text = string.Concat(Enumerable.Range(0, random.Next(1, 40)).Select(_ => parts[random.Next(parts.Length)]));
             Assert.True(Regex(text).SequenceEqual(Scan(text)), $"differs for: {text.Replace("\n", "\n").Replace("\r", "\r")}");
         }
+    }
+}
+
+/// <summary>
+/// Host-initiated work (timers, planner runs, queue tasks) resolves its command here and runs it on a background
+/// worker: any module function resolves, preloaded or loaded on demand, but never an HTTP entrypoint.
+/// </summary>
+public sealed class BackgroundScriptResolutionTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "craft-bgres-" + Guid.NewGuid().ToString("N"));
+
+    public BackgroundScriptResolutionTests()
+    {
+        Write("Modules/BgMod/BgMod.psm1", "function Start-Nightly { }\nfunction Get-Bg { }");
+        Write("Modules/Other/Other.psm1", "function Get-Other { }");
+        Write("Modules/HttpMod/Public/Invoke-ListThing.ps1", "function Invoke-ListThing {\n    param($Request, $TriggerMetadata)\n}");
+        Write("timers.json", """[ { "Id": "nightly", "Command": "Start-Nightly", "Cron": "0 0 1 * * *" } ]""");
+    }
+
+    public void Dispose() => Directory.Delete(_root, true);
+
+    private void Write(string relative, string text)
+    {
+        var path = Path.Combine(_root, relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, text);
+    }
+
+    private (PowerShellRunnerService Runner, CraftSettings Settings) NewRunner(params string[] bgModules)
+    {
+        var settings = new CraftSettings();
+        settings.Scripts.HttpModules = ["HttpMod"];
+        settings.Worker.BgModules = [.. bgModules];
+        var repo = new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings);
+        repo.LoadAll(_root);
+        return (new PowerShellRunnerService(NullLogger<PowerShellRunnerService>.Instance, null!, repo, settings), settings);
+    }
+
+    [Fact]
+    public void ModulesOutsideTheBackgroundPreloadStillResolve()
+    {
+        var (runner, _) = NewRunner("BgMod");
+
+        Assert.Equal("Get-Bg", runner.FindScript("Get-Bg"));
+        Assert.Equal("Get-Other", runner.FindScript("Get-Other"));
+    }
+
+    [Fact]
+    public void HttpEntrypointsNeverResolve()
+    {
+        var (runner, _) = NewRunner();
+
+        Assert.Null(runner.FindScript("ListThing"));
+        Assert.Null(runner.FindScript("Invoke-ListThing"));
+    }
+
+    [Fact]
+    public void RunNowFiresOnlyConfiguredTimers()
+    {
+        var (runner, settings) = NewRunner("BgMod");
+        settings.Scheduler.ConfigFile = Path.Combine(_root, "timers.json");
+        var config = new ConfigurationBuilder().AddInMemoryCollection([]).Build();
+        var pool = new PowerShellWorkerPool(new ScriptRepository(NullLogger<ScriptRepository>.Instance, settings),
+            NullLogger<PowerShellWorkerPool>.Instance, config, settings);
+        var limiter = new BackgroundTaskLimiter(NullLogger<BackgroundTaskLimiter>.Instance, config, settings, pool);
+        using var jobs = new JobManager(NullLogger<JobManager>.Instance, settings, limiter);
+        var scheduler = new SchedulerService(NullLogger<SchedulerService>.Instance, runner, limiter, null!, jobs,
+            settings, pool, null!, Craft.Endpoints.NativeScheduledTasks.Empty, null!);
+        scheduler.Start(DateTimeOffset.UtcNow);
+
+        Assert.False(scheduler.RunNow("Get-Bg"));
+        Assert.Equal(0, jobs.QueuedCount);
+        Assert.True(scheduler.RunNow("start-nightly"));
+        Assert.Equal(1, jobs.QueuedCount);
     }
 }
