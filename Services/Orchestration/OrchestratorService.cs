@@ -478,7 +478,14 @@ public class OrchestratorService : IJobDescriptorStateWriter
             _logger.LogError(ex, "[Orchestrator] PostExecution Push-{Function} failed for run {Name} (attempt {Attempt})",
                 header.PostExecFunctionName, header.Name, descriptor.Attempt);
             if (descriptor.Attempt < Math.Max(1, _settings.Orchestrator.MaxRetries))
-                await _store.ReleaseAsync(header.RunKey, WorkStore.AggregateSeq, Owner, refundAttempt: false, CancellationToken.None);
+            {
+                try { await _store.ReleaseAsync(header.RunKey, WorkStore.AggregateSeq, Owner, refundAttempt: false, CancellationToken.None); }
+                catch (Exception releaseEx)
+                {
+                    _logger.LogWarning(releaseEx, "[Orchestrator] Could not hand PostExecution for {Name} back to pending; it runs again once its claim lapses",
+                        header.Name);
+                }
+            }
             else
             {
                 _logger.LogError("[Scheduler] PostExecution for {Name} failed {Count} times — giving up and cleaning up results",
