@@ -76,16 +76,33 @@ public static class StaticFilePipeline
             {
                 var path = ctx.Context.Request.Path.Value ?? "";
                 var headers = ctx.Context.Response.Headers;
-                var directive = StaticCachePolicy.For(path);
-
-                headers.CacheControl = directive.CacheControl;
-                if (directive.IncludeETag)
-                    headers.ETag = $"\"{ctx.File.LastModified.ToFileTime():x}-{ctx.File.Length:x}\"";
+                // The ETag is left as the middleware set it: that is the value its If-None-Match check compares.
+                headers.CacheControl = StaticCachePolicy.For(path).CacheControl;
             },
         });
 
         logger.LogInformation("[System] Frontend: {Path}", frontendPath);
         return fileProvider;
+    }
+
+    /// <summary>
+    /// Answers 304 with no body when the request's <c>If-None-Match</c> names the ETag already set on the response.
+    /// </summary>
+    internal static bool IsNotModified(HttpContext context)
+    {
+        var etag = context.Response.Headers.ETag.ToString();
+        if (etag.Length == 0) return false;
+        foreach (var value in context.Request.Headers.IfNoneMatch)
+        {
+            foreach (var candidate in (value ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (candidate != "*" && !candidate.AsSpan(candidate.StartsWith("W/", StringComparison.Ordinal) ? 2 : 0).SequenceEqual(etag))
+                    continue;
+                context.Response.StatusCode = StatusCodes.Status304NotModified;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -125,11 +142,12 @@ public static class StaticFilePipeline
                 contentType = "application/octet-stream";
 
             var headers = context.Response.Headers;
-            headers.ContentEncoding = encoding.ContentEncoding;
             headers.Vary = "Accept-Encoding";
-            context.Response.ContentType = contentType;
             headers.ETag = $"\"{variant.LastModified.ToFileTime():x}-{variant.Length:x}\"";
             headers.CacheControl = StaticCachePolicy.ForPrecompressed(path);
+            if (IsNotModified(context)) return;
+            headers.ContentEncoding = encoding.ContentEncoding;
+            context.Response.ContentType = contentType;
 
             // Explicit length so the precompressed body goes out fixed-length rather than chunked.
             context.Response.ContentLength = variant.Length;
