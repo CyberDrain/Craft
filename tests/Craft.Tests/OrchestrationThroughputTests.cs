@@ -63,7 +63,7 @@ public class OrchestrationThroughputTests
 
             Assert.True(await WaitUntil(() => Task.FromResult(h.Svc.Started.Contains("f0")), 15_000));
             sw.Stop();
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1), $"the first task of a new run started after {sw.Elapsed.TotalMilliseconds:F0}ms");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1), $"the first task of a new run started after {sw.Elapsed.TotalMilliseconds:F0}ms; pump log: {string.Join(" | ", h.PumpLog.Lines.Select(l => $"{l.Level} {l.Message}"))}");
         }
         finally
         {

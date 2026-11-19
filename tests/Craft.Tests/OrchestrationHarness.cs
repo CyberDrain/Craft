@@ -103,6 +103,7 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
     public required FakeOrchestrator Svc { get; init; }
     public required WorkStore Store { get; init; }
     public required WorkPump Pump { get; init; }
+    public required CapturingLogger<WorkPump> PumpLog { get; init; }
     public required JobManager Jobs { get; init; }
     public required ICraftTableStore Tables { get; init; }
     public required CapturingLogger<OrchestratorService> Log { get; init; }
@@ -129,13 +130,15 @@ internal sealed class OrchestrationHarness : IAsyncDisposable
         var log = new CapturingLogger<OrchestratorService>();
         var svc = new FakeOrchestrator(jobs, store, results, config, settings, log);
         await svc.ResumeInterruptedRunsAsync(CancellationToken.None);
-        var pump = new WorkPump(NullLogger<WorkPump>.Instance, store, jobs, config, settings, svc);
+        var pumpLog = new CapturingLogger<WorkPump>();
+        var pump = new WorkPump(pumpLog, store, jobs, config, settings, svc);
         _ = Task.Run(() => jobs.StartAsync(CancellationToken.None));
         return new OrchestrationHarness
         {
             Svc = svc,
             Store = store,
             Pump = pump,
+            PumpLog = pumpLog,
             Jobs = jobs,
             Tables = tables,
             Log = log,
