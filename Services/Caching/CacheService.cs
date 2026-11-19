@@ -6,6 +6,9 @@ using System.Text.Json;
 using Craft.Configuration;
 using Craft.Hosting;
 using Craft.Services;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.Net.Http.Headers;
 
 namespace Craft.Caching;
 
@@ -301,6 +304,7 @@ public class CacheService : IDisposable
         var bytes = body.Length;
         var old = entry.BodyBytes;
         entry.Body = body;
+        entry.Encoded = null;
         entry.BodyBytes = bytes;
         Interlocked.Add(ref _memBytes, bytes - old);
         if (Interlocked.Read(ref _memBytes) > _maxMemoryBytes) EvictMemLru();
@@ -310,13 +314,43 @@ public class CacheService : IDisposable
     private void ForgetBody(CacheEntry? entry)
     {
         if (entry == null) return;
-        var b = entry.BodyBytes;
-        if (entry.Body != null)
+        entry.Body = null;
+        entry.Encoded = null;
+        Interlocked.Add(ref _memBytes, -Interlocked.Exchange(ref entry.BodyBytes, 0));
+    }
+
+    /// <summary>
+    /// Writes a cache hit's body. When the compression middleware would encode it, the encoded bytes are
+    /// kept on the entry and sent as they are, so only the first hit per encoding pays for compression.
+    /// </summary>
+    public async Task WriteHitBodyAsync(HttpContext context, string cacheKey, byte[] body)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(body);
+        // The feature is present only when the compression middleware wraps this request and the client accepts an encoding.
+        if (context.Features.Get<IHttpsCompressionFeature>() is not null
+            && context.RequestServices.GetService<IResponseCompressionProvider>() is { } negotiator
+            && negotiator.ShouldCompressResponse(context)
+            && negotiator.GetCompressionProvider(context) is { } provider
+            && _index.TryGetValue(cacheKey, out var entry) && ReferenceEquals(entry.Body, body))
         {
-            entry.Body = null;
-            entry.BodyBytes = 0;
-            Interlocked.Add(ref _memBytes, -b);
+            var encoded = entry.Encoded;
+            if (encoded?.Encoding != provider.EncodingName)
+            {
+                using var buffer = new MemoryStream();
+                await using (var stream = provider.CreateStream(buffer)) stream.Write(body);
+                encoded = new EncodedBody(provider.EncodingName, buffer.ToArray());
+                var delta = encoded.Bytes.Length - (entry.Encoded?.Bytes.Length ?? 0);
+                entry.Encoded = encoded;
+                Interlocked.Add(ref entry.BodyBytes, delta);
+                if (Interlocked.Add(ref _memBytes, delta) > _maxMemoryBytes) EvictMemLru();
+            }
+            context.Response.Headers.ContentEncoding = encoded.Encoding;
+            context.Response.Headers.Append(HeaderNames.Vary, HeaderNames.AcceptEncoding);
+            context.Response.ContentLength = encoded.Bytes.Length;
+            body = encoded.Bytes;
         }
+        await context.Response.Body.WriteAsync(body, context.RequestAborted);
     }
 
     /// <summary>Evict least-recently-used resident bodies until the memory budget is satisfied.</summary>
