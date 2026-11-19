@@ -21,6 +21,8 @@ public class FileLoggerProviderTests
                 if ((i & 1023) == 0) InterlockedMax(ref maxDepth, provider.QueueDepth);
             }
         });
+        // Dispose gives the writer 2 s and then abandons the tail, so let a slow runner drain first.
+        SpinWait.SpinUntil(() => provider.QueueDepth == 0, TimeSpan.FromSeconds(60));
         provider.Dispose();
 
         try
