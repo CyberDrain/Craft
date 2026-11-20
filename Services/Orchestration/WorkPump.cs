@@ -376,8 +376,11 @@ public class WorkPump : BackgroundService, IHostedLifecycleService
 
             if (probe.PendingExhausted)
             {
-                // A lapsing claim is the one change that bumps no count; look again when the earliest lease is due.
-                _skip[header.RunKey] = (entry.Done, entry.Total, probe.EarliestLeaseUntil?.UtcDateTime ?? DateTime.MaxValue, 0);
+                // A lapsing claim is the one change that bumps no count; look again when the earliest lease is due, the
+                // claims just made included (the probe read the leases before them)
+                var due = probe.EarliestLeaseUntil?.UtcDateTime ?? DateTime.MaxValue;
+                if (claims.Count > 0 && now + _lease < due) due = now + _lease;
+                _skip[header.RunKey] = (entry.Done, entry.Total, due, 0);
             }
             else if (claims.Count == 0)
             {

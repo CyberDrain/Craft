@@ -28,6 +28,10 @@ public class CacheEntry
 
     /// <summary>In-memory copy of the body (null = not resident; read from FilePath). Guarded by the mem tier.</summary>
     public volatile byte[]? Body;
-    /// <summary>Bytes charged to the memory budget for <see cref="Body"/>.</summary>
+    /// <summary>The body in the encoding last asked for, so a hit does not compress it again.</summary>
+    public volatile EncodedBody? Encoded;
+    /// <summary>Bytes charged to the memory budget for <see cref="Body"/> and <see cref="Encoded"/>.</summary>
     public int BodyBytes;
 }
+
+public sealed record EncodedBody(string Encoding, byte[] Bytes);

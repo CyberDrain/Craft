@@ -183,7 +183,7 @@ public static class PowerShellDispatchEndpoint
         context.Response.Headers["X-Request-Duration"] = $"{requestSw.ElapsedMilliseconds}ms";
 
         if (HandlerHeaders.AllowsBody(cached.Result.StatusCode))
-            await context.Response.Body.WriteAsync(cached.Result.BodyBytes);
+            await cache.WriteHitBodyAsync(context, cacheKey, cached.Result.BodyBytes);
 
         if (requestSnapshot is null) return;
 

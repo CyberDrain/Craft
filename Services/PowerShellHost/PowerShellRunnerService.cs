@@ -801,7 +801,16 @@ public class PowerShellRunnerService : IDisposable
             headers[h.Key.ToLowerInvariant()] = h.Value.ToString();
 
         object? body = null;
-        if (httpRequest.ContentLength > 0 || httpRequest.ContentType != null)
+        byte[]? rawBody = null;
+        if (httpRequest.ContentType?.StartsWith("application/octet-stream", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            httpRequest.EnableBuffering();
+            using var ms = new MemoryStream(httpRequest.ContentLength is long len and > 0 and < int.MaxValue ? (int)len : 0);
+            await httpRequest.Body.CopyToAsync(ms);
+            httpRequest.Body.Position = 0;
+            rawBody = ms.ToArray();
+        }
+        else if (httpRequest.ContentLength > 0 || httpRequest.ContentType != null)
         {
             httpRequest.EnableBuffering();
             using var reader = new StreamReader(httpRequest.Body, leaveOpen: true);
@@ -850,6 +859,7 @@ public class PowerShellRunnerService : IDisposable
             ["Query"] = query,
             ["Headers"] = headers,
             ["Body"] = body,
+            ["RawBody"] = rawBody,
             ["Params"] = routeParams
         };
     }

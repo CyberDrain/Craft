@@ -103,6 +103,32 @@ public sealed class AzureTableStore : ICraftTableStore
 
     public Task EnsureTableAsync(string table, CancellationToken ct = default) => CreateTableAsync(table, ct);
 
+    /// <summary>Waits between attempts of a transaction the service answered 503 (busy); tests shorten them.</summary>
+    internal static TimeSpan[] TransactionRetryDelays { get; set; } =
+        [TimeSpan.FromSeconds(0.5), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4), TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(16)];
+
+    /// <summary>
+    /// Submit a transaction, sending it again while the service answers 503. The SDK's retry policy never does: a
+    /// $batch whose operation the service refused still comes back 202, with the 503 inside the body. A 503 means
+    /// nothing in the transaction was applied, so the same transaction can be sent again as it is.
+    /// </summary>
+    internal static async Task SubmitTransactionAsync(TableClient client, IEnumerable<TableTransactionAction> actions, CancellationToken ct)
+    {
+        var batch = actions as IReadOnlyCollection<TableTransactionAction> ?? actions.ToList();
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await client.SubmitTransactionAsync(batch, ct);
+                return;
+            }
+            catch (RequestFailedException ex) when (ex.Status == 503 && attempt < TransactionRetryDelays.Length)
+            {
+                await Task.Delay(TransactionRetryDelays[attempt], ct);
+            }
+        }
+    }
+
     /// <summary>
     /// The service's answer for a table that does not exist: 404 with error code TableNotFound. A row
     /// that does not exist is also a 404, but ResourceNotFound, so the code is what separates "row is
@@ -244,7 +270,7 @@ public sealed class AzureTableStore : ICraftTableStore
 
         try
         {
-            await Client(table).SubmitTransactionAsync(actions, ct);
+            await SubmitTransactionAsync(Client(table), actions, ct);
         }
         catch (RequestFailedException ex) when (IsTableNotFound(ex))
         {
@@ -295,7 +321,7 @@ public sealed class AzureTableStore : ICraftTableStore
 
         try
         {
-            await Client(table).SubmitTransactionAsync(actions, ct);
+            await SubmitTransactionAsync(Client(table), actions, ct);
             return true;
         }
         catch (RequestFailedException ex) when (IsTableNotFound(ex))
@@ -313,7 +339,7 @@ public sealed class AzureTableStore : ICraftTableStore
     {
         try
         {
-            await client.SubmitTransactionAsync(batch, ct);
+            await SubmitTransactionAsync(client, batch, ct);
             return;
         }
         catch (RequestFailedException ex) when (IsTableNotFound(ex))
@@ -325,7 +351,7 @@ public sealed class AzureTableStore : ICraftTableStore
             await RecreateTableAsync(table, ct);
             try
             {
-                await client.SubmitTransactionAsync(batch, ct);
+                await SubmitTransactionAsync(client, batch, ct);
                 return;
             }
             catch (Exception)
@@ -375,7 +401,7 @@ public sealed class AzureTableStore : ICraftTableStore
             {
                 try
                 {
-                    await client.SubmitTransactionAsync(chunk
+                    await SubmitTransactionAsync(client, chunk
                         .Select(rk => new TableTransactionAction(TableTransactionActionType.Delete, new TableEntity(partitionKey, rk))), ct);
                     break;
                 }

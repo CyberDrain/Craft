@@ -483,4 +483,42 @@ public class OrchestrationRecoveryTests
         Assert.Equal(0, count.For("OrchestratorWork").UnboundedRanges);
         Assert.InRange(count.For("OrchestratorWork").Rows, 0, 1001 + 500);
     }
+
+    /// <summary>
+    /// A post-execution that fails while storage is busy, and whose hand-back to pending fails too, is left running under a claim
+    /// nobody renews. Once that claim lapses the pump must take it back and run the post-execution again (seen live: a child run sat
+    /// at 1/1 done for hours, holding its parent).
+    /// </summary>
+    [Fact]
+    public async Task APostExecutionWhoseReleaseFails_RunsAgainOnceItsClaimLapses()
+    {
+        var tables = new FaultyTableStore(new MemoryTableStore());
+        await using var h = await OrchestrationHarness.CreateAsync(tables: tables);
+        var attempts = 0;
+        h.Svc.PostExecBody = () => Interlocked.Increment(ref attempts) == 1 ? throw new InvalidOperationException("The server is busy.") : Task.CompletedTask;
+        var releaseFailed = 0;
+        // The release: the post-execution's running row out, its pending row back in
+        tables.FailSubmit = (_, ops) => ops.Any(o => o.Kind == StoreOpKind.Delete && o.Row.RowKey == $"R|{WorkStore.AggregateSeq:D8}")
+            && ops.Any(o => o.Kind == StoreOpKind.Insert && o.Row.RowKey == $"P|{WorkStore.AggregateSeq:D8}")
+            && Interlocked.Exchange(ref releaseFailed, 1) == 0;
+        Assert.True(await h.Start("BusyAgg", OrchestrationHarness.Batch(1), "Agg"));
+
+        Assert.True(await h.DriveUntil(async () => Volatile.Read(ref releaseFailed) == 1 && !h.Jobs.IsQueuedOrRunning(await AggregateJobAsync())));
+        var run = (await h.Store.GetRunByNameAsync("BusyAgg"))!;
+        var claim = Assert.Single(await h.Store.GetTasksAsync(run.RunKey, 'R'));
+        Assert.Equal((WorkStore.AggregateSeq, 1), (claim.Seq, claim.Attempt));
+
+        // Thirty-one minutes on: the claim's lease has run out, for the store and for the pump's own bookkeeping
+        var row = (await tables.GetAsync($"{h.Prefix}Work", run.RunKey, $"R|{WorkStore.AggregateSeq:D8}"))!;
+        row["LeaseUntil"] = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await tables.UpsertAsync($"{h.Prefix}Work", row);
+        h.Pump.Clock = () => DateTime.UtcNow.AddMinutes(31);
+
+        Assert.True(await h.DriveUntilFinished("BusyAgg"));
+        Assert.Equal(2, attempts);
+        Assert.Equal("Completed", (await h.Store.GetRunByNameAsync("BusyAgg"))!.PostExecStatus);
+        Assert.Contains(h.Log.Lines, l => l.Message.StartsWith("[Orchestrator] Could not hand PostExecution for BusyAgg back to pending", StringComparison.Ordinal));
+
+        async Task<string> AggregateJobAsync() => $"{(await h.Store.GetRunByNameAsync("BusyAgg"))!.RunKey}|{WorkStore.AggregateSeq}";
+    }
 }

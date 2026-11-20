@@ -40,6 +40,26 @@ public class WorkerModuleSharingTests : IDisposable
         Assert.Equal("1", Eval(second, "Add-CraftShareCount"));
     }
 
+    /// <summary>
+    /// Hosted apps keep per-worker memos in module script scope and rely on both halves of this: the memo is still
+    /// there on the worker's next invocation, and no other worker ever sees it. Clearing script scope between
+    /// invocations would silently undo their caching; sharing it would hand one request another's state.
+    /// </summary>
+    [Fact]
+    public void AModuleMemoOutlivesAnInvocationOnItsWorkerAndIsNeverSeenByAnother()
+    {
+        var shared = Load(WriteModule());
+        var first = Open(shared);
+        var second = Open(shared);
+        var inModule = $"& (Get-Module {ModuleName}) ";
+
+        Eval(first, inModule + "{ $script:Memo = [System.Collections.Generic.Dictionary[string, object]]::new(); $script:Memo['role'] = 'kept' }; $global:Stray = 1");
+
+        Assert.Equal("kept", Eval(first, inModule + "{ $script:Memo['role'] }"));
+        Assert.Equal("True", Eval(first, "$null -eq $global:Stray")); // the cleanup that kept the memo did run
+        Assert.Equal("True", Eval(second, inModule + "{ $null -eq $script:Memo }"));
+    }
+
     [Fact]
     public void EveryWorkerReportsTheModuleItsFunctionsCameFrom()
     {

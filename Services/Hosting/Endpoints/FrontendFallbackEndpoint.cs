@@ -160,9 +160,10 @@ public static class FrontendFallbackEndpoint
             var variant = new FileInfo(physicalHtmlPath + encoding.FileSuffix);
             if (variant.Exists)
             {
-                headers.ContentEncoding = encoding.ContentEncoding;
                 headers.Vary = "Accept-Encoding";
                 headers.ETag = $"\"{variant.LastWriteTimeUtc.ToFileTime():x}-{variant.Length:x}\"";
+                if (StaticFilePipeline.IsNotModified(context)) return;
+                headers.ContentEncoding = encoding.ContentEncoding;
                 context.Response.ContentLength = variant.Length;
                 await context.Response.SendFileAsync(variant.FullName, context.RequestAborted);
                 return;
@@ -175,6 +176,7 @@ public static class FrontendFallbackEndpoint
         if (raw.Exists)
         {
             headers.ETag = $"\"{raw.LastWriteTimeUtc.ToFileTime():x}-{raw.Length:x}\"";
+            if (StaticFilePipeline.IsNotModified(context)) return;
             context.Response.ContentLength = raw.Length;
         }
 
